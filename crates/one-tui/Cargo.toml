@@ -1,0 +1,14 @@
+[package]
+name = "one-tui"
+description = "One interactive terminal UI (Ratatui)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+crossterm.workspace = true
+pulldown-cmark = { version = "0.13", default-features = false }
+ratatui.workspace = true
+tokio.workspace = true
+unicode-width = "0.2"

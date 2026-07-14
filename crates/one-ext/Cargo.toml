@@ -1,0 +1,25 @@
+[package]
+name = "one-ext"
+description = "One Rust-native extension runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+dylib = ["dep:libloading", "dep:libc"]
+
+[dependencies]
+one-core.workspace = true
+async-trait.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+libloading = { version = "0.8", optional = true }
+libc = { version = "0.2", optional = true }
+
+[[example]]
+name = "status_extension"
+path = "examples/status_extension.rs"

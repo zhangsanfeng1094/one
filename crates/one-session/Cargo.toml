@@ -1,0 +1,21 @@
+[package]
+name = "one-session"
+description = "One-compatible JSONL session tree storage"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[features]
+default = []
+network = ["dep:reqwest"]
+
+[dependencies]
+one-core.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util"] }
+uuid.workspace = true
+reqwest = { workspace = true, optional = true }

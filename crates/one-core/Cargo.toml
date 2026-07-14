@@ -1,0 +1,15 @@
+[package]
+name = "one-core"
+description = "One agent core: messages, events, tool trait, agent loop"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
