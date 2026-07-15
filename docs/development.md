@@ -42,7 +42,7 @@ cargo build -p one-cli --features http-providers
 ## 添加新 Tool
 
 1. 在 `one-tools/src/` 新建模块，实现 `Tool` trait
-2. 注册到 `coding_tools()` / `read_only_tools()`
+2. 注册到 `coding_tools_with_options()` / `read_only_tools_with_policy()`；路径类工具必须走 `PathPolicy::resolve`
 3. 补充单元测试
 
 ## 添加新 Provider

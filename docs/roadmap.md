@@ -64,10 +64,17 @@
 - [x] Compaction：extractive + LLM 摘要；context overflow 重试一次
 - [x] Session UX：`/session` `/resume` `/new` `/name` + CLI `-r`
 - [x] Footer 用量：`~N tok` 估算 + thinking 标签
-- [x] Thinking level：Shift+Tab / `/thinking` + session 持久化 + Anthropic budget
+- [x] Thinking level：`/settings` / `/thinking` + session 持久化 + Anthropic budget
+- [x] Thinking 全链路：ContentBlock signature、各 provider 请求/解析/回放、TUI 流式 + Ctrl+T 折叠
 - [x] TUI 多行：Ctrl+J / Shift+Enter；paste 保留换行
 - [x] CLAUDE.md 与 AGENTS.md 一并加载
 - [x] 联网：`web_search` / `web_fetch` 内置工具；沙箱不再硬拦 curl/wget
+
+### Phase P0 日常替代感 — 2026-07-15
+- [x] Provider 面：DeepSeek / Gemini 直连 + 内置 models 预设 + `--list-providers`
+- [x] TUI：`@file` 注入 + Tab 路径补全；`-r` 交互 session 选择器
+- [x] 精确 usage：provider input/output tokens + 粗估 cost footer
+- [x] 统一 settings：`~/.one/agent/settings.json` + `/settings`
 
 ## 待完善 / 非阻塞 🔜
 
@@ -75,11 +82,9 @@
 - [ ] TS 扩展兼容层（QuickJS / WASM 评估）
 - [ ] self-update 命令
 - [ ] 性能基准套件
-- [ ] TUI 差分渲染优化 / `@` 文件模糊搜索 / 路径 Tab 补全 / 贴图
+- [ ] TUI 差分渲染优化 / 贴图 / `@` 模糊搜索增强
 - [ ] 与官方 Pi session 全量兼容性回归测试
-- [ ] DeepSeek 独立 provider（可通过 OpenRouter 使用）
-- [ ] `/resume` 完整 float 选择器（当前为列表 + 参数打开）
-- [ ] Token 精确 usage（provider 返回值）与 cost 记账
+- [ ] 更准的 per-model pricing 表
 
 ---
 
@@ -87,4 +92,10 @@
 
 - 不内置 MCP
 - 不内置子 Agent orchestrator
-- 不内置 Plan Mode（可通过扩展实现）
+
+## Plan Mode（已内置 MVP）
+
+- `/plan`、`--plan`，或 **空输入时 Space**：硬只读工具 + 仅可写 plan 文件 + `exit_plan_mode`
+- `/act` / `/build`：批准计划并切到 Build 模式开始实现；Space 再按一次仅回到 Build（不自动实现）
+- 计划落盘：`~/.one/agent/plans/<uuid>.md`
+- Thinking 深度不占用快捷键，用 `/settings thinking …`

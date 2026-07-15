@@ -74,6 +74,7 @@ impl LlmProvider for OllamaProvider {
 
         let mut stream = response.bytes_stream();
         let mut full_text = String::new();
+        let mut thinking_text = String::new();
         let mut aborted = false;
 
         while let Some(chunk) = stream.next().await {
@@ -90,24 +91,41 @@ impl LlmProvider for OllamaProvider {
                     Ok(event) => event,
                     Err(_) => continue,
                 };
-                if let Some(content) = event.message.and_then(|m| m.content) {
-                    if !content.is_empty() {
-                        full_text.push_str(&content);
-                        on_event(StreamEvent::TextDelta(content));
+                if let Some(msg) = event.message {
+                    if let Some(thinking) = msg.thinking {
+                        if !thinking.is_empty() {
+                            thinking_text.push_str(&thinking);
+                            on_event(StreamEvent::ThinkingDelta(thinking));
+                        }
+                    }
+                    if let Some(content) = msg.content {
+                        if !content.is_empty() {
+                            full_text.push_str(&content);
+                            on_event(StreamEvent::TextDelta(content));
+                        }
                     }
                 }
             }
         }
 
+        let mut content = Vec::new();
+        if !thinking_text.is_empty() {
+            content.push(ContentBlock::thinking(thinking_text));
+        }
+        if !full_text.is_empty() {
+            content.push(ContentBlock::Text { text: full_text });
+        }
+
         Ok(CompletionResponse {
             provider: self.name().to_string(),
             model: self.model.clone(),
-            content: vec![ContentBlock::Text { text: full_text }],
+            content,
             stop_reason: if aborted {
                 StopReason::Aborted
             } else {
                 StopReason::Stop
             },
+            usage: one_core::agent::TokenUsage::default(),
         })
     }
 }
@@ -120,29 +138,18 @@ fn build_body(request: &CompletionRequest, model: &str, stream: bool) -> Value {
     .chain(request.messages.iter().filter_map(map_message))
     .collect();
 
-    json!({
+    let mut body = json!({
         "model": model,
         "messages": messages,
         "stream": stream,
-    })
+    });
+    crate::thinking::apply_ollama_thinking(&mut body, request.thinking_level);
+    body
 }
 
 fn map_message(message: &one_core::AgentMessage) -> Option<Value> {
     match message {
-        one_core::AgentMessage::User(user) => {
-            let text = match &user.content {
-                one_core::message::UserContent::Text(text) => text.clone(),
-                one_core::message::UserContent::Blocks(blocks) => blocks
-                    .iter()
-                    .filter_map(|b| match b {
-                        one_core::message::TextOrImage::Text { text } => Some(text.clone()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            };
-            Some(json!({"role":"user","content":text}))
-        }
+        one_core::AgentMessage::User(user) => Some(crate::media::ollama_user_message(user)),
         one_core::AgentMessage::Assistant(assistant) => {
             let text = assistant
                 .content
@@ -153,16 +160,33 @@ fn map_message(message: &one_core::AgentMessage) -> Option<Value> {
                 })
                 .collect::<Vec<_>>()
                 .join("");
-            Some(json!({"role":"assistant","content":text}))
+            let thinking = crate::thinking::thinking_text(&assistant.content);
+            let mut msg = json!({"role":"assistant","content":text});
+            if !thinking.is_empty() {
+                // Ollama think models accept prior thinking for continuity.
+                msg["thinking"] = json!(thinking);
+            }
+            Some(msg)
         }
-        one_core::AgentMessage::ToolResult(result) => Some(json!({
-            "role": "user",
-            "content": format!("[tool:{}] {}", result.tool_name,
-                result.content.iter().filter_map(|b| match b {
-                    one_core::message::TextOrImage::Text { text } => Some(text.clone()),
-                    _ => None,
-                }).collect::<Vec<_>>().join("\n"))
-        })),
+        one_core::AgentMessage::ToolResult(result) => {
+            let text = crate::media::tool_result_plain(&result.content);
+            let images: Vec<&str> = crate::media::collect_images(&result.content)
+                .into_iter()
+                .map(|(_, data)| data)
+                .collect();
+            if images.is_empty() {
+                Some(json!({
+                    "role": "user",
+                    "content": format!("[tool:{}] {}", result.tool_name, text),
+                }))
+            } else {
+                Some(json!({
+                    "role": "user",
+                    "content": format!("[tool:{}] {}", result.tool_name, text),
+                    "images": images,
+                }))
+            }
+        }
     }
 }
 
@@ -174,4 +198,7 @@ struct OllamaStreamEvent {
 #[derive(Debug, Deserialize)]
 struct OllamaMessage {
     content: Option<String>,
+    /// Native think channel (DeepSeek-R1 / QwQ / etc. via Ollama).
+    #[serde(default)]
+    thinking: Option<String>,
 }

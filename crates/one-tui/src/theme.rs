@@ -115,9 +115,9 @@ impl Theme {
         Style::default().fg(Self::PRIMARY)
     }
 
-    /// Input caret on — thin vertical bar (not a full block).
+    /// Input caret on — software typewriter bar (▌).
     pub fn input_cursor_on() -> Style {
-        Style::default().fg(Self::FG).bg(Self::ELEMENT)
+        Style::default().fg(Self::PRIMARY).bg(Self::ELEMENT)
     }
 
     /// Input caret off — same cell width, blends into panel.
@@ -140,6 +140,27 @@ impl Theme {
 
     pub fn assistant_body() -> Style {
         Style::default().fg(Self::FG)
+    }
+
+    /// Thinking block chevron / accent.
+    pub fn thinking_chevron() -> Style {
+        Style::default().fg(Self::ACCENT)
+    }
+
+    pub fn thinking_title() -> Style {
+        Style::default()
+            .fg(Self::ACCENT)
+            .add_modifier(Modifier::DIM)
+    }
+
+    pub fn thinking_meta() -> Style {
+        Style::default().fg(Self::MUTED)
+    }
+
+    pub fn thinking_body() -> Style {
+        Style::default()
+            .fg(Self::MUTED)
+            .add_modifier(Modifier::ITALIC)
     }
 
     pub fn heading() -> Style {
@@ -265,6 +286,13 @@ impl Theme {
     }
 
     /// Soft secondary line under a tool (exit code / summary).
+    /// In-app text selection highlight (mouse drag → OSC 52 copy).
+    pub fn selection() -> Style {
+        Style::default()
+            .bg(Color::Rgb(60, 80, 120))
+            .fg(Color::Rgb(230, 235, 245))
+    }
+
     pub fn tool_summary_ok() -> Style {
         Style::default().fg(Self::SUCCESS)
     }
@@ -330,5 +358,24 @@ impl Theme {
         Style::default()
             .fg(Self::FG)
             .add_modifier(Modifier::BOLD)
+    }
+
+    /// Number / check badge on a solid chip (terminal-safe; avoids ☑/① tofu).
+    pub fn badge_primary() -> Style {
+        Style::default()
+            .fg(Self::BG)
+            .bg(Self::PRIMARY)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn badge_success() -> Style {
+        Style::default()
+            .fg(Self::BG)
+            .bg(Self::SUCCESS)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn badge_muted() -> Style {
+        Style::default().fg(Self::MUTED).bg(Self::ELEMENT)
     }
 }

@@ -6,26 +6,118 @@
 one                          # 交互模式（自动创建 session）
 one -p "explain this repo"   # print 模式
 one --continue / -c          # 继续最近 session
-one --resume / -r            # 同 --continue（交互内另有 /resume）
+one --resume / -r            # 交互：打开 session 选择器；非交互：最近 session
 one --session PATH           # 打开指定 session 文件
 one --no-session             # 不持久化
 one --read-only              # 只启用 read/grep/find/ls
-one --cwd /path/to/project   # 指定工作目录
+one --plan                   # 以 Plan 模式启动（探索 + 写计划，/act 后实现）
+one --cwd /path/to/project   # 指定工作目录（workspace 根）
+one --add-dir /other/path    # 额外可读写目录（可重复）
+one --full-access            # 关闭路径边界（危险；仅容器/可信环境）
 one -n "refactor auth"        # 设置 session 名称
-one -y                       # 自动批准高风险 bash 命令
+one -y                       # 自动批准高风险 bash 命令（不关闭路径边界）
 one --export out.html        # 导出 session 为 HTML
 one --share                  # 上传 session 到 GitHub Gist（需 GITHUB_TOKEN）
 one --list-models            # 列出可用模型
+one --list-providers         # 列出内置 + models.json 自定义 provider
 ```
+
+## 权限与路径沙箱
+
+默认 **`workspace-write`**：`read` / `write` / `edit` / `grep` / `find` / `ls` 只能访问：
+
+| 范围 | 权限 |
+|------|------|
+| `--cwd`（工作区根） | 读 + 写 |
+| `--add-dir` / settings `additional_directories` | 读 + 写 |
+| `~/.one/agent`（skills / plans） | **仅读** |
+| 其它绝对路径 / `../` 逃逸 | **拒绝** |
+
+```bash
+# 默认：只能改当前项目
+one --cwd ~/code/myapp
+
+# 允许再写一个共享目录
+one --add-dir ~/shared/proto
+
+# 关闭边界（等同 Codex danger-full-access）
+one --full-access
+```
+
+| 标志 / 设置 | 作用 |
+|-------------|------|
+| （默认） | 工作区路径硬边界 |
+| `--add-dir DIR` | 扩展可读写根 |
+| `--full-access` | 关闭路径边界 |
+| `-y` / `auto_approve` | 仅跳过**高危 bash** 确认，不放宽路径 |
+| `--read-only` | 去掉写工具与 bash |
+| `--plan` | 只能写 plan 文件 |
+
+持久化（`~/.one/agent/settings.json`）：
+
+```json
+{
+  "sandbox": "workspace-write",
+  "additional_directories": ["/home/me/shared"]
+}
+```
+
+交互：`/settings sandbox full-access` · `/settings add_dir /path/a,/path/b`
+
+### 交互审批
+
+高危 bash（如 `sudo`、`rm -rf`、`git push`）或命中 `ask` 规则时：
+
+| 模式 | 行为 |
+|------|------|
+| Interactive | 弹窗：`y` 一次 · `a` 本会话 · `n/Esc` 拒绝 |
+| Print / JSON / RPC | 直接拒绝（除非 `-y` / `ONE_AUTO_APPROVE=1`） |
+
+### 细粒度规则
+
+`settings.json`：
+
+```json
+{
+  "permissions": {
+    "allow": ["Bash(cargo *)", "Bash(git status*)"],
+    "deny": ["Bash(git push *)"],
+    "ask": ["Write(**/.env*)", "Bash(rm *)"]
+  },
+  "bash_sandbox": true
+}
+```
+
+规则语法：`Tool` 或 `Tool(specifier)`，`*` 通配。求值顺序：**deny → ask → allow → 内置默认**。
+
+交互追加：
+
+```text
+/settings allow Bash(cargo test *)
+/settings deny Bash(git push *)
+/settings ask Write(**/.env*)
+```
+
+### Bash OS 沙箱（bubblewrap）
+
+`workspace-write` 下 bash 默认经 `bwrap` 启动：
+
+- 工作区 + `--add-dir`：**读写**
+- `$HOME` / 系统路径：**只读**
+- 网络：保留（cargo/npm/curl）
+- `--full-access` 或 `bash_sandbox: false` / `ONE_BASH_SANDBOX=0`：关闭
+
 
 ## Provider 与模型配置
 
 ```bash
 one --provider mock          # 默认，本地测试
-one --provider ollama        # 本地 Ollama（需 network feature）
-one --provider anthropic     # 需 ANTHROPIC_API_KEY + http-providers
-one --provider openai        # 需 OPENAI_API_KEY + http-providers
-one --provider openrouter    # 需 OPENROUTER_API_KEY + http-providers
+one --provider ollama        # 本地 Ollama
+one --provider anthropic     # ANTHROPIC_API_KEY
+one --provider openai        # OPENAI_API_KEY
+one --provider openrouter    # OPENROUTER_API_KEY
+one --provider deepseek      # DEEPSEEK_API_KEY（OpenAI-compat）
+one --provider gemini        # GEMINI_API_KEY 或 GOOGLE_API_KEY
 
 one --model gpt-4o           # 模型 id（-m）
 one --base-url https://api.openai.com/v1
@@ -52,6 +144,32 @@ one --openai-api openai-responses   # 或 openai-completions
 | anthropic | `claude-sonnet-4-20250514` |
 | ollama | `llama3.2` |
 | openrouter | `anthropic/claude-sonnet-4` |
+| deepseek | `deepseek-chat` |
+| gemini | `gemini-2.5-flash` |
+
+### 统一设置 `~/.one/agent/settings.json`
+
+持久化 interactive 偏好（也会从旧 `preferences.json` 迁移）：
+
+```json
+{
+  "provider": "deepseek",
+  "model": "deepseek-chat",
+  "thinking": "off",
+  "auto_approve": false,
+  "context_window": 128000,
+  "sandbox": "workspace-write",
+  "additional_directories": []
+}
+```
+
+交互内：
+
+```text
+/settings                  # 查看
+/settings thinking high    # 写入并立即生效（thinking）
+/settings auto_approve true
+```
 
 ### OpenAI wire API
 
@@ -158,10 +276,18 @@ cargo run -p one-cli --features http-providers -- --provider openai -m gpt-4o
 - `Ctrl+J` / `Shift+Enter`：多行换行
 - `Alt+Enter`：follow-up
 - `Ctrl+S`：steer（运行中）
-- `Shift+Tab`：循环 thinking 级别（off → low → medium → high）
-- `Ctrl+L`：模型选择器 · `Ctrl+P`：命令面板
-- `Esc`：中止生成 / 关闭浮层
-- `Ctrl+C` / `/quit`：退出
+- `Space`（输入为空时）：切换 **Plan / Build** 模式
+- Thinking 深度：`/settings thinking <off|low|medium|high>` 或 `/thinking`（无快捷键）
+- `Ctrl+T`：展开/折叠全部 thinking 正文（**默认折叠**为 `▸ thinking · N chars`；流式输出时仍显示末 3 行 tail；点击或 ↵ 可单独展开/折叠一块）
+- `↑` / `↓` 或 `Ctrl+P` / `Ctrl+N`：切换之前提交过的提示词（**按项目持久化**，新 session / 重启进程仍可召回；来自 `~/.one/agent/sessions/--cwd--/prompt_history.jsonl`，首次会从历史 session 的用户消息播种）
+- `Esc`：输入非空时**立刻**清空草稿并记入 ↑ 历史；输入为空时再按一次 `Esc`（约 0.9s 内）打开 **当前 session** 的 rewind 菜单（conversation-only，不含代码 checkpoint）
+- `Ctrl+L`：模型选择器 · `/`：命令面板
+- `PageUp` / `PageDown`：滚动对话记录
+- `q` / `Esc`：中止生成（运行中；`q` 仅在输入为空时）
+- `Esc`：关闭浮层
+- `Ctrl+C` / `/quit`：强制退出（含卡死时；busy 下不会当成“取消”）
+- `Tab`：路径 / `@file` 补全
+- `@path`：发送时注入文件内容
 
 Slash 命令：
 
@@ -169,13 +295,17 @@ Slash 命令：
 |------|------|
 | `/help` | 显示帮助 |
 | `/session` | 当前 session 路径 / 名称 / 消息数 |
-| `/resume [id\|name\|file]` | 列出或打开历史 session |
+| `/resume [id\|name\|file]` | 列出或打开历史 session（无名称时显示首条用户消息） |
 | `/new` | 新建 session |
-| `/name <title>` | 设置 session 显示名 |
+| `/name <title>` | 设置 session 显示名（优先于首条消息预览） |
 | `/tree` / `/tree <id>` | 列出或切换分支 |
+| `/rewind` / `/rewind <id>` | 回退到某条用户提示并重新编辑（同 `Esc Esc`） |
 | `/model <provider>[:model]` | 切换 provider / 模型 |
 | `/thinking [off\|low\|medium\|high]` | 设置或循环 thinking |
+| `/plan` | 进入 Plan 模式（只读探索 + 写 plan 文件） |
+| `/act` / `/build` | 批准计划并切到 Build 模式开始实现 |
 | `/compact [instructions]` | 手动压缩上下文（LLM 摘要优先） |
+| `/settings [key value]` | 查看或写入统一设置 |
 | `/skill:name [args]` | **可选**强制加载 skill（默认由模型 `read` 按需加载） |
 | `/export [path]` | 导出 HTML |
 | `/reload` | 热重载扩展 / skills / prompts |

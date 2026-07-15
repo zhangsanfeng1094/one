@@ -16,9 +16,49 @@ use one_core::tool::Tool;
 use one_ext::{discover_extensions, ExtensionContext, ExtensionEvent, ExtensionRuntime};
 use one_resources::ResourceLoader;
 use one_session::{agent_dir, SessionInfo, SessionManager};
-use one_tools::{coding_tools_with_approve, read_only_tools};
+use one_tools::{
+    coding_tools_with_options, plan_mode_system_overlay, plan_mode_tools_with_policy,
+    read_only_tools_with_policy, BackgroundTaskRegistry, OsSandbox, PathPolicy, PermissionRules,
+    PlanExitState, SandboxMode, ToolBuildOptions,
+};
+use uuid::Uuid;
 
-use crate::cli::Cli;
+use crate::approval::PermissionGate;
+use crate::cli::{Cli, RunMode};
+
+/// Agent operating mode (Build/Act vs Plan).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AgentMode {
+    /// Full coding tools — implement changes.
+    #[default]
+    Act,
+    /// Explore + write plan only; no shell / app edits.
+    Plan,
+}
+
+impl AgentMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AgentMode::Act => "act",
+            AgentMode::Plan => "plan",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            AgentMode::Act => "Build",
+            AgentMode::Plan => "Plan",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "act" | "build" | "agent" => Some(AgentMode::Act),
+            "plan" => Some(AgentMode::Plan),
+            _ => None,
+        }
+    }
+}
 
 pub struct AppRuntime {
     pub agent: Arc<tokio::sync::Mutex<Agent>>,
@@ -31,6 +71,22 @@ pub struct AppRuntime {
     pub auto_approve: bool,
     pub cwd: PathBuf,
     read_only: bool,
+    /// Workspace path boundary + add-dir roots (rebuilt into tools on mode switch).
+    path_policy: PathPolicy,
+    /// Interactive `-r`: open session picker on TUI start.
+    pub open_session_picker: bool,
+    /// Current agent mode (Plan vs Act/Build).
+    mode: AgentMode,
+    /// Path of the active plan markdown file (set while/after plan mode).
+    plan_path: Option<PathBuf>,
+    /// Shared exit_plan_mode signal.
+    plan_exit: Arc<Mutex<PlanExitState>>,
+    /// Shared background bash registry (reused when leaving plan mode).
+    bg_registry: Arc<BackgroundTaskRegistry>,
+    /// Base system prompt without plan-mode overlay.
+    base_system_prompt: String,
+    /// Shared permission gate (interactive ask / fail-closed / auto).
+    pub permission_gate: Arc<PermissionGate>,
 }
 
 impl AppRuntime {
@@ -47,15 +103,69 @@ impl AppRuntime {
             })
             .await?;
 
-        let mut tools: Vec<Arc<dyn Tool>> = if cli.read_only {
-            read_only_tools(cwd.clone())
-        } else {
-            coding_tools_with_approve(cwd.clone(), cli.auto_approve)
-        };
-        tools.extend(extensions.tools());
+        let user_settings = crate::settings::load();
+        let auto_approve =
+            cli.auto_approve || user_settings.auto_approve.unwrap_or(false);
 
-        let system_prompt =
+        let path_policy = build_path_policy(&cwd, cli, &user_settings);
+        // Optional settings kill-switch for OS bash sandbox.
+        if user_settings.bash_sandbox == Some(false) {
+            std::env::set_var("ONE_BASH_SANDBOX", "0");
+        }
+
+        let bg_registry = Arc::new(BackgroundTaskRegistry::new());
+        // Apply OS sandbox to background tasks even before BashTool construction.
+        bg_registry.set_os_sandbox(OsSandbox::from_policy(&path_policy));
+
+        let interactive = matches!(cli.mode, RunMode::Interactive) && cli.print.is_none();
+        let perm_rules = user_settings
+            .permissions
+            .clone()
+            .unwrap_or_else(PermissionRules::default);
+        let permission_gate =
+            PermissionGate::with_auto_approve(perm_rules, auto_approve, interactive);
+
+        let start_plan = cli.plan && !cli.read_only;
+        let plan_path = if start_plan {
+            Some(new_plan_path())
+        } else {
+            None
+        };
+        let plan_exit = Arc::new(Mutex::new(PlanExitState::new(
+            plan_path
+                .clone()
+                .unwrap_or_else(|| agent_dir.join("plans").join("_none.md")),
+        )));
+
+        let mut tools: Vec<Arc<dyn Tool>> = if cli.read_only {
+            // No bash / background tools in read-only mode.
+            read_only_tools_with_policy(path_policy.clone())
+        } else if start_plan {
+            plan_mode_tools_with_policy(
+                path_policy.clone(),
+                plan_path.clone().expect("plan path"),
+                plan_exit.clone(),
+            )
+        } else {
+            coding_tools_with_options(ToolBuildOptions {
+                policy: path_policy.clone(),
+                auto_approve,
+                registry: bg_registry.clone(),
+            })
+        };
+        // Extension tools only in Act mode (may include write-capable tools).
+        if !start_plan {
+            tools.extend(extensions.tools());
+        }
+
+        let base_system_prompt =
             resources.build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
+        let system_prompt = if start_plan {
+            let p = plan_path.as_ref().expect("plan path");
+            format!("{base_system_prompt}{}", plan_mode_system_overlay(p))
+        } else {
+            base_system_prompt.clone()
+        };
         let mut agent = Agent::new(
             AgentConfig {
                 system_prompt,
@@ -64,27 +174,51 @@ impl AppRuntime {
             },
             tools,
         );
+        agent.set_tool_gate(Some(permission_gate.clone()));
+        // Claude-style: completed background bash → conversation notice (not TUI status bar).
+        if !cli.read_only {
+            agent.set_notification_queue(bg_registry.notification_queue());
+        }
+
+        // Interactive `-r` opens a picker in TUI — don't load a session yet.
+        let pick_session = cli.resume
+            && matches!(cli.mode, crate::cli::RunMode::Interactive)
+            && cli.print.is_none()
+            && cli.session.is_none();
 
         let mut session = if cli.no_session {
             None
         } else if let Some(path) = &cli.session {
             Some(SessionManager::open(path).await?)
-        } else if cli.resume {
-            // Interactive resume: open most recent if any; TUI will offer picker.
+        } else if pick_session {
+            // Empty shell until user picks via /resume float.
+            None
+        } else if cli.r#continue || (cli.resume && !pick_session) {
+            // `-c` always most-recent; non-interactive `-r` same.
             match SessionManager::continue_recent(&cwd).await {
                 Ok(session) => Some(session),
-                Err(_) => Some(SessionManager::create(&cwd).await?),
-            }
-        } else if cli.r#continue {
-            match SessionManager::continue_recent(&cwd).await {
-                Ok(session) => Some(session),
-                Err(_) => Some(SessionManager::create(&cwd).await?),
+                Err(_) => {
+                    if matches!(cli.mode, crate::cli::RunMode::Interactive) {
+                        Some(SessionManager::create(&cwd).await?)
+                    } else {
+                        None
+                    }
+                }
             }
         } else if matches!(cli.mode, crate::cli::RunMode::Interactive) && cli.print.is_none() {
             Some(SessionManager::create(&cwd).await?)
         } else {
             None
         };
+
+        // Default thinking from settings before session override.
+        if let Some(level) = user_settings
+            .thinking
+            .as_deref()
+            .and_then(ThinkingLevel::parse)
+        {
+            agent.config.thinking_level = level;
+        }
 
         if let Some(session) = &session {
             session.load_messages_into(&mut agent.messages);
@@ -104,7 +238,7 @@ impl AppRuntime {
         let followup_queue = agent.followup_queue_handle();
         let abort_flag = agent.abort_handle();
 
-        Ok(Self {
+        let mut runtime = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             abort_flag,
             steering_queue,
@@ -112,15 +246,248 @@ impl AppRuntime {
             session,
             extensions,
             resources,
-            auto_approve: cli.auto_approve,
+            auto_approve,
             cwd,
             read_only: cli.read_only,
-        })
+            path_policy,
+            open_session_picker: pick_session,
+            mode: if start_plan {
+                AgentMode::Plan
+            } else {
+                AgentMode::Act
+            },
+            plan_path,
+            plan_exit,
+            bg_registry,
+            base_system_prompt,
+            permission_gate,
+        };
+
+        // Restore plan path + mode from session custom entry if present.
+        if !cli.read_only {
+            if let Some(path) = runtime.restore_plan_path_from_session() {
+                runtime.plan_path = Some(path);
+            }
+            if !start_plan {
+                if let Some(restored) = runtime.restore_mode_from_session() {
+                    if restored == AgentMode::Plan {
+                        let _ = runtime.enter_plan_mode().await;
+                    }
+                }
+            }
+        }
+        if start_plan {
+            let _ = runtime.persist_mode().await;
+        }
+
+        Ok(runtime)
+    }
+
+    pub fn mode(&self) -> AgentMode {
+        self.mode
+    }
+
+    pub fn plan_path(&self) -> Option<&std::path::Path> {
+        self.plan_path.as_deref()
+    }
+
+    /// True if the model called `exit_plan_mode` since the last clear.
+    pub fn take_plan_exit_request(&self) -> bool {
+        let mut state = self.plan_exit.lock().expect("plan exit lock");
+        let requested = state.requested;
+        state.clear();
+        requested
+    }
+
+    /// Enter plan mode: hard tool gate + system overlay + plan file path.
+    pub async fn enter_plan_mode(&mut self) -> Result<PathBuf, Box<dyn std::error::Error>> {
+        if self.read_only {
+            return Err("already in --read-only; use full tools with /plan instead".into());
+        }
+        if self.mode == AgentMode::Plan {
+            if let Some(path) = &self.plan_path {
+                return Ok(path.clone());
+            }
+        }
+
+        let path = self
+            .plan_path
+            .clone()
+            .unwrap_or_else(new_plan_path);
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+        // Seed empty plan file so path is stable and readable.
+        if !path.exists() {
+            tokio::fs::write(
+                &path,
+                "# Plan\n\n_Write the implementation plan here._\n",
+            )
+            .await?;
+        }
+
+        {
+            let mut state = self.plan_exit.lock().expect("plan exit lock");
+            state.plan_path = path.clone();
+            state.clear();
+        }
+
+        let mut tools = plan_mode_tools_with_policy(
+            self.path_policy.clone(),
+            path.clone(),
+            self.plan_exit.clone(),
+        );
+        // Keep extension tools out of plan mode (may be write-capable).
+        let _ = &mut tools;
+
+        {
+            let mut agent = self.agent.lock().await;
+            agent.set_tools(tools);
+            agent.config.system_prompt =
+                format!("{}{}", self.base_system_prompt, plan_mode_system_overlay(&path));
+        }
+
+        self.mode = AgentMode::Plan;
+        self.plan_path = Some(path.clone());
+        self.persist_mode().await?;
+        Ok(path)
+    }
+
+    /// Leave plan mode and restore full coding tools (no auto-implement).
+    pub async fn leave_plan_mode(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.mode == AgentMode::Act {
+            return Ok(());
+        }
+        self.apply_act_tools_and_prompt().await?;
+        self.mode = AgentMode::Act;
+        {
+            let mut state = self.plan_exit.lock().expect("plan exit lock");
+            state.clear();
+        }
+        self.persist_mode().await?;
+        Ok(())
+    }
+
+    /// Approve plan and return a user prompt that starts implementation.
+    pub async fn approve_plan_prompt(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        let plan_path = self
+            .plan_path
+            .clone()
+            .ok_or("no plan file — enter /plan first")?;
+        let content = tokio::fs::read_to_string(&plan_path)
+            .await
+            .unwrap_or_default();
+        if content.trim().is_empty()
+            || content.trim() == "# Plan\n\n_Write the implementation plan here._"
+        {
+            return Err("plan file is empty — finish the plan before /act".into());
+        }
+
+        self.leave_plan_mode().await?;
+
+        Ok(format!(
+            "The plan below was approved. Implement it now. Follow the steps; \
+             do not re-plan unless blocked.\n\n\
+             Plan file: {}\n\n\
+             # Approved plan\n\n\
+             {content}",
+            plan_path.display()
+        ))
+    }
+
+    /// Read current plan file contents (if any).
+    pub async fn read_plan(&self) -> Option<String> {
+        let path = self.plan_path.as_ref()?;
+        tokio::fs::read_to_string(path).await.ok()
+    }
+
+    async fn apply_act_tools_and_prompt(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Refresh base prompt from resources in case of /reload.
+        self.base_system_prompt = self
+            .resources
+            .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
+
+        let mut tools: Vec<Arc<dyn Tool>> = if self.read_only {
+            read_only_tools_with_policy(self.path_policy.clone())
+        } else {
+            coding_tools_with_options(ToolBuildOptions {
+                policy: self.path_policy.clone(),
+                auto_approve: self.auto_approve,
+                registry: self.bg_registry.clone(),
+            })
+        };
+        tools.extend(self.extensions.tools());
+
+        let mut agent = self.agent.lock().await;
+        agent.set_tools(tools);
+        agent.config.system_prompt = self.base_system_prompt.clone();
+        if !self.read_only {
+            agent.set_notification_queue(self.bg_registry.notification_queue());
+        }
+        Ok(())
+    }
+
+    async fn persist_mode(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(session) = &mut self.session else {
+            return Ok(());
+        };
+        let data = serde_json::json!({
+            "mode": self.mode.as_str(),
+            "plan_path": self.plan_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        });
+        session.append_custom("agent_mode", data).await?;
+        Ok(())
+    }
+
+    fn restore_mode_from_session(&self) -> Option<AgentMode> {
+        let session = self.session.as_ref()?;
+        // Walk entries newest-first for latest agent_mode custom.
+        for entry in session.entries().iter().rev() {
+            if let one_session::SessionEntry::Custom {
+                custom_type, data, ..
+            } = entry
+            {
+                if custom_type == "agent_mode" {
+                    let mode = data
+                        .get("mode")
+                        .and_then(|v| v.as_str())
+                        .and_then(AgentMode::parse)?;
+                    return Some(mode);
+                }
+            }
+        }
+        None
+    }
+
+    fn restore_plan_path_from_session(&self) -> Option<PathBuf> {
+        let session = self.session.as_ref()?;
+        for entry in session.entries().iter().rev() {
+            if let one_session::SessionEntry::Custom {
+                custom_type, data, ..
+            } = entry
+            {
+                if custom_type == "agent_mode" {
+                    return data
+                        .get("plan_path")
+                        .and_then(|v| v.as_str())
+                        .map(PathBuf::from);
+                }
+            }
+        }
+        None
     }
 
     pub async fn subscribe_printer(&mut self, json: bool) {
         let mut agent = self.agent.lock().await;
         agent.subscribe(Box::new(move |event: &AgentEvent| match event {
+            AgentEvent::ThinkingDelta { delta } if !json => {
+                // Print-mode: stream reasoning to stderr so stdout stays clean for piping.
+                eprint!("{delta}");
+            }
+            AgentEvent::ThinkingDelta { delta } if json => {
+                let line = serde_json::json!({"type":"thinking_delta","delta":delta});
+                println!("{line}");
+            }
             AgentEvent::TextDelta { delta } if !json => print!("{delta}"),
             AgentEvent::TextDelta { delta } if json => {
                 let line = serde_json::json!({"type":"text_delta","delta":delta});
@@ -337,22 +704,34 @@ impl AppRuntime {
             })
             .await?;
 
-        let system_prompt = self
+        self.base_system_prompt = self
             .resources
             .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
-        {
-            let mut agent = self.agent.lock().await;
-            agent.config.system_prompt = system_prompt;
-            // Refresh tools from extensions (keep built-ins).
-            let mut tools: Vec<Arc<dyn Tool>> = if self.read_only {
-                read_only_tools(self.cwd.clone())
-            } else {
-                coding_tools_with_approve(self.cwd.clone(), self.auto_approve)
-            };
-            tools.extend(self.extensions.tools());
-            // Agent tools field is private — re-create agent messages only via system prompt update.
-            // tools are not publicly mutable; keep extension tools from initial load unless we add setter.
-            let _ = tools;
+        // Rebuild tools + prompt for current mode.
+        match self.mode {
+            AgentMode::Plan => {
+                let path = self
+                    .plan_path
+                    .clone()
+                    .unwrap_or_else(new_plan_path);
+                self.plan_path = Some(path.clone());
+                {
+                    let mut state = self.plan_exit.lock().expect("plan exit lock");
+                    state.plan_path = path.clone();
+                }
+                let tools = plan_mode_tools_with_policy(
+                    self.path_policy.clone(),
+                    path.clone(),
+                    self.plan_exit.clone(),
+                );
+                let mut agent = self.agent.lock().await;
+                agent.set_tools(tools);
+                agent.config.system_prompt =
+                    format!("{}{}", self.base_system_prompt, plan_mode_system_overlay(&path));
+            }
+            AgentMode::Act => {
+                self.apply_act_tools_and_prompt().await?;
+            }
         }
         Ok(self.extensions.names())
     }
@@ -381,6 +760,23 @@ impl AppRuntime {
         }
         load_extension_state(&self.extensions, &session);
         self.session = Some(session);
+
+        // Restore plan path / mode from session custom entries.
+        if !self.read_only {
+            if let Some(p) = self.restore_plan_path_from_session() {
+                self.plan_path = Some(p);
+            }
+            match self.restore_mode_from_session().unwrap_or(AgentMode::Act) {
+                AgentMode::Plan => {
+                    let _ = self.enter_plan_mode().await;
+                }
+                AgentMode::Act => {
+                    if self.mode == AgentMode::Plan {
+                        let _ = self.leave_plan_mode().await;
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -423,6 +819,11 @@ impl AppRuntime {
         one_core::estimate_tokens(&agent.messages)
     }
 
+    /// Provider-reported cumulative usage (input/output) for this runtime.
+    pub async fn token_usage(&self) -> one_core::TokenUsage {
+        self.agent.lock().await.token_usage
+    }
+
     pub fn session_path(&self) -> Option<PathBuf> {
         self.session
             .as_ref()
@@ -437,7 +838,10 @@ impl AppRuntime {
                     .session_file()
                     .map(|p| p.display().to_string())
                     .unwrap_or_else(|| "(memory)".into());
-                let name = s.session_name().unwrap_or_else(|| "—".into());
+                let name = s
+                    .session_name()
+                    .or_else(|| s.first_user_preview())
+                    .unwrap_or_else(|| "—".into());
                 let leaf = s.get_leaf_id().unwrap_or("root");
                 format!(
                     "session {name} · {} msgs · leaf={leaf} · {path}",
@@ -489,4 +893,43 @@ fn load_extension_state(extensions: &ExtensionRuntime, session: &SessionManager)
             extensions.restore_custom(custom_type, data.clone());
         }
     }
+}
+
+fn new_plan_path() -> PathBuf {
+    agent_dir()
+        .join("plans")
+        .join(format!("{}.md", Uuid::new_v4()))
+}
+
+/// Build path policy from CLI + settings.
+///
+/// Priority: `--full-access` / CLI `--add-dir` override settings; settings fill gaps.
+fn build_path_policy(
+    cwd: &std::path::Path,
+    cli: &Cli,
+    settings: &crate::settings::Settings,
+) -> PathPolicy {
+    let mode = if cli.full_access {
+        SandboxMode::FullAccess
+    } else if let Some(s) = settings.sandbox.as_deref().and_then(SandboxMode::parse) {
+        s
+    } else {
+        SandboxMode::WorkspaceWrite
+    };
+
+    let mut policy = PathPolicy::workspace(cwd.to_path_buf()).with_mode(mode);
+
+    let mut extras: Vec<PathBuf> = cli.add_dir.clone();
+    if let Some(dirs) = &settings.additional_directories {
+        for d in dirs {
+            extras.push(PathBuf::from(d));
+        }
+    }
+    // Dedup while preserving order.
+    let mut seen = std::collections::HashSet::new();
+    extras.retain(|p| seen.insert(p.clone()));
+    if !extras.is_empty() {
+        policy = policy.with_additional_dirs(extras);
+    }
+    policy
 }

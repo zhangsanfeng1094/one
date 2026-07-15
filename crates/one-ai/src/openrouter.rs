@@ -32,9 +32,10 @@ impl OpenRouterProvider {
         base_url: impl Into<String>,
     ) -> Self {
         Self {
-            // OpenRouter speaks Chat Completions only.
+            // OpenRouter speaks Chat Completions only; use OR thinking wire.
             inner: OpenAiProvider::with_base(api_key, model, base_url)
-                .with_wire_api(OpenaiWireApi::Completions),
+                .with_wire_api(OpenaiWireApi::Completions)
+                .with_thinking_wire(crate::thinking::ThinkingWire::OpenRouter),
         }
     }
 }

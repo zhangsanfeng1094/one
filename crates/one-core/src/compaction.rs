@@ -43,7 +43,7 @@ fn message_chars(message: &AgentMessage) -> usize {
             .iter()
             .map(|block| match block {
                 ContentBlock::Text { text } => text.len(),
-                ContentBlock::Thinking { thinking } => thinking.len(),
+                ContentBlock::Thinking { thinking, .. } => thinking.len(),
                 ContentBlock::ToolCall { name, arguments, .. } => {
                     name.len() + arguments.to_string().len() + 32
                 }

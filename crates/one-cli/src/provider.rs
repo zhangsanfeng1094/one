@@ -1,4 +1,4 @@
-use one_ai::{load_models_file, MockProvider, ModelRegistry, ModelsConfig, OpenaiWireApi};
+use one_ai::{MockProvider, ModelRegistry, ModelsConfig, OpenaiWireApi};
 use one_core::agent::LlmProvider;
 
 #[cfg(feature = "network")]
@@ -8,6 +8,7 @@ use one_ai::{AnthropicProvider, OpenAiProvider, OpenRouterProvider};
 
 use crate::cli::{Cli, OpenaiApi, ProviderKind};
 use crate::preferences;
+use crate::settings;
 
 pub struct ProviderSet {
     inner: std::sync::Arc<dyn LlmProvider>,
@@ -26,9 +27,10 @@ pub struct ProviderSet {
 impl ProviderSet {
     pub fn build(cli: &Cli) -> Result<Self, Box<dyn std::error::Error>> {
         let (models_config, config_warning) = load_config();
-        let saved = preferences::load();
-        let (provider_id, kind) = resolve_initial_provider(cli, saved.as_ref(), &models_config);
-        let effective_cli = effective_cli_with_saved_model(cli, saved.as_ref());
+        let user_settings = settings::load();
+        let (provider_id, kind) =
+            resolve_initial_provider(cli, &user_settings, &models_config);
+        let effective_cli = effective_cli_with_settings(cli, &user_settings);
         let resolved = resolve_settings(&effective_cli, &models_config, &provider_id);
         let inner = build_provider_llm(&provider_id, &resolved)?;
         Ok(Self {
@@ -70,6 +72,8 @@ impl ProviderSet {
             "anthropic" => ProviderKind::Anthropic,
             "openai" => ProviderKind::Openai,
             "openrouter" => ProviderKind::Openrouter,
+            "deepseek" => ProviderKind::Deepseek,
+            "gemini" => ProviderKind::Gemini,
             _ => {
                 // Custom: must exist in models.json providers or model list.
                 let known = self.models_config.provider(&provider_id).is_some()
@@ -102,10 +106,14 @@ impl ProviderSet {
             base_url: None,
             api_key: None,
             cwd: std::path::PathBuf::from("."),
+            add_dir: Vec::new(),
+            full_access: false,
             name: None,
             read_only: false,
+            plan: false,
             export: None,
             list_models: false,
+            list_providers: false,
             auto_approve: false,
             share: false,
         };
@@ -116,6 +124,13 @@ impl ProviderSet {
         self.provider_id = provider_id;
         self.openai_api = resolved.openai_api;
         self.base_url = resolved.base_url;
+        // Persist into unified settings + legacy preferences.
+        let mut s = settings::load();
+        s.provider = Some(self.provider_id.clone());
+        s.model = Some(self.as_llm().model().to_string());
+        if let Err(err) = settings::save(&s) {
+            tracing::warn!("failed to save settings: {err}");
+        }
         if let Err(err) = preferences::save(&self.provider_id, self.as_llm().model()) {
             tracing::warn!("failed to save model preferences: {err}");
         }
@@ -127,18 +142,31 @@ impl ProviderSet {
     }
 
     pub fn available_providers(&self) -> Vec<String> {
-        let mut ids: Vec<String> = self
-            .registry
-            .list()
+        let mut ids: Vec<String> = ModelRegistry::builtin_provider_catalog()
             .iter()
-            .map(|m| m.provider.clone())
+            .map(|(id, _, _)| (*id).to_string())
             .collect();
+        for m in self.registry.list() {
+            ids.push(m.provider.clone());
+        }
         for p in &self.models_config.providers {
             ids.push(p.id.clone());
         }
         ids.sort();
         ids.dedup();
         ids
+    }
+
+    /// Context window for the active model (settings override > registry).
+    pub fn context_window(&self) -> usize {
+        let s = settings::load();
+        if let Some(n) = s.context_window {
+            return n;
+        }
+        self.registry
+            .find(&self.provider_id, self.as_llm().model())
+            .and_then(|m| m.context_window)
+            .unwrap_or(0) as usize
     }
 
     pub fn available_models_line(&self) -> String {
@@ -161,7 +189,7 @@ struct Resolved {
 
 fn resolve_initial_provider(
     cli: &Cli,
-    saved: Option<&preferences::ModelPreferences>,
+    user_settings: &settings::Settings,
     cfg: &ModelsConfig,
 ) -> (String, ProviderKind) {
     let provider_id = cli
@@ -169,7 +197,7 @@ fn resolve_initial_provider(
         .as_ref()
         .map(provider_id_of)
         .map(str::to_string)
-        .or_else(|| saved.map(|p| p.provider.clone()))
+        .or_else(|| user_settings.provider.clone())
         .unwrap_or_else(|| "mock".to_string());
     let kind = cli
         .provider
@@ -178,21 +206,28 @@ fn resolve_initial_provider(
     (provider_id, kind)
 }
 
-fn effective_cli_with_saved_model(cli: &Cli, saved: Option<&preferences::ModelPreferences>) -> Cli {
+fn effective_cli_with_settings(cli: &Cli, user_settings: &settings::Settings) -> Cli {
     let mut effective = cli.clone();
     if effective.model.is_some() {
         return effective;
     }
-    let Some(saved) = saved else {
+    let Some(saved_model) = user_settings.model.as_ref() else {
         return effective;
     };
     let provider_id = cli
         .provider
         .as_ref()
         .map(provider_id_of)
-        .unwrap_or(saved.provider.as_str());
-    if cli.provider.is_none() || provider_id == saved.provider {
-        effective.model = Some(saved.model.clone());
+        .map(str::to_string)
+        .or_else(|| user_settings.provider.clone())
+        .unwrap_or_else(|| "mock".into());
+    if cli.provider.is_none()
+        || user_settings
+            .provider
+            .as_deref()
+            .is_some_and(|p| p == provider_id)
+    {
+        effective.model = Some(saved_model.clone());
     }
     effective
 }
@@ -204,6 +239,8 @@ fn kind_from_provider_id(provider_id: &str, cfg: &ModelsConfig) -> ProviderKind 
         "anthropic" => ProviderKind::Anthropic,
         "openai" => ProviderKind::Openai,
         "openrouter" => ProviderKind::Openrouter,
+        "deepseek" => ProviderKind::Deepseek,
+        "gemini" => ProviderKind::Gemini,
         _ => {
             let known = cfg.provider(provider_id).is_some()
                 || cfg
@@ -289,6 +326,8 @@ fn provider_id_of(kind: &ProviderKind) -> &'static str {
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Openai => "openai",
         ProviderKind::Openrouter => "openrouter",
+        ProviderKind::Deepseek => "deepseek",
+        ProviderKind::Gemini => "gemini",
     }
 }
 
@@ -299,6 +338,8 @@ fn default_model_for(provider_id: &str) -> &'static str {
         "anthropic" => "claude-sonnet-4-20250514",
         "openai" => "gpt-4o",
         "openrouter" => "anthropic/claude-sonnet-4",
+        "deepseek" => "deepseek-chat",
+        "gemini" => "gemini-2.5-flash",
         _ => "default",
     }
 }
@@ -324,6 +365,12 @@ fn env_base_url_for(provider_id: &str) -> Option<String> {
         }),
         "openrouter" => std::env::var("OPENROUTER_BASE_URL").ok(),
         "anthropic" => std::env::var("ANTHROPIC_BASE_URL").ok(),
+        "deepseek" => std::env::var("DEEPSEEK_BASE_URL")
+            .ok()
+            .or_else(|| Some("https://api.deepseek.com".into())),
+        "gemini" => std::env::var("GEMINI_BASE_URL").ok().or_else(|| {
+            Some("https://generativelanguage.googleapis.com/v1beta/openai".into())
+        }),
         _ => None,
     }
 }
@@ -333,6 +380,10 @@ fn env_api_key_for(provider_id: &str) -> Option<String> {
         "openai" => std::env::var("OPENAI_API_KEY").ok(),
         "anthropic" => std::env::var("ANTHROPIC_API_KEY").ok(),
         "openrouter" => std::env::var("OPENROUTER_API_KEY").ok(),
+        "deepseek" => std::env::var("DEEPSEEK_API_KEY").ok(),
+        "gemini" => std::env::var("GEMINI_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("GOOGLE_API_KEY").ok()),
         "ollama" => Some("ollama".into()),
         _ => None,
     }

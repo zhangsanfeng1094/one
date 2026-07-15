@@ -1,5 +1,6 @@
 //! Application state for the interactive chat TUI.
 
+use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
@@ -12,26 +13,89 @@ use crate::message::{
 use crate::slash::{self, ModelChoice, PopupKind, PopupRow};
 use crate::tool_view;
 
+/// Image attachment bound to a prompt placeholder token (`[图片.img]` / `[图片.N.img]`).
+///
+/// Deleting the token from the input detaches the image (uniform with normal editing).
+#[derive(Debug, Clone)]
+pub struct PendingImage {
+    pub id: u32,
+    pub mime_type: String,
+    pub data: String,
+    pub name: String,
+}
+
+impl PendingImage {
+    pub fn token(&self) -> String {
+        one_core::image::image_token(self.id)
+    }
+
+    pub fn label(&self) -> String {
+        one_core::image::image_label(&self.mime_type, &self.data)
+    }
+}
+
+/// Long pasted text bound to `[文本.txt]` / `[文本.N.txt]` (same atomic delete UX as images).
+#[derive(Debug, Clone)]
+pub struct PendingText {
+    pub id: u32,
+    pub body: String,
+}
+
+impl PendingText {
+    pub fn token(&self) -> String {
+        one_core::image::text_token(self.id)
+    }
+
+    pub fn summary(&self) -> String {
+        one_core::image::text_blob_summary(&self.body)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RunOutcome {
     Prompt(String),
     FollowUp(String),
     Steer(String),
-    /// Cycle thinking level (Shift+Tab).
-    CycleThinking,
+    /// Cycle agent mode Plan ↔ Build (Space on empty input).
+    CycleAgentMode,
+    /// Esc Esc on empty input — CLI should open the rewind menu.
+    OpenRewind,
     Quit,
     Noop,
+}
+
+/// Pending tool-approval prompt (interactive permission gate).
+#[derive(Debug, Clone)]
+pub struct ApprovalPrompt {
+    pub id: u64,
+    pub tool: String,
+    pub summary: String,
+    pub reason: String,
+}
+
+/// User choice for an approval prompt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalAnswer {
+    Once,
+    Session,
+    Deny,
 }
 
 impl RunOutcome {
     pub fn is_actionable(&self) -> bool {
         match self {
             RunOutcome::Noop => false,
-            RunOutcome::Prompt(t) | RunOutcome::FollowUp(t) | RunOutcome::Steer(t) => !t.is_empty(),
-            RunOutcome::CycleThinking | RunOutcome::Quit => true,
+            // Empty text is ok for Prompt when images were staged (image-only turn).
+            RunOutcome::Prompt(_) => true,
+            RunOutcome::FollowUp(t) | RunOutcome::Steer(t) => !t.is_empty(),
+            RunOutcome::CycleAgentMode | RunOutcome::OpenRewind | RunOutcome::Quit => true,
         }
     }
 }
+
+/// Max interval between Esc presses for empty-input rewind (second tap).
+/// Longer than a typical key-repeat delay so a deliberate double-tap is easy.
+const ESC_DOUBLE_MS: u128 = 900;
 
 const STATUS_IDLE: &str = "";
 const STATUS_BUSY: &str = "";
@@ -58,6 +122,16 @@ pub struct App {
     pub input: String,
     pub status: String,
     pub stream_buffer: String,
+    /// Streaming thinking / reasoning buffer (separate from assistant text).
+    pub thinking_buffer: String,
+    /// Default expand policy for **finished** thinking blocks.
+    ///
+    /// - `false` (default): collapse to `▸ thinking · N chars` after stream ends;
+    ///   click / ↵ expands one block; Ctrl+T expands/collapses all.
+    /// - `true`: finished blocks stay open showing full body.
+    ///
+    /// Live streaming always shows a short rolling tail regardless of this flag.
+    pub show_thinking: bool,
     pub busy: bool,
     /// Lines scrolled **up from the bottom** of the transcript (0 = stick to end).
     ///
@@ -74,6 +148,20 @@ pub struct App {
     pub chat_line_owners: Vec<Option<usize>>,
     /// Top of chat viewport in the full line list (updated each draw).
     pub chat_view_start: usize,
+    /// Blank rows painted above short transcripts (bottom-pin). Clicks skip these.
+    pub chat_top_pad: usize,
+    /// Terminal mouse capture is armed (wheel → chat).
+    pub mouse_capture: bool,
+    /// In-app transcript selection (absolute display-line indices, inclusive).
+    /// App-owned select + OSC 52 copy — does not need native terminal drag-select.
+    pub select_anchor: Option<usize>,
+    pub select_end: Option<usize>,
+    /// True after mouse moved while button down (distinguishes click vs drag).
+    pub select_dragging: bool,
+    /// Plain text for each display line (parallel to `chat_line_owners`), for copy.
+    pub chat_line_text: Vec<String>,
+    /// Pending clipboard payload set by UI; terminal session writes OSC 52.
+    pub clipboard_pending: Option<String>,
     pub cursor_on: bool,
     /// Compact model label for turn footers (usually just the model id).
     pub mode_label: String,
@@ -95,14 +183,49 @@ pub struct App {
     pub current_model: String,
     /// Thinking level label: off | low | medium | high.
     pub thinking_level: String,
-    /// Estimated context tokens (messages).
+    /// Estimated context tokens (messages) — char/4 heuristic.
     pub usage_tokens: usize,
+    /// Provider-reported cumulative input tokens.
+    pub usage_input: u64,
+    /// Provider-reported cumulative output tokens.
+    pub usage_output: u64,
+    /// Optional rough USD cost estimate (0 = unknown / not shown).
+    pub usage_cost_usd: f64,
     /// Optional context window for % display (0 = unknown).
     pub context_window: usize,
     turn_started: Option<Instant>,
     followup_pending: Option<String>,
     steer_pending: Option<String>,
     abort_pending: bool,
+    /// Ctrl+C force-quit: leave interactive immediately (not soft cancel).
+    force_quit_pending: bool,
+    /// Images still referenced by tokens in `input`.
+    pub pending_images: Vec<PendingImage>,
+    /// Long text pastes still referenced by `[文本.….txt]` tokens in `input`.
+    pub pending_texts: Vec<PendingText>,
+    /// Images committed on submit (input is cleared; CLI takes these for the agent).
+    committed_images: Vec<(String, String)>,
+    /// Next image token id (1-based).
+    next_image_id: u32,
+    /// Next text-chip id (1-based).
+    next_text_id: u32,
+    /// Submitted prompt history (oldest → newest). Up/Down / Ctrl+P/N navigate.
+    prompt_history: Vec<String>,
+    /// Index into `prompt_history` while browsing; `None` = live draft.
+    history_index: Option<usize>,
+    /// Input draft saved when first stepping into history with Up.
+    history_draft: String,
+    /// Timestamp of the last Esc press (for double-Esc rewind / clear).
+    last_esc_at: Option<Instant>,
+    /// Optional on-disk history file (project-scoped). Written on each push.
+    history_persist_path: Option<PathBuf>,
+    /// Optional callback-less persist via path — CLI sets this after load.
+    /// When set, `push_prompt_history` also appends a JSON line.
+    history_cwd: Option<PathBuf>,
+    /// Interactive tool approval overlay (while busy).
+    approval: Option<ApprovalPrompt>,
+    /// Choice taken by the user for the current approval.
+    approval_answer: Option<ApprovalAnswer>,
 }
 
 fn classify_toast_level(text: &str) -> AlertLevel {
@@ -128,6 +251,9 @@ impl App {
             input: String::new(),
             status: STATUS_IDLE.into(),
             stream_buffer: String::new(),
+            thinking_buffer: String::new(),
+            // Prefer collapsed headers so long reasoning doesn't flood the transcript.
+            show_thinking: false,
             busy: false,
             chat_scroll: 0,
             follow_bottom: true,
@@ -135,6 +261,13 @@ impl App {
             chat_total_lines: 0,
             chat_line_owners: Vec::new(),
             chat_view_start: 0,
+            chat_top_pad: 0,
+            mouse_capture: true,
+            select_anchor: None,
+            select_end: None,
+            select_dragging: false,
+            chat_line_text: Vec::new(),
+            clipboard_pending: None,
             cursor_on: true,
             mode_label: String::new(),
             agent_label: "Build".into(),
@@ -147,20 +280,309 @@ impl App {
             current_model: String::new(),
             thinking_level: "off".into(),
             usage_tokens: 0,
+            usage_input: 0,
+            usage_output: 0,
+            usage_cost_usd: 0.0,
             context_window: 0,
             turn_started: None,
             followup_pending: None,
             steer_pending: None,
             abort_pending: false,
+            force_quit_pending: false,
+            pending_images: Vec::new(),
+            pending_texts: Vec::new(),
+            committed_images: Vec::new(),
+            next_image_id: 1,
+            next_text_id: 1,
+            prompt_history: Vec::new(),
+            history_index: None,
+            history_draft: String::new(),
+            last_esc_at: None,
+            history_persist_path: None,
+            history_cwd: None,
+            approval: None,
+            approval_answer: None,
         }
+    }
+
+    /// Show a tool-approval modal (called from CLI while agent is busy).
+    pub fn set_approval_prompt(&mut self, prompt: ApprovalPrompt) {
+        if self.approval.as_ref().map(|p| p.id) == Some(prompt.id) {
+            return;
+        }
+        self.approval = Some(prompt);
+        self.approval_answer = None;
+    }
+
+    pub fn clear_approval_prompt(&mut self) {
+        self.approval = None;
+    }
+
+    pub fn approval_prompt(&self) -> Option<&ApprovalPrompt> {
+        self.approval.as_ref()
+    }
+
+    /// Take the user's answer if any (CLI feeds it into PermissionGate).
+    pub fn take_approval_answer(&mut self) -> Option<ApprovalAnswer> {
+        self.approval_answer.take()
+    }
+
+    /// Replace in-memory history (e.g. load from disk / past sessions).
+    /// Does **not** write back — caller already owns the file contents.
+    pub fn load_prompt_history(&mut self, entries: Vec<String>) {
+        self.prompt_history = entries;
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    /// Enable project-scoped persistence (Claude: history survives new sessions).
+    ///
+    /// `cwd` is the project directory used for `~/.one/agent/sessions/--cwd--/prompt_history.jsonl`.
+    pub fn enable_prompt_history_persist(&mut self, cwd: impl Into<PathBuf>) {
+        let cwd = cwd.into();
+        self.history_persist_path = Some(one_session_prompt_history_path(&cwd));
+        self.history_cwd = Some(cwd);
+    }
+
+    /// Record a prompt into ↑/↓ history (dedupes consecutive identical entries).
+    /// When persistence is enabled, also appends to the project history file.
+    pub fn push_prompt_history(&mut self, text: impl AsRef<str>) {
+        let text = text.as_ref().trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.prompt_history.last().map(|s| s.as_str()) == Some(text) {
+            return;
+        }
+        self.prompt_history.push(text.to_string());
+        // Cap growth so long sessions stay snappy.
+        const MAX: usize = 500;
+        if self.prompt_history.len() > MAX {
+            let drop_n = self.prompt_history.len() - MAX;
+            self.prompt_history.drain(0..drop_n);
+        }
+        self.history_index = None;
+        self.history_draft.clear();
+
+        if let Some(cwd) = &self.history_cwd {
+            // Best-effort; history recall must not fail the UI.
+            let _ = persist_append_prompt_history(cwd, text);
+        }
+    }
+
+    pub fn prompt_history_len(&self) -> usize {
+        self.prompt_history.len()
+    }
+}
+
+/// Path helper kept local so one-tui does not hard-depend on one-session types
+/// beyond the path layout we already share via the CLI wiring.
+fn one_session_prompt_history_path(cwd: &std::path::Path) -> PathBuf {
+    // Mirror one_session::paths::session_dir_for_cwd + prompt_history.jsonl
+    // so tests / App can show the path without importing session crate in all builds.
+    // Actual I/O goes through `persist_append_prompt_history` (CLI-linked).
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let encoded = cwd
+        .to_string_lossy()
+        .replace(std::path::MAIN_SEPARATOR, "-");
+    home.join(".one/agent/sessions")
+        .join(format!("--{encoded}--"))
+        .join("prompt_history.jsonl")
+}
+
+fn persist_append_prompt_history(cwd: &std::path::Path, text: &str) -> std::io::Result<()> {
+    // Inline minimal append so one-tui stays free of one-session if needed.
+    // Format matches one_session::prompt_history (JSON string per line).
+    use std::fs::{self, OpenOptions};
+    use std::io::Write;
+    let path = one_session_prompt_history_path(cwd);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    let line = serde_json::to_string(text).unwrap_or_else(|_| text.to_string());
+    file.write_all(line.as_bytes())?;
+    file.write_all(b"\n")?;
+    Ok(())
+}
+
+// Re-open App impl after free functions.
+impl App {
+    /// Step older (Up / Ctrl+P). Saves the live draft on first entry.
+    pub fn history_prev(&mut self) {
+        if self.prompt_history.is_empty() {
+            return;
+        }
+        match self.history_index {
+            None => {
+                self.history_draft = self.input.clone();
+                let i = self.prompt_history.len() - 1;
+                self.history_index = Some(i);
+                self.input = self.prompt_history[i].clone();
+            }
+            Some(0) => {
+                // Already at oldest — stay put.
+            }
+            Some(i) => {
+                let i = i - 1;
+                self.history_index = Some(i);
+                self.input = self.prompt_history[i].clone();
+            }
+        }
+        self.pending_images.clear();
+        self.pending_texts.clear();
+        self.cursor_on = true;
+        self.clear_notice();
+    }
+
+    /// Step newer (Down / Ctrl+N). Restores the draft past the newest entry.
+    pub fn history_next(&mut self) {
+        let Some(i) = self.history_index else {
+            return;
+        };
+        if i + 1 < self.prompt_history.len() {
+            let i = i + 1;
+            self.history_index = Some(i);
+            self.input = self.prompt_history[i].clone();
+        } else {
+            self.history_index = None;
+            self.input = std::mem::take(&mut self.history_draft);
+        }
+        self.pending_images.clear();
+        self.pending_texts.clear();
+        self.cursor_on = true;
+        self.clear_notice();
+    }
+
+    /// Leave history browse mode without changing the buffer (after typing, etc.).
+    fn leave_history_browse(&mut self) {
+        self.history_index = None;
+        self.history_draft.clear();
+    }
+
+    /// Take and clear images committed on the last submit (for the agent).
+    pub fn take_pending_images(&mut self) -> Vec<(String, String)> {
+        if !self.committed_images.is_empty() {
+            return std::mem::take(&mut self.committed_images);
+        }
+        // Fallback: still in the input (e.g. tests calling take without submit).
+        self.sync_pending_chips();
+        let order = one_core::image::image_token_ids_in(&self.input);
+        let mut by_id: std::collections::HashMap<u32, PendingImage> = self
+            .pending_images
+            .drain(..)
+            .map(|img| (img.id, img))
+            .collect();
+        order
+            .into_iter()
+            .filter_map(|id| by_id.remove(&id))
+            .map(|img| (img.mime_type, img.data))
+            .collect()
+    }
+
+    /// Drop chips whose token was deleted from the input.
+    pub fn sync_pending_chips(&mut self) {
+        let imgs: std::collections::HashSet<u32> = one_core::image::image_token_ids_in(&self.input)
+            .into_iter()
+            .collect();
+        self.pending_images.retain(|img| imgs.contains(&img.id));
+        let texts: std::collections::HashSet<u32> = one_core::image::text_token_ids_in(&self.input)
+            .into_iter()
+            .collect();
+        self.pending_texts.retain(|t| texts.contains(&t.id));
+    }
+
+    /// Backward-compatible alias.
+    pub fn sync_pending_images(&mut self) {
+        self.sync_pending_chips();
+    }
+
+    fn insert_chip_token(&mut self, token: &str) {
+        if !self.input.is_empty() && !self.input.ends_with(|c: char| c.is_whitespace()) {
+            self.input.push(' ');
+        }
+        self.input.push_str(token);
+        self.input.push(' ');
+    }
+
+    /// Attach image and insert `[图片.img]` / `[图片.N.img]` into the input (deletable as text).
+    pub fn attach_image(&mut self, mime_type: String, data: String, name: String) {
+        let id = self.next_image_id;
+        self.next_image_id = self.next_image_id.saturating_add(1).max(2);
+        let token = one_core::image::image_token(id);
+        let label = one_core::image::image_label(&mime_type, &data);
+        self.pending_images.push(PendingImage {
+            id,
+            mime_type,
+            data,
+            name: name.clone(),
+        });
+        self.insert_chip_token(&token);
+        self.set_notice(format!("attached {name}  {token}  {label}"));
+    }
+
+    /// Collapse a long paste into `[文本.txt]` (body kept until submit / delete).
+    pub fn attach_text_blob(&mut self, body: String) {
+        let id = self.next_text_id;
+        self.next_text_id = self.next_text_id.saturating_add(1).max(2);
+        let token = one_core::image::text_token(id);
+        let summary = one_core::image::text_blob_summary(&body);
+        self.pending_texts.push(PendingText { id, body });
+        self.insert_chip_token(&token);
+        self.set_notice(format!("pasted  {token}  {summary}"));
+    }
+
+    /// Pop one character, or an entire paste chip (`[图片.….img]` / `[文本.….txt]`).
+    pub fn pop_input(&mut self) {
+        if self.input.is_empty() {
+            return;
+        }
+        if let Some(n) = one_core::image::paste_chip_backspace_len(&self.input) {
+            let new_len = self.input.len().saturating_sub(n);
+            self.input.truncate(new_len);
+        } else {
+            self.input.pop();
+        }
+        self.sync_pending_chips();
+        self.cursor_on = true;
+        self.clear_notice();
     }
 
     pub fn set_thinking_level(&mut self, level: impl Into<String>) {
         self.thinking_level = level.into();
     }
 
+    /// Toggle default expand for finished thinking (Ctrl+T). Headers always remain.
+    ///
+    /// Also syncs every non-streaming thinking bubble to the new policy so the
+    /// transcript matches what Ctrl+T claims (expand all / collapse all).
+    pub fn toggle_show_thinking(&mut self) {
+        self.show_thinking = !self.show_thinking;
+        for msg in &mut self.messages {
+            if msg.role == MessageRole::Thinking && !msg.streaming {
+                msg.thinking_expanded = self.show_thinking;
+            }
+        }
+        self.set_notice(if self.show_thinking {
+            "thinking expanded"
+        } else {
+            "thinking collapsed"
+        });
+    }
+
     pub fn set_usage_tokens(&mut self, tokens: usize) {
         self.usage_tokens = tokens;
+    }
+
+    pub fn set_usage_io(&mut self, input: u64, output: u64) {
+        self.usage_input = input;
+        self.usage_output = output;
+    }
+
+    pub fn set_usage_cost_usd(&mut self, cost: f64) {
+        self.usage_cost_usd = cost;
     }
 
     pub fn set_context_window(&mut self, window: usize) {
@@ -258,9 +680,24 @@ impl App {
         self.clear_notice();
     }
 
+    /// Rewind menu: `(entry_id, preview)` newest first — Claude Code Esc Esc.
+    pub fn open_rewind_float(&mut self, prompts: &[(String, String)]) {
+        self.float = Some(FloatMenu::rewind_picker(prompts));
+        self.clear_notice();
+    }
+
     pub fn open_info_float(&mut self, title: impl Into<String>, rows: &[(String, String)]) {
         self.float = Some(FloatMenu::info_panel(title, rows));
         self.clear_notice();
+    }
+
+    /// Put text into the input for re-edit (after rewind). Does not submit.
+    pub fn set_input_for_edit(&mut self, text: impl Into<String>) {
+        self.input = text.into();
+        self.pending_images.clear();
+        self.pending_texts.clear();
+        self.leave_history_browse();
+        self.cursor_on = true;
     }
 
     pub fn close_float(&mut self) {
@@ -373,21 +810,27 @@ impl App {
     }
 
     pub fn push_tool_call(&mut self, name: impl Into<String>, args: impl Into<String>) {
-        // Close any in-progress assistant bubble so tool rows don't sit
-        // inside a still-streaming message, and next text starts clean.
+        // Close thinking + assistant bubbles so tool rows sit between
+        // completed segments, and the next tool-round thinking starts clean
+        // (otherwise deltas keep appending into the same buffer and the next
+        // bubble re-shows the previous segment's full text).
         self.seal_stream_segment();
         self.messages
             .push(Message::tool(name, args, ToolStatus::Running));
         self.scroll_to_bottom();
     }
 
-    /// Finalize the current streaming assistant text as a completed bubble
-    /// and reset the stream buffer (used between tool rounds).
+    /// Finalize in-progress thinking / assistant stream bubbles and reset
+    /// buffers (used between tool rounds).
     pub fn seal_stream_segment(&mut self) {
+        // Thinking must end before tools — interleaved think→tool→think
+        // rounds each own a separate bubble with only that round's deltas.
+        self.finish_thinking_stream();
+
         if self.stream_buffer.is_empty() {
-            // Still seal a trailing empty streaming marker if present.
+            // Seal a trailing empty assistant streaming marker if present.
             if let Some(last) = self.messages.last_mut() {
-                if last.streaming {
+                if last.role == MessageRole::Assistant && last.streaming {
                     last.streaming = false;
                 }
             }
@@ -395,7 +838,7 @@ impl App {
         }
         self.sync_stream_message();
         if let Some(last) = self.messages.last_mut() {
-            if last.streaming {
+            if last.role == MessageRole::Assistant && last.streaming {
                 last.streaming = false;
             }
         }
@@ -548,12 +991,174 @@ impl App {
         }
     }
 
+    /// Toggle a thinking block at `msg_index` (click / enter).
+    pub fn toggle_thinking_at(&mut self, msg_index: usize) {
+        if let Some(msg) = self.messages.get_mut(msg_index) {
+            if msg.role == MessageRole::Thinking && !msg.streaming {
+                msg.thinking_expanded = !msg.thinking_expanded;
+            }
+        }
+    }
+
+    /// Map a viewport row (0 = top of chat pane) to absolute transcript line.
+    pub fn view_row_to_line(&self, row_in_view: usize) -> Option<usize> {
+        if row_in_view < self.chat_top_pad {
+            return None;
+        }
+        let line = self
+            .chat_view_start
+            .saturating_add(row_in_view - self.chat_top_pad);
+        if line < self.chat_total_lines {
+            Some(line)
+        } else {
+            None
+        }
+    }
+
     /// Click at row offset within the chat viewport (0 = top visible line).
     pub fn click_chat_row(&mut self, row_in_view: usize) {
-        let line = self.chat_view_start.saturating_add(row_in_view);
+        let Some(line) = self.view_row_to_line(row_in_view) else {
+            return;
+        };
         if let Some(Some(msg_i)) = self.chat_line_owners.get(line).copied() {
-            self.toggle_tool_at(msg_i);
+            match self.messages.get(msg_i).map(|m| m.role) {
+                Some(MessageRole::Thinking) => self.toggle_thinking_at(msg_i),
+                Some(MessageRole::Tool) => self.toggle_tool_at(msg_i),
+                Some(MessageRole::Alert) => {
+                    // dismiss alerts if clickable — leave existing behaviour via tool path no-op
+                }
+                _ => self.toggle_tool_at(msg_i),
+            }
         }
+    }
+
+    /// Begin in-app selection at a viewport row (mouse down).
+    pub fn select_begin(&mut self, row_in_view: usize) {
+        let Some(line) = self.view_row_to_line(row_in_view) else {
+            self.clear_selection();
+            return;
+        };
+        self.select_anchor = Some(line);
+        self.select_end = Some(line);
+        self.select_dragging = false;
+    }
+
+    /// Extend selection.
+    ///
+    /// `from_drag`: true for Drag/Moved while held (always a select gesture).
+    /// false for mouse-up release row (only multi-line counts as select).
+    pub fn select_update(&mut self, row_in_view: usize, from_drag: bool) {
+        let Some(line) = self.view_row_to_line(row_in_view) else {
+            return;
+        };
+        if self.select_anchor.is_none() {
+            self.select_anchor = Some(line);
+        }
+        self.select_end = Some(line);
+        if from_drag {
+            // Any pointer motion while held → select → auto-copy on release.
+            self.select_dragging = true;
+        }
+        if let (Some(a), Some(b)) = (self.select_anchor, self.select_end) {
+            if a != b {
+                self.select_dragging = true;
+            }
+        }
+        if self.select_dragging {
+            self.follow_bottom = false;
+        }
+    }
+
+    /// Inclusive absolute line range of the current selection, if any.
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let a = self.select_anchor?;
+        let b = self.select_end.unwrap_or(a);
+        if self.chat_total_lines == 0 {
+            return Some((a.min(b), a.max(b)));
+        }
+        let max = self.chat_total_lines.saturating_sub(1);
+        let lo = a.min(b).min(max);
+        let hi = a.max(b).min(max);
+        Some((lo, hi))
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.select_anchor = None;
+        self.select_end = None;
+        self.select_dragging = false;
+    }
+
+    /// True when selection spans more than one display line.
+    pub fn selection_is_multi_line(&self) -> bool {
+        self.selection_range()
+            .is_some_and(|(lo, hi)| hi > lo)
+    }
+
+    /// Plain text for the selected lines (joined with `\n`).
+    pub fn selection_text(&self) -> Option<String> {
+        let (lo, hi) = self.selection_range()?;
+        if self.chat_line_text.is_empty() {
+            return None;
+        }
+        let hi = hi.min(self.chat_line_text.len().saturating_sub(1));
+        let lo = lo.min(hi);
+        let mut parts = Vec::new();
+        for line in &self.chat_line_text[lo..=hi] {
+            parts.push(line.as_str());
+        }
+        let text = parts.join("\n");
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(text)
+        }
+    }
+
+    /// Queue selection (or last assistant) for clipboard copy (OSC 52 + host fallbacks).
+    /// Always auto-copies when there is a real selection — default UX.
+    pub fn request_copy_selection(&mut self) -> bool {
+        if let Some(text) = self.selection_text() {
+            let lines = text.lines().count().max(1);
+            let n = text.chars().count();
+            self.clipboard_pending = Some(text);
+            // Toast updated after terminal flush with ok/err; provisional notice:
+            if lines > 1 {
+                self.set_notice(format!("copying {lines} lines…"));
+            } else {
+                self.set_notice(format!("copying {n} chars…"));
+            }
+            return true;
+        }
+        // Fallback: last assistant bubble (keybinding with no selection).
+        if let Some(msg) = self
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == MessageRole::Assistant && !m.content.is_empty())
+        {
+            let n = msg.content.chars().count();
+            self.clipboard_pending = Some(msg.content.clone());
+            self.set_notice(format!("copying last reply ({n} chars)…"));
+            return true;
+        }
+        self.set_notice("nothing to copy");
+        false
+    }
+
+    /// Finish pointer gesture: drag or multi-line → **auto-copy**;
+    /// plain click (no movement) → tool expand.
+    pub fn select_finish(&mut self, row_in_view: usize) {
+        // Apply release row without forcing drag (click stays click).
+        self.select_update(row_in_view, false);
+        // Selecting text always copies on release.
+        if self.select_dragging || self.selection_is_multi_line() {
+            let _ = self.request_copy_selection();
+            self.select_dragging = false;
+            return;
+        }
+        // Pure click: clear + expand tools.
+        self.clear_selection();
+        self.click_chat_row(row_in_view);
     }
 
     fn last_tool_streak(&self) -> Option<(usize, usize)> {
@@ -583,13 +1188,25 @@ impl App {
     }
 
     pub fn append_stream(&mut self, delta: &str) {
+        // Text arriving after thinking finalizes the thinking bubble.
+        if !self.thinking_buffer.is_empty() {
+            self.finish_thinking_stream();
+        }
         self.stream_buffer.push_str(delta);
         if self.follow_bottom {
             self.scroll_to_bottom();
         }
     }
 
+    pub fn append_thinking_stream(&mut self, delta: &str) {
+        self.thinking_buffer.push_str(delta);
+        if self.follow_bottom {
+            self.scroll_to_bottom();
+        }
+    }
+
     pub fn sync_stream_message(&mut self) {
+        self.sync_thinking_message();
         if self.stream_buffer.is_empty() {
             return;
         }
@@ -605,11 +1222,62 @@ impl App {
             .push(Message::streaming_assistant(&self.stream_buffer));
     }
 
+    pub fn sync_thinking_message(&mut self) {
+        if self.thinking_buffer.is_empty() {
+            return;
+        }
+
+        // Update the open streaming thinking bubble even if a later row
+        // (e.g. tool) was already inserted — never invent a second bubble
+        // that re-dumps the same cumulative buffer.
+        if let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == MessageRole::Thinking && m.streaming)
+        {
+            msg.content = self.thinking_buffer.clone();
+            msg.thinking_expanded = true;
+            return;
+        }
+
+        self.messages
+            .push(Message::streaming_thinking(&self.thinking_buffer));
+    }
+
+    fn finish_thinking_stream(&mut self) {
+        if self.thinking_buffer.is_empty() {
+            // Still close an orphan streaming thinking bubble (no more deltas).
+            if let Some(msg) = self
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|m| m.role == MessageRole::Thinking && m.streaming)
+            {
+                msg.streaming = false;
+                msg.thinking_expanded = self.show_thinking;
+            }
+            return;
+        }
+        self.sync_thinking_message();
+        if let Some(msg) = self
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == MessageRole::Thinking && m.streaming)
+        {
+            msg.streaming = false;
+            msg.thinking_expanded = self.show_thinking;
+        }
+        self.thinking_buffer.clear();
+    }
+
     pub fn finish_stream(&mut self) {
         self.finish_stream_with_interrupted(false);
     }
 
     pub fn finish_stream_with_interrupted(&mut self, interrupted: bool) {
+        self.finish_thinking_stream();
         if self.stream_buffer.is_empty() {
             self.remove_trailing_empty_stream();
             // Still stamp footer on last assistant if any.
@@ -664,6 +1332,7 @@ impl App {
 
     pub fn clear_stream(&mut self) {
         self.stream_buffer.clear();
+        self.thinking_buffer.clear();
         self.remove_trailing_empty_stream();
     }
 
@@ -678,6 +1347,7 @@ impl App {
     pub fn begin_busy(&mut self) {
         self.busy = true;
         self.stream_buffer.clear();
+        self.thinking_buffer.clear();
         self.remove_trailing_empty_stream();
         self.status = STATUS_BUSY.into();
         self.follow_bottom = true;
@@ -705,6 +1375,21 @@ impl App {
 
     pub fn take_abort(&mut self) -> bool {
         std::mem::take(&mut self.abort_pending)
+    }
+
+    /// Request immediate interactive exit (Ctrl+C). Distinct from soft abort (`q` / Esc).
+    pub fn request_force_quit(&mut self) {
+        self.force_quit_pending = true;
+        // Also trip abort so in-flight agent work stops if the process is about to leave.
+        self.abort_pending = true;
+    }
+
+    pub fn take_force_quit(&mut self) -> bool {
+        std::mem::take(&mut self.force_quit_pending)
+    }
+
+    pub fn force_quit_pending(&self) -> bool {
+        self.force_quit_pending
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -755,7 +1440,9 @@ impl App {
     /// Scroll the transcript down by `lines` display rows (newer content).
     pub fn scroll_down(&mut self, lines: usize) {
         self.chat_scroll = self.chat_scroll.saturating_sub(lines);
-        if self.chat_scroll == 0 {
+        // Empty welcome is top-anchored; don't re-enter follow-bottom or the
+        // next draw will snap back to the title.
+        if self.chat_scroll == 0 && !self.messages.is_empty() {
             self.follow_bottom = true;
         }
     }
@@ -777,8 +1464,32 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
+        // Image paste: data-URI or a single filesystem path to png/jpeg/gif/webp/bmp.
+        if let Some((mime, data)) = one_core::image::parse_data_uri(text) {
+            self.attach_image(mime, data, "paste".into());
+            self.cursor_on = true;
+            return;
+        }
+        if let Some((mime, data, name)) = one_core::image::try_load_image_path_paste(text) {
+            self.attach_image(mime, data, name);
+            self.cursor_on = true;
+            return;
+        }
+
         // Preserve newlines for multi-line paste (normalize \r\n / \r → \n).
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
+        // Long paste → `[文本.txt]` chip (same UX as images: compact + atomic delete).
+        if one_core::image::should_collapse_paste(&normalized) {
+            // Drop other control chars from the stored body.
+            let body: String = normalized
+                .chars()
+                .filter(|c| *c == '\n' || !c.is_control())
+                .collect();
+            self.attach_text_blob(body);
+            self.cursor_on = true;
+            return;
+        }
+
         for ch in normalized.chars() {
             match ch {
                 '\n' => self.input.push('\n'),
@@ -811,9 +1522,20 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) && self.busy => {
                 self.submit_steer()
             }
-            // Ctrl+P → command palette float
-            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_command_palette();
+            // Ctrl+P / Ctrl+N → prompt history (Claude Code / readline).
+            // Command palette remains `/` on empty input.
+            KeyCode::Char('p')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.history_prev();
+                RunOutcome::Noop
+            }
+            KeyCode::Char('n')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.history_next();
                 RunOutcome::Noop
             }
             // Ctrl+L → model picker float
@@ -823,6 +1545,7 @@ impl App {
             }
             // Ctrl+J → insert newline (multi-line compose)
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.leave_history_browse();
                 self.input.push('\n');
                 self.cursor_on = true;
                 self.clear_notice();
@@ -833,11 +1556,24 @@ impl App {
                 self.toggle_last_tool_expand();
                 RunOutcome::Noop
             }
-            // Shift+Tab → cycle thinking level
-            KeyCode::BackTab => RunOutcome::CycleThinking,
+            // Ctrl+T → show/hide thinking body (Pi-style)
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.toggle_show_thinking();
+                RunOutcome::Noop
+            }
+            // Space on empty input → cycle Plan / Build (thinking is settings-only).
+            KeyCode::Char(' ')
+                if self.input.is_empty()
+                    && !self.busy
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                RunOutcome::CycleAgentMode
+            }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.submit_followup(),
             // Shift+Enter → newline (when terminal reports SHIFT)
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.leave_history_browse();
                 self.input.push('\n');
                 self.cursor_on = true;
                 self.clear_notice();
@@ -859,12 +1595,18 @@ impl App {
                 }
                 self.submit_prompt()
             }
-            KeyCode::Backspace | KeyCode::Delete => {
-                self.input.pop();
-                self.cursor_on = true;
-                self.clear_notice();
+            // Tab → path / @file completion.
+            KeyCode::Tab => {
+                self.complete_path_token();
                 RunOutcome::Noop
             }
+            KeyCode::Backspace | KeyCode::Delete => {
+                self.leave_history_browse();
+                self.pop_input();
+                RunOutcome::Noop
+            }
+            // Esc Esc: clear draft → history, or open rewind when empty (Claude Code).
+            KeyCode::Esc => self.handle_esc(),
             // `/` on empty input → open command float (primary slash entry).
             KeyCode::Char('/')
                 if self.input.is_empty()
@@ -878,12 +1620,13 @@ impl App {
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
+                self.leave_history_browse();
                 self.input.push(ch);
                 self.cursor_on = true;
                 self.clear_notice();
                 RunOutcome::Noop
             }
-            // History navigation — transcript is kept fully; only the viewport is windowed.
+            // Transcript scroll (mouse wheel / Page keys). Up/Down = prompt history.
             KeyCode::PageUp => {
                 self.scroll_up(self.page_lines());
                 RunOutcome::Noop
@@ -900,17 +1643,59 @@ impl App {
                 self.scroll_to_bottom();
                 RunOutcome::Noop
             }
-            // ↑/↓ scroll chat history (also wheel via DECSET 1007).
+            // ↑/↓ navigate prompt history (Claude Code / bash style).
+            // Multi-line: only leave the input for history when at a single visual row
+            // or when already browsing history; otherwise PgUp/PgDn scrolls the chat.
             KeyCode::Up => {
-                self.scroll_up(3);
+                self.history_prev();
                 RunOutcome::Noop
             }
             KeyCode::Down => {
-                self.scroll_down(3);
+                self.history_next();
                 RunOutcome::Noop
             }
             _ => RunOutcome::Noop,
         }
+    }
+
+    /// Esc behavior (idle):
+    ///
+    /// | Input | Esc |
+    /// |-------|-----|
+    /// | **non-empty** | clear draft → ↑ history **immediately** (always reacts) |
+    /// | **empty** | 1st: arm + toast; 2nd within ~900ms: open rewind |
+    ///
+    /// Non-empty used to require double-Esc like Claude, but that felt dead on the
+    /// first press (toast only, easy to miss). Clear is safe + common TUI UX.
+    /// Empty still needs a double-tap so a single Esc doesn't open rewind by accident.
+    fn handle_esc(&mut self) -> RunOutcome {
+        // Always clear draft on first Esc when there is text — no double-tap.
+        if !self.input.is_empty() {
+            let draft = std::mem::take(&mut self.input);
+            self.pending_images.clear();
+            self.pending_texts.clear();
+            self.push_prompt_history(&draft);
+            self.leave_history_browse();
+            self.last_esc_at = None;
+            self.cursor_on = true;
+            self.set_notice("draft cleared · ↑ to recall · Esc Esc rewind");
+            return RunOutcome::Noop;
+        }
+
+        // Empty input: require double-Esc for rewind (Claude Code).
+        let now = Instant::now();
+        let double = self
+            .last_esc_at
+            .map(|t| now.duration_since(t).as_millis() <= ESC_DOUBLE_MS)
+            .unwrap_or(false);
+        self.last_esc_at = Some(now);
+
+        if !double {
+            self.set_notice("Esc again to rewind");
+            return RunOutcome::Noop;
+        }
+        self.last_esc_at = None;
+        RunOutcome::OpenRewind
     }
 
     fn handle_float_key(&mut self, key: KeyEvent) -> RunOutcome {
@@ -995,6 +1780,11 @@ impl App {
                 self.input.clear();
                 RunOutcome::Prompt(format!("/tree {}", entry.item.id))
             }
+            FloatKind::Rewind => {
+                self.close_float();
+                self.input.clear();
+                RunOutcome::Prompt(format!("/rewind {}", entry.item.id))
+            }
             FloatKind::Info => {
                 // Read-only panel — Enter dismisses.
                 self.close_float();
@@ -1033,8 +1823,8 @@ impl App {
                 RunOutcome::Noop
             }
             // These need runtime data → emit slash so CLI opens the right float.
-            "resume" | "session" | "tree" | "new" | "name" | "export" | "compact"
-            | "reload" | "skill" => {
+            "resume" | "session" | "tree" | "rewind" | "new" | "name" | "export" | "compact"
+            | "reload" | "skill" | "settings" => {
                 self.close_float();
                 self.input.clear();
                 let cmd = if hint.starts_with('/') {
@@ -1072,13 +1862,52 @@ impl App {
             return;
         }
 
+        // Ctrl+C always force-quits — even when a float is open or the turn is wedged.
+        // Soft cancel is `q` (empty input) / Esc; do not repurpose Ctrl+C as cancel.
+        if matches!(key.code, KeyCode::Char('c'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+        {
+            self.request_force_quit();
+            self.set_notice("force quit…");
+            return;
+        }
+
+        // Tool approval takes keyboard focus over steer / abort keys.
+        if self.approval.is_some() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
+                    self.approval_answer = Some(ApprovalAnswer::Once);
+                    self.approval = None;
+                    self.set_notice("approved once");
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    self.approval_answer = Some(ApprovalAnswer::Session);
+                    self.approval = None;
+                    self.set_notice("approved for session");
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
+                    self.approval_answer = Some(ApprovalAnswer::Deny);
+                    self.approval = None;
+                    self.set_notice("denied");
+                }
+                _ => {}
+            }
+            return;
+        }
+
         if self.float_open() {
             let _ = self.handle_float_key(key);
             return;
         }
 
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+            // `q` cancels the running turn when the steer buffer is empty.
+            // (While typing a steer/follow-up, bare `q` is a normal character.)
+            KeyCode::Char('q')
+                if self.input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
                 self.request_abort();
                 self.set_notice("interrupting…");
             }
@@ -1092,9 +1921,8 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
                 let _ = self.submit_followup();
             }
-            KeyCode::Backspace => {
-                self.input.pop();
-                self.cursor_on = true;
+            KeyCode::Backspace | KeyCode::Delete => {
+                self.pop_input();
             }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -1113,24 +1941,63 @@ impl App {
         }
     }
 
+    /// Complete the path or `@path` token under the cursor (end of input).
+    pub fn complete_path_token(&mut self) {
+        let Some((prefix, partial)) = path_token_at_end(&self.input) else {
+            return;
+        };
+        let matches = list_path_completions(&partial);
+        if matches.is_empty() {
+            self.set_notice(format!("no match for `{partial}`"));
+            return;
+        }
+        if matches.len() == 1 {
+            let completed = &matches[0];
+            self.input = format!("{prefix}{completed}");
+            self.cursor_on = true;
+            self.clear_notice();
+            return;
+        }
+        // Longest common prefix of all matches.
+        let common = longest_common_prefix(&matches);
+        if common.len() > partial.len() {
+            self.input = format!("{prefix}{common}");
+            self.cursor_on = true;
+        }
+        let preview: Vec<_> = matches.iter().take(8).cloned().collect();
+        self.set_notice(format!(
+            "{} matches · {}",
+            matches.len(),
+            preview.join("  ")
+        ));
+    }
+
     fn submit_prompt(&mut self) -> RunOutcome {
         // Keep multi-line body; only trim ends.
+        self.sync_pending_chips();
         let text = self.input.trim().to_string();
-        self.input.clear();
         if text.is_empty() {
             return RunOutcome::Noop;
         }
         if text == "/quit" || text == "/exit" {
+            self.pending_images.clear();
+            self.pending_texts.clear();
+            self.committed_images.clear();
+            self.input.clear();
             return RunOutcome::Quit;
         }
         if text == "/help" {
             self.set_notice(
-                "/session /resume /new /model /compact /thinking · skills auto-read · /skill:name force · Ctrl+J nl",
+                "/session /resume /new /model · paste → [图片.img]/[文本.txt] · Ctrl+J nl",
             );
             return RunOutcome::Noop;
         }
         if text == "/clear" {
             self.messages.clear();
+            self.pending_images.clear();
+            self.pending_texts.clear();
+            self.committed_images.clear();
+            self.input.clear();
             self.chat_scroll = 0;
             self.follow_bottom = true;
             self.set_notice("chat cleared");
@@ -1143,11 +2010,42 @@ impl App {
         }
         // UI slash commands — handled by one-cli without adding a chat turn.
         if is_ui_slash(&text) {
+            self.push_prompt_history(&text);
+            self.input.clear();
             return RunOutcome::Prompt(text);
         }
-        // Skills, prompt templates, and normal messages are user turns.
+
+        // Stage images for the agent (input will be cleared).
+        let img_order = one_core::image::image_token_ids_in(&text);
+        let mut img_by_id: std::collections::HashMap<u32, PendingImage> = self
+            .pending_images
+            .drain(..)
+            .map(|img| (img.id, img))
+            .collect();
+        self.committed_images = img_order
+            .into_iter()
+            .filter_map(|id| img_by_id.remove(&id))
+            .map(|img| (img.mime_type, img.data))
+            .collect();
+
+        // Expand `[文本.txt]` bodies for the model; strip image tokens (sent as blocks).
+        let text_bodies: std::collections::HashMap<u32, String> = self
+            .pending_texts
+            .drain(..)
+            .map(|t| (t.id, t.body))
+            .collect();
+        let plain = one_core::image::materialize_prompt_text(&text, &text_bodies);
+        let expanded = if plain.contains('@') {
+            expand_at_files(&plain)
+        } else {
+            plain
+        };
+
+        // Transcript keeps compact chips (`[图片.img]` / `[文本.txt]`), not the full paste.
+        self.push_prompt_history(&text);
+        self.input.clear();
         self.push_user(&text);
-        RunOutcome::Prompt(text)
+        RunOutcome::Prompt(expanded)
     }
 
     fn submit_followup(&mut self) -> RunOutcome {
@@ -1184,6 +2082,162 @@ fn format_duration(d: std::time::Duration) -> String {
         let s = secs % 60.0;
         format!("{m}m{s:.0}s")
     }
+}
+
+/// Split input into (prefix, path_token) when the last token looks path-like or is `@…`.
+fn path_token_at_end(input: &str) -> Option<(String, String)> {
+    let trimmed_end = input.trim_end_matches(|c: char| c == ' ' || c == '\n');
+    if trimmed_end.is_empty() {
+        return None;
+    }
+    // Find last whitespace-separated token.
+    let start = trimmed_end
+        .rfind(|c: char| c.is_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let token = &trimmed_end[start..];
+    if token.is_empty() {
+        return None;
+    }
+    let is_at = token.starts_with('@');
+    let path_part = if is_at { &token[1..] } else { token };
+    // Only complete when path-ish or @reference.
+    if !is_at
+        && !path_part.contains('/')
+        && !path_part.starts_with('.')
+        && !path_part.starts_with('~')
+    {
+        return None;
+    }
+    let prefix = input[..input.len() - token.len()].to_string();
+    let partial = if is_at {
+        format!("@{path_part}")
+    } else {
+        path_part.to_string()
+    };
+    Some((prefix, partial))
+}
+
+fn list_path_completions(partial: &str) -> Vec<String> {
+    let at = partial.starts_with('@');
+    let raw = if at { &partial[1..] } else { partial };
+    let expanded = expand_tilde(raw);
+    let (dir, file_prefix) = if expanded.ends_with('/') || expanded.is_empty() {
+        (if expanded.is_empty() { ".".into() } else { expanded.clone() }, String::new())
+    } else {
+        let path = std::path::Path::new(&expanded);
+        match (path.parent(), path.file_name()) {
+            (Some(parent), Some(name)) => (
+                if parent.as_os_str().is_empty() {
+                    ".".into()
+                } else {
+                    parent.to_string_lossy().into_owned()
+                },
+                name.to_string_lossy().into_owned(),
+            ),
+            _ => (".".into(), expanded.clone()),
+        }
+    };
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with('.') && !file_prefix.starts_with('.') {
+            continue;
+        }
+        if !name.starts_with(&file_prefix) {
+            continue;
+        }
+        let mut rendered = if dir == "." {
+            name.clone()
+        } else if dir.ends_with('/') {
+            format!("{dir}{name}")
+        } else {
+            format!("{dir}/{name}")
+        };
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            rendered.push('/');
+        }
+        if at {
+            out.push(format!("@{rendered}"));
+        } else {
+            out.push(rendered);
+        }
+    }
+    out.sort();
+    out
+}
+
+fn expand_tilde(path: &str) -> String {
+    if let Some(rest) = path.strip_prefix("~/") {
+        if let Ok(home) = std::env::var("HOME") {
+            return format!("{home}/{rest}");
+        }
+    }
+    if path == "~" {
+        if let Ok(home) = std::env::var("HOME") {
+            return home;
+        }
+    }
+    path.to_string()
+}
+
+fn longest_common_prefix(items: &[String]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let mut prefix = items[0].as_str();
+    for s in &items[1..] {
+        while !s.starts_with(prefix) {
+            if prefix.is_empty() {
+                return String::new();
+            }
+            prefix = &prefix[..prefix.len() - 1];
+        }
+    }
+    prefix.to_string()
+}
+
+/// Expand `@path` tokens into fenced file bodies for the model.
+pub fn expand_at_files(text: &str) -> String {
+    let mut out = String::new();
+    let mut rest = text;
+    while let Some(at) = rest.find('@') {
+        out.push_str(&rest[..at]);
+        rest = &rest[at + 1..];
+        // Token until whitespace.
+        let end = rest
+            .find(|c: char| c.is_whitespace())
+            .unwrap_or(rest.len());
+        let path_raw = &rest[..end];
+        rest = &rest[end..];
+        if path_raw.is_empty() {
+            out.push('@');
+            continue;
+        }
+        let path = expand_tilde(path_raw);
+        match std::fs::read_to_string(&path) {
+            Ok(body) => {
+                let name = std::path::Path::new(&path)
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(path_raw);
+                out.push_str(&format!(
+                    "\n\n--- file: {path_raw} ---\n```\n{body}\n```\n--- end {name} ---\n"
+                ));
+            }
+            Err(_) => {
+                // Keep original token if unreadable.
+                out.push('@');
+                out.push_str(path_raw);
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn split_tool_text(content: &str) -> (String, String) {
@@ -1227,7 +2281,9 @@ fn is_ui_slash(text: &str) -> bool {
             | "/model"
             | "/thinking"
             | "/compact"
+            | "/settings"
             | "/tree"
+            | "/rewind"
             | "/export"
             | "/reload"
             | "/clear"
@@ -1260,6 +2316,113 @@ mod tests {
             other => panic!("unexpected {other:?}"),
         }
         assert_eq!(app.messages.last().unwrap().content, "hello");
+        assert_eq!(app.prompt_history, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn up_down_navigates_prompt_history() {
+        let mut app = App::new("test");
+        app.push_prompt_history("first");
+        app.push_prompt_history("second");
+        app.input = "draft".into();
+
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input, "second");
+        app.handle_key(key(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(app.input, "first");
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input, "second");
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.input, "draft");
+
+        // Ctrl+P / Ctrl+N same as Up/Down.
+        app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "second");
+        app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn single_esc_clears_draft_into_history() {
+        let mut app = App::new("test");
+        app.input = "unsent draft".into();
+        // One Esc clears immediately (must always feel responsive).
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            RunOutcome::Noop
+        ));
+        assert!(app.input.is_empty());
+        assert_eq!(app.prompt_history.last().map(String::as_str), Some("unsent draft"));
+        app.history_prev();
+        assert_eq!(app.input, "unsent draft");
+    }
+
+    #[test]
+    fn double_esc_empty_opens_rewind() {
+        let mut app = App::new("test");
+        assert!(app.input.is_empty());
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            RunOutcome::Noop
+        ));
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            RunOutcome::OpenRewind
+        ));
+    }
+
+    #[test]
+    fn single_esc_empty_does_not_open_rewind() {
+        let mut app = App::new("test");
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+            RunOutcome::Noop
+        ));
+        // No second Esc — must not open rewind on a lonely press.
+        assert!(!matches!(
+            app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            RunOutcome::OpenRewind
+        ));
+    }
+
+    #[test]
+    fn load_prompt_history_enables_cross_session_recall() {
+        let mut app = App::new("test");
+        // Simulate startup load from previous sessions / disk.
+        app.load_prompt_history(vec![
+            "from last session".into(),
+            "another old prompt".into(),
+        ]);
+        assert_eq!(app.prompt_history_len(), 2);
+        app.input.clear();
+        app.history_prev();
+        assert_eq!(app.input, "another old prompt");
+        app.history_prev();
+        assert_eq!(app.input, "from last session");
+    }
+
+    #[test]
+    fn multi_line_selection_range_and_text() {
+        let mut app = App::new("t");
+        app.chat_total_lines = 5;
+        app.chat_line_text = vec![
+            "line-0".into(),
+            "line-1".into(),
+            "line-2".into(),
+            "line-3".into(),
+            "line-4".into(),
+        ];
+        app.select_anchor = Some(1);
+        app.select_end = Some(3);
+        assert!(app.selection_is_multi_line());
+        assert_eq!(app.selection_range(), Some((1, 3)));
+        let text = app.selection_text().unwrap();
+        assert_eq!(text, "line-1\nline-2\nline-3");
+        assert!(app.request_copy_selection());
+        assert_eq!(
+            app.clipboard_pending.as_deref(),
+            Some("line-1\nline-2\nline-3")
+        );
     }
 
     #[test]
@@ -1283,11 +2446,174 @@ mod tests {
     }
 
     #[test]
+    fn paste_data_uri_inserts_image_token() {
+        let mut app = App::new("test");
+        let uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        app.handle_paste(uri);
+        assert!(
+            app.input.contains(one_core::image::IMAGE_TOKEN),
+            "input={}",
+            app.input
+        );
+        assert_eq!(app.pending_images.len(), 1);
+        assert_eq!(app.pending_images[0].mime_type, "image/png");
+        let taken = app.take_pending_images();
+        assert_eq!(taken.len(), 1);
+    }
+
+    #[test]
+    fn deleting_image_token_detaches() {
+        let mut app = App::new("test");
+        app.attach_image("image/png".into(), "aaaa".into(), "shot.png".into());
+        assert_eq!(app.pending_images.len(), 1);
+        // User deletes the whole token from input.
+        app.input = "hello only".into();
+        app.sync_pending_images();
+        assert!(app.pending_images.is_empty());
+    }
+
+    #[test]
+    fn backspace_removes_image_token_atomically() {
+        let mut app = App::new("test");
+        app.input = "hello".into();
+        app.attach_image("image/png".into(), "aaaa".into(), "shot.png".into());
+        // input is "hello [图片.img] "
+        assert!(app.input.contains(one_core::image::IMAGE_TOKEN));
+        assert_eq!(app.pending_images.len(), 1);
+        // One Backspace wipes the whole token (+ spaces), not char-by-char.
+        app.pop_input();
+        assert_eq!(app.input, "hello");
+        assert!(app.pending_images.is_empty());
+    }
+
+    #[test]
+    fn long_paste_becomes_text_chip() {
+        let mut app = App::new("test");
+        let long = "line\n".repeat(30);
+        app.handle_paste(&long);
+        assert!(
+            app.input.contains(one_core::image::TEXT_TOKEN),
+            "input={}",
+            app.input
+        );
+        assert!(!app.input.contains("line\nline"));
+        assert_eq!(app.pending_texts.len(), 1);
+        assert!(app.pending_texts[0].body.contains("line"));
+
+        // Atomic backspace clears chip + body.
+        app.pop_input();
+        assert!(app.input.is_empty() || !app.input.contains("文本"));
+        assert!(app.pending_texts.is_empty());
+    }
+
+    #[test]
+    fn submit_expands_text_chip_for_agent() {
+        let mut app = App::new("test");
+        app.attach_text_blob("SECRET_BODY_XYZ\nsecond".into());
+        // Chip already in input with trailing space; append instruction.
+        app.input.push_str("summarize");
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            RunOutcome::Prompt(t) => {
+                assert!(t.contains("SECRET_BODY_XYZ"), "agent text={t}");
+                assert!(t.contains("summarize"), "agent text={t}");
+                assert!(!t.contains("文本"), "chip should expand, got {t}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        // Transcript stays compact.
+        let shown = &app.messages.last().unwrap().content;
+        assert!(shown.contains(one_core::image::TEXT_TOKEN), "{shown}");
+        assert!(!shown.contains("SECRET_BODY_XYZ"), "{shown}");
+    }
+
+    #[test]
+    fn submit_image_only_prompt() {
+        let mut app = App::new("test");
+        app.attach_image(
+            "image/png".into(),
+            "aaaa".into(),
+            "shot.png".into(),
+        );
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            RunOutcome::Prompt(t) => assert!(t.is_empty(), "token should be stripped, got {t}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Staged for CLI take.
+        let taken = app.take_pending_images();
+        assert_eq!(taken.len(), 1);
+        assert!(app
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains(one_core::image::IMAGE_TOKEN));
+    }
+
+    #[test]
     fn ctrl_j_inserts_newline() {
         let mut app = App::new("test");
         app.input = "a".into();
         app.handle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert_eq!(app.input, "a\n");
+    }
+
+    #[test]
+    fn busy_q_and_esc_abort_ctrl_c_force_quits() {
+        let mut app = App::new("test");
+        app.begin_busy();
+
+        // Soft cancel: empty-input `q`.
+        app.handle_busy_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert!(app.take_abort());
+        assert!(!app.force_quit_pending());
+
+        // Soft cancel: Esc.
+        app.handle_busy_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.take_abort());
+        assert!(!app.force_quit_pending());
+
+        // While composing steer text, bare `q` is a normal character.
+        app.handle_busy_key(key(KeyCode::Char('h'), KeyModifiers::NONE));
+        app.handle_busy_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
+        assert_eq!(app.input, "hq");
+        assert!(!app.take_abort());
+        assert!(!app.force_quit_pending());
+
+        // Force quit: Ctrl+C — never soft-cancel only.
+        app.handle_busy_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.force_quit_pending());
+        assert!(app.take_force_quit());
+        // request_force_quit also trips abort so in-flight work stops.
+        assert!(app.take_abort());
+    }
+
+    #[test]
+    fn idle_ctrl_c_quits() {
+        let mut app = App::new("test");
+        match app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+            RunOutcome::Quit => {}
+            other => panic!("expected Quit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn expand_at_files_inlines_content() {
+        let dir = std::env::temp_dir().join(format!("one-at-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("note.txt");
+        std::fs::write(&path, "hello-at-file").unwrap();
+        let input = format!("review @{}", path.display());
+        let expanded = expand_at_files(&input);
+        assert!(expanded.contains("hello-at-file"), "{expanded}");
+        assert!(expanded.contains("file:"), "{expanded}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn path_token_detects_at_and_slash() {
+        assert!(path_token_at_end("see @src/").is_some());
+        assert!(path_token_at_end("open ./foo").is_some());
+        assert!(path_token_at_end("just words").is_none());
     }
 
     #[test]
@@ -1302,6 +2628,112 @@ mod tests {
         app.finish_stream();
         assert!(!app.messages.last().unwrap().streaming);
         assert!(app.messages.last().unwrap().footer.is_some());
+    }
+
+    #[test]
+    fn thinking_stream_then_text() {
+        let mut app = App::new("test");
+        app.begin_busy();
+        app.append_thinking_stream("ponder");
+        app.sync_stream_message();
+        assert_eq!(app.messages.last().unwrap().role, MessageRole::Thinking);
+        assert!(app.messages.last().unwrap().streaming);
+        app.append_stream("answer");
+        app.sync_stream_message();
+        // Thinking finalized, assistant streaming.
+        assert_eq!(app.messages.len(), 2);
+        assert_eq!(app.messages[0].role, MessageRole::Thinking);
+        assert!(!app.messages[0].streaming);
+        assert_eq!(app.messages[1].role, MessageRole::Assistant);
+        assert_eq!(app.messages[1].content, "answer");
+        app.finish_stream();
+        assert!(!app.messages[1].streaming);
+    }
+
+    #[test]
+    fn thinking_tool_thinking_are_separate_segments() {
+        // Interleaved think → tool → think must not accumulate prior text
+        // into the second bubble (regression: seal forgot to finish thinking).
+        let mut app = App::new("test");
+        app.begin_busy();
+        app.append_thinking_stream("first round plan. ");
+        app.sync_stream_message();
+        assert_eq!(app.messages.len(), 1);
+        assert_eq!(app.messages[0].content, "first round plan. ");
+
+        app.push_tool_call("web_search", "query");
+        assert!(!app.messages[0].streaming, "thinking sealed before tool");
+        assert!(
+            app.thinking_buffer.is_empty(),
+            "buffer cleared so next round starts clean"
+        );
+        assert_eq!(app.messages[0].content, "first round plan. ");
+        // Default policy: collapse finished thinking so tool rows stay scannable.
+        assert!(
+            !app.messages[0].thinking_expanded,
+            "finished thinking collapses by default"
+        );
+        assert_eq!(app.messages.last().unwrap().role, MessageRole::Tool);
+
+        app.append_thinking_stream("second round only.");
+        app.sync_stream_message();
+        app.finish_stream();
+
+        let thinking: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Thinking)
+            .collect();
+        assert_eq!(thinking.len(), 2, "one bubble per thinking round");
+        assert_eq!(thinking[0].content, "first round plan. ");
+        assert_eq!(
+            thinking[1].content, "second round only.",
+            "second bubble must not re-include first round text"
+        );
+        assert!(!thinking[1].content.contains("first round"));
+        assert!(
+            thinking.iter().all(|m| !m.thinking_expanded && !m.streaming),
+            "both finished segments stay collapsed by default"
+        );
+    }
+
+    #[test]
+    fn finished_thinking_collapses_by_default() {
+        let mut app = App::new("test");
+        app.begin_busy();
+        app.append_thinking_stream("long chain of thought…");
+        app.sync_stream_message();
+        assert!(app.messages[0].streaming);
+        assert!(app.messages[0].thinking_expanded); // live tail while streaming
+        app.finish_stream();
+        assert!(!app.messages[0].streaming);
+        assert!(
+            !app.messages[0].thinking_expanded,
+            "after stream ends, default is ▸ collapsed header"
+        );
+        assert!(!app.show_thinking);
+    }
+
+    #[test]
+    fn ctrl_t_toggles_thinking_visibility() {
+        let mut app = App::new("test");
+        app.messages.push(Message::thinking("secret plan"));
+        // Default: collapsed.
+        assert!(!app.show_thinking);
+        assert!(!app.messages[0].thinking_expanded);
+        match app.handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL)) {
+            RunOutcome::Noop => {}
+            other => panic!("expected Noop, got {other:?}"),
+        }
+        assert!(app.show_thinking);
+        assert!(app.messages[0].thinking_expanded);
+        // Toggle back collapses all.
+        match app.handle_key(key(KeyCode::Char('t'), KeyModifiers::CONTROL)) {
+            RunOutcome::Noop => {}
+            other => panic!("expected Noop, got {other:?}"),
+        }
+        assert!(!app.show_thinking);
+        assert!(!app.messages[0].thinking_expanded);
     }
 
     #[test]

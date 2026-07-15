@@ -296,7 +296,101 @@ impl Writer {
             self.cell_buf.push_str(&text);
             return;
         }
-        self.push_run(text.to_string(), self.style);
+        self.push_text_with_safe_badges(&text);
+    }
+
+    /// Rewrite checkbox / circled-digit glyphs that often tofu into solid chips.
+    ///
+    /// Terminal fonts frequently break ☑☐✅①②③ and keycap emoji (the "symbols
+    /// with background" users expect). Map them to reverse-video ASCII badges.
+    fn push_text_with_safe_badges(&mut self, text: &str) {
+        let mut buf = String::new();
+        let flush = |w: &mut Self, buf: &mut String| {
+            if !buf.is_empty() {
+                w.push_run(std::mem::take(buf), w.style);
+            }
+        };
+
+        let mut chars = text.chars().peekable();
+        while let Some(ch) = chars.next() {
+            // Keycap digits: '1' + VS16? + combining enclosing keycap U+20E3
+            // or emoji presentation of circled numbers.
+            if ch.is_ascii_digit() {
+                let mut look = chars.clone();
+                // Optional variation selector-16
+                if look.peek() == Some(&'\u{FE0F}') {
+                    look.next();
+                }
+                if look.peek() == Some(&'\u{20E3}') {
+                    // consume from real iterator
+                    if chars.peek() == Some(&'\u{FE0F}') {
+                        chars.next();
+                    }
+                    if chars.peek() == Some(&'\u{20E3}') {
+                        chars.next();
+                    }
+                    flush(self, &mut buf);
+                    self.push_run(format!(" {ch} "), Theme::badge_primary());
+                    // drop trailing space if next is space (we already pad)
+                    if chars.peek() == Some(&' ') {
+                        chars.next();
+                    }
+                    self.push_run(" ".into(), self.style);
+                    continue;
+                }
+            }
+
+            match ch {
+                // Checked boxes / heavy checks — solid success chip
+                '☑' | '✅' | '✓' | '✔' | '🗹' | '🅥' => {
+                    flush(self, &mut buf);
+                    self.push_run("[x]".into(), Theme::badge_success());
+                    if chars.peek() == Some(&' ') {
+                        chars.next();
+                    }
+                    self.push_run(" ".into(), self.style);
+                }
+                // Empty / ballot boxes
+                '☐' | '⬜' | '◻' | '▢' | '□' => {
+                    flush(self, &mut buf);
+                    self.push_run("[ ]".into(), Theme::badge_muted());
+                    if chars.peek() == Some(&' ') {
+                        chars.next();
+                    }
+                    self.push_run(" ".into(), self.style);
+                }
+                // Circled digits ①..⑨  (and ⑩)
+                '①'..='⑨' => {
+                    let n = (ch as u32 - '①' as u32) + 1;
+                    flush(self, &mut buf);
+                    self.push_run(format!(" {n} "), Theme::badge_primary());
+                    if chars.peek() == Some(&' ') {
+                        chars.next();
+                    }
+                    self.push_run(" ".into(), self.style);
+                }
+                '⑩' => {
+                    flush(self, &mut buf);
+                    self.push_run(" 10 ".into(), Theme::badge_primary());
+                    if chars.peek() == Some(&' ') {
+                        chars.next();
+                    }
+                    self.push_run(" ".into(), self.style);
+                }
+                // Negative circled ❶..❾
+                '❶'..='❾' => {
+                    let n = (ch as u32 - '❶' as u32) + 1;
+                    flush(self, &mut buf);
+                    self.push_run(format!(" {n} "), Theme::badge_primary());
+                    if chars.peek() == Some(&' ') {
+                        chars.next();
+                    }
+                    self.push_run(" ".into(), self.style);
+                }
+                other => buf.push(other),
+            }
+        }
+        flush(self, &mut buf);
     }
 
     fn code(&mut self, code: CowStr<'_>) {
@@ -342,8 +436,14 @@ impl Writer {
     }
 
     fn task_marker(&mut self, checked: bool) {
-        let mark = if checked { "☑ " } else { "☐ " };
-        self.push_run(mark.into(), Theme::meta());
+        // Avoid ☑/☐ — many terminal fonts render them as broken dual-cell tofu.
+        // Solid reverse-video chips are single-width ASCII and always legible.
+        if checked {
+            self.push_run("[x]".into(), Theme::badge_success());
+        } else {
+            self.push_run("[ ]".into(), Theme::badge_muted());
+        }
+        self.push_run(" ".into(), Theme::assistant_body());
     }
 
     fn push_run(&mut self, text: String, style: Style) {
@@ -811,6 +911,45 @@ mod tests {
         let s = flat(&lines);
         assert!(s.contains("1. one"), "{s}");
         assert!(s.contains("2. two"), "{s}");
+    }
+
+    #[test]
+    fn task_list_uses_ascii_badges_not_unicode_boxes() {
+        let md = "- [x] done item\n- [ ] todo item";
+        let lines = render(md, 40);
+        let s = flat(&lines);
+        assert!(s.contains("[x]"), "checked badge missing: {s}");
+        assert!(s.contains("[ ]"), "unchecked badge missing: {s}");
+        assert!(s.contains("done item"), "{s}");
+        assert!(s.contains("todo item"), "{s}");
+        // Fragile dual-cell glyphs that tofu on many terminals.
+        assert!(!s.contains('☑'), "{s}");
+        assert!(!s.contains('☐'), "{s}");
+        // Badge styles: checked = success chip, unchecked = muted chip.
+        let joined: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|sp| sp.content.contains('[') )
+            .map(|sp| format!("{:?}:{}", sp.style.bg, sp.content))
+            .collect::<Vec<_>>()
+            .join("|");
+        assert!(
+            joined.contains("[x]") && joined.contains("[ ]"),
+            "expected both badges in spans: {joined}"
+        );
+    }
+
+    #[test]
+    fn unicode_checkboxes_and_circled_digits_become_badges() {
+        let md = "☑ done\n☐ todo\n① first\n2️⃣ second";
+        let lines = render(md, 48);
+        let s = flat(&lines);
+        assert!(s.contains("[x]"), "checked rewrite: {s}");
+        assert!(s.contains("[ ]"), "unchecked rewrite: {s}");
+        assert!(s.contains("1"), "circled digit rewrite: {s}");
+        assert!(s.contains("2"), "keycap digit rewrite: {s}");
+        assert!(s.contains("first") && s.contains("second") && s.contains("done"), "{s}");
+        assert!(!s.contains('☑') && !s.contains('☐') && !s.contains('①'), "{s}");
     }
 
     #[test]

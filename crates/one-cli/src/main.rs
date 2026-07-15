@@ -1,8 +1,10 @@
+mod approval;
 mod cli;
 mod modes;
 mod preferences;
 mod provider;
 mod runtime;
+mod settings;
 
 use clap::Parser;
 use one_session::export_html;
@@ -22,10 +24,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = Cli::parse();
 
+    if cli.list_providers {
+        let set = ProviderSet::build(&cli)?;
+        println!(
+            "{:<14} {:<36} {}",
+            "provider", "description", "auth"
+        );
+        println!("{}", "-".repeat(72));
+        for (id, desc, auth) in one_ai::ModelRegistry::builtin_provider_catalog() {
+            println!("{id:<14} {desc:<36} {auth}");
+        }
+        // Extra providers from models.json not in builtins.
+        let builtins: std::collections::HashSet<&str> = one_ai::ModelRegistry::builtin_provider_catalog()
+            .iter()
+            .map(|(id, _, _)| *id)
+            .collect();
+        for id in set.available_providers() {
+            if !builtins.contains(id.as_str()) {
+                println!("{id:<14} {:<36} models.json", "custom");
+            }
+        }
+        return Ok(());
+    }
+
     if cli.list_models {
         let set = ProviderSet::build(&cli)?;
         for model in set.registry.list() {
-            println!("{}:{} — {}", model.provider, model.id, model.name);
+            let ctx = model
+                .context_window
+                .map(|n| format!("  ctx={n}"))
+                .unwrap_or_default();
+            println!("{}:{} — {}{ctx}", model.provider, model.id, model.name);
         }
         return Ok(());
     }

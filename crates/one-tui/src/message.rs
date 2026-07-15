@@ -16,6 +16,8 @@
 pub enum MessageRole {
     User,
     Assistant,
+    /// Extended thinking / reasoning block (display only; agent keeps its own copy).
+    Thinking,
     System,
     Tool,
     /// Ephemeral UI card (errors, warnings). Never agent context.
@@ -56,108 +58,73 @@ pub struct Message {
     pub tool_expanded: bool,
     /// When true, this tool opts out of multi-tool group collapse (still may hide body).
     pub tool_ungroup: bool,
+    /// Thinking block expanded (Thinking role); also reused as expand flag.
+    pub thinking_expanded: bool,
     /// Alert severity (Alert role only).
     pub alert_level: Option<AlertLevel>,
 }
 
+fn blank_message(role: MessageRole, content: String) -> Message {
+    Message {
+        role,
+        content,
+        streaming: false,
+        footer: None,
+        tool_status: None,
+        tool_name: None,
+        tool_output: None,
+        tool_summary: None,
+        tool_expanded: false,
+        tool_ungroup: false,
+        thinking_expanded: false,
+        alert_level: None,
+    }
+}
+
 impl Message {
     pub fn user(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::User,
-            content: content.into(),
-            streaming: false,
-            footer: None,
-            tool_status: None,
-            tool_name: None,
-            tool_output: None,
-            tool_summary: None,
-            tool_expanded: false,
-            tool_ungroup: false,
-            alert_level: None,
-        }
+        blank_message(MessageRole::User, content.into())
     }
 
     pub fn assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            content: content.into(),
-            streaming: false,
-            footer: None,
-            tool_status: None,
-            tool_name: None,
-            tool_output: None,
-            tool_summary: None,
-            tool_expanded: false,
-            tool_ungroup: false,
-            alert_level: None,
-        }
+        blank_message(MessageRole::Assistant, content.into())
+    }
+
+    pub fn thinking(content: impl Into<String>) -> Self {
+        blank_message(MessageRole::Thinking, content.into())
+    }
+
+    pub fn streaming_thinking(content: impl Into<String>) -> Self {
+        let mut m = blank_message(MessageRole::Thinking, content.into());
+        m.streaming = true;
+        m.thinking_expanded = true; // show live stream while arriving
+        m
     }
 
     pub fn system(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::System,
-            content: content.into(),
-            streaming: false,
-            footer: None,
-            tool_status: None,
-            tool_name: None,
-            tool_output: None,
-            tool_summary: None,
-            tool_expanded: false,
-            tool_ungroup: false,
-            alert_level: None,
-        }
+        blank_message(MessageRole::System, content.into())
     }
 
     pub fn tool(name: impl Into<String>, detail: impl Into<String>, status: ToolStatus) -> Self {
         let name = name.into();
         let detail = detail.into();
-        Self {
-            role: MessageRole::Tool,
-            content: detail,
-            streaming: false,
-            footer: None,
-            tool_status: Some(status),
-            tool_name: Some(name),
-            tool_output: None,
-            tool_summary: None,
-            tool_expanded: false,
-            tool_ungroup: false,
-            alert_level: None,
-        }
+        let mut m = blank_message(MessageRole::Tool, detail);
+        m.tool_status = Some(status);
+        m.tool_name = Some(name);
+        m
     }
 
     /// UI-only card in the transcript (errors, warnings). Not agent context.
     pub fn alert(level: AlertLevel, content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::Alert,
-            content: content.into(),
-            streaming: false,
-            footer: None,
-            tool_status: None,
-            tool_name: None,
-            tool_output: None,
-            tool_summary: None,
-            tool_expanded: false,
-            tool_ungroup: false,
-            alert_level: Some(level),
-        }
+        let mut m = blank_message(MessageRole::Alert, content.into());
+        m.alert_level = Some(level);
+        m
     }
 
     pub fn streaming_assistant(content: impl Into<String>) -> Self {
-        Self {
-            role: MessageRole::Assistant,
-            content: content.into(),
-            streaming: true,
-            footer: None,
-            tool_status: None,
-            tool_name: None,
-            tool_output: None,
-            tool_summary: None,
-            tool_expanded: false,
-            tool_ungroup: false,
-            alert_level: None,
-        }
+        let mut m = blank_message(MessageRole::Assistant, content.into());
+        m.streaming = true;
+        m
     }
 
     pub fn with_footer(mut self, footer: impl Into<String>) -> Self {
@@ -170,6 +137,7 @@ impl Message {
         match self.role {
             MessageRole::User => "you",
             MessageRole::Assistant => "assistant",
+            MessageRole::Thinking => "thinking",
             MessageRole::System => "system",
             MessageRole::Tool => "tool",
             MessageRole::Alert => "alert",

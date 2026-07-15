@@ -1,17 +1,23 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use one_core::error::Result;
-use one_core::tool::{Tool, ToolCall, ToolDefinition, ToolOutput};
+use one_core::tool::{tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
+use crate::path_policy::{AccessKind, PathPolicy};
+
 pub struct LsTool {
-    cwd: PathBuf,
+    policy: PathPolicy,
 }
 
 impl LsTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self::with_policy(PathPolicy::workspace(cwd))
+    }
+
+    pub fn with_policy(policy: PathPolicy) -> Self {
+        Self { policy }
     }
 }
 
@@ -36,12 +42,26 @@ impl Tool for LsTool {
             .get("path")
             .and_then(|value| value.as_str())
             .unwrap_or(".");
-        let resolved = resolve_path(&self.cwd, path);
+        let resolved = self
+            .policy
+            .resolve(path, AccessKind::Read)
+            .map_err(|err| tool_error("ls", err))?;
 
-        let mut entries = tokio::fs::read_dir(&resolved).await?;
+        let mut entries = tokio::fs::read_dir(&resolved)
+            .await
+            .map_err(|err| tool_error("ls", err.to_string()))?;
         let mut lines = Vec::new();
-        while let Some(entry) = entries.next_entry().await? {
-            let file_type = if entry.file_type().await?.is_dir() {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|err| tool_error("ls", err.to_string()))?
+        {
+            let file_type = if entry
+                .file_type()
+                .await
+                .map_err(|err| tool_error("ls", err.to_string()))?
+                .is_dir()
+            {
                 "dir"
             } else {
                 "file"
@@ -54,14 +74,5 @@ impl Tool for LsTool {
         }
         lines.sort();
         Ok(ToolOutput::text(lines.join("\n")))
-    }
-}
-
-fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
     }
 }

@@ -1,35 +1,40 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use one_core::error::Result;
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
+use crate::path_policy::{AccessKind, PathPolicy};
+
 pub struct EditTool {
-    cwd: PathBuf,
+    policy: PathPolicy,
 }
 
 impl EditTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self::with_policy(PathPolicy::workspace(cwd))
     }
 
-    fn resolve(&self, path: &str) -> PathBuf {
-        let path = Path::new(path);
-        if path.is_absolute() {
-            path.to_path_buf()
-        } else {
-            self.cwd.join(path)
-        }
+    pub fn with_policy(policy: PathPolicy) -> Self {
+        Self { policy }
     }
 }
 
 #[async_trait]
 impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
+        let scope = if self.policy.is_full_access() {
+            "any path".to_string()
+        } else {
+            format!(
+                "paths under workspace `{}` (and --add-dir roots)",
+                self.policy.cwd().display()
+            )
+        };
         ToolDefinition {
             name: "edit".to_string(),
-            description: "Replace an exact string in a file.".to_string(),
+            description: format!("Replace an exact string in a file. Allowed: {scope}."),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -59,7 +64,10 @@ impl Tool for EditTool {
             .and_then(|value| value.as_str())
             .ok_or_else(|| invalid_args("edit", "missing `new_string`"))?;
 
-        let resolved = self.resolve(path);
+        let resolved = self
+            .policy
+            .resolve(path, AccessKind::Write)
+            .map_err(|err| tool_error("edit", err))?;
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|err| tool_error("edit", err.to_string()))?;

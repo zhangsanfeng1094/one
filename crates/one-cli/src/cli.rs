@@ -9,6 +9,8 @@ pub enum ProviderKind {
     Anthropic,
     Openai,
     Openrouter,
+    Deepseek,
+    Gemini,
 }
 
 /// OpenAI-compatible wire protocol (Pi-style `api` field).
@@ -56,7 +58,7 @@ pub struct Cli {
     #[arg(short = 'c', long = "continue")]
     pub r#continue: bool,
 
-    /// Resume: open the most recent session (same as --continue; TUI also has /resume).
+    /// Resume: open interactive session picker in TUI (print/json: most recent).
     #[arg(short = 'r', long = "resume")]
     pub resume: bool,
 
@@ -90,9 +92,19 @@ pub struct Cli {
     #[arg(long = "api-key")]
     pub api_key: Option<String>,
 
-    /// Working directory for tools.
+    /// Working directory for tools (workspace root).
     #[arg(long, default_value = ".")]
     pub cwd: PathBuf,
+
+    /// Extra directories the agent may read/write (repeatable).
+    /// Paths outside cwd + these roots are denied unless `--full-access`.
+    #[arg(long = "add-dir", value_name = "DIR")]
+    pub add_dir: Vec<PathBuf>,
+
+    /// Disable workspace path boundary (file tools may touch any path).
+    /// Prefer containers/VMs; also set via settings `sandbox=full-access`.
+    #[arg(long = "full-access")]
+    pub full_access: bool,
 
     /// Session display name.
     #[arg(short = 'n', long)]
@@ -102,6 +114,10 @@ pub struct Cli {
     #[arg(long)]
     pub read_only: bool,
 
+    /// Start in plan mode (explore + write plan; no code edits until /act).
+    #[arg(long)]
+    pub plan: bool,
+
     /// Export current session to HTML file.
     #[arg(long)]
     pub export: Option<PathBuf>,
@@ -110,7 +126,12 @@ pub struct Cli {
     #[arg(long)]
     pub list_models: bool,
 
+    /// List built-in + configured providers and exit.
+    #[arg(long)]
+    pub list_providers: bool,
+
     /// Auto-approve risky bash commands (or set ONE_AUTO_APPROVE=1).
+    /// Does not disable the workspace path boundary — use `--full-access` for that.
     #[arg(short = 'y', long = "yes")]
     pub auto_approve: bool,
 

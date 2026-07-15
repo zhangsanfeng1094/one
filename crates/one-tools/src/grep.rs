@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use one_core::error::Result;
@@ -6,13 +6,19 @@ use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, T
 use serde_json::json;
 use tokio::process::Command;
 
+use crate::path_policy::{AccessKind, PathPolicy};
+
 pub struct GrepTool {
-    cwd: PathBuf,
+    policy: PathPolicy,
 }
 
 impl GrepTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self::with_policy(PathPolicy::workspace(cwd))
+    }
+
+    pub fn with_policy(policy: PathPolicy) -> Self {
+        Self { policy }
     }
 }
 
@@ -51,13 +57,16 @@ impl Tool for GrepTool {
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
 
-        let resolved = resolve_path(&self.cwd, path);
+        let resolved = self
+            .policy
+            .resolve(path, AccessKind::Read)
+            .map_err(|err| tool_error("grep", err))?;
         let mut cmd = Command::new("rg");
         cmd.arg("--line-number").arg("--color=never").arg(pattern);
         if ignore_case {
             cmd.arg("-i");
         }
-        cmd.arg(&resolved).current_dir(&self.cwd);
+        cmd.arg(&resolved).current_dir(self.policy.cwd());
 
         let output = cmd
             .output()
@@ -77,14 +86,5 @@ impl Tool for GrepTool {
         };
 
         Ok(ToolOutput::text(text))
-    }
-}
-
-fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
     }
 }

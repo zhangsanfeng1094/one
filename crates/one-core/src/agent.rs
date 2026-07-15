@@ -10,6 +10,7 @@ use crate::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
 };
 use crate::tool::{Tool, ToolCall, ToolOutput};
+use crate::tool_gate::{ToolGate, ToolGateDecision};
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are an AI coding assistant. Use the provided tools to read, write, edit files, run shell commands, and search or fetch the web when you need current information. Be concise and precise.";
 
@@ -36,9 +37,9 @@ impl ThinkingLevel {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "off" | "none" | "0" => Some(ThinkingLevel::Off),
-            "low" | "1" => Some(ThinkingLevel::Low),
+            "low" | "1" | "minimal" => Some(ThinkingLevel::Low),
             "medium" | "med" | "2" => Some(ThinkingLevel::Medium),
-            "high" | "3" => Some(ThinkingLevel::High),
+            "high" | "3" | "xhigh" | "max" => Some(ThinkingLevel::High),
             _ => None,
         }
     }
@@ -49,6 +50,32 @@ impl ThinkingLevel {
             ThinkingLevel::Low => ThinkingLevel::Medium,
             ThinkingLevel::Medium => ThinkingLevel::High,
             ThinkingLevel::High => ThinkingLevel::Off,
+        }
+    }
+
+    pub fn is_enabled(self) -> bool {
+        !matches!(self, ThinkingLevel::Off)
+    }
+
+    /// OpenAI / OpenRouter style effort label (`None` when off).
+    pub fn effort(self) -> Option<&'static str> {
+        match self {
+            ThinkingLevel::Off => None,
+            ThinkingLevel::Low => Some("low"),
+            ThinkingLevel::Medium => Some("medium"),
+            ThinkingLevel::High => Some("high"),
+        }
+    }
+
+    /// Anthropic-style token budget for extended thinking (`None` when off).
+    ///
+    /// Defaults align with Pi's budgets (low 2k / medium 8k / high 16k).
+    pub fn budget_tokens(self) -> Option<u32> {
+        match self {
+            ThinkingLevel::Off => None,
+            ThinkingLevel::Low => Some(2_048),
+            ThinkingLevel::Medium => Some(8_192),
+            ThinkingLevel::High => Some(16_384),
         }
     }
 }
@@ -78,12 +105,47 @@ pub struct CompletionRequest {
     pub thinking_level: ThinkingLevel,
 }
 
+/// Token accounting returned by providers (when available).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cache_read_tokens: u64,
+    pub cache_write_tokens: u64,
+}
+
+impl TokenUsage {
+    pub fn total(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_write_tokens)
+    }
+
+    pub fn add_assign(&mut self, other: &TokenUsage) {
+        self.input_tokens = self.input_tokens.saturating_add(other.input_tokens);
+        self.output_tokens = self.output_tokens.saturating_add(other.output_tokens);
+        self.cache_read_tokens = self
+            .cache_read_tokens
+            .saturating_add(other.cache_read_tokens);
+        self.cache_write_tokens = self
+            .cache_write_tokens
+            .saturating_add(other.cache_write_tokens);
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.total() == 0
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct CompletionResponse {
     pub provider: String,
     pub model: String,
     pub content: Vec<ContentBlock>,
     pub stop_reason: StopReason,
+    /// Provider-reported usage for this completion (may be zero if unknown).
+    pub usage: TokenUsage,
 }
 
 #[async_trait]
@@ -117,11 +179,18 @@ pub struct Agent {
     pub config: AgentConfig,
     pub messages: Vec<AgentMessage>,
     pub is_busy: bool,
+    /// Cumulative provider-reported tokens for this process/session.
+    pub token_usage: TokenUsage,
     tools: Vec<Arc<dyn Tool>>,
     listeners: Vec<EventListener>,
     steering_queue: Arc<Mutex<Vec<String>>>,
     followup_queue: Arc<Mutex<Vec<String>>>,
+    /// Side-channel notices (e.g. background bash completions), drained before each LLM turn.
+    /// Injected as user messages with a clear prefix — not tool_results (providers require pairing).
+    notification_queue: Arc<Mutex<Vec<String>>>,
     abort_flag: Arc<AtomicBool>,
+    /// Optional pre-tool permission gate (allow/deny/ask → resolve).
+    tool_gate: Option<Arc<dyn ToolGate>>,
 }
 
 impl Agent {
@@ -130,12 +199,38 @@ impl Agent {
             config,
             messages: Vec::new(),
             is_busy: false,
+            token_usage: TokenUsage::default(),
             tools,
             listeners: Vec::new(),
             steering_queue: Arc::new(Mutex::new(Vec::new())),
             followup_queue: Arc::new(Mutex::new(Vec::new())),
+            notification_queue: Arc::new(Mutex::new(Vec::new())),
             abort_flag: Arc::new(AtomicBool::new(false)),
+            tool_gate: None,
         }
+    }
+
+    /// Install a permission gate checked before every tool execution.
+    pub fn set_tool_gate(&mut self, gate: Option<Arc<dyn ToolGate>>) {
+        self.tool_gate = gate;
+    }
+
+    pub fn tool_gate(&self) -> Option<&Arc<dyn ToolGate>> {
+        self.tool_gate.as_ref()
+    }
+
+    /// Replace the notification queue (wire shared background-task registry).
+    pub fn set_notification_queue(&mut self, queue: Arc<Mutex<Vec<String>>>) {
+        self.notification_queue = queue;
+    }
+
+    pub fn notification_queue_handle(&self) -> Arc<Mutex<Vec<String>>> {
+        self.notification_queue.clone()
+    }
+
+    /// Push a notice that will be injected before the next LLM call.
+    pub fn push_notification(&self, text: impl Into<String>) {
+        Self::push_queue(&self.notification_queue, text);
     }
 
     pub fn abort_handle(&self) -> Arc<AtomicBool> {
@@ -194,9 +289,44 @@ impl Agent {
         self.tools.iter().map(|tool| tool.definition()).collect()
     }
 
+    /// Replace the registered tool set (e.g. Plan mode ↔ Act mode).
+    pub fn set_tools(&mut self, tools: Vec<Arc<dyn Tool>>) {
+        self.tools = tools;
+    }
+
+    pub fn tools(&self) -> &[Arc<dyn Tool>] {
+        &self.tools
+    }
+
     pub async fn prompt(&mut self, provider: &dyn LlmProvider, text: &str) -> Result<String> {
-        self.messages.push(AgentMessage::user_text(text));
+        self.prompt_user(provider, AgentMessage::user_text(text))
+            .await
+    }
+
+    /// Prompt with pre-built user message (text and/or images).
+    pub async fn prompt_user(
+        &mut self,
+        provider: &dyn LlmProvider,
+        user: AgentMessage,
+    ) -> Result<String> {
+        debug_assert!(matches!(user, AgentMessage::User(_)));
+        self.messages.push(user);
         self.run(provider).await
+    }
+
+    /// Prompt with text + optional image attachments `(mime_type, base64)`.
+    pub async fn prompt_with_images(
+        &mut self,
+        provider: &dyn LlmProvider,
+        text: &str,
+        images: Vec<(String, String)>,
+    ) -> Result<String> {
+        let msg = if images.is_empty() {
+            AgentMessage::user_text(text)
+        } else {
+            AgentMessage::user_with_images(text, images)
+        };
+        self.prompt_user(provider, msg).await
     }
 
     pub async fn run(&mut self, provider: &dyn LlmProvider) -> Result<String> {
@@ -212,6 +342,8 @@ impl Agent {
             }
 
             self.drain_steering();
+            // Claude-style: background task completions appear as conversation notices.
+            self.drain_notifications();
             self.emit(AgentEvent::TurnStart { turn });
 
             let request = CompletionRequest {
@@ -248,6 +380,10 @@ impl Agent {
                     )
                     .await?
             };
+
+            if !response.usage.is_zero() {
+                self.token_usage.add_assign(&response.usage);
+            }
 
             if self.is_aborted() || response.stop_reason == StopReason::Aborted {
                 let assistant = AgentMessage::Assistant(AssistantMessage {
@@ -380,7 +516,21 @@ impl Agent {
 
     fn drain_steering(&mut self) {
         let mut queue = self.steering_queue.lock().expect("steering queue lock");
-        while let Some(text) = queue.pop() {
+        // Preserve FIFO order (push to end, drain from front).
+        let items: Vec<_> = queue.drain(..).collect();
+        for text in items {
+            self.messages.push(AgentMessage::user_text(text));
+        }
+    }
+
+    fn drain_notifications(&mut self) {
+        let mut queue = self
+            .notification_queue
+            .lock()
+            .expect("notification queue lock");
+        let items: Vec<_> = queue.drain(..).collect();
+        drop(queue);
+        for text in items {
             self.messages.push(AgentMessage::user_text(text));
         }
     }
@@ -390,13 +540,27 @@ impl Agent {
         if queue.is_empty() {
             return false;
         }
-        while let Some(text) = queue.pop() {
+        let items: Vec<_> = queue.drain(..).collect();
+        drop(queue);
+        for text in items {
             self.messages.push(AgentMessage::user_text(text));
         }
         true
     }
 
     async fn execute_tool(&self, call: &ToolCall) -> Result<ToolOutput> {
+        if let Some(gate) = &self.tool_gate {
+            match gate.check(call).await {
+                ToolGateDecision::Allow => {}
+                ToolGateDecision::Deny { message } => {
+                    return Err(OneError::Tool {
+                        tool: call.name.clone(),
+                        message,
+                    });
+                }
+            }
+        }
+
         let tool = self
             .tools
             .iter()
@@ -419,8 +583,24 @@ impl Agent {
 /// Detect soft failures that still return `Ok(ToolOutput)` (e.g. bash exit ≠ 0).
 fn tool_output_indicates_error(tool_name: &str, output: &ToolOutput) -> bool {
     match tool_name {
-        "bash" | "shell" => {
+        "bash" | "shell" | "bash_output" => {
             if let Some(details) = &output.details {
+                // Background start is never an error.
+                if details
+                    .get("background")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
+                // Still running snapshot is not an error.
+                if details
+                    .get("running")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+                {
+                    return false;
+                }
                 if let Some(ok) = details.get("ok").and_then(|v| v.as_bool()) {
                     return !ok;
                 }
@@ -525,6 +705,7 @@ mod tests {
                         text: "partial".to_string(),
                     }],
                     stop_reason: StopReason::Aborted,
+                    usage: TokenUsage::default(),
                 })
             }
         }
@@ -552,5 +733,80 @@ mod tests {
         let calls = extract_tool_calls(&content);
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].name, "bash");
+    }
+
+    #[test]
+    fn background_start_is_not_error() {
+        let output = ToolOutput::text_with_details(
+            "Background task started\ntask_id: bg_1",
+            serde_json::json!({ "background": true, "ok": true, "task_id": "bg_1" }),
+        );
+        assert!(!tool_output_indicates_error("bash", &output));
+    }
+
+    #[test]
+    fn bash_output_running_is_not_error() {
+        let output = ToolOutput::text_with_details(
+            "status: running",
+            serde_json::json!({ "running": true, "ok": true, "status": "running" }),
+        );
+        assert!(!tool_output_indicates_error("bash_output", &output));
+    }
+
+    #[tokio::test]
+    async fn injects_notifications_before_llm_turn() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct NoticeProvider {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for NoticeProvider {
+            fn name(&self) -> &str {
+                "notice"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    let has_notice = request.messages.iter().any(|m| match m {
+                        AgentMessage::User(u) => u
+                            .content
+                            .as_plain_text()
+                            .contains("[Background task completed]"),
+                        _ => false,
+                    });
+                    assert!(has_notice, "notification should be injected before LLM call");
+                }
+                Ok(CompletionResponse {
+                    provider: self.name().to_string(),
+                    model: self.model().to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    stop_reason: StopReason::Stop,
+                    usage: TokenUsage::default(),
+                })
+            }
+        }
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.push_notification(
+            "[Background task completed]\ntask_id: bg_test_1\nexit: 0\n",
+        );
+        let out = agent
+            .prompt(
+                &NoticeProvider {
+                    calls: AtomicUsize::new(0),
+                },
+                "hi",
+            )
+            .await
+            .expect("run");
+        assert_eq!(out, "done");
+        assert!(agent.messages.len() >= 3);
     }
 }

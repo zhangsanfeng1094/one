@@ -43,12 +43,32 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/thinking",
         usage: "/thinking [off|low|medium|high]",
-        description: "set or cycle thinking level",
+        description: "set thinking level (or use /settings)",
+    },
+    SlashCommand {
+        name: "/plan",
+        usage: "/plan",
+        description: "enter plan mode (read-only + plan file)",
+    },
+    SlashCommand {
+        name: "/act",
+        usage: "/act",
+        description: "approve plan and implement (Build mode)",
+    },
+    SlashCommand {
+        name: "/build",
+        usage: "/build",
+        description: "alias for /act",
     },
     SlashCommand {
         name: "/compact",
         usage: "/compact [instructions]",
         description: "manually compact context",
+    },
+    SlashCommand {
+        name: "/settings",
+        usage: "/settings [key value]",
+        description: "view or set unified settings",
     },
     SlashCommand {
         name: "/skill",
@@ -59,6 +79,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/tree",
         usage: "/tree [id]",
         description: "list or switch session branch",
+    },
+    SlashCommand {
+        name: "/rewind",
+        usage: "/rewind [id]",
+        description: "rewind to a previous prompt (Esc Esc)",
     },
     SlashCommand {
         name: "/export",

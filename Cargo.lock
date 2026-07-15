@@ -942,6 +942,7 @@ dependencies = [
 name = "one-cli"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
  "clap",
  "one-ai",
  "one-core",
@@ -955,6 +956,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -962,6 +964,7 @@ name = "one-core"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "futures",
  "serde",
  "serde_json",
@@ -1012,6 +1015,7 @@ name = "one-tools"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "base64",
  "glob",
  "one-core",
  "reqwest",
@@ -1026,8 +1030,10 @@ name = "one-tui"
 version = "0.1.0"
 dependencies = [
  "crossterm",
+ "one-core",
  "pulldown-cmark",
  "ratatui",
+ "serde_json",
  "tokio",
  "unicode-width 0.2.0",
 ]

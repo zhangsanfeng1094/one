@@ -45,6 +45,32 @@ impl ToolOutput {
         }
     }
 
+    /// Image-only tool result (vision models). `data` is standard base64.
+    pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        Self {
+            content: vec![TextOrImage::Image {
+                data: data.into(),
+                mime_type: mime_type.into(),
+            }],
+            details: None,
+        }
+    }
+
+    pub fn image_with_details(
+        data: impl Into<String>,
+        mime_type: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        Self {
+            content: vec![TextOrImage::Image {
+                data: data.into(),
+                mime_type: mime_type.into(),
+            }],
+            details: Some(details),
+        }
+    }
+
+    /// Plain text only (images dropped). Used for bash exit parsing etc.
     pub fn as_text(&self) -> String {
         self.content
             .iter()
@@ -54,6 +80,21 @@ impl ToolOutput {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    /// TUI / logs: text plus `[image · …]` labels for image blocks.
+    pub fn as_ui_text(&self) -> String {
+        self.content
+            .iter()
+            .map(TextOrImage::as_display_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    pub fn has_images(&self) -> bool {
+        self.content
+            .iter()
+            .any(|b| matches!(b, TextOrImage::Image { .. }))
     }
 }
 

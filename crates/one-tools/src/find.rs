@@ -1,17 +1,23 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use async_trait::async_trait;
 use one_core::error::Result;
-use one_core::tool::{invalid_args, Tool, ToolCall, ToolDefinition, ToolOutput};
+use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
+use crate::path_policy::{AccessKind, PathPolicy};
+
 pub struct FindTool {
-    cwd: PathBuf,
+    policy: PathPolicy,
 }
 
 impl FindTool {
     pub fn new(cwd: PathBuf) -> Self {
-        Self { cwd }
+        Self::with_policy(PathPolicy::workspace(cwd))
+    }
+
+    pub fn with_policy(policy: PathPolicy) -> Self {
+        Self { policy }
     }
 }
 
@@ -44,25 +50,22 @@ impl Tool for FindTool {
             .and_then(|value| value.as_str())
             .unwrap_or(".");
 
-        let root = resolve_path(&self.cwd, path);
+        let root = self
+            .policy
+            .resolve(path, AccessKind::Read)
+            .map_err(|err| tool_error("find", err))?;
         let glob_pattern = root.join(pattern);
         let glob_str = glob_pattern.to_string_lossy().to_string();
 
         let mut matches = Vec::new();
         for entry in glob::glob(&glob_str).into_iter().flatten().flatten() {
-            matches.push(entry.display().to_string());
+            // Drop matches that escape the allowed root (symlink / .. in glob).
+            if self.policy.check(&entry, AccessKind::Read).is_ok() {
+                matches.push(entry.display().to_string());
+            }
         }
         matches.sort();
 
         Ok(ToolOutput::text(matches.join("\n")))
-    }
-}
-
-fn resolve_path(cwd: &Path, path: &str) -> PathBuf {
-    let path = Path::new(path);
-    if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        cwd.join(path)
     }
 }

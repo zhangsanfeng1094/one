@@ -7,8 +7,10 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+one-core.workspace = true
 crossterm.workspace = true
 pulldown-cmark = { version = "0.13", default-features = false }
 ratatui.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 unicode-width = "0.2"

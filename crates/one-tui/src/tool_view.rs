@@ -7,10 +7,35 @@ pub const COLLAPSE_GROUP_MIN: usize = 3;
 
 /// Whether this tool row can hide inside a collapsed multi-tool group.
 pub fn tool_collapsible(msg: &Message) -> bool {
-    msg.role == MessageRole::Tool
-        && matches!(msg.tool_status, Some(ToolStatus::Done))
-        && !msg.tool_expanded
-        && !msg.tool_ungroup
+    if msg.role != MessageRole::Tool
+        || !matches!(msg.tool_status, Some(ToolStatus::Done))
+        || msg.tool_expanded
+        || msg.tool_ungroup
+    {
+        return false;
+    }
+    // Keep background bash lifecycle visible (start / wait / kill) — do not bury in a chip.
+    let name = msg.tool_name.as_deref().unwrap_or("");
+    if matches!(name, "bash_output" | "bash_kill") {
+        return false;
+    }
+    if name == "bash" || name == "shell" {
+        if msg
+            .tool_output
+            .as_deref()
+            .is_some_and(|o| o.contains("Background task started"))
+        {
+            return false;
+        }
+        if msg
+            .tool_summary
+            .as_deref()
+            .is_some_and(|s| s.starts_with("bg "))
+        {
+            return false;
+        }
+    }
+    true
 }
 
 /// Consecutive tool messages starting at `start`.
@@ -258,9 +283,33 @@ pub fn summarize_tool_special(
             Some((summary, false, better))
         }
         "bash" | "shell" => {
+            // Background start: show task_id prominently (Claude-style), keep expanded
+            // so it is not buried inside a collapsed "N tools" chip.
+            if output.contains("Background task started") {
+                let task_id = output
+                    .lines()
+                    .find_map(|l| l.trim().strip_prefix("task_id:"))
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("?");
+                let cmd = json_field(args, "command").unwrap_or_default();
+                let cmd_bit = if cmd.is_empty() {
+                    String::new()
+                } else {
+                    format!(" · {}", truncate(&cmd, 28))
+                };
+                return Some((
+                    format!("bg {task_id}{cmd_bit}"),
+                    true, // auto-expand so user sees the start notice
+                    None,
+                ));
+            }
+
             let (code, body) = parse_bash_exit(output);
             let body_lines = body.lines().filter(|l| !l.is_empty()).count();
-            let failed = is_error || matches!(code, Some(c) if c != 0) || code.is_none() && output.starts_with("exit signal");
+            let failed = is_error
+                || matches!(code, Some(c) if c != 0)
+                || code.is_none() && output.starts_with("exit signal");
             let summary = match code {
                 Some(0) if !is_error && body_lines == 0 => "exit 0".into(),
                 Some(0) if !is_error && body_lines == 1 => {
@@ -286,10 +335,43 @@ pub fn summarize_tool_special(
             let _ = args;
             Some((summary, failed, None))
         }
+        "bash_output" => {
+            let status = output
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("status:"))
+                .map(str::trim)
+                .unwrap_or("?");
+            let task_id = output
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("task_id:"))
+                .map(str::trim)
+                .unwrap_or("?");
+            let running = status == "running";
+            let failed = is_error || matches!(status, "timed_out" | "killed" | "failed");
+            let summary = if output.starts_with("Background tasks:") || output.starts_with("No background")
+            {
+                format!("list · {}", truncate(output.lines().next().unwrap_or("ps"), 40))
+            } else {
+                format!("{status} · {task_id}")
+            };
+            // Expand finished snapshots so bg results are visible without an extra click.
+            Some((summary, !running || failed, None))
+        }
+        "bash_kill" => {
+            let task_id = output
+                .lines()
+                .find_map(|l| l.trim().strip_prefix("task_id:"))
+                .map(str::trim)
+                .unwrap_or("?");
+            Some((format!("killed · {task_id}"), true, None))
+        }
         "read" => {
             let path = json_field(args, "path")
                 .or_else(|| json_field(args, "file_path"))
                 .unwrap_or_else(|| "file".into());
+            if output.contains("[image") {
+                return Some((format!("read {path} · image"), true, None));
+            }
             let lines = output.lines().count();
             Some((format!("read {path} · {lines} lines"), false, None))
         }

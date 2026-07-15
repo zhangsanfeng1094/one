@@ -76,7 +76,7 @@ mod inner {
     use std::sync::atomic::AtomicBool;
 
     use async_trait::async_trait;
-    use one_core::agent::{CompletionRequest, CompletionResponse, LlmProvider};
+    use one_core::agent::{CompletionRequest, CompletionResponse, LlmProvider, TokenUsage};
     use one_core::error::{OneError, Result};
     use one_core::message::{ContentBlock, StopReason};
     use one_core::streaming::StreamEvent;
@@ -94,6 +94,8 @@ mod inner {
         base_url: String,
         /// Chat Completions vs Responses (configurable).
         wire_api: OpenaiWireApi,
+        /// How to encode thinking level on chat/completions bodies.
+        thinking_wire: crate::thinking::ThinkingWire,
     }
 
     impl OpenAiProvider {
@@ -110,6 +112,7 @@ mod inner {
 
         pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
             Self::with_base(api_key, model, "https://api.openai.com/v1")
+                .with_thinking_wire(crate::thinking::ThinkingWire::ReasoningEffort)
         }
 
         pub fn with_base(
@@ -125,11 +128,20 @@ mod inner {
                 // Compatible endpoints (OpenRouter / Ollama) use Completions by default
                 // when constructed via with_base; first-party from_env uses Responses.
                 wire_api: OpenaiWireApi::Completions,
+                // Official-style `reasoning_effort` is the most widely accepted.
+                // OpenRouter overrides to ThinkingWire::OpenRouter; callers can set Auto
+                // for dual-shape proxies.
+                thinking_wire: crate::thinking::ThinkingWire::ReasoningEffort,
             }
         }
 
         pub fn with_wire_api(mut self, wire_api: OpenaiWireApi) -> Self {
             self.wire_api = wire_api;
+            self
+        }
+
+        pub fn with_thinking_wire(mut self, thinking_wire: crate::thinking::ThinkingWire) -> Self {
+            self.thinking_wire = thinking_wire;
             self
         }
 
@@ -190,7 +202,7 @@ mod inner {
             on_event: &mut (dyn FnMut(StreamEvent) + Send),
             abort: Option<&AtomicBool>,
         ) -> Result<CompletionResponse> {
-            let body = build_chat_body(&request, &self.model, stream);
+            let body = build_chat_body(&request, &self.model, stream, self.thinking_wire);
             let url = format!(
                 "{}/chat/completions",
                 self.base_url.trim_end_matches('/')
@@ -221,20 +233,33 @@ mod inner {
             }
 
             let mut full_text = String::new();
+            let mut thinking_text = String::new();
             let mut finish_reason: Option<String> = None;
             let mut tool_acc: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
+            let mut usage = TokenUsage::default();
 
             let aborted = matches!(
                 crate::sse::read_sse_response(response, &mut |data| {
                 let Ok(value) = serde_json::from_str::<Value>(data) else {
                     return;
                 };
+                let chunk_usage = parse_openai_usage(&value);
+                if !chunk_usage.is_zero() {
+                    usage = chunk_usage;
+                }
                 if let Some(reason) = value
                     .pointer("/choices/0/finish_reason")
                     .and_then(|v| v.as_str())
                     .filter(|r| !r.is_empty() && *r != "null")
                 {
                     finish_reason = Some(reason.to_string());
+                }
+                // Open thinking channels used across OpenAI-compat (DeepSeek, OR, …).
+                if let Some(delta) = extract_chat_reasoning_delta(&value) {
+                    if !delta.is_empty() {
+                        thinking_text.push_str(&delta);
+                        on_event(StreamEvent::ThinkingDelta(delta));
+                    }
                 }
                 if let Some(delta) = value
                     .pointer("/choices/0/delta/content")
@@ -277,12 +302,14 @@ mod inner {
                 Err(OneError::Aborted)
             );
 
-            let mut response = assemble_response(
+            let mut response = assemble_response_with_usage(
                 self.name(),
                 &self.model,
                 full_text,
+                thinking_text,
                 tool_acc.into_values().collect(),
                 finish_reason.as_deref(),
+                usage,
             );
             if aborted {
                 response.stop_reason = StopReason::Aborted;
@@ -330,8 +357,10 @@ mod inner {
 
             // Streaming: Responses SSE events (response.output_text.delta, …)
             let mut full_text = String::new();
+            let mut thinking_text = String::new();
             let mut tool_acc: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
             let mut status: Option<String> = None;
+            let mut usage = TokenUsage::default();
 
             let aborted = matches!(
                 crate::sse::read_sse_response(response, &mut |data| {
@@ -339,6 +368,10 @@ mod inner {
                     return;
                 };
                 let etype = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                let chunk_usage = parse_openai_usage(&value);
+                if !chunk_usage.is_zero() {
+                    usage = chunk_usage;
+                }
 
                 match etype {
                     "response.output_text.delta" | "response.refusal.delta" => {
@@ -346,6 +379,21 @@ mod inner {
                             if !delta.is_empty() {
                                 full_text.push_str(delta);
                                 on_event(StreamEvent::TextDelta(delta.to_string()));
+                            }
+                        }
+                    }
+                    // Reasoning summary / text deltas (o-series, GPT-5, …).
+                    "response.reasoning_summary_text.delta"
+                    | "response.reasoning_text.delta"
+                    | "response.reasoning.delta" => {
+                        if let Some(delta) = value
+                            .get("delta")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| value.pointer("/delta/text").and_then(|v| v.as_str()))
+                        {
+                            if !delta.is_empty() {
+                                thinking_text.push_str(delta);
+                                on_event(StreamEvent::ThinkingDelta(delta.to_string()));
                             }
                         }
                     }
@@ -434,6 +482,26 @@ mod inner {
                                 }
                             }
                         } else if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                            == Some("reasoning")
+                        {
+                            // Final reasoning summary if deltas were empty.
+                            if thinking_text.is_empty() {
+                                if let Some(summary) =
+                                    item.and_then(|i| i.get("summary")).and_then(|s| s.as_array())
+                                {
+                                    for part in summary {
+                                        if let Some(t) = part.get("text").and_then(|x| x.as_str()) {
+                                            thinking_text.push_str(t);
+                                        }
+                                    }
+                                }
+                                if let Some(t) =
+                                    item.and_then(|i| i.get("content")).and_then(|c| c.as_str())
+                                {
+                                    thinking_text.push_str(t);
+                                }
+                            }
+                        } else if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
                             == Some("message")
                         {
                             // Finalize text from completed message if stream deltas were empty.
@@ -492,12 +560,14 @@ mod inner {
                 _ => Some("stop"),
             };
 
-            let mut response = assemble_response(
+            let mut response = assemble_response_with_usage(
                 self.name(),
                 &self.model,
                 full_text,
+                thinking_text,
                 tool_acc.into_values().collect(),
                 finish,
+                usage,
             );
             if aborted {
                 response.stop_reason = StopReason::Aborted;
@@ -515,14 +585,107 @@ mod inner {
         arguments: String,
     }
 
-    fn assemble_response(
+    /// Pull reasoning/thinking deltas from chat/completions SSE chunks.
+    ///
+    /// Covers DeepSeek (`reasoning_content`), OpenRouter (`reasoning`), and
+    /// a few nested variants used by proxies.
+    fn extract_chat_reasoning_delta(value: &Value) -> Option<String> {
+        let delta = value.pointer("/choices/0/delta")?;
+        // Plain string fields.
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(s) = delta.get(key).and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return Some(s.to_string());
+                }
+            }
+        }
+        // Nested object: reasoning: { content | text }
+        if let Some(obj) = delta.get("reasoning").and_then(|v| v.as_object()) {
+            for key in ["content", "text"] {
+                if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                    if !s.is_empty() {
+                        return Some(s.to_string());
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn extract_chat_reasoning_message(message: &Value) -> String {
+        for key in ["reasoning_content", "reasoning", "thinking"] {
+            if let Some(s) = message.get(key).and_then(|v| v.as_str()) {
+                if !s.is_empty() {
+                    return s.to_string();
+                }
+            }
+        }
+        if let Some(obj) = message.get("reasoning").and_then(|v| v.as_object()) {
+            for key in ["content", "text"] {
+                if let Some(s) = obj.get(key).and_then(|v| v.as_str()) {
+                    if !s.is_empty() {
+                        return s.to_string();
+                    }
+                }
+            }
+        }
+        String::new()
+    }
+
+    fn parse_openai_usage(value: &Value) -> TokenUsage {
+        let mut usage = TokenUsage::default();
+        // Chat Completions: usage.prompt_tokens / completion_tokens
+        // Responses API: usage.input_tokens / output_tokens
+        if let Some(u) = value.get("usage") {
+            usage.input_tokens = u
+                .get("prompt_tokens")
+                .or_else(|| u.get("input_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            usage.output_tokens = u
+                .get("completion_tokens")
+                .or_else(|| u.get("output_tokens"))
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0);
+            if let Some(details) = u.get("prompt_tokens_details").or_else(|| u.get("input_tokens_details")) {
+                usage.cache_read_tokens = details
+                    .get("cached_tokens")
+                    .or_else(|| details.get("cache_read_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+            }
+        }
+        // Nested under response.completed for Responses streaming.
+        if usage.is_zero() {
+            if let Some(u) = value.pointer("/response/usage") {
+                usage.input_tokens = u
+                    .get("input_tokens")
+                    .or_else(|| u.get("prompt_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                usage.output_tokens = u
+                    .get("output_tokens")
+                    .or_else(|| u.get("completion_tokens"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+            }
+        }
+        usage
+    }
+
+    fn assemble_response_with_usage(
         provider: &str,
         model: &str,
         full_text: String,
+        thinking_text: String,
         tools: Vec<PartialToolCall>,
         finish_reason: Option<&str>,
+        usage: TokenUsage,
     ) -> CompletionResponse {
         let mut content = Vec::new();
+        if !thinking_text.is_empty() {
+            content.push(ContentBlock::thinking(thinking_text));
+        }
         if !full_text.is_empty() {
             content.push(ContentBlock::Text { text: full_text });
         }
@@ -559,6 +722,7 @@ mod inner {
             model: model.to_string(),
             content,
             stop_reason,
+            usage,
         }
     }
 
@@ -581,6 +745,7 @@ mod inner {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string();
+        let thinking = extract_chat_reasoning_message(&message);
 
         if let Some(calls) = message.get("tool_calls").and_then(|v| v.as_array()) {
             for call in calls {
@@ -604,7 +769,15 @@ mod inner {
             }
         }
 
-        Ok(assemble_response(provider, model, text, tools, finish))
+        Ok(assemble_response_with_usage(
+            provider,
+            model,
+            text,
+            thinking,
+            tools,
+            finish,
+            parse_openai_usage(value),
+        ))
     }
 
     fn parse_responses_non_stream(
@@ -613,6 +786,7 @@ mod inner {
         model: &str,
     ) -> Result<CompletionResponse> {
         let mut text = String::new();
+        let mut thinking = String::new();
         let mut tools = Vec::new();
 
         if let Some(output) = value.get("output").and_then(|v| v.as_array()) {
@@ -625,6 +799,18 @@ mod inner {
                                     text.push_str(t);
                                 }
                             }
+                        }
+                    }
+                    Some("reasoning") => {
+                        if let Some(summary) = item.get("summary").and_then(|s| s.as_array()) {
+                            for part in summary {
+                                if let Some(t) = part.get("text").and_then(|x| x.as_str()) {
+                                    thinking.push_str(t);
+                                }
+                            }
+                        }
+                        if let Some(t) = item.get("content").and_then(|c| c.as_str()) {
+                            thinking.push_str(t);
                         }
                     }
                     Some("function_call") => {
@@ -660,21 +846,41 @@ mod inner {
             _ => Some("stop"),
         };
 
-        Ok(assemble_response(provider, model, text, tools, finish))
+        Ok(assemble_response_with_usage(
+            provider,
+            model,
+            text,
+            thinking,
+            tools,
+            finish,
+            parse_openai_usage(value),
+        ))
     }
 
-    fn build_chat_body(request: &CompletionRequest, model: &str, stream: bool) -> Value {
+    fn build_chat_body(
+        request: &CompletionRequest,
+        model: &str,
+        stream: bool,
+        thinking_wire: crate::thinking::ThinkingWire,
+    ) -> Value {
         let mut messages = vec![json!({
             "role": "system",
             "content": request.system_prompt,
         })];
-        messages.extend(request.messages.iter().filter_map(map_chat_message));
+        for message in &request.messages {
+            messages.extend(map_chat_messages(message));
+        }
 
         let mut body = json!({
             "model": model,
             "messages": messages,
             "stream": stream,
         });
+
+        // Ask providers that support it to emit usage on the final stream chunk.
+        if stream {
+            body["stream_options"] = json!({ "include_usage": true });
+        }
 
         if !request.tools.is_empty() {
             let tools: Vec<Value> = request
@@ -694,6 +900,8 @@ mod inner {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
         }
+
+        crate::thinking::apply_chat_thinking(&mut body, request.thinking_level, thinking_wire);
 
         body
     }
@@ -728,14 +936,19 @@ mod inner {
             body["tool_choice"] = json!("auto");
         }
 
+        crate::thinking::apply_responses_thinking(&mut body, request.thinking_level);
+
         body
     }
 
-    fn map_chat_message(message: &one_core::AgentMessage) -> Option<Value> {
+    /// May emit 1–2 chat messages (tool result with images → tool + synthetic user).
+    fn map_chat_messages(message: &one_core::AgentMessage) -> Vec<Value> {
         match message {
             one_core::AgentMessage::User(user) => {
-                let text = user_text(user);
-                Some(json!({ "role": "user", "content": text }))
+                vec![json!({
+                    "role": "user",
+                    "content": crate::media::openai_chat_user_content(user),
+                })]
             }
             one_core::AgentMessage::Assistant(assistant) => {
                 let text = assistant
@@ -747,6 +960,10 @@ mod inner {
                     })
                     .collect::<Vec<_>>()
                     .join("");
+
+                // DeepSeek / many OpenAI-compat models require reasoning_content
+                // on assistant turns when reasoning was produced.
+                let reasoning = crate::thinking::thinking_text(&assistant.content);
 
                 let tool_calls: Vec<Value> = assistant
                     .content
@@ -774,16 +991,47 @@ mod inner {
                     json!(text)
                 };
                 let mut message = json!({ "role": "assistant", "content": content_value });
+                if !reasoning.is_empty() {
+                    message["reasoning_content"] = json!(reasoning);
+                }
                 if !tool_calls.is_empty() {
                     message["tool_calls"] = json!(tool_calls);
                 }
-                Some(message)
+                vec![message]
             }
-            one_core::AgentMessage::ToolResult(result) => Some(json!({
-                "role": "tool",
-                "tool_call_id": result.tool_call_id,
-                "content": tool_result_text(result),
-            })),
+            one_core::AgentMessage::ToolResult(result) => {
+                let mut out = Vec::new();
+                let images = crate::media::collect_images(&result.content);
+                // Chat Completions `tool` role is string-only — keep labels in tool content.
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": result.tool_call_id,
+                    "content": crate::media::tool_result_plain(&result.content),
+                }));
+                // Vision path: follow with a user message carrying real image payloads.
+                if !images.is_empty() {
+                    let mut parts = vec![json!({
+                        "type": "text",
+                        "text": format!(
+                            "[images from tool `{}` — see attached]",
+                            result.tool_name
+                        ),
+                    })];
+                    for (mime, data) in images {
+                        parts.push(json!({
+                            "type": "image_url",
+                            "image_url": {
+                                "url": format!("data:{mime};base64,{data}")
+                            }
+                        }));
+                    }
+                    out.push(json!({
+                        "role": "user",
+                        "content": parts,
+                    }));
+                }
+                out
+            }
         }
     }
 
@@ -796,10 +1044,34 @@ mod inner {
                     input.push(json!({
                         "type": "message",
                         "role": "user",
-                        "content": user_text(user),
+                        "content": crate::media::openai_responses_user_content(user),
                     }));
                 }
                 one_core::AgentMessage::Assistant(assistant) => {
+                    // Prefer replaying signed reasoning items when we have an id.
+                    for block in &assistant.content {
+                        if let ContentBlock::Thinking {
+                            thinking,
+                            signature,
+                            redacted,
+                        } = block
+                        {
+                            if *redacted {
+                                continue;
+                            }
+                            if let Some(id) = signature.as_ref().filter(|s| !s.is_empty()) {
+                                input.push(json!({
+                                    "type": "reasoning",
+                                    "id": id,
+                                    "summary": [{
+                                        "type": "summary_text",
+                                        "text": thinking,
+                                    }],
+                                }));
+                            }
+                        }
+                    }
+
                     let text = assistant
                         .content
                         .iter()
@@ -848,38 +1120,34 @@ mod inner {
                     input.push(json!({
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": tool_result_text(result),
+                        "output": crate::media::tool_result_plain(&result.content),
                     }));
+                    // Responses: function_call_output is text-only — attach images as user input.
+                    let images = crate::media::collect_images(&result.content);
+                    if !images.is_empty() {
+                        let mut parts = vec![json!({
+                            "type": "input_text",
+                            "text": format!(
+                                "[images from tool `{}` — see attached]",
+                                result.tool_name
+                            ),
+                        })];
+                        for (mime, data) in images {
+                            parts.push(json!({
+                                "type": "input_image",
+                                "image_url": format!("data:{mime};base64,{data}"),
+                            }));
+                        }
+                        input.push(json!({
+                            "type": "message",
+                            "role": "user",
+                            "content": parts,
+                        }));
+                    }
                 }
             }
         }
         input
-    }
-
-    fn user_text(user: &one_core::message::UserMessage) -> String {
-        match &user.content {
-            one_core::message::UserContent::Text(text) => text.clone(),
-            one_core::message::UserContent::Blocks(blocks) => blocks
-                .iter()
-                .filter_map(|block| match block {
-                    one_core::message::TextOrImage::Text { text } => Some(text.clone()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n"),
-        }
-    }
-
-    fn tool_result_text(result: &one_core::message::ToolResultMessage) -> String {
-        result
-            .content
-            .iter()
-            .filter_map(|block| match block {
-                one_core::message::TextOrImage::Text { text } => Some(text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
     }
 }
 
@@ -899,5 +1167,17 @@ impl OpenAiProvider {
 
     pub fn with_wire_api(self, _wire: OpenaiWireApi) -> Self {
         self
+    }
+
+    pub fn with_thinking_wire(self, _wire: crate::thinking::ThinkingWire) -> Self {
+        self
+    }
+
+    pub fn with_base(
+        _api_key: impl Into<String>,
+        _model: impl Into<String>,
+        _base_url: impl Into<String>,
+    ) -> Self {
+        Self
     }
 }

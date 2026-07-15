@@ -39,6 +39,8 @@ pub enum FloatKind {
     Thinking,
     /// Session branch tree (`/tree`).
     Tree,
+    /// Rewind to a previous user prompt (Esc Esc / `/rewind`).
+    Rewind,
     /// Read-only info panel (session summary, …). Enter closes.
     Info,
     /// Generic custom list.
@@ -172,6 +174,35 @@ impl FloatMenu {
             search: String::new(),
             sections: vec![FloatSection {
                 title: "Branches".into(),
+                items,
+            }],
+            selected: 0,
+        }
+    }
+
+    /// Esc Esc / `/rewind` — pick a prior user prompt to re-edit.
+    /// `prompts` is `(entry_id, preview)` newest first.
+    pub fn rewind_picker(prompts: &[(String, String)]) -> Self {
+        let items: Vec<FloatItem> = prompts
+            .iter()
+            .enumerate()
+            .map(|(i, (id, preview))| FloatItem {
+                id: id.clone(),
+                label: preview.clone(),
+                detail: "restore conversation before this · edit prompt".into(),
+                hint: format!("#{}", i + 1),
+            })
+            .collect();
+        Self {
+            kind: FloatKind::Rewind,
+            title: "Rewind".into(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: if items.is_empty() {
+                    "No prompts yet".into()
+                } else {
+                    format!("{} prompts · conversation only", items.len())
+                },
                 items,
             }],
             selected: 0,
@@ -359,6 +390,12 @@ fn default_command_sections() -> Vec<FloatSection> {
                 item("new", "New Session", "start a fresh session", "/new"),
                 item("name", "Name Session", "set display name", "/name "),
                 item("tree", "Session Tree", "list or switch branch", "/tree"),
+                item(
+                    "rewind",
+                    "Rewind",
+                    "edit a previous prompt · Esc Esc",
+                    "/rewind",
+                ),
                 item("export", "Export Session", "write HTML export", "/export"),
                 item("clear", "Clear Chat", "clear on-screen history", "/clear"),
             ],
@@ -368,7 +405,15 @@ fn default_command_sections() -> Vec<FloatSection> {
             items: vec![
                 item("model", "Switch Model", "pick model by provider", "/model"),
                 item("thinking", "Thinking Level", "off/low/medium/high", "/thinking"),
+                item("plan", "Plan Mode", "explore + write plan only", "/plan"),
+                item("act", "Act / Build", "approve plan and implement", "/act"),
                 item("compact", "Compact Context", "summarize older turns", "/compact"),
+                item(
+                    "settings",
+                    "Settings",
+                    "provider · model · thinking · auto_approve",
+                    "/settings",
+                ),
                 item(
                     "skill",
                     "Force-load Skill",

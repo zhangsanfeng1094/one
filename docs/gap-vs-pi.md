@@ -13,7 +13,7 @@
 
 | 维度 | 对齐程度 | 说明 |
 |------|----------|------|
-| 哲学与定位 | ⭐⭐⭐⭐ | 极简核心 + tools + 可扩展；不内置 MCP / 子 agent / plan mode |
+| 哲学与定位 | ⭐⭐⭐⭐ | 极简核心 + tools + 可扩展；不内置 MCP / 子 agent；**Plan Mode 已内置（Pi 无）** |
 | Agent loop | ⭐⭐⭐⭐ | prompt → LLM → tool → loop；steer / follow-up / abort 已有 |
 | 内置 tools | ⭐⭐⭐⭐⭐ | 7 coding tools + `web_search` / `web_fetch`（Pi 则靠 skill） |
 | Session JSONL 树 | ⭐⭐⭐⭐ | v3 子集 + 迁移 + branch；fork/clone/交互式 tree UI 弱 |
@@ -61,13 +61,13 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 | AGENTS.md 上下文 | ✅ | ✅ | 另支持 CLAUDE.md？**未确认/可能无** |
 | Prompt templates `/name` | ✅ | ✅ | `expand_prompt` |
 | Steer / Follow-up 队列 | Enter / Alt+Enter | Ctrl+S / Alt+Enter | 快捷键不同；delivery mode 配置无 |
-| Abort | Escape | abort flag 有 | TUI Escape 主要用于关 float，取消生成路径需再核 |
+| Abort | Escape | `q` / Esc 取消生成；Ctrl+C 强制退出 | busy 下 Ctrl+C 不再误绑为 soft abort |
 | models.json 自定义 | `~/.pi/agent/models.json` | `~/.one/agent/models.json` | providers 块 + legacy 扁平列表 |
 | OpenAI Responses + Completions | ✅ | ✅ | 对齐 Pi `api` 字段语义 |
 | HTML export / Gist share | ✅ | ✅ | `--export` / `--share` / `/export` |
 | Session v1/v2 → v3 迁移 | ✅ | ✅ | `one-session::migrate` |
 | 只读模式 | 工具 allowlist | `--read-only` | Pi 用 `--tools` / `--exclude-tools` 更细 |
-| 非目标一致 | 无 MCP / 无子 agent / 无 plan mode | 文档声明一致 | One 额外做了 bash 沙箱确认（见哲学差异） |
+| 非目标一致 | 无 MCP / 无子 agent / 无 plan mode | 无 MCP / 无子 agent；**有 Plan Mode** | One 额外做了 bash 沙箱 + 内置 Plan |
 
 ---
 
@@ -81,7 +81,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 | **Provider 覆盖** | 30+ 内置（Gemini、Bedrock、Azure、xAI、Groq、DeepSeek、MiniMax…） | mock / anthropic / openai / ollama / openrouter | 非 OpenRouter 路径要自己拼 models.json |
 | **TUI 编辑器** | 多行、Shift+Enter、`@` 文件模糊搜索、Tab 路径补全、Ctrl+G 外部编辑器、图片粘贴 | 单行输入为主；paste 把换行压成空格；无 `@` / 路径补全 / 图片 | 交互质感差一档 |
 | **Footer / 用量** | token↑↓、cache R/W、cost、context %、model、cwd | 基础状态条 | 无法判断上下文压力与费用 |
-| **Thinking level** | Shift+Tab 循环；session `thinking_level_change` | 类型字段有，**无 UI/无 provider 接线** | 高级模型 reasoning 用不起来 |
+| **Thinking level** | Shift+Tab 循环；session `thinking_level_change` | `/settings` / `/thinking`（无 Shift+Tab；Space 用于 Plan/Build） | 已接线 |
 | **Session 管理 UX** | `/resume` 选择历史、`/new`、`/name`、`/session` 详情、`-r` | 仅 `--continue` / `--session` | 多任务切换困难 |
 | **`/compact` 手动 + 智能自动压缩** | LLM 摘要；overflow 恢复重试；可自定义 instructions | 字符/4 估算；把旧消息 `Debug` 拼成 summary（**非模型摘要**） | 长会话质量不可用 |
 | **Skills 真正生效** | catalog + 模型 `read` SKILL.md + 可选 `/skill:name` | ✅ progressive disclosure（XML catalog + location + force-load） | 已对齐标准路径 |
@@ -177,7 +177,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 | OpenRouter | ✅ | ✅（http-providers） |
 | Google / Vertex / Bedrock / Azure | ✅ | ❌（可经 OpenRouter 或自建 OpenAI 兼容） |
 | OAuth（Claude / Codex / Copilot） | ✅ | ❌ |
-| Thinking / reasoning blocks | ✅ 完整 | 类型+事件有，**未产品化** |
+| Thinking / reasoning blocks | ✅ 完整 | ✅ level + stream + UI + multi-provider wire |
 | Token / cost 统计 | ✅ | ❌ |
 | 跨 provider 上下文 handoff | ✅ | 未做专项 |
 | 内置模型清单随版本更新 | ✅ | 依赖 models.json / 硬编码默认 |
@@ -198,11 +198,15 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 
 | 项 | Pi | One |
 |----|----|-----|
-| 权限弹窗 | **刻意不做**（容器 / 扩展自行处理） | bash 模式匹配阻断 + 高危确认（`-y` 跳过） |
+| 路径边界 | 靠环境隔离 | **默认 workspace-write**：file tools 限 cwd + `--add-dir`；`--full-access` 关闭 |
+| 权限弹窗 | **刻意不做**（容器 / 扩展自行处理） | 交互 Ask 弹窗（y/a/n）；print 模式 fail-closed；`-y` 自动批 |
+| 细粒度规则 | 扩展自行 | `permissions.allow/deny/ask`（Claude 式 `Bash(git push *)`） |
+| Bash OS 沙箱 | 靠环境隔离 | **bubblewrap**（workspace RW / home RO）；无 bwrap 时降级 |
 | Project trust | 加载项目扩展/设置前确认 | 无 |
-| 危险命令 | 靠环境隔离 | 字符串 denylist（含误伤 `curl`/`wget`） |
+| 危险命令 | 靠环境隔离 | denylist + 规则 + OS sandbox |
+| Skills 路径 | 任意 | `~/.one/agent` 默认可读，写仍限 workspace |
 
-> One 的沙箱更「默认防御」，但与 Pi 官方哲学不一致，且 pattern 规则粗糙（会拦正常网络类 bash）。
+> One 对齐 Claude/Codex 的「工作区硬边界 + 审批 + 规则」；OS 沙箱用 bwrap（非 landlock ABI）。
 
 ---
 
@@ -215,8 +219,8 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 | Extension custom state | trait 有 custom_state / restore | 生态与事件面太窄，难做真扩展 |
 | dylib 扩展 | feature 有 | 仅 `status` 名硬编码，不是通用插件 ABI |
 | `/tree` | 能切 branch | 无交互树视图、无 branch_summary 用户流 |
-| Thinking 类型 | ContentBlock / StreamEvent / session entry | 无 level 切换、无 UI 折叠 Ctrl+T |
-| 图片消息类型 | `TextOrImage::Image` | TUI 不能贴图进模型 |
+| Thinking 类型 | ContentBlock / StreamEvent / session entry | ✅ level + signature replay + TUI 折叠 Ctrl+T |
+| 图片消息类型 | `TextOrImage::Image` | ✅ read 出图 + provider 发图 + 粘贴路径/data-URI（无剪贴板位图协议） |
 | Markdown 渲染 | TUI 有表格等 | 差分渲染 / 同步输出 / flicker 控制弱于 pi-tui |
 | 文档 | 有一套 | 与代码漂移（export/migrate/reload 状态不一致） |
 
@@ -242,7 +246,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 2. **Compaction 升级**：用 LLM 生成 summary；context overflow 时 compact 后重试  
 3. **TUI 编辑器**：多行、`@` 文件、路径 Tab、图片粘贴  
 4. **Session UX**：`/resume`、`/new`、`/name`、`/session`；可选 `-r`  
-5. **Thinking level**：Shift+Tab + provider 传参 + session 记录  
+5. **Thinking level**：`/settings` / `/thinking` + provider 传参 + session 记录  
 6. **Footer 用量**：至少 input/output tokens + context 占用估算  
 7. **文档与代码对齐**（export/migrate/reload/skills 真实状态）
 

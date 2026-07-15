@@ -15,8 +15,29 @@ pub struct SessionInfo {
     pub path: PathBuf,
     pub id: String,
     pub cwd: String,
+    /// Explicit display name from a `session_info` entry (`/name`).
     pub name: Option<String>,
+    /// First user message preview (Codex-style fallback when `name` is unset).
+    pub preview: Option<String>,
     pub modified: chrono::DateTime<Utc>,
+}
+
+impl SessionInfo {
+    /// Label for `/resume` lists and notices: named → first prompt → short id.
+    pub fn display_label(&self) -> String {
+        if let Some(name) = self.name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            return name.to_string();
+        }
+        if let Some(preview) = self
+            .preview
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
+            return preview.to_string();
+        }
+        self.id.chars().take(12).collect()
+    }
 }
 
 pub struct SessionManager {
@@ -91,6 +112,7 @@ impl SessionManager {
                     id: manager.header.id.clone(),
                     cwd: manager.header.cwd.clone(),
                     name: manager.session_name(),
+                    preview: manager.first_user_preview(),
                     modified: manager
                         .entries
                         .last()
@@ -171,6 +193,59 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Rewind the active branch to *before* `entry_id` (parent becomes leaf).
+    ///
+    /// Used by Esc Esc / `/rewind`: drop the selected user prompt and everything
+    /// after it from the active context, so the prompt can be re-edited.
+    /// When the entry is a root message, the leaf is cleared (empty context).
+    pub fn rewind_before(&mut self, entry_id: &str) -> Result<()> {
+        let parent = self
+            .get_entry(entry_id)
+            .ok_or_else(|| SessionError::EntryNotFound(entry_id.to_string()))?
+            .parent_id()
+            .map(|s| s.to_string());
+        self.leaf_id = parent;
+        Ok(())
+    }
+
+    /// User prompts on the active branch (newest first), for the rewind menu.
+    ///
+    /// Each item is `(entry_id, display_text)` where `display_text` is a short
+    /// single-line preview of the user message.
+    pub fn user_prompts_for_rewind(&self) -> Vec<(String, String)> {
+        let leaf = match &self.leaf_id {
+            Some(id) => id.as_str(),
+            None => return Vec::new(),
+        };
+        let path = build_context_entries(&self.entries, leaf);
+        let mut out = Vec::new();
+        for entry in path.iter().rev() {
+            if let SessionEntry::Message {
+                base,
+                message: AgentMessage::User(user),
+            } = entry
+            {
+                let text = user.content.as_display_text();
+                let preview = first_line_preview(&text, 72);
+                if !preview.is_empty() {
+                    out.push((base.id.clone(), preview));
+                }
+            }
+        }
+        out
+    }
+
+    /// Full user-message text for a session entry (for restoring into the input).
+    pub fn user_prompt_text(&self, entry_id: &str) -> Option<String> {
+        match self.get_entry(entry_id)? {
+            SessionEntry::Message {
+                message: AgentMessage::User(user),
+                ..
+            } => Some(user.content.as_display_text()),
+            _ => None,
+        }
+    }
+
     pub fn session_name(&self) -> Option<String> {
         self.entries
             .iter()
@@ -179,6 +254,24 @@ impl SessionManager {
                 SessionEntry::SessionInfo { name, .. } => Some(name.clone()),
                 _ => None,
             })
+    }
+
+    /// First user message in file order, truncated for list labels.
+    pub fn first_user_preview(&self) -> Option<String> {
+        for entry in &self.entries {
+            if let SessionEntry::Message {
+                message: AgentMessage::User(user),
+                ..
+            } = entry
+            {
+                let text = user.content.as_display_text();
+                let preview = first_line_preview(&text, 72);
+                if !preview.is_empty() {
+                    return Some(preview);
+                }
+            }
+        }
+        None
     }
 
     pub fn build_context_entries(&self) -> Vec<SessionEntry> {
@@ -344,5 +437,55 @@ impl SessionManager {
         handle.write_all(json.as_bytes()).await?;
         handle.write_all(b"\n").await?;
         Ok(())
+    }
+}
+
+fn first_line_preview(text: &str, max_chars: usize) -> String {
+    let line = text.lines().next().unwrap_or(text).trim();
+    let mut out: String = line.chars().take(max_chars).collect();
+    if line.chars().count() > max_chars {
+        out.push('…');
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use one_core::message::AgentMessage;
+
+    #[test]
+    fn display_label_prefers_name_then_preview_then_id() {
+        let mut info = SessionInfo {
+            path: PathBuf::from("/tmp/s.jsonl"),
+            id: "abcdef0123456789".into(),
+            cwd: "/tmp".into(),
+            name: Some("  my task  ".into()),
+            preview: Some("first prompt".into()),
+            modified: Utc::now(),
+        };
+        assert_eq!(info.display_label(), "my task");
+
+        info.name = None;
+        assert_eq!(info.display_label(), "first prompt");
+
+        info.preview = None;
+        assert_eq!(info.display_label(), "abcdef012345");
+    }
+
+    #[test]
+    fn first_user_preview_from_entries() {
+        let mut sm = SessionManager::in_memory("/tmp/proj");
+        assert!(sm.first_user_preview().is_none());
+
+        // Simulate append without disk: push entries + leaf like append_message.
+        let base = crate::entries::new_entry_base(None);
+        sm.entries.push(SessionEntry::Message {
+            base: base.clone(),
+            message: AgentMessage::user_text("hello\nsecond line"),
+        });
+        sm.leaf_id = Some(base.id);
+
+        assert_eq!(sm.first_user_preview().as_deref(), Some("hello"));
     }
 }

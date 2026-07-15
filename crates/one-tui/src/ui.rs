@@ -6,7 +6,7 @@
 //! - Prompt: left-border only + agent/model meta strip
 //! - one-cli only feeds state; all paint is here
 
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Position, Rect};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -55,6 +55,98 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     if let Some(menu) = &app.float {
         draw_float_menu(frame, frame.area(), menu);
     }
+
+    // Tool approval sits above floats while the agent is waiting.
+    if app.approval_prompt().is_some() {
+        draw_approval(frame, frame.area(), app);
+    }
+}
+
+/// Centered approval dialog for high-risk / rule-ask tool calls.
+fn draw_approval(frame: &mut Frame<'_>, full: Rect, app: &App) {
+    let Some(prompt) = app.approval_prompt() else {
+        return;
+    };
+
+    // Dim backdrop.
+    frame.render_widget(
+        Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
+        full,
+    );
+
+    let width = full.width.saturating_mul(3) / 4;
+    let width = width.clamp(48, 88).min(full.width.saturating_sub(2));
+    let height = 10u16.min(full.height.saturating_sub(2));
+    let x = full.x + (full.width.saturating_sub(width)) / 2;
+    let y = full.y + (full.height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Permission required ")
+        .border_style(Style::default().fg(Color::Yellow))
+        .style(Theme::bg());
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let summary = truncate_mid(&prompt.summary, (inner.width as usize).saturating_sub(2));
+    let reason = truncate_mid(&prompt.reason, (inner.width as usize).saturating_sub(2));
+    let lines = vec![
+        Line::from(Span::styled(
+            format!("tool  {}", prompt.tool),
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::raw(summary)),
+        Line::from(Span::styled(
+            reason,
+            Style::default().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("y/Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" once   "),
+            Span::styled("a", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" session   "),
+            Span::styled("n/Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+            Span::raw(" deny"),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn truncate_mid(s: &str, max: usize) -> String {
+    if max == 0 {
+        return String::new();
+    }
+    let w = UnicodeWidthStr::width(s);
+    if w <= max {
+        return s.to_string();
+    }
+    if max <= 3 {
+        return "…".to_string();
+    }
+    let keep = max - 1;
+    let mut out = String::new();
+    let mut used = 0;
+    for ch in s.chars() {
+        let cw = UnicodeWidthStr::width(ch.to_string().as_str());
+        if used + cw > keep {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    out
 }
 
 /// Ephemeral top-right toast — UI only, never agent context.
@@ -146,6 +238,7 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
         FloatKind::Info => " Enter / Esc close ",
         FloatKind::Sessions => " ↑/↓  ·  Enter resume  ·  Esc  ·  type to filter ",
         FloatKind::Tree => " ↑/↓  ·  Enter branch  ·  Esc  ·  type to filter ",
+        FloatKind::Rewind => " ↑/↓  ·  Enter edit prompt  ·  Esc  ·  type to filter ",
         FloatKind::Thinking => " ↑/↓  ·  Enter set level  ·  Esc ",
         FloatKind::Help => " ↑/↓  ·  Enter open  ·  Esc  ·  type to search ",
         FloatKind::Models => " ↑/↓  ·  Enter switch  ·  Esc  ·  type to search ",
@@ -318,13 +411,29 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.chat_view_height = view_h;
     app.chat_total_lines = total;
     app.chat_line_owners = owners;
+    app.chat_line_text = all_lines
+        .iter()
+        .map(|line| {
+            line.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        })
+        .collect();
 
-    if app.follow_bottom {
+    let empty_welcome = app.messages.is_empty() && !app.busy;
+
+    if empty_welcome && app.follow_bottom {
+        // Fresh session / after `/clear`: pin welcome to the top (title first).
+        // Keep follow_bottom false so later PgDn can reveal lower tips.
+        app.follow_bottom = false;
+        app.chat_scroll = max_from_bottom;
+    } else if app.follow_bottom {
         app.chat_scroll = 0;
     } else {
         // Keep offset in range so PageDown can re-stick without a huge backlog.
         app.chat_scroll = app.chat_scroll.min(max_from_bottom);
-        if app.chat_scroll == 0 {
+        if app.chat_scroll == 0 && !empty_welcome {
             app.follow_bottom = true;
         }
     }
@@ -338,13 +447,46 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let start = max_from_bottom.saturating_sub(from_bottom);
     let end = (start + view_h).min(total);
     app.chat_view_start = start;
+    // New / short chats start at the top of the pane (0,0) — not pinned to the prompt.
+    app.chat_top_pad = 0;
+    let sel = app.selection_range();
     let window: Vec<Line<'static>> = if start < end {
-        all_lines[start..end].to_vec()
+        all_lines[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| {
+                let abs = start + i;
+                if sel.is_some_and(|(lo, hi)| abs >= lo && abs <= hi) {
+                    highlight_line(line)
+                } else {
+                    line.clone()
+                }
+            })
+            .collect()
     } else {
         Vec::new()
     };
 
     frame.render_widget(Paragraph::new(window).style(Theme::bg()), area);
+}
+
+/// Paint a line with selection background (keeps glyph content).
+fn highlight_line(line: &Line<'static>) -> Line<'static> {
+    let spans: Vec<Span<'static>> = line
+        .spans
+        .iter()
+        .map(|s| {
+            let mut style = s.style;
+            // Force readable selection colors; keep bold/italic if present.
+            style = style.patch(Theme::selection());
+            Span::styled(s.content.clone(), style)
+        })
+        .collect();
+    if spans.is_empty() {
+        Line::from(Span::styled(" ", Theme::selection()))
+    } else {
+        Line::from(spans)
+    }
 }
 
 /// Build the full chat transcript as terminal lines (wrap-aware).
@@ -362,6 +504,17 @@ fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Op
             owners.push(owner);
         }
     };
+
+    // Fresh session: fill the empty pane with a soft welcome + tips.
+    if app.messages.is_empty() && !app.busy {
+        push_owned(
+            &mut lines,
+            &mut owners,
+            empty_state_lines(app, wrap_width),
+            None,
+        );
+        return (lines, owners);
+    }
 
     let mut i = 0;
     while i < app.messages.len() {
@@ -402,7 +555,10 @@ fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Op
             owners.push(None);
         }
         let chunk = message_lines(msg, app, wrap_width);
-        let owner = if msg.role == MessageRole::Alert {
+        let owner = if matches!(
+            msg.role,
+            MessageRole::Alert | MessageRole::Thinking | MessageRole::Tool
+        ) {
             Some(i)
         } else {
             None
@@ -411,7 +567,8 @@ fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Op
         i += 1;
     }
 
-    if app.busy && app.stream_buffer.is_empty() {
+    // Spinner while waiting for first token, or while only thinking has started.
+    if app.busy && app.stream_buffer.is_empty() && app.thinking_buffer.is_empty() {
         let show = app
             .messages
             .last()
@@ -423,10 +580,15 @@ fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Op
                 owners.push(None);
             }
             let spin = SPINNER[app.spinner_frame % SPINNER.len()];
+            let label = if app.thinking_level != "off" {
+                "Thinking…"
+            } else {
+                "Working…"
+            };
             lines.push(Line::from(vec![
                 Span::raw("  "),
                 Span::styled(format!("{spin} "), Theme::prompt_bar()),
-                Span::styled("Thinking…", Theme::busy()),
+                Span::styled(label, Theme::busy()),
             ]));
             owners.push(None);
         }
@@ -434,6 +596,134 @@ fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Op
 
     debug_assert_eq!(lines.len(), owners.len());
     (lines, owners)
+}
+
+/// Empty-session welcome: title, context, tips — kept short so it fits a
+/// typical chat pane without scrolling away the title.
+fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    let blank = || Line::from(Span::styled("", Theme::bg()));
+    let muted = |s: String| {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(s, Theme::meta()),
+        ])
+    };
+    let tip_row = |parts: &[(&str, &str)]| {
+        let mut spans = vec![Span::raw("  ")];
+        for (i, (key, desc)) in parts.iter().enumerate() {
+            if i > 0 {
+                spans.push(Span::styled("   ", Theme::meta()));
+            }
+            spans.push(Span::styled(format!("{key} "), Theme::status_key()));
+            spans.push(Span::styled((*desc).to_string(), Theme::meta()));
+        }
+        Line::from(spans)
+    };
+
+    lines.push(blank());
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "one",
+            Style::default()
+                .fg(Theme::PRIMARY)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled("  ·  coding agent", Theme::meta()),
+    ]));
+
+    let agent = if app.agent_label.is_empty() {
+        "Build"
+    } else {
+        app.agent_label.as_str()
+    };
+    let mut ctx = format!("{agent}");
+    if !app.current_model.is_empty() {
+        ctx.push_str("  ·  ");
+        ctx.push_str(&app.current_model);
+    } else if !app.mode_label.is_empty() {
+        ctx.push_str("  ·  ");
+        ctx.push_str(&app.mode_label);
+    }
+    if !app.current_provider.is_empty() {
+        ctx.push_str("  ·  ");
+        ctx.push_str(&app.current_provider);
+    }
+    lines.push(muted(ctx));
+    lines.push(blank());
+
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "Describe a task to get started — tools run when needed.",
+            Theme::assistant_body(),
+        ),
+    ]));
+    lines.push(blank());
+
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "tips",
+            Style::default()
+                .fg(Theme::MUTED)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    lines.push(tip_row(&[
+        ("/", "commands"),
+        ("Space", "Plan ↔ Build"),
+        ("Ctrl+L", "model"),
+    ]));
+    lines.push(tip_row(&[
+        ("Ctrl+J", "newline"),
+        ("Esc Esc", "rewind"),
+        ("↑↓", "history"),
+    ]));
+    lines.push(tip_row(&[
+        ("/help", "more"),
+        ("/model", "switch"),
+        ("/resume", "sessions"),
+    ]));
+    lines.push(blank());
+
+    lines.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(
+            "try",
+            Style::default()
+                .fg(Theme::MUTED)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ]));
+    for (i, example) in [
+        "list files in this directory",
+        "explain how the agent loop works",
+        "fix the failing tests",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        // Peach number chip — solid bg, no emoji/circled-digit tofu.
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!(" {} ", i + 1), Theme::badge_primary()),
+            Span::styled(format!("  \"{example}\""), Theme::meta()),
+        ]));
+    }
+    lines.push(blank());
+
+    let footer = "paste image/text · drag to copy · /quit to exit";
+    if wrap_width > 0 && display_width(footer) + 2 > wrap_width {
+        for part in wrap_str(footer, wrap_width.saturating_sub(2)) {
+            lines.push(muted(part));
+        }
+    } else {
+        lines.push(muted(footer.into()));
+    }
+    lines
 }
 
 /// Collapsed multi-tool chip (soft chip, not a raw text dump).
@@ -471,6 +761,7 @@ fn message_lines(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'s
     match message.role {
         MessageRole::User => render_user(&message.content, wrap_width),
         MessageRole::Alert => render_alert(message, wrap_width),
+        MessageRole::Thinking => render_thinking(message, app, wrap_width),
         MessageRole::Assistant => {
             let mut lines = render_assistant(
                 &message.content,
@@ -493,6 +784,93 @@ fn message_lines(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'s
         MessageRole::System => render_system(&message.content, wrap_width),
         MessageRole::Tool => render_tool(message, app, wrap_width),
     }
+}
+
+/// While thinking is streaming, only keep the rolling tail so long chains
+/// don't flood the transcript (last N wrapped lines).
+const THINKING_STREAM_TAIL_LINES: usize = 3;
+
+/// Thinking / reasoning block — collapsible, muted.
+///
+/// ```text
+///   ▸ thinking · 128 chars   ↵/click   (finished, default collapsed)
+///   ▾ thinking …                       (streaming: last 3 wrapped lines)
+///     …
+///   ▾ thinking · 128 chars             (expanded full body)
+///     …
+/// ```
+fn render_thinking(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'static>> {
+    let chars = message.content.chars().count();
+    // Live stream always shows a short tail; finished blocks honor per-message
+    // expand (click/↵) or the global Ctrl+T default (`show_thinking`).
+    let expanded = message.streaming || message.thinking_expanded;
+    let chevron = if expanded { "▾" } else { "▸" };
+    let mut lines = Vec::new();
+
+    if expanded {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(chevron, Theme::thinking_chevron()),
+            Span::styled(" thinking", Theme::thinking_title()),
+            if message.streaming {
+                Span::styled(" …", Theme::thinking_meta())
+            } else {
+                Span::styled(format!(" · {chars} chars"), Theme::thinking_meta())
+            },
+            // Expanded finished blocks: hint how to collapse again.
+            if !message.streaming {
+                Span::styled("   ↵/click", Theme::meta())
+            } else {
+                Span::raw("")
+            },
+        ]));
+        let budget = wrap_width.saturating_sub(4).max(8);
+        let mut body = wrap_paragraphs(&message.content, budget);
+        // Live stream: rolling window of the last few lines only.
+        if message.streaming && body.len() > THINKING_STREAM_TAIL_LINES {
+            body = body
+                [body.len() - THINKING_STREAM_TAIL_LINES..]
+                .to_vec();
+        }
+        let last = body.len().saturating_sub(1);
+        if body.is_empty() {
+            // Empty so far — reserve one row with a stable-width caret (no vertical jump).
+            if message.streaming {
+                let caret = if app.cursor_on {
+                    Span::styled("▌", Theme::cursor())
+                } else {
+                    Span::raw(" ")
+                };
+                lines.push(Line::from(vec![Span::raw("    "), caret]));
+            }
+        } else {
+            for (i, line) in body.into_iter().enumerate() {
+                let mut spans = vec![
+                    Span::raw("    "),
+                    Span::styled(line, Theme::thinking_body()),
+                ];
+                // Inline caret on the last line (same pattern as assistant stream).
+                // Always reserve width so blink does not shift layout.
+                if message.streaming && i == last {
+                    if app.cursor_on {
+                        spans.push(Span::styled(" ▌", Theme::cursor()));
+                    } else {
+                        spans.push(Span::raw("  "));
+                    }
+                }
+                lines.push(Line::from(spans));
+            }
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(chevron, Theme::thinking_chevron()),
+            Span::styled(" thinking", Theme::thinking_title()),
+            Span::styled(format!(" · {chars} chars"), Theme::thinking_meta()),
+            Span::styled("   ↵/click", Theme::meta()),
+        ]));
+    }
+    lines
 }
 
 /// User: peach left rail + soft panel fill (tight, no empty pad rows).
@@ -655,7 +1033,7 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
     }
     lines.push(Line::from(spans));
 
-    let show_summary = message.tool_summary.as_ref().is_some_and(|s| {
+    let show_summary = message.tool_summary.as_ref().is_some_and(|_s| {
         !message.tool_expanded || message.tool_output.is_none()
     });
     if show_summary {
@@ -679,16 +1057,18 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
     }
 
     // Expanded body with proper tree rails (├ / └), not a floating │ dump.
+    // Caps are generous: the main chat is line-scrolled (full viewport), so long
+    // tool output should participate in that scroll instead of feeling "clipped".
     if message.tool_expanded {
         if let Some(output) = message.tool_output.as_deref() {
             let body_budget = wrap_width.saturating_sub(8).max(12);
             let is_diff = tool_view::looks_like_diff(output);
             let max_lines = if status == ToolStatus::Error {
-                10
+                40
             } else if is_diff {
-                16
+                48
             } else {
-                8
+                60
             };
             let default_style = if status == ToolStatus::Error {
                 Theme::error_body()
@@ -924,20 +1304,17 @@ fn char_width(ch: char) -> usize {
     UnicodeWidthStr::width(ch.encode_utf8(&mut [0; 4])).max(1)
 }
 
-/// Prompt — ratatui [user_input] pattern + 1-col reserved caret cell.
+/// Prompt — soft left bar + multi-line input + software typewriter caret.
 ///
 /// ```text
 /// │              ← top padding (not input)
-/// │  hello █     ← indent + text + 1-cell caret slot
+/// │  hello ▌     ← indent + text + blinking software caret
 /// │              ← bottom padding
 ///   Build  deepseek-v4-flash  opencode
 /// ```
 ///
-/// Cursor always sits on a **dedicated 1-column slot** after the text (or before
-/// the placeholder when empty). Never overlaid on the middle of a string.
-/// Position uses **display width** (`unicode-width`), not `chars().count()`.
-///
-/// [user_input]: https://ratatui.rs/examples/apps/user_input/
+/// Caret sits on a **dedicated 1-column slot** after the text (or before the
+/// placeholder when empty). Hardware cursor stays hidden.
 fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let input_lines_n = app.input_line_count() as u16;
     let box_h = (input_lines_n + 2).clamp(3, 8); // top pad + lines + bottom pad
@@ -961,15 +1338,22 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     const INDENT: &str = "  ";
-    const INDENT_COLS: u16 = 2;
-    const CARET_SLOT: &str = " ";
+
+    // Software caret (▌) so the typewriter is visible even when the hardware
+    // I-beam is hidden by the emulator / tmux / mouse reporting.
+    let caret = if app.cursor_on {
+        Span::styled("▌", Theme::input_cursor_on())
+    } else {
+        Span::styled(" ", Theme::input_cursor_off())
+    };
 
     // Multi-line input: one Line per input row; caret on last line.
+    // Image attachments appear as `[图片.img]` tokens inside the text (deletable).
     let mut content: Vec<Line> = vec![Line::from("")]; // top padding
     if app.input.is_empty() {
         content.push(Line::from(vec![
             Span::raw(INDENT),
-            Span::raw(CARET_SLOT),
+            caret.clone(),
             Span::styled(placeholder, Theme::input_placeholder()),
         ]));
     } else {
@@ -980,7 +1364,7 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 content.push(Line::from(vec![
                     Span::raw(INDENT),
                     Span::styled(*line, Theme::input_text()),
-                    Span::raw(CARET_SLOT),
+                    caret.clone(),
                 ]));
             } else {
                 content.push(Line::from(vec![
@@ -1000,26 +1384,7 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 
     frame.render_widget(paragraph, box_area);
-
-    // Caret on last input line after last character.
-    let last_line = app.input.split('\n').next_back().unwrap_or("");
-    let text_cols = display_cols(last_line);
-    let line_offset = app.input_line_count().saturating_sub(1) as u16;
-    #[allow(clippy::cast_possible_truncation)]
-    {
-        let x = box_area
-            .x
-            .saturating_add(1)
-            .saturating_add(INDENT_COLS)
-            .saturating_add(text_cols);
-        let y = box_area.y.saturating_add(1).saturating_add(line_offset);
-        let max_x = box_area.x.saturating_add(box_area.width.saturating_sub(1));
-        let max_y = box_area.y.saturating_add(box_area.height.saturating_sub(1));
-        frame.set_cursor_position(Position {
-            x: x.min(max_x),
-            y: y.min(max_y),
-        });
-    }
+    // Hardware cursor stays hidden — software ▌ above is the typewriter caret.
 
     // Prompt meta: agent (accent)  model  provider — no api/host noise.
     let agent = if app.agent_label.is_empty() {
@@ -1213,12 +1578,125 @@ mod tests {
     }
 
     #[test]
+    fn empty_session_shows_welcome_tips() {
+        // Tall enough for chat pane to show welcome title + a tip row.
+        let backend = TestBackend::new(72, 28);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("one");
+        app.set_agent_label("Build");
+        app.set_current_model("mock", "mock-model");
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap();
+
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            flat.contains("coding agent"),
+            "empty session should show welcome title, got:\n{flat}"
+        );
+        assert!(
+            flat.contains("tips") || flat.contains("commands"),
+            "empty session should show guidance, got:\n{flat}"
+        );
+        assert!(
+            flat.contains("mock-model"),
+            "empty session should surface current model, got:\n{flat}"
+        );
+
+        // Once a message exists, welcome leaves the transcript.
+        app.push_user("hello there unique-marker");
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap();
+        let after: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            after.contains("hello there unique-marker"),
+            "user message must paint, got:\n{after}"
+        );
+        assert!(
+            !after.contains("coding agent"),
+            "welcome must hide after first message, got:\n{after}"
+        );
+    }
+
+    #[test]
     fn caret_sits_on_reserved_slot_not_mid_text() {
         // empty: indent(2) + slot(1) → caret col = border(1)+2 = 3 from box.x
         // typed "ab": indent(2)+width(2)+slot → caret after "ab"
         assert_eq!(display_cols("ab"), 2);
         assert_eq!(display_cols("你好"), 4); // fullwidth
         assert_eq!(display_cols(""), 0);
+    }
+
+    #[test]
+    fn streaming_thinking_shows_only_last_three_lines() {
+        let backend = TestBackend::new(48, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.busy = true;
+        // Distinct markers per line so we can assert the rolling tail.
+        let body = (0..8)
+            .map(|i| format!("think-line-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.messages
+            .push(crate::message::Message::streaming_thinking(body));
+        app.cursor_on = true;
+
+        terminal
+            .draw(|frame| draw(frame, &mut app))
+            .unwrap();
+
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+
+        assert!(
+            flat.contains("think-line-05")
+                && flat.contains("think-line-06")
+                && flat.contains("think-line-07"),
+            "streaming thinking must keep the last 3 lines, got:\n{flat}"
+        );
+        assert!(
+            !flat.contains("think-line-00") && !flat.contains("think-line-04"),
+            "older thinking lines must scroll off the rolling window, got:\n{flat}"
+        );
+    }
+
+    #[test]
+    fn streaming_thinking_caret_does_not_add_extra_row() {
+        // Blink off must not drop a full line (that was the vertical jump).
+        let body = "alpha\nbeta\ngamma\ndelta";
+        let msg = crate::message::Message::streaming_thinking(body);
+        let mut app = App::new("test");
+        app.cursor_on = true;
+        let on = render_thinking(&msg, &app, 40);
+        app.cursor_on = false;
+        let off = render_thinking(&msg, &app, 40);
+        assert_eq!(
+            on.len(),
+            off.len(),
+            "caret blink must keep the same row count (no vertical jump)"
+        );
+        // Tail window: header + last 3 body lines (delta/beta/gamma/delta → last 3).
+        assert_eq!(on.len(), 1 + THINKING_STREAM_TAIL_LINES);
     }
 
     #[test]
@@ -1362,7 +1840,9 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
 
     if app.busy {
         let mut left = vec![Span::raw("  ")];
-        left.extend(pair("esc", " stop  "));
+        // Soft cancel vs hard exit — Ctrl+C must never be "just stop".
+        left.extend(pair("q/esc", " stop  "));
+        left.extend(pair("^c", " quit  "));
         left.extend(pair("ctrl+s", " steer"));
         let right = vec![Span::styled("working  ", Theme::status_faint())];
         return (left, right);
@@ -1372,20 +1852,48 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     let mut left = vec![Span::raw("  ")];
     left.extend(pair("enter", " send  "));
     left.extend(pair("/", " cmd  "));
-    left.extend(pair("^j", " nl"));
+    left.extend(pair("^j", " nl  "));
+    left.extend(pair("↑↓", " hist  "));
+    left.extend(pair("esc", " clear"));
     if app.can_scroll() {
         left.push(Span::raw("  "));
-        left.extend(pair("↑", " hist"));
+        left.extend(pair("pgup", " scroll"));
+    }
+    // Mouse on: drag selects in-app → OSC 52 clipboard (not terminal native select).
+    if app.mouse_capture {
+        left.push(Span::raw("  "));
+        left.extend(pair("drag", " copy"));
     }
 
     let mut right = Vec::new();
     if app.thinking_level != "off" {
+        // Default is collapsed; only badge when the user opted into full bodies.
+        let vis = if app.show_thinking { "·full" } else { "" };
         right.push(Span::styled(
-            format!("think:{}  ", app.thinking_level),
+            format!("think:{}{vis}  ", app.thinking_level),
             Theme::status_faint(),
         ));
     }
-    if app.usage_tokens > 0 {
+    // Prefer precise provider I/O tokens when available.
+    if app.usage_input > 0 || app.usage_output > 0 {
+        let mut usage = format!(
+            "↑{} ↓{}  ",
+            format_tokens(app.usage_input as usize),
+            format_tokens(app.usage_output as usize)
+        );
+        if app.usage_cost_usd > 0.0 {
+            if app.usage_cost_usd < 0.01 {
+                usage.push_str(&format!("${:.4}  ", app.usage_cost_usd));
+            } else {
+                usage.push_str(&format!("${:.3}  ", app.usage_cost_usd));
+            }
+        }
+        if app.context_window > 0 && app.usage_tokens > 0 {
+            let pct = (app.usage_tokens * 100) / app.context_window.max(1);
+            usage.push_str(&format!("ctx {pct}%  "));
+        }
+        right.push(Span::styled(usage, Theme::status_faint()));
+    } else if app.usage_tokens > 0 {
         let usage = if app.context_window > 0 {
             let pct = (app.usage_tokens * 100) / app.context_window.max(1);
             format!("~{} tok {}%  ", format_tokens(app.usage_tokens), pct)

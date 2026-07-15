@@ -6,6 +6,7 @@ Rust 实现的编程 Agent，灵感来自 [Pi Agent](https://pi.dev)：极简核
 
 - **极简 Agent 核心**：短 system prompt + tool-calling 循环
 - **内置工具**：`read` / `write` / `edit` / `bash` / `grep` / `find` / `ls` / `web_search` / `web_fetch`
+- **工作区路径沙箱**：默认只能读写 `--cwd`（+ `--add-dir`）；`--full-access` 关闭边界
 - **四种运行模式**：Interactive TUI / Print / JSON / RPC
 - **会话持久化**：JSONL 树形 session，`--continue` 恢复
 - **资源加载**：`AGENTS.md`、skills（含内置 `create-skill`）、`/prompt` 模板
@@ -73,7 +74,7 @@ docs/            设计与使用文档
 | JSONL session 树 | ✅ | ✅（v3 子集） |
 | Skills / prompts | ✅ progressive disclosure | ✅ catalog + `read` 按需加载 |
 | Compaction | ✅ LLM | ✅ LLM + overflow 重试 |
-| Thinking level | ✅ | ✅ Shift+Tab / `/thinking` |
+| Thinking level | ✅ | ✅ `/settings thinking` / `/thinking` · stream · Ctrl+T · multi-provider |
 | TypeScript 扩展 | ✅ | ❌（Rust 扩展） |
 | MCP 内置 | ❌ | ❌ |
 | Interactive TUI | ✅ 完整 | ✅ 可用（多行/用量 footer） |

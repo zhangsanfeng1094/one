@@ -5,6 +5,7 @@
 1. **极简核心**：Agent loop 保持短小，复杂能力通过扩展和资源配置实现
 2. **Pi 兼容**：Session 格式、工具名称、配置目录尽量与官方 Pi 对齐
 3. **crate 分层**：每层职责单一，可独立测试和嵌入
+4. **默认工作区边界**：file tools 默认只能访问 `--cwd` + `--add-dir`；`~/.one/agent` 默认可读（skills）；`--full-access` 显式关闭
 
 ## Crate 依赖图
 
@@ -25,7 +26,7 @@ one-cli
 用户输入
   → [可选] prompt 模板展开 (/deploy)
   → [可选] compaction 检查
-  → LLM complete（支持 text delta 事件）
+  → LLM complete（text + thinking delta 事件）
   → 有 tool_call？
       是 → 执行 tool → 结果写入 messages → 继续循环
       否 → 返回最终文本
@@ -35,8 +36,14 @@ one-cli
 核心类型：
 
 - `Agent`：维护 `messages`、`tools`、事件订阅
-- `LlmProvider`：统一 `complete` / `complete_with_deltas`
+- `LlmProvider`：统一 `complete` / `complete_streaming`
+- `ThinkingLevel`：统一 off/low/medium/high；各 provider 经 `one_ai::thinking` 映射到 budget / effort / think
+- `ContentBlock::Thinking`：thinking 正文 + 可选 `signature`（多轮回传）+ `redacted`
 - `Tool`：异步执行，返回 `ToolOutput`（内置含 `web_search` / `web_fetch`，`network` feature）
+- `PathPolicy` / `SandboxMode`（`one-tools`）：路径 canonicalize 后校验 workspace 根；`workspace-write`（默认）vs `full-access`
+- `ToolGate`（`one-core`）+ `PermissionGate`（`one-cli`）：工具执行前 allow/deny/ask；交互弹窗或 fail-closed
+- `PermissionRules`：Claude 式 `Bash(git push *)` / `Write(**/.env*)` 规则
+- `OsSandbox`：workspace-write 下 bash 经 `bwrap`（workspace RW、home RO）
 
 ## Session 树
 
@@ -86,3 +93,15 @@ trait Extension {
 | RPC | `one --mode rpc` | stdin/stdout JSONL 集成 |
 
 RPC 协议见 [cli.md](cli.md#rpc-模式)。
+
+## Plan Mode（内置）
+
+Agent 在 **Plan** 与 **Act/Build** 之间切换：
+
+| 状态 | 工具 | 产出 |
+|------|------|------|
+| Plan | 只读 + 仅可写 plan 文件 + `exit_plan_mode` | `~/.one/agent/plans/<uuid>.md` |
+| Act | 完整 coding tools + 扩展 tools | 按批准的 plan 改代码 |
+
+进入：`/plan`、`--plan`。退出并实现：`/act` / `/build`（注入 plan 正文并自动开一轮实现）。  
+硬门控（无 bash / 不能写业务代码）+ system prompt overlay，对齐 Claude Code 工作流。

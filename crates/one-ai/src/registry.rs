@@ -84,8 +84,74 @@ impl ModelRegistry {
                     base_url: Some("http://127.0.0.1:11434/v1".into()),
                     api_key: None,
                 },
+                ModelEntry {
+                    provider: "openrouter".into(),
+                    id: "anthropic/claude-sonnet-4".into(),
+                    name: "Claude Sonnet 4 (OpenRouter)".into(),
+                    context_window: Some(200_000),
+                    api: Some("openai-completions".into()),
+                    base_url: Some("https://openrouter.ai/api/v1".into()),
+                    api_key: None,
+                },
+                ModelEntry {
+                    provider: "deepseek".into(),
+                    id: "deepseek-chat".into(),
+                    name: "DeepSeek Chat (V3)".into(),
+                    context_window: Some(128_000),
+                    api: Some("openai-completions".into()),
+                    base_url: Some("https://api.deepseek.com".into()),
+                    api_key: None,
+                },
+                ModelEntry {
+                    provider: "deepseek".into(),
+                    id: "deepseek-reasoner".into(),
+                    name: "DeepSeek Reasoner (R1)".into(),
+                    context_window: Some(128_000),
+                    api: Some("openai-completions".into()),
+                    base_url: Some("https://api.deepseek.com".into()),
+                    api_key: None,
+                },
+                ModelEntry {
+                    provider: "gemini".into(),
+                    id: "gemini-2.5-flash".into(),
+                    name: "Gemini 2.5 Flash".into(),
+                    context_window: Some(1_000_000),
+                    api: Some("openai-completions".into()),
+                    base_url: Some(
+                        "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+                    ),
+                    api_key: None,
+                },
+                ModelEntry {
+                    provider: "gemini".into(),
+                    id: "gemini-2.5-pro".into(),
+                    name: "Gemini 2.5 Pro".into(),
+                    context_window: Some(1_000_000),
+                    api: Some("openai-completions".into()),
+                    base_url: Some(
+                        "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+                    ),
+                    api_key: None,
+                },
             ],
         }
+    }
+
+    /// Built-in provider ids with a one-line description for `--list-providers`.
+    pub fn builtin_provider_catalog() -> &'static [(&'static str, &'static str, &'static str)] {
+        &[
+            ("mock", "Mock (offline)", "—"),
+            ("anthropic", "Anthropic Messages", "ANTHROPIC_API_KEY"),
+            ("openai", "OpenAI Responses/Completions", "OPENAI_API_KEY"),
+            ("ollama", "Ollama local", "—"),
+            ("openrouter", "OpenRouter", "OPENROUTER_API_KEY"),
+            ("deepseek", "DeepSeek (OpenAI-compat)", "DEEPSEEK_API_KEY"),
+            (
+                "gemini",
+                "Google Gemini (OpenAI-compat)",
+                "GEMINI_API_KEY / GOOGLE_API_KEY",
+            ),
+        ]
     }
 
     pub fn list(&self) -> &[ModelEntry] {
