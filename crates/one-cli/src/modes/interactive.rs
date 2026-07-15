@@ -5,17 +5,239 @@ use one_core::error::OneError;
 use one_core::events::AgentEvent;
 use one_core::message::AgentMessage;
 use one_tui::{
-    App, ApprovalAnswer, ApprovalPrompt, ForceQuit, ModelChoice, RunOutcome, TerminalSession,
+    App, ApprovalAnswer, ApprovalPrompt, ConfigOp, ForceQuit, ModelChoice, RunOutcome, SelectKind,
+    TerminalSession,
 };
 
-use crate::approval::ApprovalChoice;
+use crate::approval::{ApprovalChoice, PermissionGate};
+use crate::hitl::HitlChannel;
 use crate::provider::ProviderSet;
 use crate::runtime::{AgentMode, AppRuntime};
 use one_session::export_html;
 
+/// Poll permission gate + ask_user HITL and feed TUI answers back.
+fn drain_hitl(app: &mut App, gate: &PermissionGate, hitl: &HitlChannel) {
+    if let Some(req) = gate.poll_request() {
+        app.set_approval_prompt(ApprovalPrompt {
+            id: req.id,
+            tool: req.tool,
+            summary: req.summary,
+            reason: req.reason,
+        });
+    }
+    if let Some(answer) = app.take_approval_answer() {
+        let choice = match answer {
+            ApprovalAnswer::Always => ApprovalChoice::Always,
+            ApprovalAnswer::Once => ApprovalChoice::Once,
+            ApprovalAnswer::Session => ApprovalChoice::Session,
+            ApprovalAnswer::Deny { feedback } => ApprovalChoice::Deny { feedback },
+        };
+        let _ = gate.respond(choice);
+    }
+
+    if let Some(req) = hitl.poll_request() {
+        app.set_select_prompt(SelectKind::AskUser { id: req.id }, req.prompt);
+    }
+    if let Some((kind, result)) = app.take_select_result() {
+        if matches!(kind, SelectKind::AskUser { .. }) {
+            let _ = hitl.respond(result);
+        }
+    }
+}
+
+fn cancel_hitl(app: &mut App, gate: &PermissionGate, hitl: &HitlChannel) {
+    gate.cancel_pending();
+    hitl.cancel_pending();
+    app.clear_approval_prompt();
+    app.clear_select_prompt();
+    let _ = app.take_select_result();
+}
+
 /// Short label for turn footers / compact chrome: just the model id.
 fn format_mode_label(providers: &ProviderSet) -> String {
     providers.as_llm().model().to_string()
+}
+
+/// Refresh model picker + Settings lists after models.json CRUD.
+fn refresh_model_catalog(app: &mut App, providers: &ProviderSet) {
+    app.set_model_catalog(
+        providers
+            .registry
+            .list()
+            .iter()
+            .map(|m| ModelChoice {
+                provider: m.provider.clone(),
+                id: m.id.clone(),
+                name: m.name.clone(),
+            })
+            .collect(),
+    );
+    app.set_settings_catalog(
+        providers.providers_rows(),
+        providers.models_rows(None),
+        providers.provider_field_rows(),
+    );
+}
+
+async fn apply_switch_model(
+    runtime: &mut AppRuntime,
+    providers: &mut ProviderSet,
+    app: &mut App,
+    provider_name: &str,
+    model: Option<String>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match providers.switch_named(provider_name, model) {
+        Ok(()) => {
+            app.set_mode_label(format_mode_label(providers));
+            app.set_current_model(&providers.provider_id, providers.as_llm().model());
+            if let Some(session) = &mut runtime.session {
+                session
+                    .append_model_change(providers.provider_id.clone(), providers.as_llm().model())
+                    .await?;
+            }
+            app.set_context_window(providers.context_window());
+            app.set_notice(format!(
+                "model → {} / {}",
+                providers.provider_id,
+                providers.as_llm().model(),
+            ));
+        }
+        Err(err) => app.set_notice(format!("model: {err}")),
+    }
+    Ok(())
+}
+
+async fn apply_config_op(providers: &mut ProviderSet, app: &mut App, op: ConfigOp) {
+    match op {
+        ConfigOp::ProviderAdd { id, base_url } => {
+            // Create provider in Settings; set base_url later on provider detail (in-float).
+            let mut kv = Vec::new();
+            if let Some(url) = base_url.filter(|u| !u.is_empty()) {
+                kv.push(("base_url".into(), url));
+            }
+            match providers.provider_add(&id, &kv) {
+                Ok(msg) => {
+                    refresh_model_catalog(app, providers);
+                    app.set_notice(msg);
+                    app.settings_provider_focus = id.clone();
+                    app.reopen_settings_provider_detail();
+                }
+                Err(err) => app.set_notice(format!("provider: {err}")),
+            }
+        }
+        ConfigOp::ProviderSet { id, key, value } => {
+            match providers.provider_set(&id, &key, &value) {
+                Ok(msg) => {
+                    refresh_model_catalog(app, providers);
+                    app.set_notice(msg);
+                    app.settings_provider_focus = id;
+                    app.reopen_settings_provider_detail();
+                }
+                Err(err) => app.set_notice(format!("provider: {err}")),
+            }
+        }
+        ConfigOp::ProviderRm { id } => match providers.provider_rm(&id) {
+            Ok(msg) => {
+                refresh_model_catalog(app, providers);
+                app.set_notice(msg);
+                app.settings_provider_focus.clear();
+                app.open_settings_providers(&app.settings_provider_rows.clone());
+            }
+            Err(err) => app.set_notice(format!("provider: {err}")),
+        },
+        ConfigOp::ProviderFetchModels { id } => {
+            app.set_notice(format!("fetching models for `{id}`..."));
+            match providers.remote_model_rows(&id).await {
+                Ok(rows) => {
+                    let count = rows.len();
+                    app.open_settings_remote_models(&id, rows);
+                    app.set_notice(format!("fetched {count} model(s) for `{id}`"));
+                }
+                Err(err) => {
+                    app.settings_provider_focus = id;
+                    app.reopen_settings_provider_detail();
+                    app.set_notice(format!("models: {err}"));
+                }
+            }
+        }
+        ConfigOp::ModelAdd {
+            spec,
+            name,
+            context_window,
+        } => {
+            let mut kv = Vec::new();
+            if let Some(n) = name {
+                kv.push(("name".into(), n));
+            }
+            if let Some(ctx) = context_window {
+                kv.push(("ctx".into(), ctx.to_string()));
+            }
+            match providers.model_add(&spec, &kv) {
+                Ok(msg) => {
+                    refresh_model_catalog(app, providers);
+                    app.set_notice(msg);
+                    app.model_draft = None;
+                    app.settings_form_edit = None;
+                    let provider = spec
+                        .split_once(':')
+                        .map(|(p, _)| p.to_string())
+                        .unwrap_or_else(|| app.settings_provider_focus.clone());
+                    app.open_settings_models_for_provider(&provider);
+                }
+                Err(err) => app.set_notice(format!("model: {err}")),
+            }
+        }
+        ConfigOp::ModelSet { spec, key, value } => match providers.model_set(&spec, &key, &value) {
+            Ok(msg) => {
+                refresh_model_catalog(app, providers);
+                app.set_notice(msg);
+                let provider = spec
+                    .split_once(':')
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or_else(|| app.settings_provider_focus.clone());
+                app.open_settings_models_for_provider(&provider);
+            }
+            Err(err) => app.set_notice(format!("model: {err}")),
+        },
+        ConfigOp::ModelRm { spec } => match providers.model_rm(&spec) {
+            Ok(msg) => {
+                refresh_model_catalog(app, providers);
+                app.set_notice(msg);
+                let provider = spec
+                    .split_once(':')
+                    .map(|(p, _)| p.to_string())
+                    .unwrap_or_else(|| app.settings_provider_focus.clone());
+                app.open_settings_models_for_provider(&provider);
+            }
+            Err(err) => app.set_notice(format!("model: {err}")),
+        },
+        ConfigOp::SettingSet { key, value } => {
+            let mut s = crate::settings::load();
+            let apply_value = match (key.as_str(), value.as_str()) {
+                ("auto_approve", "toggle") => {
+                    let cur = s.auto_approve.unwrap_or(false);
+                    if cur { "false" } else { "true" }.to_string()
+                }
+                ("sandbox", "cycle") => {
+                    let cur = s.sandbox.as_deref().unwrap_or("workspace-write");
+                    if cur == "full-access" {
+                        "workspace-write".to_string()
+                    } else {
+                        "full-access".to_string()
+                    }
+                }
+                (_, v) => v.to_string(),
+            };
+            match crate::settings::set_key(&mut s, &key, &apply_value) {
+                Ok(()) => {
+                    let _ = crate::settings::save(&s);
+                    app.set_notice(format!("settings.{key} = {apply_value}"));
+                    app.open_settings_float();
+                }
+                Err(err) => app.set_notice(format!("settings: {err}")),
+            }
+        }
+    }
 }
 
 /// Result of handling a slash command.
@@ -36,18 +258,7 @@ pub async fn run_interactive(
     let mut app = App::new("one");
     app.set_agent_label(runtime.mode().label());
     app.set_mode_label(format_mode_label(providers));
-    app.set_model_catalog(
-        providers
-            .registry
-            .list()
-            .iter()
-            .map(|m| ModelChoice {
-                provider: m.provider.clone(),
-                id: m.id.clone(),
-                name: m.name.clone(),
-            })
-            .collect(),
-    );
+    refresh_model_catalog(&mut app, providers);
     app.set_current_model(&providers.provider_id, providers.as_llm().model());
     app.set_thinking_level(runtime.thinking_level().await.as_str());
     app.set_context_window(providers.context_window());
@@ -220,6 +431,18 @@ pub async fn run_interactive(
                     .draw(&mut app)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
+            RunOutcome::SwitchModel { provider, model } => {
+                apply_switch_model(runtime, providers, &mut app, &provider, model).await?;
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            RunOutcome::ConfigOp(op) => {
+                apply_config_op(providers, &mut app, op).await;
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
             RunOutcome::Noop => {}
         }
     }
@@ -319,30 +542,15 @@ async fn run_turn_streaming(
     };
 
     let gate = runtime.permission_gate.clone();
+    let hitl = runtime.hitl.clone();
     let prompt_result = match terminal
         .run_busy(
             app,
             |app| {
                 drain_events(app, &events);
-                // Surface interactive permission asks from the agent task.
-                if let Some(req) = gate.poll_request() {
-                    app.set_approval_prompt(ApprovalPrompt {
-                        id: req.id,
-                        tool: req.tool,
-                        summary: req.summary,
-                        reason: req.reason,
-                    });
-                }
-                if let Some(answer) = app.take_approval_answer() {
-                    let choice = match answer {
-                        ApprovalAnswer::Once => ApprovalChoice::Once,
-                        ApprovalAnswer::Session => ApprovalChoice::Session,
-                        ApprovalAnswer::Deny => ApprovalChoice::Deny,
-                    };
-                    let _ = gate.respond(choice);
-                }
+                drain_hitl(app, &gate, &hitl);
                 if app.take_abort() {
-                    gate.cancel_pending();
+                    cancel_hitl(app, &gate, &hitl);
                     runtime.abort();
                 }
                 if let Some(text) = app.take_steer() {
@@ -360,15 +568,14 @@ async fn run_turn_streaming(
     {
         Ok(result) => result,
         Err(ForceQuit) => {
-            gate.cancel_pending();
+            cancel_hitl(app, &gate, &hitl);
             runtime.abort();
             app.end_busy();
             app.finish_stream_with_interrupted(true);
             return Ok(TurnEnd::ForceQuit);
         }
     };
-    gate.cancel_pending();
-    app.clear_approval_prompt();
+    cancel_hitl(app, &gate, &hitl);
 
     // Overflow recovery: force compact + retry once.
     let prompt_result = match prompt_result {
@@ -399,29 +606,15 @@ async fn run_turn_streaming(
                 }
             });
             let gate2 = runtime.permission_gate.clone();
+            let hitl2 = runtime.hitl.clone();
             match terminal
                 .run_busy(
                     app,
                     |app| {
                         drain_events(app, &events2);
-                        if let Some(req) = gate2.poll_request() {
-                            app.set_approval_prompt(ApprovalPrompt {
-                                id: req.id,
-                                tool: req.tool,
-                                summary: req.summary,
-                                reason: req.reason,
-                            });
-                        }
-                        if let Some(answer) = app.take_approval_answer() {
-                            let choice = match answer {
-                                ApprovalAnswer::Once => ApprovalChoice::Once,
-                                ApprovalAnswer::Session => ApprovalChoice::Session,
-                                ApprovalAnswer::Deny => ApprovalChoice::Deny,
-                            };
-                            let _ = gate2.respond(choice);
-                        }
+                        drain_hitl(app, &gate2, &hitl2);
                         if app.take_abort() {
-                            gate2.cancel_pending();
+                            cancel_hitl(app, &gate2, &hitl2);
                             runtime.abort();
                         }
                     },
@@ -431,7 +624,7 @@ async fn run_turn_streaming(
             {
                 Ok(result) => result,
                 Err(ForceQuit) => {
-                    gate2.cancel_pending();
+                    cancel_hitl(app, &gate2, &hitl2);
                     runtime.abort();
                     app.end_busy();
                     app.finish_stream_with_interrupted(true);
@@ -640,7 +833,9 @@ async fn handle_slash(
                     s.path.to_string_lossy().contains(spec)
                         || s.id.starts_with(spec)
                         || s.name.as_deref().is_some_and(|n| n == *spec)
-                        || s.preview.as_deref().is_some_and(|p| p == *spec || p.contains(spec))
+                        || s.preview
+                            .as_deref()
+                            .is_some_and(|p| p == *spec || p.contains(spec))
                 });
                 if let Some(info) = target {
                     load_session_into_app(runtime, app, info).await?;
@@ -665,11 +860,7 @@ async fn handle_slash(
                         .and_then(|f| f.to_str())
                         .unwrap_or("?")
                         .to_string();
-                    let detail = format!(
-                        "{}  {}",
-                        s.modified.format("%Y-%m-%d %H:%M"),
-                        file
-                    );
+                    let detail = format!("{}  {}", s.modified.format("%Y-%m-%d %H:%M"), file);
                     let hint = s.id.chars().take(8).collect();
                     (id, label, detail, hint)
                 })
@@ -702,7 +893,10 @@ async fn handle_slash(
                 return Ok(SlashAction::Consumed);
             }
             // Leave plan without implementing if user only wants tools back and no plan yet.
-            if parts.get(1).is_some_and(|s| *s == "skip" || *s == "--no-run") {
+            if parts
+                .get(1)
+                .is_some_and(|s| *s == "skip" || *s == "--no-run")
+            {
                 runtime.leave_plan_mode().await?;
                 app.set_agent_label(AgentMode::Act.label());
                 app.set_notice("Build mode (plan not auto-run)");
@@ -736,9 +930,7 @@ async fn handle_slash(
             } else {
                 app.set_notice("compacting…");
             }
-            runtime
-                .maybe_compact(providers.as_llm(), true)
-                .await?;
+            runtime.maybe_compact(providers.as_llm(), true).await?;
             refresh_usage(app, runtime).await;
             app.set_notice(format!(
                 "compacted · ~{} tokens",
@@ -800,7 +992,9 @@ async fn handle_slash(
                         SessionEntry::ModelChange { .. } => "model",
                         SessionEntry::ThinkingLevelChange { .. } => "thinking",
                         SessionEntry::Label { .. } => "label",
-                        SessionEntry::Custom { .. } | SessionEntry::CustomMessage { .. } => "custom",
+                        SessionEntry::Custom { .. } | SessionEntry::CustomMessage { .. } => {
+                            "custom"
+                        }
                     };
                     let mark = if id == leaf { "●" } else { " " };
                     let label = format!("{mark} {kind}");
@@ -841,7 +1035,8 @@ async fn handle_slash(
         }
         Some("/model") => {
             let Some(spec) = parts.get(1) else {
-                app.open_model_picker();
+                // Bare /model → docked select (same as Ctrl+L).
+                app.open_model_select();
                 return Ok(SlashAction::Consumed);
             };
 
@@ -851,27 +1046,7 @@ async fn handle_slash(
                 ((*spec).to_string(), parts.get(2).map(|s| (*s).to_string()))
             };
 
-            match providers.switch_named(&provider_name, model) {
-                Ok(()) => {
-                    app.set_mode_label(format_mode_label(providers));
-                    app.set_current_model(&providers.provider_id, providers.as_llm().model());
-                    if let Some(session) = &mut runtime.session {
-                        session
-                            .append_model_change(
-                                providers.provider_id.clone(),
-                                providers.as_llm().model(),
-                            )
-                            .await?;
-                    }
-                    app.set_context_window(providers.context_window());
-                    app.set_notice(format!(
-                        "model → {} / {}",
-                        providers.provider_id,
-                        providers.as_llm().model(),
-                    ));
-                }
-                Err(err) => app.set_notice(format!("model: {err}")),
-            }
+            apply_switch_model(runtime, providers, app, &provider_name, model).await?;
             Ok(SlashAction::Consumed)
         }
         Some("/thinking") => {
@@ -901,7 +1076,6 @@ async fn handle_slash(
                 match crate::settings::set_key(&mut s, key, &value) {
                     Ok(()) => {
                         crate::settings::save(&s)?;
-                        // Apply live where possible.
                         if key.eq_ignore_ascii_case("thinking") {
                             if let Some(tl) = ThinkingLevel::parse(&value) {
                                 runtime.set_thinking_level(tl).await?;
@@ -916,11 +1090,10 @@ async fn handle_slash(
                                 app.set_context_window(n);
                             }
                         }
-                        if key.eq_ignore_ascii_case("provider")
-                            || key.eq_ignore_ascii_case("model")
+                        if key.eq_ignore_ascii_case("provider") || key.eq_ignore_ascii_case("model")
                         {
                             app.set_notice(format!(
-                                "settings.{key} = {value} · use /model to apply live"
+                                "settings.{key} = {value} · Ctrl+L to switch live"
                             ));
                         } else {
                             app.set_notice(format!("settings.{key} = {value}"));
@@ -929,9 +1102,8 @@ async fn handle_slash(
                     Err(err) => app.set_notice(format!("settings: {err}")),
                 }
             } else {
-                let s = crate::settings::load();
-                let rows = crate::settings::rows(&s);
-                app.open_info_float("Settings", &rows);
+                // Bare /settings → center Settings panel (same as Ctrl+G).
+                app.open_settings_float();
             }
             Ok(SlashAction::Consumed)
         }
@@ -994,10 +1166,7 @@ async fn load_session_into_app(
 }
 
 /// Esc Esc / `/rewind` menu — list user prompts on the active branch.
-fn open_rewind_menu(
-    runtime: &AppRuntime,
-    app: &mut App,
-) -> Result<(), Box<dyn std::error::Error>> {
+fn open_rewind_menu(runtime: &AppRuntime, app: &mut App) -> Result<(), Box<dyn std::error::Error>> {
     let Some(session) = &runtime.session else {
         app.set_notice("no session · nothing to rewind");
         return Ok(());
@@ -1056,9 +1225,7 @@ fn rebuild_tui_from_agent(app: &mut App, messages: &[AgentMessage]) {
                 for block in &a.content {
                     match block {
                         one_core::message::ContentBlock::Thinking {
-                            thinking,
-                            redacted,
-                            ..
+                            thinking, redacted, ..
                         } => {
                             if !thinking.is_empty() {
                                 let mut msg = one_tui::message::Message::thinking(thinking.clone());
@@ -1071,7 +1238,9 @@ fn rebuild_tui_from_agent(app: &mut App, messages: &[AgentMessage]) {
                                 app.push_assistant(text);
                             }
                         }
-                        one_core::message::ContentBlock::ToolCall { name, arguments, .. } => {
+                        one_core::message::ContentBlock::ToolCall {
+                            name, arguments, ..
+                        } => {
                             let args = match arguments {
                                 serde_json::Value::String(s) => s.clone(),
                                 other => other.to_string(),

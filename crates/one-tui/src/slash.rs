@@ -37,13 +37,18 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/model",
-        usage: "/model <provider>[:model]",
-        description: "switch provider / model",
+        usage: "/model [provider[:model]]",
+        description: "switch model (bare = select above input · Ctrl+L)",
+    },
+    SlashCommand {
+        name: "/settings",
+        usage: "/settings [key value]",
+        description: "settings panel (Ctrl+G) or set key value",
     },
     SlashCommand {
         name: "/thinking",
         usage: "/thinking [off|low|medium|high]",
-        description: "set thinking level (or use /settings)",
+        description: "set thinking level (or Ctrl+G Settings)",
     },
     SlashCommand {
         name: "/plan",
@@ -64,11 +69,6 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         name: "/compact",
         usage: "/compact [instructions]",
         description: "manually compact context",
-    },
-    SlashCommand {
-        name: "/settings",
-        usage: "/settings [key value]",
-        description: "view or set unified settings",
     },
     SlashCommand {
         name: "/skill",
@@ -311,7 +311,9 @@ pub fn completion_for_row(row: &PopupRow) -> Option<String> {
     match row {
         PopupRow::Header(_) => None,
         PopupRow::Command(c) => {
-            let needs_args = c.usage.contains('<') || c.usage.contains('[');
+            // Only required args (`<…>`) keep a trailing space so the user can type.
+            // Optional `[…]` alone (e.g. `/settings`) must not block Enter from running.
+            let needs_args = c.usage.contains('<');
             Some(if needs_args {
                 format!("{} ", c.name)
             } else {
@@ -403,5 +405,25 @@ mod tests {
             completion_for_row(&row).as_deref(),
             Some("/model opencode:deepseek-v4-flash")
         );
+    }
+
+    #[test]
+    fn settings_completion_has_no_trailing_space() {
+        let cmd = SLASH_COMMANDS
+            .iter()
+            .find(|c| c.name == "/settings")
+            .expect("settings command");
+        let row = PopupRow::Command(cmd);
+        assert_eq!(completion_for_row(&row).as_deref(), Some("/settings"));
+    }
+
+    #[test]
+    fn name_completion_keeps_trailing_space_for_required_arg() {
+        let cmd = SLASH_COMMANDS
+            .iter()
+            .find(|c| c.name == "/name")
+            .expect("name command");
+        let row = PopupRow::Command(cmd);
+        assert_eq!(completion_for_row(&row).as_deref(), Some("/name "));
     }
 }

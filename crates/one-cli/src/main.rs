@@ -1,5 +1,6 @@
 mod approval;
 mod cli;
+mod hitl;
 mod modes;
 mod preferences;
 mod provider;

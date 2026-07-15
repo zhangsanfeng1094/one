@@ -60,8 +60,128 @@ pub enum RunOutcome {
     CycleAgentMode,
     /// Esc Esc on empty input — CLI should open the rewind menu.
     OpenRewind,
+    /// Model select confirmed — CLI switches provider/model.
+    SwitchModel {
+        provider: String,
+        model: Option<String>,
+    },
+    /// Settings UI mutation (providers / models.json).
+    ConfigOp(ConfigOp),
     Quit,
     Noop,
+}
+
+/// Mutations emitted by the Settings center float + field-edit select.
+#[derive(Debug, Clone)]
+pub enum ConfigOp {
+    ProviderAdd {
+        id: String,
+        base_url: Option<String>,
+    },
+    ProviderSet {
+        id: String,
+        key: String,
+        value: String,
+    },
+    ProviderRm {
+        id: String,
+    },
+    /// Fetch OpenAI-compatible remote models for this provider.
+    ProviderFetchModels {
+        id: String,
+    },
+    /// Add/upsert model. Connection fields (base_url / api) live on the provider.
+    ModelAdd {
+        /// `provider:id`
+        spec: String,
+        name: Option<String>,
+        context_window: Option<u32>,
+    },
+    ModelSet {
+        spec: String,
+        key: String,
+        value: String,
+    },
+    ModelRm {
+        spec: String,
+    },
+    /// Persist a settings.json key (thinking, sandbox, …).
+    SettingSet {
+        key: String,
+        value: String,
+    },
+}
+
+/// In-float draft when adding a model (stays inside Settings).
+/// Connection (`base_url` / `api`) is provider-level only.
+#[derive(Debug, Clone, Default)]
+pub struct ModelDraft {
+    pub provider: String,
+    pub id: String,
+    pub name: String,
+    pub context_window: String,
+}
+
+impl ModelDraft {
+    pub fn new(provider: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            ..Default::default()
+        }
+    }
+
+    pub fn field(&self, key: &str) -> &str {
+        match key {
+            "id" => &self.id,
+            "name" => &self.name,
+            "context_window" | "ctx" => &self.context_window,
+            _ => "",
+        }
+    }
+
+    pub fn set_field(&mut self, key: &str, value: String) {
+        match key {
+            "id" => self.id = value,
+            "name" => self.name = value,
+            "context_window" | "ctx" => self.context_window = value,
+            _ => {}
+        }
+    }
+
+    /// Build ConfigOp if id is non-empty.
+    pub fn to_config_op(&self) -> Result<ConfigOp, String> {
+        let id = self.id.trim();
+        if id.is_empty() {
+            return Err("model id is required".into());
+        }
+        if id.chars().any(|c| c.is_whitespace()) {
+            return Err("model id must not contain whitespace".into());
+        }
+        let name = {
+            let n = self.name.trim();
+            if n.is_empty() {
+                None
+            } else {
+                Some(n.to_string())
+            }
+        };
+        let context_window = {
+            let s = self.context_window.trim();
+            if s.is_empty() {
+                None
+            } else {
+                Some(
+                    s.parse::<u32>()
+                        .map_err(|_| format!("context_window must be a number, got `{s}`"))?,
+                )
+            }
+        };
+        Ok(ConfigOp::ModelAdd {
+            spec: format!("{}:{id}", self.provider),
+            name,
+            context_window,
+        })
+    }
 }
 
 /// Pending tool-approval prompt (interactive permission gate).
@@ -73,12 +193,28 @@ pub struct ApprovalPrompt {
     pub reason: String,
 }
 
+/// Why a [`crate::select::SelectPrompt`] is open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SelectKind {
+    /// Tool permission gate (`PermissionGate`).
+    Approval { id: u64 },
+    /// Agent `ask_user` question (sequential multi-question uses one at a time).
+    AskUser { id: u64 },
+    /// Model switcher docked above the input (Ctrl+L).
+    Model,
+}
+
 /// User choice for an approval prompt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalAnswer {
+    /// Session-wide auto-approve for remaining process.
+    Always,
+    /// Allow this single call.
     Once,
+    /// Allow matching fingerprint for the rest of the process.
     Session,
-    Deny,
+    /// Deny; optional free-text feedback is sent back to the model.
+    Deny { feedback: Option<String> },
 }
 
 impl RunOutcome {
@@ -88,7 +224,11 @@ impl RunOutcome {
             // Empty text is ok for Prompt when images were staged (image-only turn).
             RunOutcome::Prompt(_) => true,
             RunOutcome::FollowUp(t) | RunOutcome::Steer(t) => !t.is_empty(),
-            RunOutcome::CycleAgentMode | RunOutcome::OpenRewind | RunOutcome::Quit => true,
+            RunOutcome::CycleAgentMode
+            | RunOutcome::OpenRewind
+            | RunOutcome::SwitchModel { .. }
+            | RunOutcome::ConfigOp(_)
+            | RunOutcome::Quit => true,
         }
     }
 }
@@ -173,14 +313,31 @@ pub struct App {
     pub slash_selected: usize,
     /// Models from registry / models.json for `/model` picker.
     pub model_catalog: Vec<ModelChoice>,
+    /// Provider rows for Settings → Providers (`id`, detail).
+    pub settings_provider_rows: Vec<(String, String)>,
+    /// Provider field rows for Settings → Provider detail (`provider:key`, display value).
+    pub settings_provider_field_rows: Vec<(String, String)>,
+    /// Model rows for Settings → Models (`provider:id`, detail).
+    pub settings_model_rows: Vec<(String, String)>,
     /// Ephemeral toast (top-right). **Not** chat context, **not** agent messages.
     pub toast: Option<Toast>,
-    /// Centered floating secondary menu (model picker, command palette, …).
+    /// Centered floating secondary menu (Settings, commands, sessions, …).
     pub float: Option<FloatMenu>,
     /// Current provider id (for model picker "current" marker).
     pub current_provider: String,
     /// Current model id.
     pub current_model: String,
+    /// Provider id while in Settings → Provider → Models hierarchy.
+    pub settings_provider_focus: String,
+    /// Model spec (`provider:id`) while on model detail page.
+    pub settings_model_focus: String,
+    /// Draft for Settings → Add model form (in-float, never leaves Settings).
+    pub model_draft: Option<ModelDraft>,
+    /// When set, float search bar edits this model-draft field (`id` / `name` / …).
+    pub settings_form_edit: Option<String>,
+    /// When set, float search bar edits a ConfigOp field (never opens docked select).
+    /// e.g. `provider_set:linuxdo:base_url`, `model_set:p:id:name`, `provider_add_id`.
+    pub settings_inline_op: Option<String>,
     /// Thinking level label: off | low | medium | high.
     pub thinking_level: String,
     /// Estimated context tokens (messages) — char/4 heuristic.
@@ -222,10 +379,16 @@ pub struct App {
     /// Optional callback-less persist via path — CLI sets this after load.
     /// When set, `push_prompt_history` also appends a JSON line.
     history_cwd: Option<PathBuf>,
-    /// Interactive tool approval overlay (while busy).
+    /// Interactive tool approval overlay (while busy) — metadata for gate id.
     approval: Option<ApprovalPrompt>,
     /// Choice taken by the user for the current approval.
     approval_answer: Option<ApprovalAnswer>,
+    /// Active single/multi-select HITL prompt (permission or ask_user).
+    select: Option<crate::select::SelectPrompt>,
+    /// Why `select` is open.
+    select_kind: Option<SelectKind>,
+    /// Completed select result (ask_user path); approval maps into `approval_answer`.
+    select_result: Option<(SelectKind, crate::select::SelectResult)>,
 }
 
 fn classify_toast_level(text: &str) -> AlertLevel {
@@ -274,10 +437,18 @@ impl App {
             spinner_frame: 0,
             slash_selected: 0,
             model_catalog: Vec::new(),
+            settings_provider_rows: Vec::new(),
+            settings_provider_field_rows: Vec::new(),
+            settings_model_rows: Vec::new(),
             toast: None,
             float: None,
             current_provider: String::new(),
             current_model: String::new(),
+            settings_provider_focus: String::new(),
+            settings_model_focus: String::new(),
+            model_draft: None,
+            settings_form_edit: None,
+            settings_inline_op: None,
             thinking_level: "off".into(),
             usage_tokens: 0,
             usage_input: 0,
@@ -302,6 +473,9 @@ impl App {
             history_cwd: None,
             approval: None,
             approval_answer: None,
+            select: None,
+            select_kind: None,
+            select_result: None,
         }
     }
 
@@ -310,21 +484,372 @@ impl App {
         if self.approval.as_ref().map(|p| p.id) == Some(prompt.id) {
             return;
         }
+        let select =
+            crate::select::SelectPrompt::permission(&prompt.tool, &prompt.summary, &prompt.reason);
+        let id = prompt.id;
         self.approval = Some(prompt);
         self.approval_answer = None;
+        self.select = Some(select);
+        self.select_kind = Some(SelectKind::Approval { id });
+        self.select_result = None;
     }
 
     pub fn clear_approval_prompt(&mut self) {
         self.approval = None;
+        if matches!(self.select_kind, Some(SelectKind::Approval { .. })) {
+            self.select = None;
+            self.select_kind = None;
+        }
     }
 
     pub fn approval_prompt(&self) -> Option<&ApprovalPrompt> {
         self.approval.as_ref()
     }
 
+    /// Active select prompt (permission or ask_user).
+    pub fn select_prompt(&self) -> Option<&crate::select::SelectPrompt> {
+        self.select.as_ref()
+    }
+
+    pub fn select_kind(&self) -> Option<&SelectKind> {
+        self.select_kind.as_ref()
+    }
+
+    /// Show a generic select prompt (ask_user HITL).
+    pub fn set_select_prompt(&mut self, kind: SelectKind, prompt: crate::select::SelectPrompt) {
+        // Don't clobber a different in-flight prompt of another kind with same id.
+        if self.select_kind.as_ref() == Some(&kind) && self.select.is_some() {
+            return;
+        }
+        self.select = Some(prompt);
+        self.select_kind = Some(kind);
+        self.select_result = None;
+    }
+
+    pub fn clear_select_prompt(&mut self) {
+        self.select = None;
+        self.select_kind = None;
+    }
+
+    /// Take a finished select result (ask_user). Approval results go to
+    /// [`Self::take_approval_answer`] instead.
+    pub fn take_select_result(&mut self) -> Option<(SelectKind, crate::select::SelectResult)> {
+        self.select_result.take()
+    }
+
     /// Take the user's answer if any (CLI feeds it into PermissionGate).
     pub fn take_approval_answer(&mut self) -> Option<ApprovalAnswer> {
         self.approval_answer.take()
+    }
+
+    /// Apply a finished select; may return a [`RunOutcome`] for CLI to handle.
+    fn apply_select_result(&mut self, result: crate::select::SelectResult) -> Option<RunOutcome> {
+        let kind = match self.select_kind.take() {
+            Some(k) => k,
+            None => return None,
+        };
+        self.select = None;
+        match kind {
+            SelectKind::Approval { .. } => {
+                self.approval = None;
+                let answer = match result {
+                    crate::select::SelectResult::Cancelled => {
+                        ApprovalAnswer::Deny { feedback: None }
+                    }
+                    crate::select::SelectResult::Confirmed { ids, other } => {
+                        match ids.first().map(|s| s.as_str()) {
+                            Some("always") => ApprovalAnswer::Always,
+                            Some("once") => ApprovalAnswer::Once,
+                            Some("session") => ApprovalAnswer::Session,
+                            Some("deny") => ApprovalAnswer::Deny { feedback: other },
+                            _ => ApprovalAnswer::Deny { feedback: other },
+                        }
+                    }
+                };
+                let notice = match &answer {
+                    ApprovalAnswer::Always => "always-approve mode",
+                    ApprovalAnswer::Once => "approved once",
+                    ApprovalAnswer::Session => "approved for session",
+                    ApprovalAnswer::Deny { feedback } => {
+                        if feedback.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
+                            "denied (with feedback)"
+                        } else {
+                            "denied"
+                        }
+                    }
+                };
+                self.set_notice(notice);
+                self.approval_answer = Some(answer);
+                None
+            }
+            SelectKind::AskUser { .. } => {
+                self.select_result = Some((kind, result));
+                None
+            }
+            SelectKind::Model => match result {
+                crate::select::SelectResult::Cancelled => {
+                    self.set_notice("model select cancelled");
+                    None
+                }
+                crate::select::SelectResult::Confirmed { ids, .. } => {
+                    let Some(spec) = ids.first() else {
+                        return None;
+                    };
+                    if let Some((p, m)) = spec.split_once(':') {
+                        Some(RunOutcome::SwitchModel {
+                            provider: p.to_string(),
+                            model: Some(m.to_string()),
+                        })
+                    } else {
+                        Some(RunOutcome::SwitchModel {
+                            provider: spec.clone(),
+                            model: None,
+                        })
+                    }
+                }
+            },
+        }
+    }
+
+    /// Height of the select dock above the prompt (`0` when closed).
+    pub fn select_dock_height(&self) -> u16 {
+        use crate::select::SelectPhase;
+        let Some(prompt) = self.select.as_ref() else {
+            return 0;
+        };
+        let body = prompt.body.lines().filter(|l| !l.is_empty()).count();
+        let body = if body == 0 { 0 } else { body + 1 }; // + blank
+        let typing = if matches!(prompt.phase, SelectPhase::Typing { .. }) {
+            2
+        } else {
+            0
+        };
+        // border(2) + title area absorbed in border + body + options + footer
+        let content = body + prompt.option_count().min(8) + typing + 1;
+        ((content as u16) + 2).clamp(5, 14)
+    }
+
+    /// Open model switcher as docked select (Ctrl+L / `/model`).
+    pub fn open_model_select(&mut self) {
+        use crate::select::{SelectOption, SelectPrompt};
+        self.close_float();
+        let options: Vec<SelectOption> = self
+            .model_catalog
+            .iter()
+            .map(|m| {
+                let id = format!("{}:{}", m.provider, m.id);
+                let label = if m.provider == self.current_provider && m.id == self.current_model {
+                    format!("{id}  (current)")
+                } else {
+                    id.clone()
+                };
+                let desc = if m.name != m.id {
+                    m.name.clone()
+                } else {
+                    String::new()
+                };
+                SelectOption::new(id, label, desc)
+            })
+            .collect();
+        if options.is_empty() {
+            self.set_notice("no models in catalog");
+            return;
+        }
+        let current_spec = format!("{}:{}", self.current_provider, self.current_model);
+        let selected = options
+            .iter()
+            .position(|o| o.id == current_spec)
+            .unwrap_or(0);
+        let mut prompt = SelectPrompt::single("Model", "Switch provider / model", options);
+        prompt.selected = selected;
+        prompt.footer_hint = "↑↓ enter switch · esc cancel".into();
+        self.select = Some(prompt);
+        self.select_kind = Some(SelectKind::Model);
+        self.select_result = None;
+        self.clear_notice();
+    }
+
+    /// Open centered Settings (Ctrl+G / bare `/settings`).
+    pub fn open_settings_float(&mut self) {
+        self.close_float();
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::settings_root(
+            &self.thinking_level,
+            &self.current_provider,
+            &self.current_model,
+        ));
+        self.clear_notice();
+    }
+
+    /// Start in-float field edit (search bar). Never opens the yellow docked select.
+    pub fn start_settings_inline_edit(
+        &mut self,
+        op: impl Into<String>,
+        label: impl Into<String>,
+        initial: impl Into<String>,
+    ) {
+        let op = op.into();
+        let label = label.into();
+        let initial = initial.into();
+        self.settings_inline_op = Some(op);
+        if let Some(f) = self.float.as_mut() {
+            f.begin_edit(label, initial);
+        }
+        self.clear_notice();
+    }
+
+    pub fn cancel_settings_inline_edit(&mut self) {
+        self.settings_inline_op = None;
+        if let Some(f) = self.float.as_mut() {
+            f.end_edit();
+        }
+    }
+
+    /// Provider management list (from Settings).
+    pub fn open_settings_providers(&mut self, rows: &[(String, String)]) {
+        self.float = Some(FloatMenu::settings_providers(rows));
+        self.clear_notice();
+    }
+
+    /// Models for the focused provider (second level under provider detail).
+    pub fn open_settings_models_for_provider(&mut self, provider: &str) {
+        self.settings_provider_focus = provider.to_string();
+        self.float = Some(FloatMenu::settings_models_for_provider(
+            provider,
+            &self.settings_model_rows,
+        ));
+        self.clear_notice();
+    }
+
+    pub fn open_settings_provider_detail(&mut self, id: &str, detail: &str) {
+        self.settings_provider_focus = id.to_string();
+        let fields = self.provider_detail_fields(id);
+        self.float = Some(FloatMenu::settings_provider_detail(id, detail, &fields));
+        self.clear_notice();
+    }
+
+    pub fn open_settings_provider_api(&mut self, id: &str) {
+        self.settings_provider_focus = id.to_string();
+        self.float = Some(FloatMenu::settings_provider_api(id));
+        self.clear_notice();
+    }
+
+    pub fn open_settings_remote_models(&mut self, provider: &str, rows: Vec<(String, String)>) {
+        self.settings_provider_focus = provider.to_string();
+        self.float = Some(FloatMenu::settings_remote_models(provider, &rows));
+        self.clear_notice();
+    }
+
+    pub fn open_settings_model_detail(&mut self, spec: &str, detail: &str) {
+        self.settings_model_focus = spec.to_string();
+        if let Some((p, _)) = spec.split_once(':') {
+            self.settings_provider_focus = p.to_string();
+        }
+        self.float = Some(FloatMenu::settings_model_detail(spec, detail));
+        self.clear_notice();
+    }
+
+    /// Re-open provider detail for the focused provider (after edits).
+    pub fn reopen_settings_provider_detail(&mut self) {
+        let id = self.settings_provider_focus.clone();
+        if id.is_empty() {
+            self.open_settings_providers(&self.settings_provider_rows.clone());
+            return;
+        }
+        let detail = self
+            .settings_provider_rows
+            .iter()
+            .find(|(k, _)| k == &id)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        self.open_settings_provider_detail(&id, &detail);
+    }
+
+    /// Open in-float Add model form for the focused provider.
+    pub fn open_settings_model_add(&mut self) {
+        let provider = self.settings_provider_focus.clone();
+        if provider.is_empty() {
+            self.set_notice("no provider selected");
+            return;
+        }
+        self.model_draft = Some(ModelDraft::new(&provider));
+        self.settings_form_edit = None;
+        self.rebuild_settings_model_add_float();
+        self.clear_notice();
+    }
+
+    pub fn rebuild_settings_model_add_float(&mut self) {
+        let Some(draft) = self.model_draft.clone() else {
+            return;
+        };
+        let editing = self.settings_form_edit.clone();
+        let mut menu = FloatMenu::settings_model_add(&draft.provider, &draft, editing.as_deref());
+        // When editing a field, put current value into search for typing.
+        if let Some(key) = &editing {
+            menu.begin_edit(key.clone(), draft.field(key));
+        }
+        self.float = Some(menu);
+    }
+
+    /// Navigate one level up in the Settings hierarchy. Returns true if handled.
+    pub fn settings_go_back(&mut self) -> bool {
+        // Cancel inline ConfigOp field edit first.
+        if self.settings_inline_op.is_some() {
+            self.cancel_settings_inline_edit();
+            return true;
+        }
+        // Cancel in-form field edit first.
+        if self.settings_form_edit.take().is_some() {
+            self.rebuild_settings_model_add_float();
+            return true;
+        }
+        let Some(kind) = self.float.as_ref().map(|f| f.kind) else {
+            return false;
+        };
+        match kind {
+            FloatKind::Settings => {
+                self.close_float();
+                true
+            }
+            FloatKind::SettingsProviders => {
+                self.open_settings_float();
+                true
+            }
+            FloatKind::SettingsProviderDetail => {
+                self.open_settings_providers(&self.settings_provider_rows.clone());
+                true
+            }
+            FloatKind::SettingsProviderApi | FloatKind::SettingsRemoteModels => {
+                self.reopen_settings_provider_detail();
+                true
+            }
+            FloatKind::SettingsModels => {
+                self.reopen_settings_provider_detail();
+                true
+            }
+            FloatKind::SettingsModelDetail => {
+                let p = self.settings_provider_focus.clone();
+                if p.is_empty() {
+                    self.open_settings_providers(&self.settings_provider_rows.clone());
+                } else {
+                    self.open_settings_models_for_provider(&p);
+                }
+                true
+            }
+            FloatKind::SettingsModelAdd => {
+                self.model_draft = None;
+                self.settings_form_edit = None;
+                let p = self.settings_provider_focus.clone();
+                self.open_settings_models_for_provider(&p);
+                true
+            }
+            FloatKind::Thinking => {
+                // Opened from Settings — return to root rather than blank.
+                self.open_settings_float();
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Replace in-memory history (e.g. load from disk / past sessions).
@@ -593,6 +1118,37 @@ impl App {
         self.model_catalog = catalog;
     }
 
+    /// Feed Settings → Providers / Models lists (from ProviderSet).
+    pub fn set_settings_catalog(
+        &mut self,
+        providers: Vec<(String, String)>,
+        models: Vec<(String, String)>,
+        provider_fields: Vec<(String, String)>,
+    ) {
+        self.settings_provider_rows = providers;
+        self.settings_model_rows = models;
+        self.settings_provider_field_rows = provider_fields;
+    }
+
+    fn provider_detail_fields(&self, provider: &str) -> Vec<(String, String)> {
+        let prefix = format!("{provider}:");
+        self.settings_provider_field_rows
+            .iter()
+            .filter_map(|(key, value)| {
+                key.strip_prefix(&prefix)
+                    .map(|field| (field.to_string(), value.clone()))
+            })
+            .collect()
+    }
+
+    fn provider_detail_field_value(&self, provider: &str, key: &str) -> String {
+        self.settings_provider_field_rows
+            .iter()
+            .find(|(k, _)| k == &format!("{provider}:{key}"))
+            .map(|(_, v)| v.clone())
+            .unwrap_or_default()
+    }
+
     pub fn set_current_model(&mut self, provider: impl Into<String>, model: impl Into<String>) {
         self.current_provider = provider.into();
         self.current_model = model.into();
@@ -643,14 +1199,9 @@ impl App {
         self.float.is_some()
     }
 
+    /// Legacy name — opens docked model select (not center float).
     pub fn open_model_picker(&mut self) {
-        let cur = if !self.current_provider.is_empty() && !self.current_model.is_empty() {
-            Some((self.current_provider.as_str(), self.current_model.as_str()))
-        } else {
-            None
-        };
-        self.float = Some(FloatMenu::model_picker(&self.model_catalog, cur));
-        self.clear_notice();
+        self.open_model_select();
     }
 
     pub fn open_command_palette(&mut self) {
@@ -710,14 +1261,24 @@ impl App {
     }
 
     pub fn slash_menu_visible(&self) -> bool {
-        !self.popup_rows().is_empty()
+        // Only while composing a slash command (not when a HITL select is open).
+        self.select.is_none() && !self.popup_rows().is_empty()
+    }
+
+    /// Height of the `/` command menu docked above the prompt (`0` when closed).
+    pub fn slash_dock_height(&self) -> u16 {
+        if !self.slash_menu_visible() {
+            return 0;
+        }
+        let n = self.popup_rows().len() as u16;
+        n.clamp(1, 10)
     }
 
     pub fn popup_kind(&self) -> Option<PopupKind> {
         slash::popup_kind(&self.input)
     }
 
-    fn clamp_slash_selection(&mut self) {
+    pub fn clamp_slash_selection(&mut self) {
         let rows = self.popup_rows();
         let selectable = slash::selectable_indices(&rows);
         if selectable.is_empty() {
@@ -741,7 +1302,7 @@ impl App {
         }
     }
 
-    fn move_slash_selection(&mut self, delta: isize) {
+    pub fn move_slash_selection(&mut self, delta: isize) {
         let rows = self.popup_rows();
         let selectable = slash::selectable_indices(&rows);
         if selectable.is_empty() {
@@ -759,7 +1320,8 @@ impl App {
         self.slash_selected = selectable[next];
     }
 
-    fn apply_slash_completion(&mut self) {
+    /// Fill input from the highlighted slash row.
+    pub fn apply_slash_completion(&mut self) {
         let rows = self.popup_rows();
         if rows.is_empty() {
             return;
@@ -773,6 +1335,45 @@ impl App {
                 self.clamp_slash_selection();
             }
         }
+    }
+
+    /// Enter on slash menu: complete selection, then run or wait for args.
+    fn confirm_slash_menu(&mut self) -> RunOutcome {
+        if !self.slash_menu_visible() {
+            return RunOutcome::Noop;
+        }
+        self.apply_slash_completion();
+        let t = self.input.trim().to_string();
+        // Commands that open secondary UI instead of submitting as a prompt.
+        match t.as_str() {
+            "/model" => {
+                self.input.clear();
+                self.open_model_select();
+                return RunOutcome::Noop;
+            }
+            "/settings" => {
+                self.input.clear();
+                self.open_settings_float();
+                return RunOutcome::Noop;
+            }
+            "/thinking" => {
+                self.input.clear();
+                self.open_thinking_float();
+                return RunOutcome::Noop;
+            }
+            "/help" => {
+                self.input.clear();
+                self.open_help_float();
+                return RunOutcome::Noop;
+            }
+            _ => {}
+        }
+        // Trailing space → still typing args (e.g. `/name `).
+        if self.input.ends_with(' ') {
+            return RunOutcome::Noop;
+        }
+        // Complete command → submit as slash prompt for CLI.
+        self.submit_prompt()
     }
 
     pub fn set_mode_label(&mut self, label: impl Into<String>) {
@@ -853,12 +1454,7 @@ impl App {
         self.finish_tool_with_output(name, error, None);
     }
 
-    pub fn finish_tool_with_output(
-        &mut self,
-        name: &str,
-        error: bool,
-        output: Option<String>,
-    ) {
+    pub fn finish_tool_with_output(&mut self, name: &str, error: bool, output: Option<String>) {
         let status = if error {
             ToolStatus::Error
         } else {
@@ -1090,8 +1686,7 @@ impl App {
 
     /// True when selection spans more than one display line.
     pub fn selection_is_multi_line(&self) -> bool {
-        self.selection_range()
-            .is_some_and(|(lo, hi)| hi > lo)
+        self.selection_range().is_some_and(|(lo, hi)| hi > lo)
     }
 
     /// Plain text for the selected lines (joined with `\n`).
@@ -1512,7 +2107,19 @@ impl App {
             return RunOutcome::Noop;
         }
 
-        // Floating modal captures all keys while open (all `/` UX lives here).
+        // Docked select (model / field edit / ask) captures keys before float.
+        if self.select.is_some() {
+            if let Some(prompt) = self.select.as_mut() {
+                if let Some(result) = prompt.handle_key(key) {
+                    if let Some(outcome) = self.apply_select_result(result) {
+                        return outcome;
+                    }
+                }
+            }
+            return RunOutcome::Noop;
+        }
+
+        // Center float (Settings / commands / sessions).
         if self.float_open() {
             return self.handle_float_key(key);
         }
@@ -1538,9 +2145,15 @@ impl App {
                 self.history_next();
                 RunOutcome::Noop
             }
-            // Ctrl+L → model picker float
+            // Ctrl+L → model select (docked above input)
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.open_model_picker();
+                self.open_model_select();
+                RunOutcome::Noop
+            }
+            // Ctrl+G → Settings center float
+            // (Ctrl+, / Ctrl+. often swallowed by IME or never sent by terminals)
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.open_settings_float();
                 RunOutcome::Noop
             }
             // Ctrl+J → insert newline (multi-line compose)
@@ -1581,39 +2194,61 @@ impl App {
             }
 
             KeyCode::Enter => {
-                let t = self.input.trim();
-                // Any bare / incomplete slash → open command float instead of sending.
-                if t == "/" {
-                    self.input.clear();
-                    self.open_command_palette();
-                    return RunOutcome::Noop;
+                // `/` menu open → complete highlighted row (and maybe run).
+                if self.slash_menu_visible() {
+                    return self.confirm_slash_menu();
                 }
+                let t = self.input.trim();
                 if t == "/model" || t == "/model " {
                     self.input.clear();
-                    self.open_model_picker();
+                    self.open_model_select();
+                    return RunOutcome::Noop;
+                }
+                if t == "/settings" || t == "/settings " {
+                    self.input.clear();
+                    self.open_settings_float();
                     return RunOutcome::Noop;
                 }
                 self.submit_prompt()
             }
-            // Tab → path / @file completion.
+            // Tab → slash complete, else path / @file completion.
             KeyCode::Tab => {
-                self.complete_path_token();
+                if self.slash_menu_visible() {
+                    self.apply_slash_completion();
+                } else {
+                    self.complete_path_token();
+                }
                 RunOutcome::Noop
             }
             KeyCode::Backspace | KeyCode::Delete => {
                 self.leave_history_browse();
                 self.pop_input();
+                self.clamp_slash_selection();
                 RunOutcome::Noop
             }
             // Esc Esc: clear draft → history, or open rewind when empty (Claude Code).
-            KeyCode::Esc => self.handle_esc(),
-            // `/` on empty input → open command float (primary slash entry).
+            KeyCode::Esc => {
+                if self.slash_menu_visible() {
+                    // Dismiss slash: clear incomplete command.
+                    self.input.clear();
+                    self.slash_selected = 0;
+                    self.clear_notice();
+                    return RunOutcome::Noop;
+                }
+                self.handle_esc()
+            }
+            // `/` inserts into input and shows docked command list (not center float).
             KeyCode::Char('/')
                 if self.input.is_empty()
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
-                self.open_command_palette();
+                self.leave_history_browse();
+                self.input.push('/');
+                self.slash_selected = 0;
+                self.clamp_slash_selection();
+                self.cursor_on = true;
+                self.clear_notice();
                 RunOutcome::Noop
             }
             KeyCode::Char(ch)
@@ -1624,9 +2259,12 @@ impl App {
                 self.input.push(ch);
                 self.cursor_on = true;
                 self.clear_notice();
+                if self.input.starts_with('/') {
+                    self.clamp_slash_selection();
+                }
                 RunOutcome::Noop
             }
-            // Transcript scroll (mouse wheel / Page keys). Up/Down = prompt history.
+            // Transcript scroll (mouse wheel / Page keys).
             KeyCode::PageUp => {
                 self.scroll_up(self.page_lines());
                 RunOutcome::Noop
@@ -1643,15 +2281,21 @@ impl App {
                 self.scroll_to_bottom();
                 RunOutcome::Noop
             }
-            // ↑/↓ navigate prompt history (Claude Code / bash style).
-            // Multi-line: only leave the input for history when at a single visual row
-            // or when already browsing history; otherwise PgUp/PgDn scrolls the chat.
+            // ↑/↓: slash menu when open, else prompt history.
             KeyCode::Up => {
-                self.history_prev();
+                if self.slash_menu_visible() {
+                    self.move_slash_selection(-1);
+                } else {
+                    self.history_prev();
+                }
                 RunOutcome::Noop
             }
             KeyCode::Down => {
-                self.history_next();
+                if self.slash_menu_visible() {
+                    self.move_slash_selection(1);
+                } else {
+                    self.history_next();
+                }
                 RunOutcome::Noop
             }
             _ => RunOutcome::Noop,
@@ -1699,18 +2343,41 @@ impl App {
     }
 
     fn handle_float_key(&mut self, key: KeyEvent) -> RunOutcome {
+        let editing = self.settings_inline_op.is_some()
+            || self.settings_form_edit.is_some()
+            || self.float.as_ref().map(|f| f.edit_mode).unwrap_or(false);
+
         match key.code {
-            KeyCode::Esc => {
-                self.close_float();
+            KeyCode::Char('f')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !editing
+                    && self
+                        .float
+                        .as_ref()
+                        .is_some_and(|f| f.kind == FloatKind::SettingsModels) =>
+            {
+                let id = self.settings_provider_focus.clone();
+                if id.is_empty() {
+                    self.set_notice("no provider selected");
+                    RunOutcome::Noop
+                } else {
+                    RunOutcome::ConfigOp(ConfigOp::ProviderFetchModels { id })
+                }
+            }
+            // Esc / ← : cancel field edit, else one level up.
+            KeyCode::Esc | KeyCode::Left => {
+                if !self.settings_go_back() {
+                    self.close_float();
+                }
                 RunOutcome::Noop
             }
-            KeyCode::Up => {
+            KeyCode::Up if !editing => {
                 if let Some(f) = self.float.as_mut() {
                     f.move_selection(-1);
                 }
                 RunOutcome::Noop
             }
-            KeyCode::Down => {
+            KeyCode::Down if !editing => {
                 if let Some(f) = self.float.as_mut() {
                     f.move_selection(1);
                 }
@@ -1722,9 +2389,10 @@ impl App {
                     .as_ref()
                     .map(|f| f.search.is_empty())
                     .unwrap_or(true);
-                if empty {
-                    // Backspace on empty search closes the float (like dismissing /).
-                    self.close_float();
+                if empty && !editing {
+                    if !self.settings_go_back() {
+                        self.close_float();
+                    }
                 } else if let Some(f) = self.float.as_mut() {
                     f.pop_search();
                 }
@@ -1739,8 +2407,58 @@ impl App {
                 }
                 RunOutcome::Noop
             }
-            KeyCode::Enter | KeyCode::Tab => self.confirm_float_selection(),
+            KeyCode::Enter | KeyCode::Tab => {
+                if self.settings_inline_op.is_some() {
+                    self.commit_settings_inline_edit()
+                } else if self.settings_form_edit.is_some() {
+                    self.commit_settings_form_edit()
+                } else {
+                    self.confirm_float_selection()
+                }
+            }
             _ => RunOutcome::Noop,
+        }
+    }
+
+    /// Save float search into the model draft field being edited.
+    fn commit_settings_form_edit(&mut self) -> RunOutcome {
+        let Some(key) = self.settings_form_edit.take() else {
+            return RunOutcome::Noop;
+        };
+        let value = self
+            .float
+            .as_ref()
+            .map(|f| f.search.clone())
+            .unwrap_or_default();
+        if let Some(draft) = self.model_draft.as_mut() {
+            draft.set_field(&key, value);
+        }
+        if let Some(f) = self.float.as_mut() {
+            f.end_edit();
+        }
+        self.rebuild_settings_model_add_float();
+        RunOutcome::Noop
+    }
+
+    /// Commit in-float ConfigOp edit (provider/model field).
+    fn commit_settings_inline_edit(&mut self) -> RunOutcome {
+        let Some(op) = self.settings_inline_op.take() else {
+            return RunOutcome::Noop;
+        };
+        let value = self
+            .float
+            .as_ref()
+            .map(|f| f.search.clone())
+            .unwrap_or_default();
+        if let Some(f) = self.float.as_mut() {
+            f.end_edit();
+        }
+        match config_op_from_field(&op, &value) {
+            Some(cfg) => RunOutcome::ConfigOp(cfg),
+            None => {
+                self.set_notice("invalid value");
+                RunOutcome::Noop
+            }
         }
     }
 
@@ -1759,10 +2477,18 @@ impl App {
 
         match kind {
             FloatKind::Models => {
+                // Prefer docked select; if center model float still used, switch via outcome.
                 self.close_float();
-                let cmd = format!("/model {}", entry.item.id);
-                self.input.clear();
-                RunOutcome::Prompt(cmd)
+                if let Some((p, m)) = entry.item.id.split_once(':') {
+                    return RunOutcome::SwitchModel {
+                        provider: p.to_string(),
+                        model: Some(m.to_string()),
+                    };
+                }
+                RunOutcome::SwitchModel {
+                    provider: entry.item.id.clone(),
+                    model: None,
+                }
             }
             FloatKind::Thinking => {
                 self.close_float();
@@ -1772,7 +2498,6 @@ impl App {
             FloatKind::Sessions => {
                 self.close_float();
                 self.input.clear();
-                // id is path or session id accepted by /resume.
                 RunOutcome::Prompt(format!("/resume {}", entry.item.id))
             }
             FloatKind::Tree => {
@@ -1786,21 +2511,253 @@ impl App {
                 RunOutcome::Prompt(format!("/rewind {}", entry.item.id))
             }
             FloatKind::Info => {
-                // Read-only panel — Enter dismisses.
                 self.close_float();
                 RunOutcome::Noop
             }
+            FloatKind::Settings => self.confirm_settings_root(&entry.item.id),
+            FloatKind::SettingsProviders => self.confirm_settings_providers(&entry.item.id),
+            FloatKind::SettingsProviderDetail => {
+                self.confirm_settings_provider_detail(&entry.item.id)
+            }
+            FloatKind::SettingsProviderApi => self.confirm_settings_provider_api(&entry.item.id),
+            FloatKind::SettingsRemoteModels => self.confirm_settings_remote_models(&entry.item.id),
+            FloatKind::SettingsModels => self.confirm_settings_models(&entry.item.id),
+            FloatKind::SettingsModelDetail => self.confirm_settings_model_detail(&entry.item.id),
+            FloatKind::SettingsModelAdd => self.confirm_settings_model_add(&entry.item.id),
             FloatKind::Help | FloatKind::Commands | FloatKind::Custom => {
                 self.dispatch_command_item(&entry.item.id, &entry.item.hint)
             }
         }
     }
 
+    fn confirm_settings_root(&mut self, id: &str) -> RunOutcome {
+        match id {
+            "thinking" => {
+                self.open_thinking_float();
+                RunOutcome::Noop
+            }
+            "auto_approve" => {
+                self.close_float();
+                RunOutcome::ConfigOp(ConfigOp::SettingSet {
+                    key: "auto_approve".into(),
+                    value: "toggle".into(),
+                })
+            }
+            "sandbox" => {
+                self.close_float();
+                RunOutcome::ConfigOp(ConfigOp::SettingSet {
+                    key: "sandbox".into(),
+                    value: "cycle".into(),
+                })
+            }
+            "providers" => {
+                self.open_settings_providers(&self.settings_provider_rows.clone());
+                RunOutcome::Noop
+            }
+            "switch_model" => {
+                self.open_model_select();
+                RunOutcome::Noop
+            }
+            _ => RunOutcome::Noop,
+        }
+    }
+
+    fn confirm_settings_providers(&mut self, id: &str) -> RunOutcome {
+        match id {
+            "add_provider" => {
+                self.start_settings_inline_edit("provider_add_id", "provider id", "");
+                RunOutcome::Noop
+            }
+            id if id.starts_with("p:") => {
+                let clean = id.trim_start_matches("p:").to_string();
+                let detail = self
+                    .settings_provider_rows
+                    .iter()
+                    .find(|(k, _)| k == &clean)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_default();
+                self.open_settings_provider_detail(&clean, &detail);
+                RunOutcome::Noop
+            }
+            _ => RunOutcome::Noop,
+        }
+    }
+
+    fn confirm_settings_provider_detail(&mut self, id: &str) -> RunOutcome {
+        let focus = self.settings_provider_focus.clone();
+        match id {
+            "models" => {
+                self.open_settings_models_for_provider(&focus);
+                RunOutcome::Noop
+            }
+            "set_provider_type" => {
+                let initial = self.provider_detail_field_value(&focus, "provider_type");
+                self.start_settings_inline_edit(
+                    format!("provider_set:{focus}:provider_type"),
+                    "providerType",
+                    if initial == "default/unset" {
+                        ""
+                    } else {
+                        &initial
+                    },
+                );
+                RunOutcome::Noop
+            }
+            "set_base_url" => {
+                let initial = self.provider_detail_field_value(&focus, "base_url");
+                self.start_settings_inline_edit(
+                    format!("provider_set:{focus}:base_url"),
+                    "base_url",
+                    if initial == "unset" { "" } else { &initial },
+                );
+                RunOutcome::Noop
+            }
+            "set_api" => {
+                self.open_settings_provider_api(&focus);
+                RunOutcome::Noop
+            }
+            "set_api_key" => {
+                let initial = self.provider_detail_field_value(&focus, "api_key");
+                self.start_settings_inline_edit(
+                    format!("provider_set:{focus}:api_key"),
+                    "api_key",
+                    if initial == "unset" || initial == "set" {
+                        ""
+                    } else {
+                        &initial
+                    },
+                );
+                RunOutcome::Noop
+            }
+            "set_default_model" => {
+                let initial = self.provider_detail_field_value(&focus, "default_model");
+                self.start_settings_inline_edit(
+                    format!("provider_set:{focus}:default_model"),
+                    "default_model",
+                    if initial == "unset" { "" } else { &initial },
+                );
+                RunOutcome::Noop
+            }
+            "rm_provider" => RunOutcome::ConfigOp(ConfigOp::ProviderRm { id: focus }),
+            _ => RunOutcome::Noop,
+        }
+    }
+
+    fn confirm_settings_provider_api(&mut self, id: &str) -> RunOutcome {
+        let Some(value) = id.strip_prefix("api:") else {
+            return RunOutcome::Noop;
+        };
+        let provider = self.settings_provider_focus.clone();
+        if provider.is_empty() {
+            self.set_notice("no provider selected");
+            return RunOutcome::Noop;
+        }
+        RunOutcome::ConfigOp(ConfigOp::ProviderSet {
+            id: provider,
+            key: "api".into(),
+            value: value.to_string(),
+        })
+    }
+
+    fn confirm_settings_remote_models(&mut self, id: &str) -> RunOutcome {
+        let Some(model_id) = id.strip_prefix("remote_model:") else {
+            return RunOutcome::Noop;
+        };
+        let provider = self.settings_provider_focus.clone();
+        if provider.is_empty() || model_id.trim().is_empty() {
+            self.set_notice("no remote model selected");
+            return RunOutcome::Noop;
+        }
+        RunOutcome::ConfigOp(ConfigOp::ModelAdd {
+            spec: format!("{provider}:{model_id}"),
+            name: Some(model_id.to_string()),
+            context_window: None,
+        })
+    }
+
+    fn confirm_settings_models(&mut self, id: &str) -> RunOutcome {
+        match id {
+            "add_model" => {
+                // Stay inside Settings float — form with id + optional fields.
+                self.open_settings_model_add();
+                RunOutcome::Noop
+            }
+            id if id.starts_with("m:") => {
+                let clean = id.trim_start_matches("m:").to_string();
+                let detail = self
+                    .settings_model_rows
+                    .iter()
+                    .find(|(k, _)| k == &clean)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_default();
+                self.open_settings_model_detail(&clean, &detail);
+                RunOutcome::Noop
+            }
+            _ => RunOutcome::Noop,
+        }
+    }
+
+    fn confirm_settings_model_add(&mut self, id: &str) -> RunOutcome {
+        match id {
+            "save" => match self
+                .model_draft
+                .as_ref()
+                .ok_or_else(|| "no draft".to_string())
+                .and_then(|d| d.to_config_op())
+            {
+                Ok(op) => {
+                    self.model_draft = None;
+                    self.settings_form_edit = None;
+                    RunOutcome::ConfigOp(op)
+                }
+                Err(err) => {
+                    self.set_notice(format!("add model: {err}"));
+                    RunOutcome::Noop
+                }
+            },
+            "cancel" => {
+                self.settings_go_back();
+                RunOutcome::Noop
+            }
+            id if id.starts_with("field:") => {
+                let key = id.trim_start_matches("field:").to_string();
+                self.settings_form_edit = Some(key);
+                self.rebuild_settings_model_add_float();
+                RunOutcome::Noop
+            }
+            _ => RunOutcome::Noop,
+        }
+    }
+
+    fn confirm_settings_model_detail(&mut self, id: &str) -> RunOutcome {
+        let focus = self.settings_model_focus.clone();
+        match id {
+            "set_name" => {
+                self.start_settings_inline_edit(format!("model_set:{focus}:name"), "name", "");
+                RunOutcome::Noop
+            }
+            "set_ctx" => {
+                self.start_settings_inline_edit(
+                    format!("model_set:{focus}:ctx"),
+                    "context_window",
+                    "",
+                );
+                RunOutcome::Noop
+            }
+            "rm_model" => RunOutcome::ConfigOp(ConfigOp::ModelRm { spec: focus }),
+            _ => RunOutcome::Noop,
+        }
+    }
+
     /// Shared handler for command-palette / help rows.
     fn dispatch_command_item(&mut self, id: &str, hint: &str) -> RunOutcome {
         match id {
-            "model" => {
-                self.open_model_picker();
+            "model" | "switch_model" => {
+                self.open_model_select();
+                RunOutcome::Noop
+            }
+            "settings" => {
+                self.open_settings_float();
                 RunOutcome::Noop
             }
             "help" => {
@@ -1824,7 +2781,7 @@ impl App {
             }
             // These need runtime data → emit slash so CLI opens the right float.
             "resume" | "session" | "tree" | "rewind" | "new" | "name" | "export" | "compact"
-            | "reload" | "skill" | "settings" => {
+            | "reload" | "skill" | "plan" | "act" | "build" => {
                 self.close_float();
                 self.input.clear();
                 let cmd = if hint.starts_with('/') {
@@ -1832,7 +2789,6 @@ impl App {
                 } else {
                     format!("/{id}")
                 };
-                // Trailing space commands (name) leave input for typing? Prefer float/prompt.
                 if cmd.ends_with(' ') {
                     self.input = cmd;
                     RunOutcome::Noop
@@ -1844,7 +2800,10 @@ impl App {
                 self.close_float();
                 if hint.starts_with('/') {
                     if hint == "/model" || hint.starts_with("/model ") {
-                        self.open_model_picker();
+                        self.open_model_select();
+                        RunOutcome::Noop
+                    } else if hint == "/settings" || hint.starts_with("/settings ") {
+                        self.open_settings_float();
                         RunOutcome::Noop
                     } else {
                         self.input.clear();
@@ -1864,33 +2823,19 @@ impl App {
 
         // Ctrl+C always force-quits — even when a float is open or the turn is wedged.
         // Soft cancel is `q` (empty input) / Esc; do not repurpose Ctrl+C as cancel.
-        if matches!(key.code, KeyCode::Char('c'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
             self.request_force_quit();
             self.set_notice("force quit…");
             return;
         }
 
-        // Tool approval takes keyboard focus over steer / abort keys.
-        if self.approval.is_some() {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') | KeyCode::Enter => {
-                    self.approval_answer = Some(ApprovalAnswer::Once);
-                    self.approval = None;
-                    self.set_notice("approved once");
+        // Docked select (permission / ask_user / model) takes focus over steer / abort.
+        if self.select.is_some() {
+            if let Some(prompt) = self.select.as_mut() {
+                if let Some(result) = prompt.handle_key(key) {
+                    // Model/ConfigOp outcomes are ignored while busy (approval only).
+                    let _ = self.apply_select_result(result);
                 }
-                KeyCode::Char('a') | KeyCode::Char('A') => {
-                    self.approval_answer = Some(ApprovalAnswer::Session);
-                    self.approval = None;
-                    self.set_notice("approved for session");
-                }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    self.approval_answer = Some(ApprovalAnswer::Deny);
-                    self.approval = None;
-                    self.set_notice("denied");
-                }
-                _ => {}
             }
             return;
         }
@@ -2123,7 +3068,14 @@ fn list_path_completions(partial: &str) -> Vec<String> {
     let raw = if at { &partial[1..] } else { partial };
     let expanded = expand_tilde(raw);
     let (dir, file_prefix) = if expanded.ends_with('/') || expanded.is_empty() {
-        (if expanded.is_empty() { ".".into() } else { expanded.clone() }, String::new())
+        (
+            if expanded.is_empty() {
+                ".".into()
+            } else {
+                expanded.clone()
+            },
+            String::new(),
+        )
     } else {
         let path = std::path::Path::new(&expanded);
         match (path.parent(), path.file_name()) {
@@ -2209,9 +3161,7 @@ pub fn expand_at_files(text: &str) -> String {
         out.push_str(&rest[..at]);
         rest = &rest[at + 1..];
         // Token until whitespace.
-        let end = rest
-            .find(|c: char| c.is_whitespace())
-            .unwrap_or(rest.len());
+        let end = rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len());
         let path_raw = &rest[..end];
         rest = &rest[end..];
         if path_raw.is_empty() {
@@ -2290,7 +3240,80 @@ fn is_ui_slash(text: &str) -> bool {
             | "/help"
             | "/quit"
             | "/exit"
+            | "/plan"
+            | "/act"
+            | "/build"
     )
+}
+
+/// Parse Settings field-edit op + typed value into a [`ConfigOp`].
+fn config_op_from_field(op: &str, value: &str) -> Option<ConfigOp> {
+    let value = value.trim();
+    if op == "provider_add_id" {
+        if value.is_empty() {
+            return None;
+        }
+        return Some(ConfigOp::ProviderAdd {
+            id: value.to_string(),
+            base_url: None,
+        });
+    }
+    if let Some(rest) = op.strip_prefix("provider_add_base:") {
+        return Some(ConfigOp::ProviderAdd {
+            id: rest.to_string(),
+            base_url: if value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            },
+        });
+    }
+    if op == "model_add" {
+        if value.is_empty() {
+            return None;
+        }
+        return Some(ConfigOp::ModelAdd {
+            spec: value.to_string(),
+            name: None,
+            context_window: None,
+        });
+    }
+    // model_add:<provider> — value is model id only (legacy docked path)
+    if let Some(provider) = op.strip_prefix("model_add:") {
+        if value.is_empty() || provider.is_empty() {
+            return None;
+        }
+        return Some(ConfigOp::ModelAdd {
+            spec: format!("{provider}:{value}"),
+            name: None,
+            context_window: None,
+        });
+    }
+    if let Some(rest) = op.strip_prefix("provider_set:") {
+        // provider_set:<id>:<key>
+        let (id, key) = rest.split_once(':')?;
+        if id.is_empty() || key.is_empty() {
+            return None;
+        }
+        return Some(ConfigOp::ProviderSet {
+            id: id.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    if let Some(rest) = op.strip_prefix("model_set:") {
+        // model_set:<provider:id>:<key> — key is after the last ':'
+        let (spec, key) = rest.rsplit_once(':')?;
+        if spec.is_empty() || key.is_empty() {
+            return None;
+        }
+        return Some(ConfigOp::ModelSet {
+            spec: spec.to_string(),
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
+    None
 }
 
 #[cfg(test)]
@@ -2317,6 +3340,170 @@ mod tests {
         }
         assert_eq!(app.messages.last().unwrap().content, "hello");
         assert_eq!(app.prompt_history, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn ctrl_g_opens_settings_float() {
+        let mut app = App::new("test");
+        let out = app.handle_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
+        assert!(matches!(out, RunOutcome::Noop));
+        let f = app.float.as_ref().expect("settings float open");
+        assert_eq!(f.kind, FloatKind::Settings);
+        assert!(!f.filtered_entries().is_empty());
+    }
+
+    #[test]
+    fn settings_models_ctrl_f_fetches_remote_models() {
+        let mut app = App::new("test");
+        app.settings_provider_focus = "proxy".into();
+        app.open_settings_models_for_provider("proxy");
+
+        let out = app.handle_key(key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+
+        assert!(matches!(
+            out,
+            RunOutcome::ConfigOp(ConfigOp::ProviderFetchModels { id }) if id == "proxy"
+        ));
+    }
+
+    #[test]
+    fn settings_provider_detail_ctrl_f_no_longer_fetches() {
+        let mut app = App::new("test");
+        app.open_settings_provider_detail("proxy", "1 model");
+
+        let out = app.handle_key(key(KeyCode::Char('f'), KeyModifiers::CONTROL));
+
+        assert!(matches!(out, RunOutcome::Noop), "got {out:?}");
+    }
+
+    #[test]
+    fn provider_detail_rows_show_configured_values() {
+        let mut app = App::new("test");
+        app.set_settings_catalog(
+            vec![("proxy".into(), "1 model".into())],
+            vec![],
+            vec![
+                ("proxy:provider_type".into(), "openai-compatible".into()),
+                ("proxy:base_url".into(), "https://proxy.example/v1".into()),
+                ("proxy:api".into(), "openai-completions".into()),
+                ("proxy:api_key".into(), "$PROXY_KEY".into()),
+                ("proxy:default_model".into(), "m1".into()),
+            ],
+        );
+
+        app.open_settings_provider_detail("proxy", "1 model");
+        let entries = app.float.as_ref().unwrap().filtered_entries();
+
+        assert!(entries
+            .iter()
+            .any(|e| e.item.id == "set_provider_type" && e.item.detail == "openai-compatible"));
+        assert!(entries
+            .iter()
+            .any(|e| e.item.id == "set_base_url" && e.item.detail == "https://proxy.example/v1"));
+        assert!(entries
+            .iter()
+            .any(|e| e.item.id == "set_api" && e.item.detail == "openai-completions"));
+    }
+
+    #[test]
+    fn settings_remote_model_list_filters_and_adds_model() {
+        let mut app = App::new("test");
+        app.open_settings_provider_detail("proxy", "1 model");
+        app.open_settings_remote_models(
+            "proxy",
+            vec![
+                ("gpt-4.1".into(), "remote".into()),
+                ("o3".into(), "remote".into()),
+            ],
+        );
+
+        let f = app.float.as_mut().expect("remote models float");
+        assert_eq!(f.kind, FloatKind::SettingsRemoteModels);
+        f.search = "o3".into();
+        let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(
+            out,
+            RunOutcome::ConfigOp(ConfigOp::ModelAdd {
+                spec,
+                name,
+                context_window: None,
+            }) if spec == "proxy:o3" && name.as_deref() == Some("o3")
+        ));
+    }
+
+    #[test]
+    fn provider_api_uses_enum_picker() {
+        let mut app = App::new("test");
+        app.open_settings_provider_detail("proxy", "1 model");
+        let f = app.float.as_mut().expect("provider detail");
+        let api_index = f
+            .filtered_entries()
+            .iter()
+            .position(|e| e.item.id == "set_api")
+            .unwrap();
+        f.selected = api_index;
+
+        let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(matches!(out, RunOutcome::Noop));
+        let f = app.float.as_ref().expect("api picker");
+        assert_eq!(f.kind, FloatKind::SettingsProviderApi);
+        assert!(f
+            .filtered_entries()
+            .iter()
+            .any(|e| e.item.id == "api:openai-responses"));
+        assert!(f
+            .filtered_entries()
+            .iter()
+            .any(|e| e.item.id == "api:openai-completions"));
+    }
+
+    #[test]
+    fn provider_api_picker_saves_fixed_values_and_unset() {
+        let mut app = App::new("test");
+        app.open_settings_provider_detail("proxy", "1 model");
+        app.open_settings_provider_api("proxy");
+        let f = app.float.as_mut().expect("api picker");
+        f.selected = f
+            .filtered_entries()
+            .iter()
+            .position(|e| e.item.id == "api:openai-responses")
+            .unwrap();
+
+        let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            out,
+            RunOutcome::ConfigOp(ConfigOp::ProviderSet { id, key, value })
+                if id == "proxy" && key == "api" && value == "openai-responses"
+        ));
+
+        app.open_settings_provider_api("proxy");
+        let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            out,
+            RunOutcome::ConfigOp(ConfigOp::ProviderSet { id, key, value })
+                if id == "proxy" && key == "api" && value.is_empty()
+        ));
+    }
+
+    #[test]
+    fn slash_settings_enter_opens_settings_float() {
+        let mut app = App::new("test");
+        app.input = "/settings".into();
+        app.clamp_slash_selection();
+        // Highlight /settings if filtered list has it.
+        let rows = app.popup_rows();
+        if let Some(i) = rows
+            .iter()
+            .position(|r| matches!(r, PopupRow::Command(c) if c.name == "/settings"))
+        {
+            app.slash_selected = i;
+        }
+        let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(out, RunOutcome::Noop), "got {out:?}");
+        let f = app.float.as_ref().expect("settings float after /settings");
+        assert_eq!(f.kind, FloatKind::Settings);
     }
 
     #[test]
@@ -2352,7 +3539,10 @@ mod tests {
             RunOutcome::Noop
         ));
         assert!(app.input.is_empty());
-        assert_eq!(app.prompt_history.last().map(String::as_str), Some("unsent draft"));
+        assert_eq!(
+            app.prompt_history.last().map(String::as_str),
+            Some("unsent draft")
+        );
         app.history_prev();
         assert_eq!(app.input, "unsent draft");
     }
@@ -2529,11 +3719,7 @@ mod tests {
     #[test]
     fn submit_image_only_prompt() {
         let mut app = App::new("test");
-        app.attach_image(
-            "image/png".into(),
-            "aaaa".into(),
-            "shot.png".into(),
-        );
+        app.attach_image("image/png".into(), "aaaa".into(), "shot.png".into());
         match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
             RunOutcome::Prompt(t) => assert!(t.is_empty(), "token should be stripped, got {t}"),
             other => panic!("unexpected {other:?}"),
@@ -2692,7 +3878,9 @@ mod tests {
         );
         assert!(!thinking[1].content.contains("first round"));
         assert!(
-            thinking.iter().all(|m| !m.thinking_expanded && !m.streaming),
+            thinking
+                .iter()
+                .all(|m| !m.thinking_expanded && !m.streaming),
             "both finished segments stay collapsed by default"
         );
     }
@@ -2763,7 +3951,11 @@ mod tests {
         let last = app.messages.last().unwrap();
         assert_eq!(last.tool_status, Some(ToolStatus::Error));
         assert!(last.tool_expanded);
-        assert!(last.tool_output.as_ref().unwrap().contains("could not compile"));
+        assert!(last
+            .tool_output
+            .as_ref()
+            .unwrap()
+            .contains("could not compile"));
         assert!(last.tool_summary.as_ref().unwrap().contains("error"));
     }
 
@@ -2787,7 +3979,10 @@ mod tests {
         let last = app.messages.last().unwrap();
         assert_eq!(last.tool_status, Some(ToolStatus::Done));
         let summary = last.tool_summary.as_deref().unwrap_or("");
-        assert!(summary.contains("edited") || summary.contains("a.rs"), "{summary}");
+        assert!(
+            summary.contains("edited") || summary.contains("a.rs"),
+            "{summary}"
+        );
         let out = last.tool_output.as_deref().unwrap_or("");
         assert!(out.contains('+') || out.contains("Updated"), "{out}");
     }

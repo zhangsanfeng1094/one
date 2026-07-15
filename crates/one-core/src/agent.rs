@@ -12,7 +12,7 @@ use crate::message::{
 use crate::tool::{Tool, ToolCall, ToolOutput};
 use crate::tool_gate::{ToolGate, ToolGateDecision};
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are an AI coding assistant. Use the provided tools to read, write, edit files, run shell commands, and search or fetch the web when you need current information. Be concise and precise.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are an AI coding assistant. Use the provided tools to read, write, edit files, run shell commands, and search or fetch the web when you need current information. When requirements are ambiguous, use the `ask_user` tool to ask structured clarifying questions instead of guessing. Be concise and precise.";
 
 /// Reasoning / extended-thinking intensity (provider-specific mapping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

@@ -341,6 +341,7 @@ pub fn plan_mode_tools(
         crate::path_policy::PathPolicy::workspace(cwd),
         plan_path,
         exit_state,
+        None,
     )
 }
 
@@ -349,10 +350,15 @@ pub fn plan_mode_tools_with_policy(
     policy: crate::path_policy::PathPolicy,
     plan_path: PathBuf,
     exit_state: Arc<Mutex<PlanExitState>>,
+    ask_user: Option<Arc<dyn crate::ask_user::AskUserHandler>>,
 ) -> Vec<Arc<dyn Tool>> {
     let cwd = policy.cwd().to_path_buf();
     // Allow reading/writing the plan file even when it lives under ~/.one/agent/plans.
     let policy = policy.with_allowed_file(plan_path.clone());
+    let ask_handler = ask_user.unwrap_or_else(|| {
+        Arc::new(crate::ask_user::FailClosedAskUser)
+            as Arc<dyn crate::ask_user::AskUserHandler>
+    });
     #[allow(unused_mut)] // mut when `network` feature pushes extra tools
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(crate::read::ReadTool::with_policy(policy.clone())),
@@ -362,6 +368,7 @@ pub fn plan_mode_tools_with_policy(
         Arc::new(PlanWriteTool::new(cwd.clone(), plan_path.clone())),
         Arc::new(PlanEditTool::new(cwd, plan_path)),
         Arc::new(ExitPlanModeTool::new(exit_state)),
+        Arc::new(crate::ask_user::AskUserTool::new(ask_handler)),
     ];
     #[cfg(feature = "network")]
     {
@@ -384,7 +391,7 @@ other instructions about implementing changes.
 
 You MAY:
 - Read files, search the codebase (grep/find/ls), and use web tools when needed
-- Ask the user clarifying questions
+- Ask the user clarifying questions via the `ask_user` tool (single- or multi-select)
 - Write and edit ONLY the plan file at: `{plan}`
 - Call `exit_plan_mode` when the plan is ready for approval
 
@@ -500,6 +507,7 @@ mod tests {
         assert!(names.contains(&"read".to_string()));
         assert!(names.contains(&"write".to_string()));
         assert!(names.contains(&"exit_plan_mode".to_string()));
+        assert!(names.contains(&"ask_user".to_string()));
         assert!(!names.iter().any(|n| n == "bash"));
         let _ = std::fs::remove_dir_all(&dir);
     }

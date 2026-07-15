@@ -29,7 +29,7 @@ pub struct FloatSection {
 pub enum FloatKind {
     /// Root command palette (`/`).
     Commands,
-    /// Model picker (`/model`).
+    /// Model picker (legacy center; prefer docked select).
     Models,
     /// Help catalog (`/help`) — selecting a row drills into that command.
     Help,
@@ -43,6 +43,22 @@ pub enum FloatKind {
     Rewind,
     /// Read-only info panel (session summary, …). Enter closes.
     Info,
+    /// Settings root (Ctrl+G).
+    Settings,
+    /// Provider list under Settings.
+    SettingsProviders,
+    /// Actions for one provider.
+    SettingsProviderDetail,
+    /// Provider-level API enum picker.
+    SettingsProviderApi,
+    /// Remote model ids fetched from the provider.
+    SettingsRemoteModels,
+    /// Model list under Settings.
+    SettingsModels,
+    /// Actions for one model.
+    SettingsModelDetail,
+    /// Add-model form under a provider (stays in Settings float).
+    SettingsModelAdd,
     /// Generic custom list.
     Custom,
 }
@@ -56,6 +72,11 @@ pub struct FloatMenu {
     pub sections: Vec<FloatSection>,
     /// Index into flattened **selectable** items (not headers).
     pub selected: usize,
+    /// When true, `search` is an in-float value editor (not a filter).
+    /// Used by Settings so we never leave the float for a docked select.
+    pub edit_mode: bool,
+    /// Label shown instead of "search:" while `edit_mode` (e.g. `base_url`).
+    pub edit_label: String,
 }
 
 /// Flat view of a selectable entry (for navigation / confirm).
@@ -66,26 +87,29 @@ pub struct FloatEntry {
 }
 
 impl FloatMenu {
-    pub fn commands_palette() -> Self {
+    fn with_sections(
+        kind: FloatKind,
+        title: impl Into<String>,
+        sections: Vec<FloatSection>,
+    ) -> Self {
         Self {
-            kind: FloatKind::Commands,
-            title: "Commands".into(),
+            kind,
+            title: title.into(),
             search: String::new(),
-            sections: default_command_sections(),
+            sections,
             selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
         }
+    }
+
+    pub fn commands_palette() -> Self {
+        Self::with_sections(FloatKind::Commands, "Commands", default_command_sections())
     }
 
     /// `/help` — browse commands; confirm drills into secondary UI or runs.
     pub fn help_menu() -> Self {
-        Self {
-            kind: FloatKind::Help,
-            title: "Help".into(),
-            search: String::new(),
-            // Reuse the same catalog as the command palette (grouped).
-            sections: default_command_sections(),
-            selected: 0,
-        }
+        Self::with_sections(FloatKind::Help, "Help", default_command_sections())
     }
 
     /// `/thinking` level picker.
@@ -123,13 +147,13 @@ impl FloatMenu {
                 items,
             }],
             selected: levels.iter().position(|l| *l == current).unwrap_or(0),
+            edit_mode: false,
+            edit_label: String::new(),
         }
     }
 
     /// `/resume` session list. `id` is the resume key (path or session id).
-    pub fn sessions_picker(
-        sessions: &[(String, String, String, String)],
-    ) -> Self {
+    pub fn sessions_picker(sessions: &[(String, String, String, String)]) -> Self {
         // (id, label, detail, hint)
         let items: Vec<FloatItem> = sessions
             .iter()
@@ -153,6 +177,8 @@ impl FloatMenu {
                 items,
             }],
             selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
         }
     }
 
@@ -177,6 +203,8 @@ impl FloatMenu {
                 items,
             }],
             selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
         }
     }
 
@@ -206,6 +234,8 @@ impl FloatMenu {
                 items,
             }],
             selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
         }
     }
 
@@ -229,6 +259,326 @@ impl FloatMenu {
                 items,
             }],
             selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+        }
+    }
+
+    /// Settings root — separate from `/` command palette.
+    ///
+    /// Hierarchy: Settings → Providers → Provider → Models → Model
+    /// (no standalone global Models entry).
+    pub fn settings_root(thinking: &str, provider: &str, model: &str) -> Self {
+        Self {
+            kind: FloatKind::Settings,
+            title: "Settings".into(),
+            search: String::new(),
+            sections: vec![
+                FloatSection {
+                    title: "General".into(),
+                    items: vec![
+                        item(
+                            "thinking",
+                            "Thinking",
+                            &format!("current: {thinking}"),
+                            "levels",
+                        ),
+                        item(
+                            "auto_approve",
+                            "Auto-approve",
+                            "toggle bash danger prompts",
+                            "toggle",
+                        ),
+                        item(
+                            "sandbox",
+                            "Sandbox",
+                            "workspace-write / full-access",
+                            "cycle",
+                        ),
+                    ],
+                },
+                FloatSection {
+                    title: "Providers".into(),
+                    items: vec![
+                        item(
+                            "providers",
+                            "Manage providers",
+                            "base_url · api · models · keys",
+                            "models.json",
+                        ),
+                        item(
+                            "switch_model",
+                            "Switch active model",
+                            &format!("now {provider}:{model}"),
+                            "Ctrl+L",
+                        ),
+                    ],
+                },
+            ],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+        }
+    }
+
+    pub fn settings_providers(rows: &[(String, String)]) -> Self {
+        let mut items: Vec<FloatItem> = rows
+            .iter()
+            .map(|(id, detail)| FloatItem {
+                id: format!("p:{id}"),
+                label: id.clone(),
+                detail: detail.clone(),
+                hint: "→".into(),
+            })
+            .collect();
+        items.push(item(
+            "add_provider",
+            "+ Add provider",
+            "id + base_url → models.json",
+            "new",
+        ));
+        Self {
+            kind: FloatKind::SettingsProviders,
+            title: "Providers".into(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: format!("{} · Esc/← back", rows.len()),
+                items,
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+        }
+    }
+
+    pub fn settings_provider_detail(id: &str, detail: &str, fields: &[(String, String)]) -> Self {
+        let field_value = |key: &str, fallback: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        let provider_type = field_value("provider_type", "default/unset");
+        let base_url = field_value("base_url", "unset");
+        let api = field_value("api", "default/unset");
+        let api_key = field_value("api_key", "unset");
+        let default_model = field_value("default_model", "unset");
+        Self {
+            kind: FloatKind::SettingsProviderDetail,
+            title: format!("Provider · {id}"),
+            search: String::new(),
+            sections: vec![
+                FloatSection {
+                    title: detail.into(),
+                    items: vec![item(
+                        "models",
+                        "Models",
+                        "list · add · edit under this provider",
+                        "→",
+                    )],
+                },
+                FloatSection {
+                    title: "Connection".into(),
+                    items: vec![
+                        item("set_provider_type", "providerType", &provider_type, "edit"),
+                        item("set_base_url", "base_url", &base_url, "edit"),
+                        item("set_api", "api", &api, "select"),
+                        item("set_api_key", "api_key", &api_key, "edit"),
+                        item("set_default_model", "default_model", &default_model, "edit"),
+                    ],
+                },
+                FloatSection {
+                    title: "Danger".into(),
+                    items: vec![item(
+                        "rm_provider",
+                        "Delete provider",
+                        "removes provider and its models",
+                        "rm",
+                    )],
+                },
+            ],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+        }
+    }
+
+    pub fn settings_provider_api(provider: &str) -> Self {
+        Self {
+            kind: FloatKind::SettingsProviderApi,
+            title: format!("Provider API · {provider}"),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: "Wire API".into(),
+                items: vec![
+                    item("api:", "default/unset", "clear provider-level api", ""),
+                    item(
+                        "api:openai-responses",
+                        "openai-responses",
+                        "OpenAI Responses API",
+                        "",
+                    ),
+                    item(
+                        "api:openai-completions",
+                        "openai-completions",
+                        "Chat Completions compatible",
+                        "",
+                    ),
+                ],
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+        }
+    }
+
+    pub fn settings_remote_models(provider: &str, rows: &[(String, String)]) -> Self {
+        let items: Vec<FloatItem> = rows
+            .iter()
+            .map(|(id, detail)| FloatItem {
+                id: format!("remote_model:{id}"),
+                label: id.clone(),
+                detail: detail.clone(),
+                hint: "add".into(),
+            })
+            .collect();
+        Self {
+            kind: FloatKind::SettingsRemoteModels,
+            title: format!("Remote models · {provider}"),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: format!("{} fetched · Enter add · Esc back", items.len()),
+                items,
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+        }
+    }
+
+    /// Models for **one** provider (second level under Provider detail).
+    pub fn settings_models_for_provider(provider: &str, rows: &[(String, String)]) -> Self {
+        let prefix = format!("{provider}:");
+        let mut items: Vec<FloatItem> = rows
+            .iter()
+            .filter(|(spec, _)| spec == provider || spec.starts_with(&prefix))
+            .map(|(spec, detail)| {
+                let label = spec
+                    .strip_prefix(&prefix)
+                    .unwrap_or(spec.as_str())
+                    .to_string();
+                FloatItem {
+                    id: format!("m:{spec}"),
+                    label,
+                    detail: detail.clone(),
+                    hint: "→".into(),
+                }
+            })
+            .collect();
+        let n = items.len();
+        items.push(item(
+            "add_model",
+            "+ Add model",
+            &format!("adds under {provider}"),
+            "new",
+        ));
+        Self {
+            kind: FloatKind::SettingsModels,
+            title: format!("Models · {provider}"),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: format!("{n} · Esc/← back to provider"),
+                items,
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+        }
+    }
+
+    pub fn settings_model_detail(spec: &str, detail: &str) -> Self {
+        let short = spec.split_once(':').map(|(_, id)| id).unwrap_or(spec);
+        Self {
+            kind: FloatKind::SettingsModelDetail,
+            title: format!("Model · {short}"),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: detail.into(),
+                items: vec![
+                    item("set_name", "name", short, "edit"),
+                    item("set_ctx", "context_window", "e.g. 128000", "edit"),
+                    item("rm_model", "Delete model", "remove from models.json", "rm"),
+                ],
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+        }
+    }
+
+    /// In-float add-model form. Connection (`base_url` / `api`) is provider-level only.
+    pub fn settings_model_add(
+        provider: &str,
+        draft: &crate::app::ModelDraft,
+        editing: Option<&str>,
+    ) -> Self {
+        let mark = |key: &str, label: &str, value: &str, hint: &str| -> FloatItem {
+            let editing_here = editing == Some(key);
+            let display = if value.is_empty() {
+                "(empty)".to_string()
+            } else {
+                value.to_string()
+            };
+            let label = if editing_here {
+                format!("▸ {label}")
+            } else {
+                label.to_string()
+            };
+            FloatItem {
+                id: format!("field:{key}"),
+                label,
+                detail: display,
+                hint: if editing_here {
+                    "typing…".into()
+                } else {
+                    hint.into()
+                },
+            }
+        };
+        Self {
+            kind: FloatKind::SettingsModelAdd,
+            title: format!("Add model · {provider}"),
+            search: String::new(),
+            sections: vec![
+                FloatSection {
+                    title: if editing.is_some() {
+                        "Type value in search · Enter save field · Esc cancel edit".into()
+                    } else {
+                        "id required · name/ctx optional · base_url/api on provider".into()
+                    },
+                    items: vec![
+                        mark("id", "id *", &draft.id, "required"),
+                        mark("name", "name", &draft.name, "optional"),
+                        mark(
+                            "context_window",
+                            "context_window",
+                            &draft.context_window,
+                            "optional",
+                        ),
+                    ],
+                },
+                FloatSection {
+                    title: "Actions".into(),
+                    items: vec![
+                        item("save", "Save model", "write to models.json", "enter"),
+                        item("cancel", "Cancel", "back to model list", "esc"),
+                    ],
+                },
+            ],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
         }
     }
 
@@ -268,10 +618,7 @@ impl FloatMenu {
                 })
                 .collect();
             if !items.is_empty() {
-                sections.push(FloatSection {
-                    title: prov,
-                    items,
-                });
+                sections.push(FloatSection { title: prov, items });
             }
         }
         Self {
@@ -280,12 +627,19 @@ impl FloatMenu {
             search: String::new(),
             sections,
             selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
         }
     }
 
     /// Flatten filtered selectable items.
     pub fn filtered_entries(&self) -> Vec<FloatEntry> {
-        let q = self.search.trim().to_ascii_lowercase();
+        // In edit mode search holds the value being typed — never filter the list.
+        let q = if self.edit_mode {
+            String::new()
+        } else {
+            self.search.trim().to_ascii_lowercase()
+        };
         let mut out = Vec::new();
         for sec in &self.sections {
             for item in &sec.items {
@@ -304,6 +658,19 @@ impl FloatMenu {
             }
         }
         out
+    }
+
+    /// Enter in-float value edit (search bar becomes the editor).
+    pub fn begin_edit(&mut self, label: impl Into<String>, initial: impl Into<String>) {
+        self.edit_mode = true;
+        self.edit_label = label.into();
+        self.search = initial.into();
+    }
+
+    pub fn end_edit(&mut self) {
+        self.edit_mode = false;
+        self.edit_label.clear();
+        self.search.clear();
     }
 
     /// Rows for rendering: headers injected when section changes.
@@ -385,8 +752,18 @@ fn default_command_sections() -> Vec<FloatSection> {
         FloatSection {
             title: "Session".into(),
             items: vec![
-                item("session", "Session Info", "path · name · messages", "/session"),
-                item("resume", "Resume Session", "list / open past sessions", "/resume"),
+                item(
+                    "session",
+                    "Session Info",
+                    "path · name · messages",
+                    "/session",
+                ),
+                item(
+                    "resume",
+                    "Resume Session",
+                    "list / open past sessions",
+                    "/resume",
+                ),
                 item("new", "New Session", "start a fresh session", "/new"),
                 item("name", "Name Session", "set display name", "/name "),
                 item("tree", "Session Tree", "list or switch branch", "/tree"),
@@ -403,16 +780,26 @@ fn default_command_sections() -> Vec<FloatSection> {
         FloatSection {
             title: "Model & Context".into(),
             items: vec![
-                item("model", "Switch Model", "pick model by provider", "/model"),
-                item("thinking", "Thinking Level", "off/low/medium/high", "/thinking"),
-                item("plan", "Plan Mode", "explore + write plan only", "/plan"),
-                item("act", "Act / Build", "approve plan and implement", "/act"),
-                item("compact", "Compact Context", "summarize older turns", "/compact"),
+                item("model", "Switch Model", "select above input", "Ctrl+L"),
                 item(
                     "settings",
                     "Settings",
-                    "provider · model · thinking · auto_approve",
-                    "/settings",
+                    "thinking · providers · models",
+                    "Ctrl+G",
+                ),
+                item(
+                    "thinking",
+                    "Thinking Level",
+                    "off/low/medium/high",
+                    "/thinking",
+                ),
+                item("plan", "Plan Mode", "explore + write plan only", "/plan"),
+                item("act", "Act / Build", "approve plan and implement", "/act"),
+                item(
+                    "compact",
+                    "Compact Context",
+                    "summarize older turns",
+                    "/compact",
                 ),
                 item(
                     "skill",
@@ -420,7 +807,12 @@ fn default_command_sections() -> Vec<FloatSection> {
                     "optional; agent auto-loads via read",
                     "/skill:",
                 ),
-                item("reload", "Reload", "extensions · skills · prompts", "/reload"),
+                item(
+                    "reload",
+                    "Reload",
+                    "extensions · skills · prompts",
+                    "/reload",
+                ),
             ],
         },
         FloatSection {
@@ -489,14 +881,12 @@ mod tests {
 
     #[test]
     fn sessions_picker_builds() {
-        let rows = vec![
-            (
-                "/tmp/a.jsonl".into(),
-                "demo".into(),
-                "today".into(),
-                "abc".into(),
-            ),
-        ];
+        let rows = vec![(
+            "/tmp/a.jsonl".into(),
+            "demo".into(),
+            "today".into(),
+            "abc".into(),
+        )];
         let m = FloatMenu::sessions_picker(&rows);
         assert_eq!(m.kind, FloatKind::Sessions);
         assert_eq!(m.filtered_entries().len(), 1);

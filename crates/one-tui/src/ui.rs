@@ -24,19 +24,24 @@ const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Clear to OpenCode near-black.
-    frame.render_widget(
-        Block::default().style(Theme::bg()),
-        frame.area(),
-    );
+    frame.render_widget(Block::default().style(Theme::bg()), frame.area());
 
-    // All slash / secondary menus use the centered float — no inline strip.
-    // Prompt grows with multi-line input (1..6 lines) + pad + meta row.
+    // Dock above the prompt (priority: HITL select > `/` command menu).
+    // Centered float remains for Settings (Ctrl+G) and sessions/tree/etc.
     let input_lines = app.input_line_count() as u16;
     let prompt_h = (input_lines + 2).clamp(3, 8).saturating_add(1); // box + meta
+    let select_h = app.select_dock_height();
+    let slash_h = if select_h == 0 {
+        app.slash_dock_height()
+    } else {
+        0
+    };
+    let dock_h = select_h.max(slash_h);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(3),           // transcript
+            Constraint::Length(dock_h),   // select or `/` menu (0 when closed)
             Constraint::Length(prompt_h), // prompt box + agent meta
             Constraint::Length(1),        // footer
         ])
@@ -45,82 +50,248 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     app.tick_toast();
 
     draw_chat(frame, chunks[0], app);
-    draw_prompt(frame, chunks[1], app);
-    draw_status(frame, chunks[2], app);
+    if select_h > 0 {
+        draw_select_dock(frame, chunks[1], app);
+    } else if slash_h > 0 {
+        draw_slash_dock(frame, chunks[1], app);
+    }
+    draw_prompt(frame, chunks[2], app);
+    draw_status(frame, chunks[3], app);
 
     // Top-right toast sits above chat (not the footer).
     draw_toast(frame, frame.area(), app);
 
-    // Floating modal on top of everything (commands, models, …).
+    // Floating modal on top (Settings, sessions, …) — not used for `/`.
     if let Some(menu) = &app.float {
         draw_float_menu(frame, frame.area(), menu);
     }
-
-    // Tool approval sits above floats while the agent is waiting.
-    if app.approval_prompt().is_some() {
-        draw_approval(frame, frame.area(), app);
-    }
 }
 
-/// Centered approval dialog for high-risk / rule-ask tool calls.
-fn draw_approval(frame: &mut Frame<'_>, full: Rect, app: &App) {
-    let Some(prompt) = app.approval_prompt() else {
+/// Slash command list above the input (Claude Code / Codex style — see image.png).
+///
+/// ```text
+/// /quit     Quit the application          ← highlighted
+/// /help     Browse commands…
+/// ─────────────────────────────────────
+/// > /█
+/// ```
+fn draw_slash_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use crate::slash::PopupRow;
+
+    let rows = app.popup_rows();
+    if rows.is_empty() || area.height == 0 {
+        return;
+    }
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(Theme::slash_panel()), area);
+
+    let max_w = area.width as usize;
+    let visible = area.height as usize;
+    let selected = app.slash_selected.min(rows.len().saturating_sub(1));
+
+    // Scroll window so selection stays visible.
+    let start = if rows.len() > visible {
+        selected
+            .saturating_sub(visible.saturating_sub(1) / 2)
+            .min(rows.len().saturating_sub(visible))
+    } else {
+        0
+    };
+    let end = (start + visible).min(rows.len());
+
+    let mut lines: Vec<Line> = Vec::new();
+    for idx in start..end {
+        let row = &rows[idx];
+        let focused = idx == selected && row.selectable();
+        let name = row.label();
+        let desc = row.description();
+
+        match row {
+            PopupRow::Header(h) => {
+                lines.push(Line::from(Span::styled(
+                    truncate_mid(&format!(" {h}"), max_w),
+                    Theme::slash_title(),
+                )));
+            }
+            PopupRow::Command(_) | PopupRow::Model(_) => {
+                // name left · description right (image layout)
+                let name_w = UnicodeWidthStr::width(name.as_str()).clamp(10, 22);
+                let name_col = format!(" {:<width$}", name, width = name_w);
+                let used = UnicodeWidthStr::width(name_col.as_str());
+                let rest = max_w.saturating_sub(used).saturating_sub(1);
+                let desc_col = if rest > 2 && !desc.is_empty() {
+                    format!(" {}", truncate_mid(&desc, rest.saturating_sub(1)))
+                } else {
+                    String::new()
+                };
+                let style = if focused {
+                    Theme::slash_selected()
+                } else {
+                    Theme::slash_item()
+                };
+                let desc_style = if focused {
+                    Theme::slash_selected()
+                } else {
+                    Theme::slash_desc()
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(name_col, style),
+                    Span::styled(desc_col, desc_style),
+                ]));
+            }
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
+}
+
+/// Codex-style select list docked above the input (model / permission / ask / field edit).
+fn draw_select_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    use crate::select::SelectPhase;
+
+    let Some(prompt) = app.select_prompt() else {
         return;
     };
 
-    // Dim backdrop.
-    frame.render_widget(
-        Block::default().style(Style::default().bg(Color::Rgb(0, 0, 0))),
-        full,
-    );
-
-    let width = full.width.saturating_mul(3) / 4;
-    let width = width.clamp(48, 88).min(full.width.saturating_sub(2));
-    let height = 10u16.min(full.height.saturating_sub(2));
-    let x = full.x + (full.width.saturating_sub(width)) / 2;
-    let y = full.y + (full.height.saturating_sub(height)) / 2;
-    let area = Rect {
-        x,
-        y,
-        width,
-        height,
-    };
-
     frame.render_widget(Clear, area);
+    let title = format!(" {} ", prompt.title);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Permission required ")
+        .title(title)
         .border_style(Style::default().fg(Color::Yellow))
         .style(Theme::bg());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    let summary = truncate_mid(&prompt.summary, (inner.width as usize).saturating_sub(2));
-    let reason = truncate_mid(&prompt.reason, (inner.width as usize).saturating_sub(2));
-    let lines = vec![
-        Line::from(Span::styled(
-            format!("tool  {}", prompt.tool),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::raw(summary)),
-        Line::from(Span::styled(
-            reason,
+    let max_w = (inner.width as usize).saturating_sub(2);
+    let mut lines: Vec<Line> = Vec::new();
+
+    for (i, line) in prompt.body.lines().enumerate() {
+        let text = truncate_mid(line, max_w);
+        if i == 0 {
+            lines.push(Line::from(Span::styled(
+                text,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                text,
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+    if !prompt.body.is_empty() {
+        lines.push(Line::from(""));
+    }
+
+    // Scroll window if too many options for the dock height.
+    let opt_n = prompt.option_count();
+    let typing_rows = if matches!(prompt.phase, SelectPhase::Typing { .. }) {
+        2
+    } else {
+        0
+    };
+    let fixed = lines.len() + 1 + typing_rows; // + footer
+    let avail = (inner.height as usize).saturating_sub(fixed).max(1);
+    let start = if opt_n > avail {
+        prompt
+            .selected
+            .saturating_sub(avail.saturating_sub(1) / 2)
+            .min(opt_n.saturating_sub(avail))
+    } else {
+        0
+    };
+    let end = (start + avail).min(opt_n);
+    for idx in start..end {
+        lines.push(select_option_line(prompt, idx, max_w));
+    }
+
+    if let SelectPhase::Typing { buffer } = &prompt.phase {
+        lines.push(Line::from(Span::styled(
+            truncate_mid(&prompt.other_label, max_w),
             Style::default().fg(Color::DarkGray),
-        )),
-        Line::from(""),
-        Line::from(vec![
-            Span::styled("y/Enter", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" once   "),
-            Span::styled("a", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" session   "),
-            Span::styled("n/Esc", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
-            Span::raw(" deny"),
-        ]),
-    ];
+        )));
+        let input = format!("> {buffer}█");
+        lines.push(Line::from(Span::styled(
+            truncate_mid(&input, max_w),
+            Style::default().fg(Color::White),
+        )));
+    }
+
+    lines.push(Line::from(Span::styled(
+        truncate_mid(&prompt.footer(), max_w),
+        Style::default().fg(Color::DarkGray),
+    )));
+
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+fn select_option_line(
+    prompt: &crate::select::SelectPrompt,
+    idx: usize,
+    max_w: usize,
+) -> Line<'static> {
+    use crate::select::SelectMode;
+
+    let focused = prompt.selected == idx;
+    let (mark, label, desc) = if prompt.is_other_row(idx) {
+        let mark = match prompt.mode {
+            SelectMode::Single => {
+                if focused {
+                    "(•)"
+                } else {
+                    "( )"
+                }
+            }
+            SelectMode::Multi => {
+                if focused {
+                    "[•]"
+                } else {
+                    "[ ]"
+                }
+            }
+        };
+        (mark, prompt.other_label.as_str(), "")
+    } else {
+        let opt = &prompt.options[idx];
+        let mark = match prompt.mode {
+            SelectMode::Single => {
+                if focused {
+                    "(•)"
+                } else {
+                    "( )"
+                }
+            }
+            SelectMode::Multi => {
+                if prompt.checked.contains(&idx) {
+                    "[x]"
+                } else {
+                    "[ ]"
+                }
+            }
+        };
+        (mark, opt.label.as_str(), opt.description.as_str())
+    };
+
+    let num = idx + 1;
+    let main = if desc.is_empty() {
+        format!("{num} {mark} {label}")
+    } else {
+        // Keep description on same line when short; truncate together.
+        format!("{num} {mark} {label}")
+    };
+    let style = if focused {
+        Style::default()
+            .bg(Color::Rgb(48, 48, 48))
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::Gray)
+    };
+    Line::from(Span::styled(truncate_mid(&main, max_w), style))
 }
 
 fn truncate_mid(s: &str, max: usize) -> String {
@@ -234,16 +405,32 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
     frame.render_widget(Clear, area);
 
     let title = format!(" {} ", menu.title);
-    let footer = match menu.kind {
-        FloatKind::Info => " Enter / Esc close ",
-        FloatKind::Sessions => " ↑/↓  ·  Enter resume  ·  Esc  ·  type to filter ",
-        FloatKind::Tree => " ↑/↓  ·  Enter branch  ·  Esc  ·  type to filter ",
-        FloatKind::Rewind => " ↑/↓  ·  Enter edit prompt  ·  Esc  ·  type to filter ",
-        FloatKind::Thinking => " ↑/↓  ·  Enter set level  ·  Esc ",
-        FloatKind::Help => " ↑/↓  ·  Enter open  ·  Esc  ·  type to search ",
-        FloatKind::Models => " ↑/↓  ·  Enter switch  ·  Esc  ·  type to search ",
-        FloatKind::Commands | FloatKind::Custom => {
-            " ↑/↓  ·  Enter select  ·  Esc close  ·  type to search "
+    let footer = if menu.edit_mode {
+        " type value  ·  Enter save  ·  Esc cancel "
+    } else {
+        match menu.kind {
+            FloatKind::Info => " Enter / Esc close ",
+            FloatKind::Sessions => " ↑/↓  ·  Enter resume  ·  Esc  ·  type to filter ",
+            FloatKind::Tree => " ↑/↓  ·  Enter branch  ·  Esc  ·  type to filter ",
+            FloatKind::Rewind => " ↑/↓  ·  Enter edit prompt  ·  Esc  ·  type to filter ",
+            FloatKind::Thinking => " ↑/↓  ·  Enter set level  ·  Esc ",
+            FloatKind::Help => " ↑/↓  ·  Enter open  ·  Esc  ·  type to search ",
+            FloatKind::Models => " ↑/↓  ·  Enter switch  ·  Esc  ·  type to search ",
+            FloatKind::Settings => " ↑/↓  ·  Enter  ·  Esc close  ·  type to filter ",
+            FloatKind::SettingsModels => {
+                " ↑/↓  ·  Enter  ·  Ctrl+F fetch  ·  Esc/← back  ·  type to filter "
+            }
+            FloatKind::SettingsProviders
+            | FloatKind::SettingsProviderDetail
+            | FloatKind::SettingsProviderApi
+            | FloatKind::SettingsRemoteModels
+            | FloatKind::SettingsModelDetail => " ↑/↓  ·  Enter  ·  Esc/← back  ·  type to filter ",
+            FloatKind::SettingsModelAdd => {
+                " ↑/↓ fields  ·  Enter edit/save  ·  Esc/← back  ·  type in search "
+            }
+            FloatKind::Commands | FloatKind::Custom => {
+                " ↑/↓  ·  Enter select  ·  Esc close  ·  type to search "
+            }
         }
     };
 
@@ -264,15 +451,24 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
         .constraints([Constraint::Length(2), Constraint::Min(3)])
         .split(inner);
 
-    // Search row
+    // Search / in-float edit row
+    let search_prefix = if menu.edit_mode {
+        if menu.edit_label.is_empty() {
+            "  edit: ".to_string()
+        } else {
+            format!("  {}: ", menu.edit_label)
+        }
+    } else {
+        "  search: ".to_string()
+    };
     let search_line = if menu.search.is_empty() {
         Line::from(vec![
-            Span::styled("  search: ", Theme::slash_desc()),
-            Span::styled("…", Theme::slash_desc()),
+            Span::styled(search_prefix, Theme::slash_desc()),
+            Span::styled(if menu.edit_mode { "▌" } else { "…" }, Theme::slash_desc()),
         ])
     } else {
         Line::from(vec![
-            Span::styled("  search: ", Theme::slash_desc()),
+            Span::styled(search_prefix, Theme::slash_desc()),
             Span::styled(menu.search.as_str(), Theme::slash_item()),
             Span::styled("▌", Theme::input_cursor_on()),
         ])
@@ -281,8 +477,7 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
         Paragraph::new(vec![
             search_line,
             Line::from(Span::styled(
-                "  ".to_string()
-                    + &"─".repeat(parts[0].width.saturating_sub(2) as usize),
+                "  ".to_string() + &"─".repeat(parts[0].width.saturating_sub(2) as usize),
                 Theme::slash_desc(),
             )),
         ])
@@ -355,11 +550,13 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
                     spans.push(Span::styled(format!("  {detail}"), desc_style));
                 }
                 // pad then hint
-                let used = 2 + 20 + if detail.is_empty() {
-                    0
-                } else {
-                    2 + detail.chars().count()
-                };
+                let used = 2
+                    + 20
+                    + if detail.is_empty() {
+                        0
+                    } else {
+                        2 + detail.chars().count()
+                    };
                 let pad = list_area
                     .width
                     .saturating_sub(used as u16)
@@ -569,11 +766,7 @@ fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Op
 
     // Spinner while waiting for first token, or while only thinking has started.
     if app.busy && app.stream_buffer.is_empty() && app.thinking_buffer.is_empty() {
-        let show = app
-            .messages
-            .last()
-            .map(|m| !m.streaming)
-            .unwrap_or(true);
+        let show = app.messages.last().map(|m| !m.streaming).unwrap_or(true);
         if show {
             if !lines.is_empty() {
                 lines.push(Line::from(""));
@@ -604,12 +797,7 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let blank = || Line::from(Span::styled("", Theme::bg()));
-    let muted = |s: String| {
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled(s, Theme::meta()),
-        ])
-    };
+    let muted = |s: String| Line::from(vec![Span::raw("  "), Span::styled(s, Theme::meta())]);
     let tip_row = |parts: &[(&str, &str)]| {
         let mut spans = vec![Span::raw("  ")];
         for (i, (key, desc)) in parts.iter().enumerate() {
@@ -828,9 +1016,7 @@ fn render_thinking(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<
         let mut body = wrap_paragraphs(&message.content, budget);
         // Live stream: rolling window of the last few lines only.
         if message.streaming && body.len() > THINKING_STREAM_TAIL_LINES {
-            body = body
-                [body.len() - THINKING_STREAM_TAIL_LINES..]
-                .to_vec();
+            body = body[body.len() - THINKING_STREAM_TAIL_LINES..].to_vec();
         }
         let last = body.len().saturating_sub(1);
         if body.is_empty() {
@@ -983,10 +1169,7 @@ fn render_system(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
 ///     └ boom
 /// ```
 fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'static>> {
-    let name = message
-        .tool_name
-        .clone()
-        .unwrap_or_else(|| "tool".into());
+    let name = message.tool_name.clone().unwrap_or_else(|| "tool".into());
     let detail = message.content.trim();
     let status = message.tool_status.unwrap_or(ToolStatus::Done);
 
@@ -1012,9 +1195,7 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
     };
 
     let name_w = display_width(&name).max(4).min(10);
-    let budget = wrap_width
-        .saturating_sub(4 + name_w + 2)
-        .max(8);
+    let budget = wrap_width.saturating_sub(4 + name_w + 2).max(8);
     let pretty = if detail.is_empty() {
         String::new()
     } else {
@@ -1033,9 +1214,10 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
     }
     lines.push(Line::from(spans));
 
-    let show_summary = message.tool_summary.as_ref().is_some_and(|_s| {
-        !message.tool_expanded || message.tool_output.is_none()
-    });
+    let show_summary = message
+        .tool_summary
+        .as_ref()
+        .is_some_and(|_s| !message.tool_expanded || message.tool_output.is_none());
     if show_summary {
         if let Some(summary) = message.tool_summary.as_deref() {
             let sum_style = if status == ToolStatus::Error {
@@ -1107,10 +1289,7 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
                 }
             }
             if total_raw > max_lines {
-                visual.push((
-                    format!("… +{} lines", total_raw - max_lines),
-                    Theme::meta(),
-                ));
+                visual.push((format!("… +{} lines", total_raw - max_lines), Theme::meta()));
             }
 
             let last = visual.len().saturating_sub(1);
@@ -1334,7 +1513,7 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let placeholder = if app.busy {
         "steer or follow-up…"
     } else {
-        "Message…  ^J newline  / commands"
+        "Message…  / commands  ^J newline  Ctrl+L model  Ctrl+G settings"
     };
 
     const INDENT: &str = "  ";
@@ -1456,9 +1635,7 @@ mod tests {
         let mut app = App::new("test");
         app.input = "hello-world".into();
 
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let buffer = terminal.backend().buffer();
         let flat: String = buffer
@@ -1486,9 +1663,7 @@ mod tests {
         app.push_assistant(&body);
         app.follow_bottom = true;
 
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let buffer = terminal.backend().buffer();
         let flat: String = buffer
@@ -1521,9 +1696,7 @@ mod tests {
         app.push_user("latest-user");
         app.push_assistant(&body);
 
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let bottom: String = terminal
             .backend()
             .buffer()
@@ -1538,9 +1711,7 @@ mod tests {
 
         // Scroll all the way to the top of the transcript.
         app.scroll_to_top();
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let top: String = terminal
             .backend()
             .buffer()
@@ -1561,9 +1732,7 @@ mod tests {
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("test");
 
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let buffer = terminal.backend().buffer();
         let flat: String = buffer
@@ -1586,9 +1755,7 @@ mod tests {
         app.set_agent_label("Build");
         app.set_current_model("mock", "mock-model");
 
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let flat: String = terminal
             .backend()
@@ -1612,9 +1779,7 @@ mod tests {
 
         // Once a message exists, welcome leaves the transcript.
         app.push_user("hello there unique-marker");
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
         let after: String = terminal
             .backend()
             .buffer()
@@ -1656,9 +1821,7 @@ mod tests {
             .push(crate::message::Message::streaming_thinking(body));
         app.cursor_on = true;
 
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let flat: String = terminal
             .backend()
@@ -1708,9 +1871,7 @@ mod tests {
             "## Specs\n\n| Field | Value |\n|-------|-------|\n| RAM   | 16 GB |\n| Disk  | 1 TB  |\n",
         );
 
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let flat: String = terminal
             .backend()
@@ -1721,8 +1882,14 @@ mod tests {
             .collect();
 
         assert!(flat.contains("Specs"), "heading: {flat}");
-        assert!(flat.contains("Field") && flat.contains("Value"), "header: {flat}");
-        assert!(flat.contains("RAM") && flat.contains("16 GB"), "body: {flat}");
+        assert!(
+            flat.contains("Field") && flat.contains("Value"),
+            "header: {flat}"
+        );
+        assert!(
+            flat.contains("RAM") && flat.contains("16 GB"),
+            "body: {flat}"
+        );
         assert!(
             flat.contains('┌') || flat.contains('│'),
             "table borders: {flat}"
@@ -1741,9 +1908,7 @@ mod tests {
             app.push_assistant(&format!("line-{i:02}"));
         }
 
-        terminal
-            .draw(|frame| draw(frame, &mut app))
-            .unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         let buf = terminal.backend().buffer();
         let w = buf.area.width as usize;
@@ -1763,7 +1928,10 @@ mod tests {
             meta_row.contains("deepseek-v4-flash"),
             "model on meta: {meta_row}"
         );
-        assert!(meta_row.contains("opencode"), "provider on meta: {meta_row}");
+        assert!(
+            meta_row.contains("opencode"),
+            "provider on meta: {meta_row}"
+        );
         assert!(
             !meta_row.contains("completions") && !meta_row.contains(" · "),
             "meta must not dump api/host or middle-dot soup: {meta_row}"
@@ -1793,10 +1961,7 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
         .constraints([Constraint::Min(8), Constraint::Length(12)])
         .split(area);
 
-    frame.render_widget(
-        Paragraph::new(Line::from(left)).style(Theme::bg()),
-        row[0],
-    );
+    frame.render_widget(Paragraph::new(Line::from(left)).style(Theme::bg()), row[0]);
     frame.render_widget(
         Paragraph::new(Line::from(right))
             .alignment(Alignment::Right)
@@ -1831,10 +1996,7 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         let pct = ((app.chat_scroll as f64 / max as f64) * 100.0).round() as u16;
         let mut left = vec![Span::raw("  ")];
         left.extend(pair("end", " latest"));
-        let right = vec![Span::styled(
-            format!("↑{pct}%  "),
-            Theme::status_faint(),
-        )];
+        let right = vec![Span::styled(format!("↑{pct}%  "), Theme::status_faint())];
         return (left, right);
     }
 

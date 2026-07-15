@@ -64,14 +64,47 @@ one --full-access
 
 交互：`/settings sandbox full-access` · `/settings add_dir /path/a,/path/b`
 
-### 交互审批
+### 交互审批（人在环）
 
-高危 bash（如 `sudo`、`rm -rf`、`git push`）或命中 `ask` 规则时：
+高危 bash（如 `sudo`、`rm -rf`、`git push`）或命中 `ask` 规则时，TUI 弹出 **列表式单选**（Codex 风格）：
+
+| # | 选项 | 语义 |
+|---|------|------|
+| 1 | Yes, and don't ask again for anything | 本进程剩余时间 always-approve（不写 disk） |
+| 2 | Yes, proceed | 仅本次 |
+| 3 | Yes, and don't ask again for this | 同 fingerprint 本进程免问 |
+| 4 | No, reject (type to add feedback) | 拒绝；可键入反馈给模型 |
+
+快捷键：`↑/↓` 或 `1–4` 移动 · `Enter` 确认 · `Ctrl+o` 直接 Always · `y`/`a`/`n` 兼容 · `Esc` 取消。
 
 | 模式 | 行为 |
 |------|------|
-| Interactive | 弹窗：`y` 一次 · `a` 本会话 · `n/Esc` 拒绝 |
+| Interactive | 上表列表选择 |
 | Print / JSON / RPC | 直接拒绝（除非 `-y` / `ONE_AUTO_APPROVE=1`） |
+
+### ask_user（澄清问题）
+
+模型可调用 `ask_user` 做结构化单选/多选（对齐 Claude `AskUserQuestion`）：
+
+```json
+{
+  "questions": [
+    {
+      "question": "Which test runner?",
+      "header": "Runner",
+      "options": [
+        { "label": "Jest", "description": "…" },
+        { "label": "Vitest", "description": "…" }
+      ],
+      "multi_select": false
+    }
+  ]
+}
+```
+
+- 1–4 题，每题 2–4 选项；`multi_select: true` 为多选（Space 勾选）。
+- 始终可走 **Other** 键入自由文本。
+- 仅 Interactive 可用；print/RPC 下 fail-closed。
 
 ### 细粒度规则
 
@@ -248,6 +281,44 @@ cargo run -p one-cli --features http-providers -- \
 - 字面量：`"sk-..."`
 - 环境变量：`"$OPENAI_API_KEY"` 或 `"${OPENAI_API_KEY}"`
 
+### 交互 UI 分层（对齐 Claude Code / Codex）
+
+| 层 | 打开方式 | 用途 |
+|----|----------|------|
+| **输入框上方 `/` 列表** | 输入 `/`（边打边筛） | slash 命令：session / plan / compact…；↑↓ 选、Enter 执行 |
+| **输入框上方 Select** | **Ctrl+L**、裸 `/model`；权限 / ask_user | 选模型等 |
+| **屏幕中间弹窗** | **Ctrl+G**、裸 `/settings` | Settings 层级配置 |
+
+Settings 层级（无独立 Models 入口；Add model **不离开** Settings）：
+
+```
+Settings
+├ General (thinking / sandbox / …)
+└ Providers
+   └ <provider>          ← connection + Models
+      └ Models
+         ├ + Add model   ← 表单：id* + name / context_window
+         └ <model>       ← name / context_window / 删除
+```
+
+模型字段（`base_url` / `api` 只在 **Provider** 层配置）：
+
+| 字段 | 必填 | 说明 |
+|------|------|------|
+| `id` | ✅ | 模型 id |
+| `name` | | 显示名（默认 = id） |
+| `context_window` | | 上下文窗口 token 数 |
+
+返回上一级：**Esc** / **←** / 空搜索时 **Backspace**。  
+切换当前会话模型仍用 **Ctrl+L**（输入框上方 select）。  
+配置写入 `~/.one/agent/models.json`（首次保存设 `includeDefaults: false`）。
+
+快捷键：
+
+- **Ctrl+L** — 切换 active model（输入框上方）
+- **Ctrl+G** — Settings 居中面板
+- **Esc / ←** — Settings 内返回上一级；根级关闭
+
 ### 常用环境变量
 
 | 变量 | 作用 |
@@ -281,7 +352,9 @@ cargo run -p one-cli --features http-providers -- --provider openai -m gpt-4o
 - `Ctrl+T`：展开/折叠全部 thinking 正文（**默认折叠**为 `▸ thinking · N chars`；流式输出时仍显示末 3 行 tail；点击或 ↵ 可单独展开/折叠一块）
 - `↑` / `↓` 或 `Ctrl+P` / `Ctrl+N`：切换之前提交过的提示词（**按项目持久化**，新 session / 重启进程仍可召回；来自 `~/.one/agent/sessions/--cwd--/prompt_history.jsonl`，首次会从历史 session 的用户消息播种）
 - `Esc`：输入非空时**立刻**清空草稿并记入 ↑ 历史；输入为空时再按一次 `Esc`（约 0.9s 内）打开 **当前 session** 的 rewind 菜单（conversation-only，不含代码 checkpoint）
-- `Ctrl+L`：模型选择器 · `/`：命令面板
+- `/`：输入框**上方**命令列表（边打边筛 · ↑↓ 选择 · Enter 执行；同 Claude Code）
+- `Ctrl+L`：模型 select（输入框上方）
+- `Ctrl+G`：Settings 居中面板
 - `PageUp` / `PageDown`：滚动对话记录
 - `q` / `Esc`：中止生成（运行中；`q` 仅在输入为空时）
 - `Esc`：关闭浮层
@@ -300,7 +373,8 @@ Slash 命令：
 | `/name <title>` | 设置 session 显示名（优先于首条消息预览） |
 | `/tree` / `/tree <id>` | 列出或切换分支 |
 | `/rewind` / `/rewind <id>` | 回退到某条用户提示并重新编辑（同 `Esc Esc`） |
-| `/model <provider>[:model]` | 切换 provider / 模型 |
+| `/model [provider[:model]]` | 切换模型；裸 `/model` 打开**输入框上方** select（同 **Ctrl+L**） |
+| `/settings [key value]` | 裸命令打开**居中 Settings**（同 **Ctrl+G**）；带参则写 settings.json |
 | `/thinking [off\|low\|medium\|high]` | 设置或循环 thinking |
 | `/plan` | 进入 Plan 模式（只读探索 + 写 plan 文件） |
 | `/act` / `/build` | 批准计划并切到 Build 模式开始实现 |

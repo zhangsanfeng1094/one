@@ -24,9 +24,13 @@ pub struct ModelEntry {
 #[derive(Debug, Clone, Default)]
 pub struct ProviderConfig {
     pub id: String,
+    pub provider_type: Option<String>,
     pub base_url: Option<String>,
     pub api: Option<OpenaiWireApi>,
+    /// Resolved API key (env refs expanded).
     pub api_key: Option<String>,
+    /// Original `apiKey` string from file (e.g. `$OPENAI_API_KEY`) for round-trip save.
+    pub api_key_raw: Option<String>,
     pub default_model: Option<String>,
 }
 
@@ -176,10 +180,30 @@ impl ModelRegistry {
         }
     }
 
+    /// Remove a single model. Returns `true` if something was removed.
+    pub fn remove(&mut self, provider: &str, id: &str) -> bool {
+        let before = self.models.len();
+        self.models
+            .retain(|m| !(m.provider == provider && m.id == id));
+        self.models.len() != before
+    }
+
+    /// Remove all models for a provider. Returns how many were removed.
+    pub fn remove_by_provider(&mut self, provider: &str) -> usize {
+        let before = self.models.len();
+        self.models.retain(|m| m.provider != provider);
+        before - self.models.len()
+    }
+
     pub fn list_by_provider(&self, provider: &str) -> Vec<&ModelEntry> {
         self.models
             .iter()
             .filter(|m| m.provider == provider)
             .collect()
+    }
+
+    /// Empty registry (no built-in defaults).
+    pub fn empty() -> Self {
+        Self { models: Vec::new() }
     }
 }

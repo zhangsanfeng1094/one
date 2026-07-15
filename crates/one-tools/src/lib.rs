@@ -1,3 +1,4 @@
+pub mod ask_user;
 pub mod bash;
 pub mod bash_kill;
 pub mod bash_output;
@@ -22,6 +23,7 @@ use std::sync::Arc;
 
 use one_core::tool::Tool;
 
+pub use ask_user::{AskUserHandler, AskUserTool, FailClosedAskUser};
 pub use bash::BashTool;
 pub use bash_kill::BashKillTool;
 pub use bash_output::BashOutputTool;
@@ -53,6 +55,8 @@ pub struct ToolBuildOptions {
     pub policy: PathPolicy,
     pub auto_approve: bool,
     pub registry: Arc<BackgroundTaskRegistry>,
+    /// Human-in-the-loop bridge for `ask_user` (fail-closed when None).
+    pub ask_user: Option<Arc<dyn AskUserHandler>>,
 }
 
 impl ToolBuildOptions {
@@ -61,6 +65,7 @@ impl ToolBuildOptions {
             policy: PathPolicy::workspace(cwd),
             auto_approve: true,
             registry: Arc::new(BackgroundTaskRegistry::new()),
+            ask_user: None,
         }
     }
 
@@ -76,6 +81,11 @@ impl ToolBuildOptions {
 
     pub fn with_registry(mut self, registry: Arc<BackgroundTaskRegistry>) -> Self {
         self.registry = registry;
+        self
+    }
+
+    pub fn with_ask_user(mut self, handler: Arc<dyn AskUserHandler>) -> Self {
+        self.ask_user = Some(handler);
         self
     }
 }
@@ -106,12 +116,18 @@ pub fn coding_tools_with_registry(
         policy: PathPolicy::workspace(cwd),
         auto_approve,
         registry,
+        ask_user: None,
     })
 }
 
 /// Build coding tools with an explicit path policy (workspace / full-access).
 pub fn coding_tools_with_options(opts: ToolBuildOptions) -> Vec<Arc<dyn Tool>> {
     let policy = opts.policy;
+    let ask_handler = opts
+        .ask_user
+        .clone()
+        .unwrap_or_else(|| Arc::new(FailClosedAskUser) as Arc<dyn AskUserHandler>);
+    #[allow(unused_mut)] // mut when `network` feature pushes extra tools
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadTool::with_policy(policy.clone())),
         Arc::new(WriteTool::with_policy(policy.clone())),
@@ -126,6 +142,7 @@ pub fn coding_tools_with_options(opts: ToolBuildOptions) -> Vec<Arc<dyn Tool>> {
         Arc::new(GrepTool::with_policy(policy.clone())),
         Arc::new(FindTool::with_policy(policy.clone())),
         Arc::new(LsTool::with_policy(policy)),
+        Arc::new(AskUserTool::new(ask_handler)),
     ];
     #[cfg(feature = "network")]
     {
@@ -140,11 +157,22 @@ pub fn read_only_tools(cwd: std::path::PathBuf) -> Vec<Arc<dyn Tool>> {
 }
 
 pub fn read_only_tools_with_policy(policy: PathPolicy) -> Vec<Arc<dyn Tool>> {
+    read_only_tools_with_ask(policy, None)
+}
+
+pub fn read_only_tools_with_ask(
+    policy: PathPolicy,
+    ask_user: Option<Arc<dyn AskUserHandler>>,
+) -> Vec<Arc<dyn Tool>> {
+    let ask_handler =
+        ask_user.unwrap_or_else(|| Arc::new(FailClosedAskUser) as Arc<dyn AskUserHandler>);
+    #[allow(unused_mut)] // mut when `network` feature pushes extra tools
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(ReadTool::with_policy(policy.clone())),
         Arc::new(GrepTool::with_policy(policy.clone())),
         Arc::new(FindTool::with_policy(policy.clone())),
         Arc::new(LsTool::with_policy(policy)),
+        Arc::new(AskUserTool::new(ask_handler)),
     ];
     #[cfg(feature = "network")]
     {

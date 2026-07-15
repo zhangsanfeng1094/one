@@ -4,7 +4,7 @@
 //! an optional UI channel for Ask verdicts.
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -39,14 +39,16 @@ pub struct ApprovalRequest {
     pub fingerprint: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalChoice {
+    /// Session-wide auto-approve for the rest of this process.
+    Always,
     /// Allow this single call.
     Once,
     /// Allow matching fingerprint for the rest of the process.
     Session,
-    /// Deny this call.
-    Deny,
+    /// Deny this call; optional feedback is returned to the model.
+    Deny { feedback: Option<String> },
 }
 
 struct Pending {
@@ -57,7 +59,9 @@ struct Pending {
 /// Shared gate installed on the agent.
 pub struct PermissionGate {
     rules: Vec<PermissionRule>,
-    mode: ApprovalMode,
+    mode: Mutex<ApprovalMode>,
+    /// Set by ApprovalChoice::Always for the rest of the process.
+    session_auto: AtomicBool,
     session_allows: Mutex<HashSet<String>>,
     pending: Mutex<Option<Pending>>,
 }
@@ -66,7 +70,8 @@ impl PermissionGate {
     pub fn new(rules: PermissionRules, mode: ApprovalMode) -> Arc<Self> {
         Arc::new(Self {
             rules: rules.compiled(),
-            mode,
+            mode: Mutex::new(mode),
+            session_auto: AtomicBool::new(matches!(mode, ApprovalMode::Auto)),
             session_allows: Mutex::new(HashSet::new()),
             pending: Mutex::new(None),
         })
@@ -84,7 +89,18 @@ impl PermissionGate {
     }
 
     pub fn mode(&self) -> ApprovalMode {
-        self.mode
+        *self.mode.lock().expect("mode lock")
+    }
+
+    /// True when Always-approve was chosen (or started in Auto).
+    pub fn session_auto(&self) -> bool {
+        self.session_auto.load(Ordering::Relaxed)
+    }
+
+    /// Enable process-wide auto-approve (permission option 1 / Ctrl+O).
+    pub fn enable_session_auto(&self) {
+        self.session_auto.store(true, Ordering::Relaxed);
+        *self.mode.lock().expect("mode lock") = ApprovalMode::Auto;
     }
 
     /// Non-blocking poll for a pending interactive approval (TUI).
@@ -100,11 +116,17 @@ impl PermissionGate {
     pub fn respond(&self, choice: ApprovalChoice) -> bool {
         let mut g = self.pending.lock().expect("pending lock");
         if let Some(pending) = g.take() {
-            if matches!(choice, ApprovalChoice::Session) {
-                self.session_allows
-                    .lock()
-                    .expect("session allows")
-                    .insert(pending.request.fingerprint.clone());
+            match &choice {
+                ApprovalChoice::Session => {
+                    self.session_allows
+                        .lock()
+                        .expect("session allows")
+                        .insert(pending.request.fingerprint.clone());
+                }
+                ApprovalChoice::Always => {
+                    self.enable_session_auto();
+                }
+                _ => {}
             }
             let _ = pending.tx.send(choice);
             true
@@ -116,7 +138,7 @@ impl PermissionGate {
     /// Abort any waiter (force-quit / turn cancel).
     pub fn cancel_pending(&self) {
         if let Some(pending) = self.pending.lock().expect("pending lock").take() {
-            let _ = pending.tx.send(ApprovalChoice::Deny);
+            let _ = pending.tx.send(ApprovalChoice::Deny { feedback: None });
         }
     }
 }
@@ -124,6 +146,11 @@ impl PermissionGate {
 #[async_trait]
 impl ToolGate for PermissionGate {
     async fn check(&self, call: &ToolCall) -> ToolGateDecision {
+        // ask_user is itself a HITL tool — never double-prompt via permission UI.
+        if call.name == "ask_user" {
+            return ToolGateDecision::Allow;
+        }
+
         let fp = call_fingerprint(call);
         if self
             .session_allows
@@ -141,7 +168,8 @@ impl ToolGate for PermissionGate {
             .as_deref()
             == Some("1");
 
-        let auto = env_auto || matches!(self.mode, ApprovalMode::Auto);
+        let mode = self.mode();
+        let auto = env_auto || self.session_auto() || matches!(mode, ApprovalMode::Auto);
         match evaluate_permissions(call, &self.rules, auto) {
             PermissionVerdict::Allow => ToolGateDecision::Allow,
             PermissionVerdict::Deny { reason } => ToolGateDecision::Deny { message: reason },
@@ -149,7 +177,7 @@ impl ToolGate for PermissionGate {
                 if auto {
                     return ToolGateDecision::Allow;
                 }
-                match self.mode {
+                match mode {
                     ApprovalMode::Auto => ToolGateDecision::Allow,
                     ApprovalMode::FailClosed => ToolGateDecision::Deny {
                         message: format!(
@@ -181,10 +209,20 @@ impl ToolGate for PermissionGate {
                             });
                         }
                         match rx.await {
-                            Ok(ApprovalChoice::Once) | Ok(ApprovalChoice::Session) => {
-                                ToolGateDecision::Allow
+                            Ok(ApprovalChoice::Once)
+                            | Ok(ApprovalChoice::Session)
+                            | Ok(ApprovalChoice::Always) => ToolGateDecision::Allow,
+                            Ok(ApprovalChoice::Deny { feedback }) => {
+                                let msg = match feedback {
+                                    Some(fb) if !fb.trim().is_empty() => format!(
+                                        "user denied tool `{}` ({reason}): {fb}",
+                                        call.name
+                                    ),
+                                    _ => format!("user denied tool `{}` ({reason})", call.name),
+                                };
+                                ToolGateDecision::Deny { message: msg }
                             }
-                            Ok(ApprovalChoice::Deny) | Err(_) => ToolGateDecision::Deny {
+                            Err(_) => ToolGateDecision::Deny {
                                 message: format!(
                                     "user denied tool `{}` ({reason})",
                                     call.name
@@ -242,5 +280,82 @@ mod tests {
             })
             .await;
         assert!(matches!(decision, ToolGateDecision::Deny { .. }));
+    }
+
+    #[tokio::test]
+    async fn always_enables_session_auto() {
+        let gate = PermissionGate::with_auto_approve(PermissionRules::default(), false, true);
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "sudo id" }),
+            })
+            .await
+        });
+        // Wait until pending is set.
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.respond(ApprovalChoice::Always));
+        let d = handle.await.unwrap();
+        assert_eq!(d, ToolGateDecision::Allow);
+        assert!(gate.session_auto());
+        // Next ask should auto-allow without pending.
+        let d2 = gate
+            .check(&ToolCall {
+                id: "2".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "sudo whoami" }),
+            })
+            .await;
+        assert_eq!(d2, ToolGateDecision::Allow);
+        assert!(gate.poll_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn deny_with_feedback_message() {
+        let gate = PermissionGate::with_auto_approve(PermissionRules::default(), false, true);
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "sudo id" }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.respond(ApprovalChoice::Deny {
+            feedback: Some("use a safer command".into()),
+        }));
+        match handle.await.unwrap() {
+            ToolGateDecision::Deny { message } => {
+                assert!(message.contains("use a safer command"), "{message}");
+            }
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ask_user_tool_always_allowed() {
+        let gate = PermissionGate::with_auto_approve(PermissionRules::default(), false, false);
+        let d = gate
+            .check(&ToolCall {
+                id: "1".into(),
+                name: "ask_user".into(),
+                arguments: json!({ "questions": [] }),
+            })
+            .await;
+        assert_eq!(d, ToolGateDecision::Allow);
     }
 }

@@ -22,6 +22,7 @@ pub mod error;
 pub mod float;
 pub mod markdown;
 pub mod message;
+pub mod select;
 pub mod slash;
 pub mod terminal;
 pub mod theme;
@@ -29,12 +30,13 @@ pub mod tool_view;
 pub mod ui;
 
 pub use app::{
-    expand_at_files, App, ApprovalAnswer, ApprovalPrompt, InteractiveApp, PendingImage,
-    PendingText, RunOutcome, Toast,
+    expand_at_files, App, ApprovalAnswer, ApprovalPrompt, ConfigOp, InteractiveApp, PendingImage,
+    PendingText, RunOutcome, SelectKind, Toast,
 };
 pub use error::Result;
 pub use float::{FloatItem, FloatKind, FloatMenu, FloatSection};
 pub use message::{AlertLevel, Message, MessageRole, ToolStatus};
+pub use select::{SelectMode, SelectOption, SelectPhase, SelectPrompt, SelectResult};
 pub use slash::{ModelChoice, PopupKind, PopupRow, SlashCommand, SLASH_COMMANDS};
 pub use terminal::{ForceQuit, TerminalSession};
 

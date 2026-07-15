@@ -18,13 +18,14 @@ use one_resources::ResourceLoader;
 use one_session::{agent_dir, SessionInfo, SessionManager};
 use one_tools::{
     coding_tools_with_options, plan_mode_system_overlay, plan_mode_tools_with_policy,
-    read_only_tools_with_policy, BackgroundTaskRegistry, OsSandbox, PathPolicy, PermissionRules,
-    PlanExitState, SandboxMode, ToolBuildOptions,
+    read_only_tools_with_ask, AskUserHandler, BackgroundTaskRegistry, OsSandbox, PathPolicy,
+    PermissionRules, PlanExitState, SandboxMode, ToolBuildOptions,
 };
 use uuid::Uuid;
 
 use crate::approval::PermissionGate;
 use crate::cli::{Cli, RunMode};
+use crate::hitl::{HitlChannel, InteractiveAskUser};
 
 /// Agent operating mode (Build/Act vs Plan).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -87,6 +88,9 @@ pub struct AppRuntime {
     base_system_prompt: String,
     /// Shared permission gate (interactive ask / fail-closed / auto).
     pub permission_gate: Arc<PermissionGate>,
+    /// Human-in-the-loop channel for `ask_user` select prompts.
+    pub hitl: HitlChannel,
+    ask_user_handler: Arc<dyn AskUserHandler>,
 }
 
 impl AppRuntime {
@@ -125,6 +129,10 @@ impl AppRuntime {
         let permission_gate =
             PermissionGate::with_auto_approve(perm_rules, auto_approve, interactive);
 
+        let hitl = HitlChannel::new(interactive);
+        let ask_user_handler: Arc<dyn AskUserHandler> =
+            Arc::new(InteractiveAskUser::new(hitl.clone()));
+
         let start_plan = cli.plan && !cli.read_only;
         let plan_path = if start_plan {
             Some(new_plan_path())
@@ -139,18 +147,20 @@ impl AppRuntime {
 
         let mut tools: Vec<Arc<dyn Tool>> = if cli.read_only {
             // No bash / background tools in read-only mode.
-            read_only_tools_with_policy(path_policy.clone())
+            read_only_tools_with_ask(path_policy.clone(), Some(ask_user_handler.clone()))
         } else if start_plan {
             plan_mode_tools_with_policy(
                 path_policy.clone(),
                 plan_path.clone().expect("plan path"),
                 plan_exit.clone(),
+                Some(ask_user_handler.clone()),
             )
         } else {
             coding_tools_with_options(ToolBuildOptions {
                 policy: path_policy.clone(),
                 auto_approve,
                 registry: bg_registry.clone(),
+                ask_user: Some(ask_user_handler.clone()),
             })
         };
         // Extension tools only in Act mode (may include write-capable tools).
@@ -261,6 +271,8 @@ impl AppRuntime {
             bg_registry,
             base_system_prompt,
             permission_gate,
+            hitl,
+            ask_user_handler,
         };
 
         // Restore plan path + mode from session custom entry if present.
@@ -336,6 +348,7 @@ impl AppRuntime {
             self.path_policy.clone(),
             path.clone(),
             self.plan_exit.clone(),
+            Some(self.ask_user_handler.clone()),
         );
         // Keep extension tools out of plan mode (may be write-capable).
         let _ = &mut tools;
@@ -408,12 +421,16 @@ impl AppRuntime {
             .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
 
         let mut tools: Vec<Arc<dyn Tool>> = if self.read_only {
-            read_only_tools_with_policy(self.path_policy.clone())
+            read_only_tools_with_ask(
+                self.path_policy.clone(),
+                Some(self.ask_user_handler.clone()),
+            )
         } else {
             coding_tools_with_options(ToolBuildOptions {
                 policy: self.path_policy.clone(),
                 auto_approve: self.auto_approve,
                 registry: self.bg_registry.clone(),
+                ask_user: Some(self.ask_user_handler.clone()),
             })
         };
         tools.extend(self.extensions.tools());
@@ -723,6 +740,7 @@ impl AppRuntime {
                     self.path_policy.clone(),
                     path.clone(),
                     self.plan_exit.clone(),
+                    Some(self.ask_user_handler.clone()),
                 );
                 let mut agent = self.agent.lock().await;
                 agent.set_tools(tools);
