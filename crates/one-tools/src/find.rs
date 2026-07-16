@@ -66,6 +66,7 @@ impl Tool for FindTool {
         }
         matches.sort();
 
-        Ok(ToolOutput::text(matches.join("\n")))
+        let joined = matches.join("\n");
+        Ok(ToolOutput::text(crate::truncate::apply_head_default(&joined)))
     }
 }

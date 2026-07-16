@@ -29,6 +29,7 @@ use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 
+use crate::compat::CompatConfig;
 use crate::openai::OpenaiWireApi;
 use crate::registry::{ModelEntry, ModelRegistry, ProviderConfig};
 
@@ -87,6 +88,9 @@ struct ProviderFileEntry {
         skip_serializing_if = "Option::is_none"
     )]
     api_key: Option<String>,
+    /// Provider-level Pi `compat` defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compat: Option<CompatConfig>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     models: Vec<ProviderModelEntry>,
 }
@@ -108,6 +112,20 @@ struct ProviderModelEntry {
         skip_serializing_if = "Option::is_none"
     )]
     base_url: Option<String>,
+    /// Whether the model supports extended thinking (Pi `reasoning`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reasoning: Option<bool>,
+    /// Pi `thinkingLevelMap`.
+    #[serde(
+        default,
+        rename = "thinkingLevelMap",
+        alias = "thinking_level_map",
+        skip_serializing_if = "Option::is_none"
+    )]
+    thinking_level_map: Option<crate::compat::ThinkingLevelMap>,
+    /// Per-model `compat` overrides (merged over provider-level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    compat: Option<CompatConfig>,
 }
 
 /// On-disk snapshot written by CRUD.
@@ -231,10 +249,18 @@ pub fn try_load_models_file(path: &Path) -> Result<ModelsConfig, String> {
         let provider_base = entry.base_url.clone();
         let api_key_raw = entry.api_key.clone();
         let api_key = api_key_raw.as_deref().map(resolve_secret);
+        let provider_compat = entry.compat.clone();
 
         for m in &entry.models {
             let api = m.api.clone().or_else(|| provider_api.clone());
             let base_url = m.base_url.clone().or_else(|| provider_base.clone());
+            // Model compat is stored raw; merge with provider happens at resolve time.
+            let compat = match (&provider_compat, &m.compat) {
+                (Some(p), Some(m)) => Some(p.merge_override(m)),
+                (Some(p), None) => Some(p.clone()),
+                (None, Some(m)) => Some(m.clone()),
+                (None, None) => None,
+            };
             registry.add(ModelEntry {
                 provider: id.clone(),
                 name: m.name.clone().unwrap_or_else(|| m.id.clone()),
@@ -243,18 +269,30 @@ pub fn try_load_models_file(path: &Path) -> Result<ModelsConfig, String> {
                 api,
                 base_url,
                 api_key: None, // key lives on provider
+                reasoning: m.reasoning,
+                thinking_level_map: m.thinking_level_map.clone(),
+                compat,
             });
         }
 
         let default_model = entry.models.first().map(|m| m.id.clone());
+        // Prefer explicit `api`; fall back to `providerType` (same fixed protocol set).
+        let api = provider_api
+            .as_deref()
+            .and_then(OpenaiWireApi::parse)
+            .or_else(|| entry.provider_type.as_deref().and_then(OpenaiWireApi::parse));
+        let provider_type = api
+            .map(|a| a.as_str().to_string())
+            .or(entry.provider_type);
         providers.push(ProviderConfig {
             id: id.clone(),
-            provider_type: entry.provider_type,
+            provider_type,
             base_url: provider_base,
-            api: provider_api.as_deref().and_then(OpenaiWireApi::parse),
+            api,
             api_key,
             api_key_raw,
             default_model,
+            compat: provider_compat,
         });
     }
 
@@ -270,6 +308,9 @@ pub fn try_load_models_file(path: &Path) -> Result<ModelsConfig, String> {
             api: entry.api.clone(),
             base_url: entry.base_url.clone(),
             api_key: api_key_raw.as_deref().map(resolve_secret),
+            reasoning: None,
+            thinking_level_map: None,
+            compat: None,
         });
 
         // Ensure a provider config exists for flat entries that carry baseUrl.
@@ -283,6 +324,7 @@ pub fn try_load_models_file(path: &Path) -> Result<ModelsConfig, String> {
                     api_key: api_key_raw.as_deref().map(resolve_secret),
                     api_key_raw,
                     default_model: Some(id),
+                    compat: None,
                 });
             }
         }
@@ -323,6 +365,7 @@ fn build_file_out(cfg: &ModelsConfig) -> ModelsFileOut {
                 base_url: p.base_url.clone(),
                 api: p.api.map(|a| a.as_str().to_string()),
                 api_key: serialize_api_key(p),
+                compat: p.compat.clone().filter(|c| !c.is_empty()),
                 models: Vec::new(),
             },
         );
@@ -338,6 +381,7 @@ fn build_file_out(cfg: &ModelsConfig) -> ModelsFileOut {
                 base_url: None,
                 api: None,
                 api_key: None,
+                compat: None,
                 models: Vec::new(),
             });
         if entry.base_url.is_none() {
@@ -375,12 +419,28 @@ fn build_file_out(cfg: &ModelsConfig) -> ModelsFileOut {
             Some(m.name.clone())
         };
 
+        // Prefer model-only delta when provider already has the same base compat.
+        // For simplicity, write the stored merged model compat when present and
+        // distinct from provider-level (full blob is fine for round-trip).
+        let model_compat = m.compat.clone().filter(|c| {
+            if c.is_empty() {
+                return false;
+            }
+            match &entry.compat {
+                Some(pc) if pc == c => false,
+                _ => true,
+            }
+        });
+
         entry.models.push(ProviderModelEntry {
             id: m.id.clone(),
             name,
             context_window: m.context_window,
             api: model_api,
             base_url: model_base,
+            reasoning: m.reasoning,
+            thinking_level_map: m.thinking_level_map.clone().filter(|map| !map.is_empty()),
+            compat: model_compat,
         });
     }
 
@@ -515,6 +575,58 @@ mod tests {
     }
 
     #[test]
+    fn load_compat_merge_provider_and_model() {
+        let dir = tempfile_dir("compat");
+        let path = dir.join("models.json");
+        let mut f = std::fs::File::create(&path).unwrap();
+        write!(
+            f,
+            r#"{{
+              "includeDefaults": false,
+              "providers": {{
+                "ollama": {{
+                  "baseUrl": "http://127.0.0.1:11434/v1",
+                  "api": "openai-completions",
+                  "apiKey": "ollama",
+                  "compat": {{
+                    "supportsDeveloperRole": false,
+                    "supportsReasoningEffort": false
+                  }},
+                  "models": [
+                    {{
+                      "id": "gpt-oss:20b",
+                      "reasoning": true,
+                      "compat": {{
+                        "thinkingFormat": "openai",
+                        "supportsReasoningEffort": true
+                      }}
+                    }}
+                  ]
+                }}
+              }}
+            }}"#
+        )
+        .unwrap();
+
+        let cfg = try_load_models_file(&path).unwrap();
+        let m = cfg.find_model("ollama", "gpt-oss:20b").unwrap();
+        assert_eq!(m.reasoning, Some(true));
+        let c = m.compat.as_ref().expect("merged compat");
+        assert_eq!(c.openai.supports_developer_role, Some(false));
+        // Model override wins for reasoning effort.
+        assert_eq!(c.openai.supports_reasoning_effort, Some(true));
+        assert_eq!(
+            c.openai.thinking_format,
+            Some(crate::compat::ThinkingFormat::Openai)
+        );
+
+        let resolved = c.openai.resolve("ollama", "http://127.0.0.1:11434/v1", "gpt-oss:20b");
+        assert!(!resolved.supports_developer_role);
+        assert!(resolved.supports_reasoning_effort);
+        assert_eq!(resolved.thinking_format, crate::compat::ThinkingFormat::Openai);
+    }
+
+    #[test]
     fn load_pi_style_providers() {
         let dir = tempfile_dir("pi");
         let path = dir.join("models.json");
@@ -567,15 +679,21 @@ mod tests {
         .unwrap();
 
         let cfg = try_load_models_file(&path).unwrap();
+        // Alias normalizes to canonical protocol id.
         assert_eq!(
             cfg.provider("proxy")
                 .and_then(|p| p.provider_type.as_deref()),
-            Some("openai-compatible")
+            Some("openai-completions")
+        );
+        assert_eq!(
+            cfg.provider("proxy").and_then(|p| p.api),
+            Some(OpenaiWireApi::OpenaiCompletions)
         );
 
         save_models_file(&path, &cfg).unwrap();
         let saved = std::fs::read_to_string(&path).unwrap();
-        assert!(saved.contains("\"providerType\": \"openai-compatible\""));
+        assert!(saved.contains("\"providerType\": \"openai-completions\""));
+        assert!(saved.contains("\"api\": \"openai-completions\""));
     }
 
     #[test]
@@ -594,6 +712,9 @@ mod tests {
             api: Some("openai-completions".into()),
             base_url: Some("https://x/v1".into()),
             api_key: None,
+            reasoning: None,
+            thinking_level_map: None,
+            compat: None,
         });
         if let Some(p) = cfg.provider_mut("myproxy") {
             p.api_key = Some("sk-test".into());

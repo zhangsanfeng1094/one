@@ -1,71 +1,155 @@
-//! OpenAI provider with selectable wire API (Pi-style).
+//! LLM wire protocols + OpenAI HTTP provider (Pi-style `api` field).
 //!
-//! - [`OpenaiWireApi::Completions`] → `POST /v1/chat/completions`
-//! - [`OpenaiWireApi::Responses`]   → `POST /v1/responses`  (default for official OpenAI)
+//! - [`ProviderApi::OpenaiCompletions`] → `POST {base}/chat/completions`
+//! - [`ProviderApi::OpenaiResponses`]   → `POST {base}/responses`
+//! - [`ProviderApi::AnthropicMessages`] → `POST {base}/v1/messages`
+//! - [`ProviderApi::GeminiGenerateContent`] → `POST {base}/models/{model}:generateContent`
 //!
-//! Configured via constructor / CLI `--openai-api` / `models.json` `api` field.
+//! Configured via constructor / CLI `--openai-api` / `models.json` `api` / `providerType`.
 
 use serde::{Deserialize, Serialize};
 
-/// Which OpenAI-compatible HTTP API to call.
+/// Wire protocol that drives request/response encoding for a provider.
 ///
-/// Mirrors Pi's `api` field: `openai-completions` | `openai-responses`.
+/// Stored in `models.json` as `api` (and optionally mirrored as `providerType`).
+/// Users pick one of these fixed values — never free-form strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
-pub enum OpenaiWireApi {
-    /// Chat Completions — most compatible (Ollama, OpenRouter, proxies).
-    #[serde(alias = "openai-completions", alias = "chat-completions", alias = "completions")]
-    Completions,
-    /// Responses API — default for first-party OpenAI models (Pi default).
+pub enum ProviderApi {
+    /// OpenAI Chat Completions — widest compatibility (Ollama, OpenRouter, DeepSeek, proxies).
+    #[serde(
+        rename = "openai-completions",
+        alias = "openai-compatible",
+        alias = "chat-completions",
+        alias = "completions"
+    )]
+    OpenaiCompletions,
+    /// OpenAI Responses API — default for first-party OpenAI (Pi default).
     #[default]
-    #[serde(alias = "openai-responses", alias = "responses")]
-    Responses,
+    #[serde(rename = "openai-responses", alias = "responses")]
+    OpenaiResponses,
+    /// Anthropic Messages API (`/v1/messages`).
+    #[serde(rename = "anthropic-messages", alias = "anthropic", alias = "messages")]
+    AnthropicMessages,
+    /// Google Gemini native `generateContent` / `streamGenerateContent`.
+    #[serde(
+        rename = "gemini-generate-content",
+        alias = "gemini",
+        alias = "google-gemini",
+        alias = "generate-content",
+        alias = "generateContent"
+    )]
+    GeminiGenerateContent,
 }
 
-impl OpenaiWireApi {
+/// Backward-compatible alias used across the crate.
+pub type OpenaiWireApi = ProviderApi;
+
+impl ProviderApi {
+    pub const ALL: &'static [Self] = &[
+        Self::OpenaiCompletions,
+        Self::OpenaiResponses,
+        Self::AnthropicMessages,
+        Self::GeminiGenerateContent,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Completions => "openai-completions",
-            Self::Responses => "openai-responses",
+            Self::OpenaiCompletions => "openai-completions",
+            Self::OpenaiResponses => "openai-responses",
+            Self::AnthropicMessages => "anthropic-messages",
+            Self::GeminiGenerateContent => "gemini-generate-content",
+        }
+    }
+
+    /// Short human label for pickers.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::OpenaiCompletions => "OpenAI Chat Completions (compatible)",
+            Self::OpenaiResponses => "OpenAI Responses API",
+            Self::AnthropicMessages => "Anthropic Messages API",
+            Self::GeminiGenerateContent => "Gemini generateContent (native)",
         }
     }
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "openai-completions" | "chat-completions" | "completions" | "chat" => {
-                Some(Self::Completions)
-            }
-            "openai-responses" | "responses" | "response" => Some(Self::Responses),
+            "openai-completions"
+            | "openai-compatible"
+            | "chat-completions"
+            | "completions"
+            | "chat" => Some(Self::OpenaiCompletions),
+            "openai-responses" | "responses" | "response" => Some(Self::OpenaiResponses),
+            "anthropic-messages" | "anthropic" | "messages" => Some(Self::AnthropicMessages),
+            "gemini-generate-content"
+            | "gemini"
+            | "google-gemini"
+            | "generate-content"
+            | "generatecontent" => Some(Self::GeminiGenerateContent),
             _ => None,
         }
     }
+
+    /// Whether this protocol is handled by the OpenAI HTTP client.
+    pub fn is_openai_wire(self) -> bool {
+        matches!(self, Self::OpenaiCompletions | Self::OpenaiResponses)
+    }
 }
 
-impl std::fmt::Display for OpenaiWireApi {
+impl std::fmt::Display for ProviderApi {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(self.as_str())
     }
 }
 
+impl ProviderApi {
+    /// Alias for [`Self::OpenaiCompletions`] (legacy name used in call sites).
+    #[allow(non_upper_case_globals)]
+    pub const Completions: Self = Self::OpenaiCompletions;
+    /// Alias for [`Self::OpenaiResponses`] (legacy name used in call sites).
+    #[allow(non_upper_case_globals)]
+    pub const Responses: Self = Self::OpenaiResponses;
+}
+
 #[cfg(test)]
 mod wire_api_tests {
-    use super::OpenaiWireApi;
+    use super::ProviderApi;
 
     #[test]
     fn parse_aliases() {
         assert_eq!(
-            OpenaiWireApi::parse("openai-responses"),
-            Some(OpenaiWireApi::Responses)
+            ProviderApi::parse("openai-responses"),
+            Some(ProviderApi::OpenaiResponses)
         );
         assert_eq!(
-            OpenaiWireApi::parse("completions"),
-            Some(OpenaiWireApi::Completions)
+            ProviderApi::parse("completions"),
+            Some(ProviderApi::OpenaiCompletions)
         );
         assert_eq!(
-            OpenaiWireApi::parse("chat-completions"),
-            Some(OpenaiWireApi::Completions)
+            ProviderApi::parse("openai-compatible"),
+            Some(ProviderApi::OpenaiCompletions)
         );
-        assert_eq!(OpenaiWireApi::parse("nope"), None);
+        assert_eq!(
+            ProviderApi::parse("chat-completions"),
+            Some(ProviderApi::OpenaiCompletions)
+        );
+        assert_eq!(
+            ProviderApi::parse("anthropic-messages"),
+            Some(ProviderApi::AnthropicMessages)
+        );
+        assert_eq!(
+            ProviderApi::parse("anthropic"),
+            Some(ProviderApi::AnthropicMessages)
+        );
+        assert_eq!(
+            ProviderApi::parse("gemini-generate-content"),
+            Some(ProviderApi::GeminiGenerateContent)
+        );
+        assert_eq!(
+            ProviderApi::parse("gemini"),
+            Some(ProviderApi::GeminiGenerateContent)
+        );
+        assert_eq!(ProviderApi::parse("nope"), None);
     }
 }
 
@@ -92,10 +176,18 @@ mod inner {
         api_key: String,
         model: String,
         base_url: String,
+        /// Provider id used for compat auto-detect (`openai`, `ollama`, …).
+        provider_id: String,
         /// Chat Completions vs Responses (configurable).
         wire_api: OpenaiWireApi,
-        /// How to encode thinking level on chat/completions bodies.
+        /// How to encode thinking level on chat/completions bodies (legacy bridge).
         thinking_wire: crate::thinking::ThinkingWire,
+        /// Pi-style resolved `compat` for chat/completions.
+        compat: crate::compat::ResolvedOpenAiCompat,
+        /// Whether this model supports extended reasoning (Pi `reasoning`).
+        reasoning_model: bool,
+        /// Sticky session id for providers that honor affinity headers.
+        session_id: String,
     }
 
     impl OpenAiProvider {
@@ -120,11 +212,20 @@ mod inner {
             model: impl Into<String>,
             base_url: impl Into<String>,
         ) -> Self {
+            let model = model.into();
+            let base_url = base_url.into();
+            let provider_id = "openai".to_string();
+            let compat = crate::compat::OpenAiCompletionsCompat::default().resolve(
+                &provider_id,
+                &base_url,
+                &model,
+            );
             Self {
                 client: Client::new(),
                 api_key: api_key.into(),
-                model: model.into(),
-                base_url: base_url.into(),
+                model,
+                base_url,
+                provider_id,
                 // Compatible endpoints (OpenRouter / Ollama) use Completions by default
                 // when constructed via with_base; first-party from_env uses Responses.
                 wire_api: OpenaiWireApi::Completions,
@@ -132,7 +233,28 @@ mod inner {
                 // OpenRouter overrides to ThinkingWire::OpenRouter; callers can set Auto
                 // for dual-shape proxies.
                 thinking_wire: crate::thinking::ThinkingWire::ReasoningEffort,
+                compat,
+                reasoning_model: false,
+                session_id: crate::cache::new_session_affinity_id(),
             }
+        }
+
+        fn apply_request_headers(
+            &self,
+            req: reqwest::RequestBuilder,
+        ) -> reqwest::RequestBuilder {
+            let mut req = req.bearer_auth(&self.api_key);
+            if self.compat.send_session_affinity_headers {
+                use crate::compat::SessionAffinityFormat;
+                let header = match self.compat.session_affinity_format.unwrap_or_default() {
+                    SessionAffinityFormat::Openrouter => "x-session-id",
+                    SessionAffinityFormat::Openai | SessionAffinityFormat::OpenaiNosession => {
+                        "x-session-affinity"
+                    }
+                };
+                req = req.header(header, &self.session_id);
+            }
+            req
         }
 
         pub fn with_wire_api(mut self, wire_api: OpenaiWireApi) -> Self {
@@ -142,6 +264,41 @@ mod inner {
 
         pub fn with_thinking_wire(mut self, thinking_wire: crate::thinking::ThinkingWire) -> Self {
             self.thinking_wire = thinking_wire;
+            // Bridge legacy ThinkingWire into compat.thinking_format when set.
+            use crate::compat::ThinkingFormat;
+            use crate::thinking::ThinkingWire;
+            match thinking_wire {
+                ThinkingWire::OpenRouter => {
+                    self.compat.thinking_format = ThinkingFormat::Openrouter;
+                }
+                ThinkingWire::ReasoningEffort => {
+                    self.compat.thinking_format = ThinkingFormat::Openai;
+                }
+                ThinkingWire::Off => {
+                    self.compat.supports_reasoning_effort = false;
+                }
+                ThinkingWire::Auto => {
+                    // Keep detect / explicit format; Auto is dual-shape at apply time.
+                }
+            }
+            self
+        }
+
+        /// Set provider id used for logging / detect refresh.
+        pub fn with_provider_id(mut self, provider_id: impl Into<String>) -> Self {
+            self.provider_id = provider_id.into();
+            self
+        }
+
+        /// Apply fully resolved Pi `compat` (from models.json + detect).
+        pub fn with_compat(mut self, compat: crate::compat::ResolvedOpenAiCompat) -> Self {
+            self.compat = compat;
+            self
+        }
+
+        /// Whether the model supports extended thinking (gates developer role, etc.).
+        pub fn with_reasoning_model(mut self, reasoning: bool) -> Self {
+            self.reasoning_model = reasoning;
             self
         }
 
@@ -151,6 +308,10 @@ mod inner {
 
         pub fn model(&self) -> &str {
             &self.model
+        }
+
+        pub fn compat(&self) -> &crate::compat::ResolvedOpenAiCompat {
+            &self.compat
         }
     }
 
@@ -166,11 +327,20 @@ mod inner {
 
         async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
             match self.wire_api {
-                OpenaiWireApi::Completions => {
+                OpenaiWireApi::OpenaiCompletions => {
                     self.complete_chat(request, false, &mut |_| {}, None).await
                 }
-                OpenaiWireApi::Responses => {
+                OpenaiWireApi::OpenaiResponses => {
                     self.complete_responses(request, false, &mut |_| {}, None).await
+                }
+                OpenaiWireApi::AnthropicMessages | OpenaiWireApi::GeminiGenerateContent => {
+                    Err(OneError::Provider(
+                        format!(
+                            "{} is not handled by OpenAiProvider (use the native provider)",
+                            self.wire_api.as_str()
+                        )
+                        .into(),
+                    ))
                 }
             }
         }
@@ -182,11 +352,20 @@ mod inner {
             abort: Option<&AtomicBool>,
         ) -> Result<CompletionResponse> {
             match self.wire_api {
-                OpenaiWireApi::Completions => {
+                OpenaiWireApi::OpenaiCompletions => {
                     self.complete_chat(request, true, on_event, abort).await
                 }
-                OpenaiWireApi::Responses => {
+                OpenaiWireApi::OpenaiResponses => {
                     self.complete_responses(request, true, on_event, abort).await
+                }
+                OpenaiWireApi::AnthropicMessages | OpenaiWireApi::GeminiGenerateContent => {
+                    Err(OneError::Provider(
+                        format!(
+                            "{} is not handled by OpenAiProvider (use the native provider)",
+                            self.wire_api.as_str()
+                        )
+                        .into(),
+                    ))
                 }
             }
         }
@@ -202,15 +381,33 @@ mod inner {
             on_event: &mut (dyn FnMut(StreamEvent) + Send),
             abort: Option<&AtomicBool>,
         ) -> Result<CompletionResponse> {
-            let body = build_chat_body(&request, &self.model, stream, self.thinking_wire);
+            let body = build_chat_body(
+                &request,
+                &self.model,
+                stream,
+                &self.compat,
+                self.reasoning_model,
+                self.thinking_wire,
+                &self.base_url,
+            );
+            crate::cache::record_cache_debug(
+                &self.provider_id,
+                "request",
+                Some(&body),
+                None,
+                Some(json!({
+                    "model": self.model,
+                    "base_url": self.base_url,
+                    "wire": "chat/completions",
+                    "cache_control_format": self.compat.cache_control_format,
+                })),
+            );
             let url = format!(
                 "{}/chat/completions",
                 self.base_url.trim_end_matches('/')
             );
             let response = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.api_key)
+                .apply_request_headers(self.client.post(&url))
                 .json(&body)
                 .send()
                 .await
@@ -219,6 +416,13 @@ mod inner {
             if !response.status().is_success() {
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
+                crate::cache::record_cache_debug(
+                    &self.provider_id,
+                    "error",
+                    Some(&body),
+                    None,
+                    Some(json!({ "status": status.as_u16(), "body_head": text.chars().take(500).collect::<String>() })),
+                );
                 return Err(OneError::Provider(format!(
                     "openai chat/completions {status}: {text}"
                 )));
@@ -229,7 +433,15 @@ mod inner {
                     .json()
                     .await
                     .map_err(|err| OneError::Provider(err.to_string()))?;
-                return parse_chat_non_stream(&value, self.name(), &self.model);
+                let parsed = parse_chat_non_stream(&value, self.name(), &self.model)?;
+                crate::cache::record_cache_debug(
+                    &self.provider_id,
+                    "response",
+                    Some(&body),
+                    Some(&parsed.usage),
+                    Some(json!({ "model": self.model, "wire": "chat/completions", "stream": false })),
+                );
+                return Ok(parsed);
             }
 
             let mut full_text = String::new();
@@ -314,6 +526,18 @@ mod inner {
             if aborted {
                 response.stop_reason = StopReason::Aborted;
             }
+            crate::cache::record_cache_debug(
+                &self.provider_id,
+                "response",
+                Some(&body),
+                Some(&response.usage),
+                Some(json!({
+                    "model": self.model,
+                    "wire": "chat/completions",
+                    "stream": true,
+                    "aborted": aborted,
+                })),
+            );
             Ok(response)
         }
     }
@@ -331,9 +555,7 @@ mod inner {
             let body = build_responses_body(&request, &self.model, stream);
             let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
             let response = self
-                .client
-                .post(&url)
-                .bearer_auth(&self.api_key)
+                .apply_request_headers(self.client.post(&url))
                 .json(&body)
                 .send()
                 .await
@@ -632,42 +854,43 @@ mod inner {
         String::new()
     }
 
+    fn merge_openai_usage_details(usage: &mut TokenUsage, u: &Value) {
+        usage.input_tokens = u
+            .get("prompt_tokens")
+            .or_else(|| u.get("input_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(usage.input_tokens);
+        usage.output_tokens = u
+            .get("completion_tokens")
+            .or_else(|| u.get("output_tokens"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(usage.output_tokens);
+        // `cached_tokens` is a subset of prompt/input tokens (OpenAI automatic cache).
+        if let Some(details) = u
+            .get("prompt_tokens_details")
+            .or_else(|| u.get("input_tokens_details"))
+        {
+            if let Some(n) = details
+                .get("cached_tokens")
+                .or_else(|| details.get("cache_read_tokens"))
+                .and_then(|v| v.as_u64())
+            {
+                usage.cache_read_tokens = n;
+            }
+        }
+    }
+
     fn parse_openai_usage(value: &Value) -> TokenUsage {
         let mut usage = TokenUsage::default();
         // Chat Completions: usage.prompt_tokens / completion_tokens
         // Responses API: usage.input_tokens / output_tokens
         if let Some(u) = value.get("usage") {
-            usage.input_tokens = u
-                .get("prompt_tokens")
-                .or_else(|| u.get("input_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            usage.output_tokens = u
-                .get("completion_tokens")
-                .or_else(|| u.get("output_tokens"))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(0);
-            if let Some(details) = u.get("prompt_tokens_details").or_else(|| u.get("input_tokens_details")) {
-                usage.cache_read_tokens = details
-                    .get("cached_tokens")
-                    .or_else(|| details.get("cache_read_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-            }
+            merge_openai_usage_details(&mut usage, u);
         }
         // Nested under response.completed for Responses streaming.
         if usage.is_zero() {
             if let Some(u) = value.pointer("/response/usage") {
-                usage.input_tokens = u
-                    .get("input_tokens")
-                    .or_else(|| u.get("prompt_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
-                usage.output_tokens = u
-                    .get("output_tokens")
-                    .or_else(|| u.get("completion_tokens"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(0);
+                merge_openai_usage_details(&mut usage, u);
             }
         }
         usage
@@ -861,14 +1084,66 @@ mod inner {
         request: &CompletionRequest,
         model: &str,
         stream: bool,
+        compat: &crate::compat::ResolvedOpenAiCompat,
+        reasoning_model: bool,
         thinking_wire: crate::thinking::ThinkingWire,
+        base_url: &str,
     ) -> Value {
-        let mut messages = vec![json!({
-            "role": "system",
-            "content": request.system_prompt,
-        })];
+        let role = compat.system_role(reasoning_model);
+        let use_anthropic_cache = compat
+            .cache_control_format
+            .as_deref()
+            .is_some_and(|s| s.eq_ignore_ascii_case("anthropic"));
+        let cache = if use_anthropic_cache {
+            Some(crate::cache::anthropic_cache_control(
+                compat.supports_long_cache_retention,
+            ))
+        } else {
+            None
+        };
+
+        let mut messages = Vec::new();
+        if !request.system_prompt.trim().is_empty() {
+            // Keep system as string here; cache pass below normalizes + marks it.
+            messages.push(json!({
+                "role": role,
+                "content": request.system_prompt,
+            }));
+        }
+
+        let mut last_role: Option<String> = None;
         for message in &request.messages {
-            messages.extend(map_chat_messages(message));
+            // Some proxies reject user messages immediately after tool results.
+            if compat.requires_assistant_after_tool_result
+                && last_role.as_deref() == Some("tool")
+                && matches!(message, one_core::AgentMessage::User(_))
+            {
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": "I have processed the tool results.",
+                }));
+            }
+            let mapped = map_chat_messages(message, compat, reasoning_model);
+            if let Some(last) = mapped.last() {
+                last_role = last
+                    .get("role")
+                    .and_then(|r| r.as_str())
+                    .map(|s| s.to_string());
+            }
+            messages.extend(mapped);
+        }
+
+        // OpenRouter Anthropic cache: stabilize *all* non-tool message shapes first
+        // (avoids last-only string→array flip), then place system + tools + suffix markers.
+        if let Some(ref c) = cache {
+            crate::cache::stabilize_messages_for_cache(&mut messages);
+            if let Some(sys) = messages.first_mut() {
+                let r = sys.get("role").and_then(|v| v.as_str()).unwrap_or("");
+                if r == "system" || r == "developer" {
+                    let _ = crate::cache::attach_cache_control_to_message(sys, c);
+                }
+            }
+            let _ = crate::cache::attach_cache_control_to_messages_suffix(&mut messages, c);
         }
 
         let mut body = json!({
@@ -878,30 +1153,54 @@ mod inner {
         });
 
         // Ask providers that support it to emit usage on the final stream chunk.
-        if stream {
+        if stream && compat.supports_usage_in_streaming {
             body["stream_options"] = json!({ "include_usage": true });
         }
 
+        if compat.supports_store {
+            body["store"] = json!(false);
+        }
+
         if !request.tools.is_empty() {
-            let tools: Vec<Value> = request
+            let mut tools: Vec<Value> = request
                 .tools
                 .iter()
                 .map(|tool| {
+                    let mut function = json!({
+                        "name": tool.name,
+                        "description": tool.description,
+                        "parameters": tool.parameters,
+                    });
+                    // Only include `strict` when the provider accepts it.
+                    if compat.supports_strict_mode {
+                        function["strict"] = json!(false);
+                    }
                     json!({
                         "type": "function",
-                        "function": {
-                            "name": tool.name,
-                            "description": tool.description,
-                            "parameters": tool.parameters,
-                        }
+                        "function": function,
                     })
                 })
                 .collect();
+            if cache.is_some() {
+                if let Some(ref c) = cache {
+                    crate::cache::attach_cache_control_to_last_tool(&mut tools, c);
+                }
+            }
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
         }
 
-        crate::thinking::apply_chat_thinking(&mut body, request.thinking_level, thinking_wire);
+        // Prefer Pi compat thinkingFormat; fall back to legacy ThinkingWire::Auto dual-shape.
+        if matches!(thinking_wire, crate::thinking::ThinkingWire::Auto) {
+            crate::thinking::apply_chat_thinking(
+                &mut body,
+                request.thinking_level,
+                thinking_wire,
+            );
+        } else {
+            compat.apply_thinking(&mut body, request.thinking_level, reasoning_model);
+        }
+        compat.apply_routing_and_extras(&mut body, base_url);
 
         body
     }
@@ -942,7 +1241,11 @@ mod inner {
     }
 
     /// May emit 1–2 chat messages (tool result with images → tool + synthetic user).
-    fn map_chat_messages(message: &one_core::AgentMessage) -> Vec<Value> {
+    fn map_chat_messages(
+        message: &one_core::AgentMessage,
+        compat: &crate::compat::ResolvedOpenAiCompat,
+        reasoning_model: bool,
+    ) -> Vec<Value> {
         match message {
             one_core::AgentMessage::User(user) => {
                 vec![json!({
@@ -961,8 +1264,6 @@ mod inner {
                     .collect::<Vec<_>>()
                     .join("");
 
-                // DeepSeek / many OpenAI-compat models require reasoning_content
-                // on assistant turns when reasoning was produced.
                 let reasoning = crate::thinking::thinking_text(&assistant.content);
 
                 let tool_calls: Vec<Value> = assistant
@@ -985,31 +1286,77 @@ mod inner {
                     })
                     .collect();
 
-                let content_value = if text.is_empty() {
-                    Value::Null
+                let mut message = if compat.requires_thinking_as_text && !reasoning.is_empty() {
+                    // Fold thinking into text so proxies that reject reasoning fields still work.
+                    let combined = if text.is_empty() {
+                        reasoning.clone()
+                    } else {
+                        format!("{reasoning}\n\n{text}")
+                    };
+                    json!({ "role": "assistant", "content": combined })
                 } else {
-                    json!(text)
+                    let content_value = if text.is_empty() {
+                        // Some providers reject null content when tool_calls are present;
+                        // prefer empty string when requires_assistant_after_tool_result.
+                        if compat.requires_assistant_after_tool_result {
+                            json!("")
+                        } else {
+                            Value::Null
+                        }
+                    } else {
+                        json!(text)
+                    };
+                    json!({ "role": "assistant", "content": content_value })
                 };
-                let mut message = json!({ "role": "assistant", "content": content_value });
-                if !reasoning.is_empty() {
+
+                if !compat.requires_thinking_as_text && !reasoning.is_empty() {
+                    // DeepSeek / many OpenAI-compat models require reasoning_content
+                    // on assistant turns when reasoning was produced.
                     message["reasoning_content"] = json!(reasoning);
+                } else if compat.requires_reasoning_content_on_assistant_messages
+                    && reasoning_model
+                    && message.get("reasoning_content").is_none()
+                {
+                    message["reasoning_content"] = json!("");
                 }
+
                 if !tool_calls.is_empty() {
                     message["tool_calls"] = json!(tool_calls);
                 }
+
+                // Skip empty assistant turns with no tool calls (aborted responses).
+                let has_content = match message.get("content") {
+                    Some(Value::String(s)) => !s.is_empty(),
+                    Some(Value::Null) | None => false,
+                    Some(_) => true,
+                };
+                if !has_content && tool_calls.is_empty() {
+                    return Vec::new();
+                }
+
                 vec![message]
             }
             one_core::AgentMessage::ToolResult(result) => {
                 let mut out = Vec::new();
                 let images = crate::media::collect_images(&result.content);
                 // Chat Completions `tool` role is string-only — keep labels in tool content.
-                out.push(json!({
+                let mut tool_msg = json!({
                     "role": "tool",
                     "tool_call_id": result.tool_call_id,
                     "content": crate::media::tool_result_plain(&result.content),
-                }));
+                });
+                if compat.requires_tool_result_name {
+                    tool_msg["name"] = json!(result.tool_name);
+                }
+                out.push(tool_msg);
                 // Vision path: follow with a user message carrying real image payloads.
                 if !images.is_empty() {
+                    if compat.requires_assistant_after_tool_result {
+                        out.push(json!({
+                            "role": "assistant",
+                            "content": "I have processed the tool results.",
+                        }));
+                    }
                     let mut parts = vec![json!({
                         "type": "text",
                         "text": format!(
@@ -1170,6 +1517,18 @@ impl OpenAiProvider {
     }
 
     pub fn with_thinking_wire(self, _wire: crate::thinking::ThinkingWire) -> Self {
+        self
+    }
+
+    pub fn with_provider_id(self, _provider_id: impl Into<String>) -> Self {
+        self
+    }
+
+    pub fn with_compat(self, _compat: crate::compat::ResolvedOpenAiCompat) -> Self {
+        self
+    }
+
+    pub fn with_reasoning_model(self, _reasoning: bool) -> Self {
         self
     }
 

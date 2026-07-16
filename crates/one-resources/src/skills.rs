@@ -27,6 +27,17 @@ pub struct Skill {
     pub body: String,
     /// When true, omit from model catalog; only `/skill:name` can activate.
     pub disable_model_invocation: bool,
+    /// User enable/disable (Codex-style skills.config). Default true after discovery.
+    /// When false: hidden from catalog and not force-loadable until re-enabled.
+    pub enabled: bool,
+}
+
+/// Durable per-skill enable/disable (mirrors Codex `[[skills.config]]`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillConfigEntry {
+    /// Absolute path to `SKILL.md` (canonical preferred).
+    pub path: String,
+    pub enabled: bool,
 }
 
 impl Skill {
@@ -141,7 +152,79 @@ pub fn parse_skill_md(content: &str, path: &Path) -> Option<Skill> {
         content: content.to_string(),
         body: body.trim().to_string(),
         disable_model_invocation: meta.disable_model_invocation,
+        enabled: true,
     })
+}
+
+/// Apply Codex-style enable/disable config by skill path.
+///
+/// Entries not listed default to **enabled**. Matching is path-based (exact or
+/// after canonicalize). Name-only configs are not supported here — callers may
+/// resolve names to paths before building entries.
+pub fn apply_skills_config(skills: &mut [Skill], config: &[SkillConfigEntry]) {
+    if config.is_empty() {
+        for s in skills.iter_mut() {
+            s.enabled = true;
+        }
+        return;
+    }
+    for skill in skills.iter_mut() {
+        skill.enabled = true;
+        if let Some(entry) = find_config_for_path(config, &skill.location) {
+            skill.enabled = entry.enabled;
+        }
+    }
+}
+
+fn find_config_for_path<'a>(
+    config: &'a [SkillConfigEntry],
+    location: &Path,
+) -> Option<&'a SkillConfigEntry> {
+    config.iter().find(|e| paths_match(&e.path, location))
+}
+
+/// Whether a skill path is enabled given config (default true when unset).
+pub fn is_path_enabled(config: &[SkillConfigEntry], location: &Path) -> bool {
+    find_config_for_path(config, location)
+        .map(|e| e.enabled)
+        .unwrap_or(true)
+}
+
+/// Upsert a path entry in the skills config list.
+pub fn set_skill_enabled(
+    config: &mut Vec<SkillConfigEntry>,
+    location: &Path,
+    enabled: bool,
+) {
+    let path = location
+        .canonicalize()
+        .unwrap_or_else(|_| location.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if let Some(idx) = config.iter().position(|e| paths_match(&e.path, location)) {
+        config[idx].path = path;
+        config[idx].enabled = enabled;
+    } else {
+        config.push(SkillConfigEntry { path, enabled });
+    }
+}
+
+fn paths_match(config_path: &str, location: &Path) -> bool {
+    let loc = location.to_string_lossy();
+    if config_path == loc {
+        return true;
+    }
+    let p = Path::new(config_path);
+    if p == location {
+        return true;
+    }
+    match (location.file_name(), p.file_name()) {
+        (Some(a), Some(b)) if a == b => {
+            location.parent().and_then(|pp| pp.file_name())
+                == p.parent().and_then(|pp| pp.file_name())
+        }
+        _ => false,
+    }
 }
 
 fn split_frontmatter(content: &str) -> (String, String) {
@@ -292,11 +375,11 @@ fn unquote(s: &str) -> String {
 }
 
 /// Tier-1 catalog for the system prompt (XML per agentskills.io integrate guide).
-/// Excludes `disable_model_invocation` skills.
+/// Excludes disabled and `disable_model_invocation` skills.
 pub fn skills_catalog_xml(skills: &[Skill]) -> Option<String> {
     let visible: Vec<&Skill> = skills
         .iter()
-        .filter(|s| !s.disable_model_invocation)
+        .filter(|s| s.enabled && !s.disable_model_invocation)
         .collect();
     if visible.is_empty() {
         return None;
@@ -358,7 +441,7 @@ pub fn resolve_skill_invocation<'a>(
 
     let skill = skills
         .iter()
-        .find(|s| s.name.eq_ignore_ascii_case(name))?;
+        .find(|s| s.enabled && s.name.eq_ignore_ascii_case(name))?;
     Some((skill, extra))
 }
 
@@ -485,5 +568,37 @@ description: >
             resolve_skill_invocation(&skills, "/skill:review focus on auth").unwrap();
         assert_eq!(s.name, "review");
         assert_eq!(extra, "focus on auth");
+    }
+
+    #[test]
+    fn apply_config_disables_by_path() {
+        let mut skill = parse_skill_md(
+            "---\nname: review\ndescription: d\n---\nbody\n",
+            Path::new("/tmp/review/SKILL.md"),
+        )
+        .unwrap();
+        assert!(skill.enabled);
+        apply_skills_config(
+            std::slice::from_mut(&mut skill),
+            &[SkillConfigEntry {
+                path: "/tmp/review/SKILL.md".into(),
+                enabled: false,
+            }],
+        );
+        assert!(!skill.enabled);
+        assert!(skills_catalog_xml(std::slice::from_ref(&skill)).is_none());
+        assert!(resolve_skill_invocation(std::slice::from_ref(&skill), "/skill:review").is_none());
+    }
+
+    #[test]
+    fn set_skill_enabled_upserts() {
+        let mut cfg = Vec::new();
+        let path = Path::new("/tmp/a/SKILL.md");
+        set_skill_enabled(&mut cfg, path, false);
+        assert_eq!(cfg.len(), 1);
+        assert!(!cfg[0].enabled);
+        set_skill_enabled(&mut cfg, path, true);
+        assert_eq!(cfg.len(), 1);
+        assert!(cfg[0].enabled);
     }
 }

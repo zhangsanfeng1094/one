@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use one_core::agent::{CompletionRequest, CompletionResponse, LlmProvider};
 use one_core::error::{OneError, Result};
 
+use crate::compat::ResolvedOpenAiCompat;
 use crate::openai::{OpenAiProvider, OpenaiWireApi};
 
 const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4";
@@ -31,11 +32,34 @@ impl OpenRouterProvider {
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
+        let model = model.into();
+        let base_url = base_url.into();
+        let compat = crate::compat::OpenAiCompletionsCompat::default().resolve(
+            "openrouter",
+            &base_url,
+            &model,
+        );
         Self {
-            // OpenRouter speaks Chat Completions only; use OR thinking wire.
+            // OpenRouter speaks Chat Completions; detect sets thinkingFormat=openrouter.
             inner: OpenAiProvider::with_base(api_key, model, base_url)
                 .with_wire_api(OpenaiWireApi::Completions)
-                .with_thinking_wire(crate::thinking::ThinkingWire::OpenRouter),
+                .with_provider_id("openrouter")
+                .with_compat(compat)
+                .with_reasoning_model(true),
+        }
+    }
+
+    /// Override resolved OpenAI `compat` (from models.json merge + detect).
+    pub fn with_compat(self, compat: ResolvedOpenAiCompat) -> Self {
+        Self {
+            inner: self.inner.with_compat(compat),
+        }
+    }
+
+    /// Whether the selected model supports extended reasoning.
+    pub fn with_reasoning_model(self, reasoning: bool) -> Self {
+        Self {
+            inner: self.inner.with_reasoning_model(reasoning),
         }
     }
 }

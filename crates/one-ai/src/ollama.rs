@@ -170,7 +170,7 @@ fn map_message(message: &one_core::AgentMessage) -> Option<Value> {
         }
         one_core::AgentMessage::ToolResult(result) => {
             let text = crate::media::tool_result_plain(&result.content);
-            let images: Vec<&str> = crate::media::collect_images(&result.content)
+            let images: Vec<String> = crate::media::collect_images(&result.content)
                 .into_iter()
                 .map(|(_, data)| data)
                 .collect();

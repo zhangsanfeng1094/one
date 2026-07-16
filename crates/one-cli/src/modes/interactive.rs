@@ -95,7 +95,9 @@ async fn apply_switch_model(
                     .append_model_change(providers.provider_id.clone(), providers.as_llm().model())
                     .await?;
             }
-            app.set_context_window(providers.context_window());
+            let ctx = providers.context_window();
+            app.set_context_window(ctx);
+            runtime.set_context_window(ctx);
             app.set_notice(format!(
                 "model → {} / {}",
                 providers.provider_id,
@@ -107,7 +109,33 @@ async fn apply_switch_model(
     Ok(())
 }
 
-async fn apply_config_op(providers: &mut ProviderSet, app: &mut App, op: ConfigOp) {
+fn refresh_skills_rows(app: &mut App, runtime: &AppRuntime) {
+    let rows: Vec<(String, String, String, bool)> = runtime
+        .resources
+        .all_skills()
+        .iter()
+        .map(|s| {
+            let path = s.location.to_string_lossy().to_string();
+            let label = s.name.clone();
+            let mut detail = s.description.clone();
+            if detail.chars().count() > 80 {
+                detail = detail.chars().take(77).collect::<String>() + "…";
+            }
+            if s.disable_model_invocation {
+                detail = format!("[manual only] {detail}");
+            }
+            (path, label, detail, s.enabled)
+        })
+        .collect();
+    app.set_skills_rows(rows);
+}
+
+async fn apply_config_op(
+    runtime: &mut AppRuntime,
+    providers: &mut ProviderSet,
+    app: &mut App,
+    op: ConfigOp,
+) {
     match op {
         ConfigOp::ProviderAdd { id, base_url } => {
             // Create provider in Settings; set base_url later on provider detail (in-float).
@@ -146,16 +174,34 @@ async fn apply_config_op(providers: &mut ProviderSet, app: &mut App, op: ConfigO
             Err(err) => app.set_notice(format!("provider: {err}")),
         },
         ConfigOp::ProviderFetchModels { id } => {
-            app.set_notice(format!("fetching models for `{id}`..."));
+            // Toast may already say "fetching…" (painted before await); refresh if not.
+            let already = app
+                .toast_active()
+                .is_some_and(|t| t.text.contains("fetching"));
+            if !already {
+                app.set_notice(format!("fetching models for `{id}` · GET /models…"));
+            }
             match providers.remote_model_rows(&id).await {
                 Ok(rows) => {
-                    let count = rows.len();
-                    app.open_settings_remote_models(&id, rows);
-                    app.set_notice(format!("fetched {count} model(s) for `{id}`"));
+                    let fetched = rows.len();
+                    // Batch-import into models.json (single write) — no one-by-one Enter.
+                    match providers.model_add_batch(&id, &rows) {
+                        Ok(msg) => {
+                            refresh_model_catalog(app, providers);
+                            app.settings_provider_focus = id.clone();
+                            app.open_settings_models_for_provider(&id);
+                            app.set_notice(format!("fetched {fetched} · {msg}"));
+                        }
+                        Err(err) => {
+                            app.settings_provider_focus = id;
+                            app.set_notice(format!("models import: {err}"));
+                        }
+                    }
                 }
                 Err(err) => {
+                    // Stay on the current Settings screen (Models / provider detail) so
+                    // the user can fix base_url / api_key without losing their place.
                     app.settings_provider_focus = id;
-                    app.reopen_settings_provider_detail();
                     app.set_notice(format!("models: {err}"));
                 }
             }
@@ -237,6 +283,31 @@ async fn apply_config_op(providers: &mut ProviderSet, app: &mut App, op: ConfigO
                 Err(err) => app.set_notice(format!("settings: {err}")),
             }
         }
+        ConfigOp::SkillToggle { path } => {
+            let path_buf = std::path::PathBuf::from(&path);
+            let current = runtime
+                .resources
+                .find_skill_by_path(&path_buf)
+                .map(|s| s.enabled)
+                .unwrap_or(true);
+            let new_enabled = !current;
+            match runtime.set_skill_enabled(&path_buf, new_enabled).await {
+                Ok(_) => {
+                    refresh_skills_rows(app, runtime);
+                    let name = runtime
+                        .resources
+                        .find_skill_by_path(&path_buf)
+                        .map(|s| s.name.as_str())
+                        .unwrap_or("skill");
+                    app.set_notice(format!(
+                        "skill `{name}` → {}",
+                        if new_enabled { "enabled" } else { "disabled" }
+                    ));
+                    app.reopen_skills_float();
+                }
+                Err(err) => app.set_notice(format!("skill: {err}")),
+            }
+        }
     }
 }
 
@@ -261,7 +332,9 @@ pub async fn run_interactive(
     refresh_model_catalog(&mut app, providers);
     app.set_current_model(&providers.provider_id, providers.as_llm().model());
     app.set_thinking_level(runtime.thinking_level().await.as_str());
-    app.set_context_window(providers.context_window());
+    let ctx = providers.context_window();
+    app.set_context_window(ctx);
+    runtime.set_context_window(ctx);
     refresh_usage(&mut app, runtime).await;
 
     // Project-scoped ↑/↓ history (survives `/new` and process restart).
@@ -275,12 +348,33 @@ pub async fn run_interactive(
     }
 
     // Skills: model sees catalog only; force-load via /skill:name is optional.
+    refresh_skills_rows(&mut app, runtime);
     let visible = runtime.resources.model_visible_skills();
-    if !visible.is_empty() {
+    let total = runtime.resources.all_skills().len();
+    let disabled = total.saturating_sub(visible.len());
+    if total > 0 {
         let names: Vec<_> = visible.iter().map(|s| s.name.as_str()).collect();
+        let note = if disabled > 0 {
+            format!(
+                "skills ready ({}/{} on) · /skills to manage · {}",
+                visible.len(),
+                total,
+                names.join(", ")
+            )
+        } else {
+            format!(
+                "skills ready ({}) · /skills to manage · agent auto-reads when relevant",
+                names.join(", ")
+            )
+        };
+        app.set_notice(note);
+    }
+
+    if one_ai::cache::debug_cache_enabled() {
+        // Quiet footer-style notice once; dump always goes to disk by default.
         app.set_notice(format!(
-            "skills ready ({}) · agent auto-reads SKILL.md when relevant",
-            names.join(", ")
+            "cache-debug · {}",
+            one_ai::cache::debug_cache_latest_path().display()
         ));
     }
 
@@ -402,13 +496,13 @@ pub async fn run_interactive(
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
             RunOutcome::CycleAgentMode => {
-                // Space on empty prompt: Plan ↔ Build (thinking lives in /settings).
+                // Shift+Tab: Plan ↔ Build (thinking lives in /settings).
                 match runtime.mode() {
                     AgentMode::Act => match runtime.enter_plan_mode().await {
                         Ok(path) => {
                             app.set_agent_label(AgentMode::Plan.label());
                             app.set_notice(format!(
-                                "plan mode · {} · Space or /act to leave",
+                                "plan mode · {} · S-Tab or /act to leave",
                                 path.display()
                             ));
                         }
@@ -438,7 +532,14 @@ pub async fn run_interactive(
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
             RunOutcome::ConfigOp(op) => {
-                apply_config_op(providers, &mut app, op).await;
+                // Paint "fetching…" before the network await so Ctrl+F feels responsive.
+                if let ConfigOp::ProviderFetchModels { ref id } = op {
+                    app.set_notice(format!("fetching models for `{id}` · GET /models…"));
+                    terminal
+                        .draw(&mut app)
+                        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                }
+                apply_config_op(runtime, providers, &mut app, op).await;
                 terminal
                     .draw(&mut app)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -458,18 +559,24 @@ async fn refresh_usage(app: &mut App, runtime: &AppRuntime) {
     app.set_usage_tokens(tokens);
     let usage = runtime.token_usage().await;
     app.set_usage_io(usage.input_tokens, usage.output_tokens);
-    // Rough blended cost (USD / 1M tokens) — good enough for a footer estimate.
+    app.set_usage_cache(usage.cache_read_tokens, usage.cache_write_tokens);
+    // Rough blended cost (USD / 1M tokens) — cache read/write discounted when known.
     let cost = estimate_cost_usd(
         &app.current_provider,
         &app.current_model,
-        usage.input_tokens,
-        usage.output_tokens,
+        &usage,
     );
     app.set_usage_cost_usd(cost);
 }
 
 /// Very rough public list prices (USD per 1M tokens). Zero when unknown.
-fn estimate_cost_usd(provider: &str, model: &str, input: u64, output: u64) -> f64 {
+///
+/// Accounting:
+/// - **Anthropic-style** (`cache_write > 0` or pure Anthropic provider): cache fields are
+///   *disjoint* from `input_tokens` — bill input + 1.25× write + 0.1× read + output.
+/// - **OpenAI-style**: `cache_read` is a *subset* of `input` — bill uncached at full rate,
+///   cached at ~50% (OpenAI automatic prompt cache discount).
+fn estimate_cost_usd(provider: &str, model: &str, usage: &one_core::TokenUsage) -> f64 {
     let (in_rate, out_rate) = match (provider, model) {
         ("openai", m) if m.contains("gpt-4o-mini") => (0.15, 0.60),
         ("openai", m) if m.contains("gpt-4o") => (2.50, 10.0),
@@ -478,13 +585,37 @@ fn estimate_cost_usd(provider: &str, model: &str, input: u64, output: u64) -> f6
         ("deepseek", _) => (0.27, 1.10),
         ("gemini", m) if m.contains("pro") => (1.25, 10.0),
         ("gemini", _) => (0.15, 0.60),
+        ("openrouter", m) if m.contains("anthropic/") || m.contains("claude") => (3.0, 15.0),
         ("openrouter", _) => (0.0, 0.0),
         _ => (0.0, 0.0),
     };
     if in_rate == 0.0 && out_rate == 0.0 {
         return 0.0;
     }
-    (input as f64 / 1_000_000.0) * in_rate + (output as f64 / 1_000_000.0) * out_rate
+    let per_m = 1_000_000.0;
+    let out_cost = (usage.output_tokens as f64 / per_m) * out_rate;
+
+    // Prefer Anthropic disjoint accounting when we saw cache writes, or native Anthropic /
+    // OpenRouter Claude (we inject cache_control so creation tokens appear).
+    let anthropic_style = provider == "anthropic"
+        || usage.cache_write_tokens > 0
+        || (provider == "openrouter"
+            && (model.contains("anthropic/") || model.contains("claude")));
+
+    let in_cost = if anthropic_style {
+        let write_rate = in_rate * 1.25;
+        let read_rate = in_rate * 0.10;
+        (usage.input_tokens as f64 / per_m) * in_rate
+            + (usage.cache_write_tokens as f64 / per_m) * write_rate
+            + (usage.cache_read_tokens as f64 / per_m) * read_rate
+    } else {
+        // OpenAI: prompt_tokens includes cached_tokens.
+        let uncached = usage.uncached_input_tokens();
+        let cached = usage.cache_read_tokens;
+        let cache_rate = in_rate * 0.50;
+        (uncached as f64 / per_m) * in_rate + (cached as f64 / per_m) * cache_rate
+    };
+    in_cost + out_cost
 }
 
 enum TurnEnd {
@@ -941,6 +1072,7 @@ async fn handle_slash(
         Some("/reload") => {
             match runtime.reload_extensions().await {
                 Ok(names) => {
+                    refresh_skills_rows(app, runtime);
                     let skills = runtime.resources.skill_names();
                     app.set_notice(format!(
                         "reloaded ext=[{}] skills=[{}]",
@@ -952,6 +1084,66 @@ async fn handle_slash(
                 Err(err) => app.set_notice(format!("reload failed: {err}")),
             }
             Ok(SlashAction::Consumed)
+        }
+        Some("/skills") => {
+            refresh_skills_rows(app, runtime);
+            let sub = parts.get(1).copied().unwrap_or("");
+            match sub {
+                "" | "list" => {
+                    if parts.get(1).copied() == Some("list") {
+                        let rows: Vec<(String, String)> = runtime
+                            .resources
+                            .all_skills()
+                            .iter()
+                            .map(|s| {
+                                let status = if s.enabled { "on" } else { "off" };
+                                (
+                                    format!("{status} · {}", s.name),
+                                    s.location.display().to_string(),
+                                )
+                            })
+                            .collect();
+                        if rows.is_empty() {
+                            app.set_notice("no skills discovered");
+                        } else {
+                            app.open_info_float("Skills", &rows);
+                        }
+                    } else {
+                        app.open_skills_float();
+                    }
+                    Ok(SlashAction::Consumed)
+                }
+                "enable" | "on" | "disable" | "off" => {
+                    let name = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
+                    if name.is_empty() {
+                        app.set_notice(format!("usage: /skills {sub} <name>"));
+                        return Ok(SlashAction::Consumed);
+                    }
+                    let Some(skill) = runtime.resources.find_skill(&name) else {
+                        app.set_notice(format!("unknown skill `{name}` · /skills list"));
+                        return Ok(SlashAction::Consumed);
+                    };
+                    let path = skill.location.clone();
+                    let enable = matches!(sub, "enable" | "on");
+                    match runtime.set_skill_enabled(&path, enable).await {
+                        Ok(_) => {
+                            refresh_skills_rows(app, runtime);
+                            app.set_notice(format!(
+                                "skill `{name}` → {}",
+                                if enable { "enabled" } else { "disabled" }
+                            ));
+                        }
+                        Err(err) => app.set_notice(format!("skill: {err}")),
+                    }
+                    Ok(SlashAction::Consumed)
+                }
+                other => {
+                    app.set_notice(format!(
+                        "unknown /skills {other} · try: /skills | enable|disable <name> | list"
+                    ));
+                    Ok(SlashAction::Consumed)
+                }
+            }
         }
         Some("/tree") => {
             let Some(session) = &mut runtime.session else {
@@ -1086,9 +1278,10 @@ async fn handle_slash(
                             || key.eq_ignore_ascii_case("context-window")
                             || key.eq_ignore_ascii_case("context")
                         {
-                            if let Some(n) = s.context_window {
-                                app.set_context_window(n);
-                            }
+                            // Re-resolve via provider (settings override > model registry).
+                            let n = providers.context_window();
+                            app.set_context_window(n);
+                            runtime.set_context_window(n);
                         }
                         if key.eq_ignore_ascii_case("provider") || key.eq_ignore_ascii_case("model")
                         {
@@ -1191,8 +1384,10 @@ async fn apply_rewind(
         return Ok(());
     };
 
-    let prompt_text = session
-        .user_prompt_text(entry_id)
+    // Prefer structured restore so images stay as vision bytes, not
+    // `[image · png · NKB]` labels (which the model cannot see).
+    let (prompt_text, images) = session
+        .user_prompt_for_edit(entry_id)
         .ok_or_else(|| format!("rewind: entry not a user prompt: {entry_id}"))?;
 
     session.rewind_before(entry_id)?;
@@ -1204,9 +1399,16 @@ async fn apply_rewind(
         rebuild_tui_from_agent(app, &agent.messages);
     }
 
-    app.set_input_for_edit(prompt_text);
+    app.set_input_for_edit_with_images(prompt_text, images);
     refresh_usage(app, runtime).await;
-    app.set_notice("rewound · edit prompt and Enter to re-send");
+    let n = app.pending_images.len();
+    if n > 0 {
+        app.set_notice(format!(
+            "rewound · {n} image(s) restored · edit and Enter to re-send"
+        ));
+    } else {
+        app.set_notice("rewound · edit prompt and Enter to re-send");
+    }
     Ok(())
 }
 

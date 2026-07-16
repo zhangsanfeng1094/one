@@ -82,7 +82,15 @@ impl Tool for GrepTool {
                 stderr.to_string()
             }
         } else {
-            stdout.to_string()
+            // Per-line cap (Pi GREP_MAX_LINE_LENGTH) then overall head cap.
+            let capped: String = stdout
+                .lines()
+                .map(|line| {
+                    crate::truncate::truncate_line(line, crate::truncate::GREP_MAX_LINE_LENGTH).0
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            crate::truncate::apply_head_default(&capped)
         };
 
         Ok(ToolOutput::text(text))

@@ -11,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::App;
 use crate::float::{FloatKind, FloatMenu, FloatRenderRow};
@@ -347,50 +347,80 @@ fn draw_toast(frame: &mut Frame<'_>, full: Rect, app: &App) {
         height,
     };
 
-    let (border_fg, title_bg) = match toast.level {
-        AlertLevel::Error => (Theme::ERROR, Theme::ERROR),
-        AlertLevel::Warn => (Theme::WARNING, Theme::WARNING),
-        AlertLevel::Info => (Theme::SECONDARY, Theme::SECONDARY),
+    // Info stays quiet (dim label) — errors/warns keep a strong chip.
+    // Low-frequency mouse/copy tips must not outshine the prompt.
+    let (border_fg, title_span) = match toast.level {
+        AlertLevel::Error => (
+            Theme::ERROR,
+            Span::styled(" error ", Style::default().fg(Theme::BG).bg(Theme::ERROR)),
+        ),
+        AlertLevel::Warn => (
+            Theme::WARNING,
+            Span::styled(" warn ", Style::default().fg(Theme::BG).bg(Theme::WARNING)),
+        ),
+        AlertLevel::Info => (
+            Theme::BORDER,
+            Span::styled(" i ", Style::default().fg(Theme::MUTED).bg(Theme::PANEL)),
+        ),
     };
 
     frame.render_widget(Clear, area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
-        .border_style(Style::default().fg(border_fg))
+        .border_style(Style::default().fg(border_fg).bg(Theme::PANEL))
         .style(Style::default().bg(Theme::PANEL))
-        .title(Span::styled(
-            " notice ",
-            Style::default().fg(Theme::BG).bg(title_bg),
-        ));
+        .title(title_span);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    let body_fg = match toast.level {
+        AlertLevel::Info => Theme::MUTED,
+        _ => Theme::FG,
+    };
     let body: Vec<Line> = lines
         .into_iter()
         .map(|l| {
             Line::from(Span::styled(
                 format!(" {l}"),
-                Style::default().fg(Theme::FG).bg(Theme::PANEL),
+                Style::default().fg(body_fg).bg(Theme::PANEL),
             ))
         })
         .collect();
     frame.render_widget(Paragraph::new(body).style(Theme::bg()), inner);
 }
 
-/// Centered floating panel — dim backdrop + bordered menu with search & groups.
+/// Centered floating panel — solid backdrop, padded chrome, three-column rows.
+///
+/// ```text
+/// ┌─ title ──────────────────────────────────────────┐
+/// │                                                  │  ← top pad
+/// │   Filter: query▌                                 │  ← only when typing / edit
+/// │   ╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌╌  │
+/// │   Connection                                     │
+/// │     protocol    openai-completions      [select] │  ← key · value · action
+/// │   > api_key     set                       [edit] │
+/// │                                                  │  ← bottom pad
+/// └─ ↑/↓ Navigate · Enter Select · Esc Back ─────────┘
+/// ```
+///
+/// When `edit_mode`, the list is fully dimmed and the `›` marker is hidden so
+/// the top field is the sole interaction focus.
 fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
-    // Soft dim: re-paint full area with a translucent-feel dark overlay (solid bg).
-    // True alpha isn't available in terminals; use a dark panel wash.
-    let dim = Block::default().style(Style::default().bg(Color::Rgb(0x0a, 0x0a, 0x0a)));
-    // Only darken by drawing a semi-empty overlay is hard; skip full dim, just center card.
-
-    let width = full.width.saturating_mul(7) / 10; // ~70%
-    let width = width.clamp(40, full.width.saturating_sub(4));
+    // Leave ≥2 cols of terminal chrome outside the modal so chat never sits
+    // flush against the border (reduces “half glyph on the edge” artifacts).
+    let max_w = full.width.saturating_sub(6).max(36);
+    let width = (full.width.saturating_mul(7) / 10).clamp(42, max_w);
     let render_rows = menu.render_rows();
-    // title+search+sep + rows + footer  ≈ content height
-    let content_h = (render_rows.len() as u16).min(16).saturating_add(5);
-    let height = content_h.clamp(10, full.height.saturating_sub(2));
+    let show_filter = menu.edit_mode || !menu.search.is_empty();
+    // Outer height includes border (2). Inner: top pad + optional filter+rule + list + bottom pad.
+    let filter_h: u16 = if show_filter { 2 } else { 0 };
+    let list_rows = (render_rows.len() as u16).clamp(1, 16);
+    let inner_h = 1u16 // top pad
+        .saturating_add(filter_h)
+        .saturating_add(list_rows)
+        .saturating_add(1); // bottom pad
+    let height = (inner_h.saturating_add(2)).clamp(10, full.height.saturating_sub(2));
 
     let x = full.x + (full.width.saturating_sub(width)) / 2;
     let y = full.y + (full.height.saturating_sub(height)) / 2;
@@ -401,94 +431,74 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
         height,
     };
 
-    // Clear under the float so chat doesn't bleed through.
+    // 1) Clear terminal cells  2) fill solid PANEL  3) border on top.
+    // Without the fill, Clear leaves transparent cells and chat bleeds through
+    // border / padded regions where no span sets a background.
     frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(Theme::slash_panel()), area);
 
     let title = format!(" {} ", menu.title);
-    let footer = if menu.edit_mode {
-        " type value  ·  Enter save  ·  Esc cancel "
-    } else {
-        match menu.kind {
-            FloatKind::Info => " Enter / Esc close ",
-            FloatKind::Sessions => " ↑/↓  ·  Enter resume  ·  Esc  ·  type to filter ",
-            FloatKind::Tree => " ↑/↓  ·  Enter branch  ·  Esc  ·  type to filter ",
-            FloatKind::Rewind => " ↑/↓  ·  Enter edit prompt  ·  Esc  ·  type to filter ",
-            FloatKind::Thinking => " ↑/↓  ·  Enter set level  ·  Esc ",
-            FloatKind::Help => " ↑/↓  ·  Enter open  ·  Esc  ·  type to search ",
-            FloatKind::Models => " ↑/↓  ·  Enter switch  ·  Esc  ·  type to search ",
-            FloatKind::Settings => " ↑/↓  ·  Enter  ·  Esc close  ·  type to filter ",
-            FloatKind::SettingsModels => {
-                " ↑/↓  ·  Enter  ·  Ctrl+F fetch  ·  Esc/← back  ·  type to filter "
-            }
-            FloatKind::SettingsProviders
-            | FloatKind::SettingsProviderDetail
-            | FloatKind::SettingsProviderApi
-            | FloatKind::SettingsRemoteModels
-            | FloatKind::SettingsModelDetail => " ↑/↓  ·  Enter  ·  Esc/← back  ·  type to filter ",
-            FloatKind::SettingsModelAdd => {
-                " ↑/↓ fields  ·  Enter edit/save  ·  Esc/← back  ·  type in search "
-            }
-            FloatKind::Commands | FloatKind::Custom => {
-                " ↑/↓  ·  Enter select  ·  Esc close  ·  type to search "
-            }
-        }
-    };
-
+    let footer = float_footer_text(menu);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(ratatui::widgets::BorderType::Rounded)
         .border_style(Theme::border())
         .style(Theme::slash_panel())
         .title(Span::styled(title, Theme::title()))
-        .title_bottom(Span::styled(footer, Theme::slash_title()));
+        .title_bottom(Span::styled(footer, Theme::float_footer()));
 
-    let inner = block.inner(area);
+    let border_inner = block.inner(area);
     frame.render_widget(block, area);
 
-    // Layout inside: search (1) + list (rest)
+    // Horizontal breathing: 2 cols each side inside the border.
+    let h_pad = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(border_inner);
+
+    let v_constraints = if show_filter {
+        vec![
+            Constraint::Length(1), // top breathe
+            Constraint::Length(2), // filter + hairline
+            Constraint::Min(3),    // list
+            Constraint::Length(1), // bottom breathe
+        ]
+    } else {
+        vec![
+            Constraint::Length(1), // top breathe
+            Constraint::Min(3),    // list
+            Constraint::Length(1), // bottom breathe
+        ]
+    };
     let parts = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(3)])
-        .split(inner);
+        .constraints(v_constraints)
+        .split(h_pad[1]);
 
-    // Search / in-float edit row
-    let search_prefix = if menu.edit_mode {
-        if menu.edit_label.is_empty() {
-            "  edit: ".to_string()
-        } else {
-            format!("  {}: ", menu.edit_label)
-        }
-    } else {
-        "  search: ".to_string()
-    };
-    let search_line = if menu.search.is_empty() {
-        Line::from(vec![
-            Span::styled(search_prefix, Theme::slash_desc()),
-            Span::styled(if menu.edit_mode { "▌" } else { "…" }, Theme::slash_desc()),
-        ])
-    } else {
-        Line::from(vec![
-            Span::styled(search_prefix, Theme::slash_desc()),
-            Span::styled(menu.search.as_str(), Theme::slash_item()),
-            Span::styled("▌", Theme::input_cursor_on()),
-        ])
-    };
-    frame.render_widget(
-        Paragraph::new(vec![
-            search_line,
-            Line::from(Span::styled(
-                "  ".to_string() + &"─".repeat(parts[0].width.saturating_sub(2) as usize),
-                Theme::slash_desc(),
-            )),
-        ])
-        .style(Theme::slash_panel()),
-        parts[0],
-    );
+    let list_area = if show_filter { parts[2] } else { parts[1] };
+
+    if show_filter {
+        let search_area = parts[1];
+        let search_line = float_filter_line(menu);
+        let rule_w = search_area.width as usize;
+        let hairline = "╌".repeat(rule_w.max(1));
+        // Paint full row bg so no chat peeks between spans.
+        frame.render_widget(
+            Paragraph::new(vec![
+                search_line,
+                Line::from(Span::styled(hairline, Theme::hairline())),
+            ])
+            .style(Theme::slash_panel()),
+            search_area,
+        );
+    }
 
     // List with scroll around selected
-    let list_area = parts[1];
     let max_rows = list_area.height as usize;
-    // Map selected entry_index → row index for scroll
     let selected_row = render_rows
         .iter()
         .position(|r| match r {
@@ -499,29 +509,13 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
     let start = selected_row.saturating_sub(max_rows.saturating_sub(1));
     let end = (start + max_rows).min(render_rows.len());
 
+    let editing = menu.edit_mode;
+    let col_w = list_area.width as usize;
     let mut lines: Vec<Line> = Vec::new();
     for row in &render_rows[start..end] {
         match row {
             FloatRenderRow::Header(title) => {
-                lines.push(Line::from(vec![
-                    Span::styled("  ", Theme::slash_panel()),
-                    Span::styled(
-                        format!("{title} "),
-                        Style::default()
-                            .bg(Theme::PANEL)
-                            .fg(Theme::MUTED)
-                            .add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(
-                        "─".repeat(
-                            list_area
-                                .width
-                                .saturating_sub(4 + title.len() as u16)
-                                .max(1) as usize,
-                        ),
-                        Theme::slash_desc(),
-                    ),
-                ]));
+                lines.push(float_header_line(title, col_w, editing));
             }
             FloatRenderRow::Item {
                 entry_index,
@@ -529,59 +523,250 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
                 detail,
                 hint,
             } => {
-                let active = *entry_index == menu.selected;
-                let marker = if active { "› " } else { "  " };
-                let name_style = if active {
-                    Theme::slash_selected()
-                } else {
-                    Theme::slash_item()
-                };
-                let desc_style = if active {
-                    Theme::slash_selected()
-                } else {
-                    Theme::slash_desc()
-                };
-                // label left, detail mid, hint right (best-effort in one line)
-                let mut spans = vec![
-                    Span::styled(marker, name_style),
-                    Span::styled(format!("{label:<20}"), name_style),
-                ];
-                if !detail.is_empty() {
-                    spans.push(Span::styled(format!("  {detail}"), desc_style));
-                }
-                // pad then hint
-                let used = 2
-                    + 20
-                    + if detail.is_empty() {
-                        0
-                    } else {
-                        2 + detail.chars().count()
-                    };
-                let pad = list_area
-                    .width
-                    .saturating_sub(used as u16)
-                    .saturating_sub(hint.chars().count() as u16 + 2);
-                if !hint.is_empty() {
-                    spans.push(Span::styled(
-                        format!("{:>width$}", hint, width = pad as usize + hint.len()),
-                        desc_style,
-                    ));
-                }
-                lines.push(Line::from(spans));
+                let active = !editing && *entry_index == menu.selected;
+                lines.push(float_item_line(label, detail, hint, col_w, active, editing));
             }
         }
     }
 
     if lines.is_empty() {
         lines.push(Line::from(Span::styled(
-            "  (no matches)",
-            Theme::slash_desc(),
+            "(no matches)",
+            if editing {
+                Theme::float_dim()
+            } else {
+                Theme::slash_desc()
+            },
+        )));
+    }
+
+    // Fill remaining list rows with blank PANEL lines so short menus don't
+    // leave uncleared chat cells in the lower half of the float.
+    while lines.len() < max_rows {
+        lines.push(Line::from(Span::styled(
+            " ".repeat(col_w.max(1)),
+            Theme::slash_panel(),
         )));
     }
 
     frame.render_widget(Paragraph::new(lines).style(Theme::slash_panel()), list_area);
+}
 
-    let _ = dim; // reserved if we add backdrop later
+fn float_footer_text(menu: &FloatMenu) -> String {
+    if menu.edit_mode {
+        return " ←→ Cursor  ·  Enter Save  ·  Esc Cancel ".into();
+    }
+    let base = match menu.kind {
+        FloatKind::Info => " Enter / Esc Close ",
+        FloatKind::Sessions => " ↑/↓ Navigate  ·  Enter Resume  ·  Esc Back ",
+        FloatKind::Tree => " ↑/↓ Navigate  ·  Enter Branch  ·  Esc Back ",
+        FloatKind::Rewind => " ↑/↓ Navigate  ·  Enter Edit  ·  Esc Back ",
+        FloatKind::Thinking => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Back ",
+        FloatKind::Help => " ↑/↓ Navigate  ·  Enter Open  ·  Esc Back ",
+        FloatKind::Models => " ↑/↓ Navigate  ·  Enter Switch  ·  Esc Back ",
+        FloatKind::Settings => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
+        FloatKind::SettingsModels => {
+            " ↑/↓ Navigate  ·  Enter Select  ·  Ctrl+F Import  ·  Esc Back "
+        }
+        FloatKind::SettingsProviderDetail => {
+            " ↑/↓ Navigate  ·  Enter Select  ·  Ctrl+F Import  ·  Esc Back "
+        }
+        FloatKind::SettingsRemoteModels => {
+            " ↑/↓ Navigate  ·  Enter Add  ·  Ctrl+F Re-import  ·  Esc Back "
+        }
+        FloatKind::SettingsProviders
+        | FloatKind::SettingsProviderApi
+        | FloatKind::SettingsThinkingFormat
+        | FloatKind::SettingsMaxTokensField
+        | FloatKind::SettingsModelDetail => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Back ",
+        FloatKind::SettingsModelAdd => " ↑/↓ Fields  ·  Enter Edit/Save  ·  Esc Back ",
+        FloatKind::Skills => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Close ",
+        FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
+    };
+    base.into()
+}
+
+fn float_filter_line(menu: &FloatMenu) -> Line<'static> {
+    let (before, after) = menu.search_split_at_cursor();
+    let before = before.to_string();
+    let after = after.to_string();
+    if menu.edit_mode {
+        let prefix = if menu.edit_label.is_empty() {
+            "edit: ".to_string()
+        } else {
+            format!("{}: ", menu.edit_label)
+        };
+        return Line::from(vec![
+            Span::styled(prefix, Theme::float_edit_label()),
+            Span::styled(before, Theme::float_edit_text()),
+            Span::styled("▌", Theme::input_cursor_on()),
+            Span::styled(after, Theme::float_edit_text()),
+        ]);
+    }
+    // Active filter: elevated chip + caret (type-to-filter always available).
+    Line::from(vec![
+        Span::styled("Filter: ".to_string(), Theme::float_filter_label()),
+        Span::styled(before, Theme::float_filter_active()),
+        Span::styled("▌", Theme::input_cursor_on()),
+        Span::styled(after, Theme::float_filter_active()),
+    ])
+}
+
+fn float_header_line(title: &str, col_w: usize, editing: bool) -> Line<'static> {
+    let head_style = if editing {
+        Theme::float_dim()
+    } else {
+        Style::default()
+            .bg(Theme::PANEL)
+            .fg(Theme::MUTED)
+            .add_modifier(Modifier::BOLD)
+    };
+    let rule_style = if editing {
+        Theme::float_dim_desc()
+    } else {
+        Theme::hairline()
+    };
+    let title_w = title.width();
+    let rule_len = col_w.saturating_sub(title_w.saturating_add(1)).max(1);
+    Line::from(vec![
+        Span::styled(format!("{title} "), head_style),
+        Span::styled("╌".repeat(rule_len), rule_style),
+    ])
+}
+
+/// Three-column row: marker+key | value (truncated) | [action]
+fn float_item_line(
+    label: &str,
+    detail: &str,
+    hint: &str,
+    col_w: usize,
+    active: bool,
+    editing: bool,
+) -> Line<'static> {
+    let marker = if active { "› " } else { "  " };
+    let action = format_float_action(hint);
+    let action_w = action.width();
+
+    // Key column ~25%, action ~15%, value takes the rest (min widths for small panels).
+    let key_w = ((col_w * 25) / 100).clamp(12, 22);
+    let action_slot = if action.is_empty() {
+        0
+    } else {
+        action_w.saturating_add(1).max(9)
+    };
+    // marker(2) + key + gap(1) + value + gap(1) + action
+    let value_w = col_w
+        .saturating_sub(2)
+        .saturating_sub(key_w)
+        .saturating_sub(1)
+        .saturating_sub(if action_slot == 0 { 0 } else { 1 + action_slot });
+
+    let key = pad_or_truncate(label, key_w);
+    let value = if detail.is_empty() {
+        " ".repeat(value_w)
+    } else {
+        pad_or_truncate(detail, value_w)
+    };
+
+    let (key_style, value_style, action_style) = if editing {
+        (
+            Theme::float_dim(),
+            Theme::float_dim_desc(),
+            Theme::float_dim_desc(),
+        )
+    } else if active {
+        (
+            Theme::slash_selected(),
+            Theme::slash_selected(),
+            Theme::float_action_selected(),
+        )
+    } else {
+        (
+            Theme::slash_item(),
+            Theme::slash_desc(),
+            Theme::float_action(),
+        )
+    };
+
+    let mut spans = vec![
+        Span::styled(marker.to_string(), key_style),
+        Span::styled(key, key_style),
+        Span::styled(" ".to_string(), key_style),
+        Span::styled(value, value_style),
+    ];
+    if !action.is_empty() {
+        let gap = " ".repeat(1);
+        // Right-align action inside its slot.
+        let pad = action_slot.saturating_sub(action_w);
+        spans.push(Span::styled(gap, value_style));
+        if pad > 0 {
+            spans.push(Span::styled(" ".repeat(pad), value_style));
+        }
+        spans.push(Span::styled(action, action_style));
+    }
+
+    // Pad to full width so selected / panel bg covers the entire row cell.
+    let used: usize = spans.iter().map(|s| s.content.width()).sum();
+    if used < col_w {
+        let fill_style = if active && !editing {
+            Theme::slash_selected()
+        } else if editing {
+            Theme::float_dim()
+        } else {
+            Theme::slash_panel()
+        };
+        spans.push(Span::styled(" ".repeat(col_w - used), fill_style));
+    }
+
+    Line::from(spans)
+}
+
+fn format_float_action(hint: &str) -> String {
+    let h = hint.trim();
+    if h.is_empty() {
+        return String::new();
+    }
+    // Keep pure symbols (→) unbracketed; chip-wrap alphanumeric actions.
+    if h.chars().any(|c| c.is_ascii_alphanumeric()) {
+        format!("[{h}]")
+    } else {
+        h.to_string()
+    }
+}
+
+/// Pad with spaces or truncate with ellipsis to exact display width `width`.
+fn pad_or_truncate(s: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+    let w = s.width();
+    if w == width {
+        return s.to_string();
+    }
+    if w < width {
+        return format!("{s}{}", " ".repeat(width - w));
+    }
+    // Truncate by display width, reserve 1 for ellipsis.
+    if width == 1 {
+        return "…".to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0usize;
+    for ch in s.chars() {
+        let cw = ch.width().unwrap_or(0);
+        if used + cw > width - 1 {
+            break;
+        }
+        out.push(ch);
+        used += cw;
+    }
+    out.push('…');
+    // If ellipsis made us short (wide chars edge), pad.
+    let final_w = out.width();
+    if final_w < width {
+        out.push_str(&" ".repeat(width - final_w));
+    }
+    out
 }
 
 fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
@@ -791,55 +976,58 @@ fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Op
     (lines, owners)
 }
 
-/// Empty-session welcome: title, context, tips — kept short so it fits a
-/// typical chat pane without scrolling away the title.
+/// Empty-session welcome: brand, advanced tips, try samples — no chrome
+/// that already lives on the prompt meta strip / status footer.
 fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<Line<'static>> = Vec::new();
 
     let blank = || Line::from(Span::styled("", Theme::bg()));
     let muted = |s: String| Line::from(vec![Span::raw("  "), Span::styled(s, Theme::meta())]);
-    let tip_row = |parts: &[(&str, &str)]| {
-        let mut spans = vec![Span::raw("  ")];
-        for (i, (key, desc)) in parts.iter().enumerate() {
-            if i > 0 {
-                spans.push(Span::styled("   ", Theme::meta()));
-            }
-            spans.push(Span::styled(format!("{key} "), Theme::status_key()));
-            spans.push(Span::styled((*desc).to_string(), Theme::meta()));
-        }
-        Line::from(spans)
+    // One tip per row so keys scan as a left-aligned column.
+    let tip_line = |key: &str, desc: &str| {
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("{key:<12}"), Theme::status_key()),
+            Span::styled(desc.to_string(), Theme::meta()),
+        ])
     };
 
     lines.push(blank());
-    lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled(
-            "one",
-            Style::default()
-                .fg(Theme::PRIMARY)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("  ·  coding agent", Theme::meta()),
-    ]));
-
-    let agent = if app.agent_label.is_empty() {
-        "Build"
+    // Pure-ASCII wordmark (small figlet-style). Falls back when the pane is tight.
+    //
+    //    ___  _ __   ___
+    //   / _ \| '_ \ / _ \
+    //  | (_) | | | |  __/
+    //   \___/|_| |_|\___|
+    const LOGO: &[&str] = &[
+        r#"  ___  _ __   ___"#,
+        r#" / _ \| '_ \ / _ \"#,
+        r#"| (_) | | | |  __/"#,
+        r#" \___/|_| |_|\___|"#,
+    ];
+    let logo_w = LOGO.iter().map(|l| l.len()).max().unwrap_or(0);
+    let brand = Style::default()
+        .fg(Theme::PRIMARY)
+        .add_modifier(Modifier::BOLD);
+    if wrap_width == 0 || wrap_width >= logo_w + 2 {
+        for row in LOGO {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled((*row).to_string(), brand),
+            ]));
+        }
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("coding agent", Theme::meta()),
+        ]));
     } else {
-        app.agent_label.as_str()
-    };
-    let mut ctx = format!("{agent}");
-    if !app.current_model.is_empty() {
-        ctx.push_str("  ·  ");
-        ctx.push_str(&app.current_model);
-    } else if !app.mode_label.is_empty() {
-        ctx.push_str("  ·  ");
-        ctx.push_str(&app.mode_label);
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("one", brand),
+            Span::styled("  ·  coding agent", Theme::meta()),
+        ]));
     }
-    if !app.current_provider.is_empty() {
-        ctx.push_str("  ·  ");
-        ctx.push_str(&app.current_provider);
-    }
-    lines.push(muted(ctx));
+    // Agent / model / provider live on the prompt meta strip — do not repeat.
     lines.push(blank());
 
     lines.push(Line::from(vec![
@@ -851,6 +1039,7 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
     ]));
     lines.push(blank());
 
+    // Advanced only: keys already on the status strip (Ctrl+G/L, ?) stay out.
     lines.push(Line::from(vec![
         Span::raw("  "),
         Span::styled(
@@ -860,21 +1049,11 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
-    lines.push(tip_row(&[
-        ("/", "commands"),
-        ("Space", "Plan ↔ Build"),
-        ("Ctrl+L", "model"),
-    ]));
-    lines.push(tip_row(&[
-        ("Ctrl+J", "newline"),
-        ("Esc Esc", "rewind"),
-        ("↑↓", "history"),
-    ]));
-    lines.push(tip_row(&[
-        ("/help", "more"),
-        ("/model", "switch"),
-        ("/resume", "sessions"),
-    ]));
+    lines.push(tip_line("Shift+Tab", "Plan ↔ Build"));
+    lines.push(tip_line("Ctrl+J", "newline"));
+    lines.push(tip_line("Ctrl+V", "paste clipboard image (Ctrl+Alt+V on WSL)"));
+    lines.push(tip_line("Esc Esc", "rewind last turn"));
+    lines.push(tip_line("/resume", "past sessions"));
     lines.push(blank());
 
     lines.push(Line::from(vec![
@@ -885,25 +1064,24 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
                 .fg(Theme::MUTED)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled("  ·  press 1–3", Theme::meta()),
     ]));
-    for (i, example) in [
-        "list files in this directory",
-        "explain how the agent loop works",
-        "fix the failing tests",
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        // Peach number chip — solid bg, no emoji/circled-digit tofu.
+    for (i, example) in crate::app::WELCOME_TRY_PROMPTS.iter().enumerate() {
+        // Muted [n] — readable index without a "clickable chip" false affordance;
+        // keys 1–3 actually run these when the session is empty.
         lines.push(Line::from(vec![
             Span::raw("  "),
-            Span::styled(format!(" {} ", i + 1), Theme::badge_primary()),
+            Span::styled(format!("[{}]", i + 1), Theme::status_faint()),
             Span::styled(format!("  \"{example}\""), Theme::meta()),
         ]));
     }
     lines.push(blank());
 
-    let footer = "paste image/text · drag to copy · /quit to exit";
+    let footer = if app.mouse_capture {
+        "type or paste below · drag to copy · Ctrl+Shift+M toggles mouse"
+    } else {
+        "type or paste below · PgUp/PgDn scroll · Ctrl+Shift+M toggles mouse"
+    };
     if wrap_width > 0 && display_width(footer) + 2 > wrap_width {
         for part in wrap_str(footer, wrap_width.saturating_sub(2)) {
             lines.push(muted(part));
@@ -1510,20 +1688,27 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Theme::prompt_bar()
     };
 
+    // Keep placeholder quiet — keybindings live on the sparse status strip / `?` help.
     let placeholder = if app.busy {
         "steer or follow-up…"
     } else {
-        "Message…  / commands  ^J newline  Ctrl+L model  Ctrl+G settings"
+        "Message…"
     };
 
     const INDENT: &str = "  ";
 
     // Software caret (▌) so the typewriter is visible even when the hardware
     // I-beam is hidden by the emulator / tmux / mouse reporting.
-    let caret = if app.cursor_on {
+    // Hidden entirely while a float modal or select dock owns focus — paste/keys
+    // go there, so the main prompt must not look editable.
+    let prompt_focused = app.prompt_focused();
+    let caret = if prompt_focused && app.cursor_on {
         Span::styled("▌", Theme::input_cursor_on())
-    } else {
+    } else if prompt_focused {
         Span::styled(" ", Theme::input_cursor_off())
+    } else {
+        // Unfocused: no caret slot (empty input still shows placeholder only).
+        Span::raw("")
     };
 
     // Multi-line input: one Line per input row; caret on last line.
@@ -1582,7 +1767,8 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     let mut meta_spans = vec![
         Span::styled("  ", Theme::bg()),
-        Span::styled(agent, Theme::prompt_bar()),
+        // Copper identity tag — PRIMARY reserved for caret / list selection.
+        Span::styled(agent, Theme::mode_label()),
     ];
     if !model.is_empty() {
         meta_spans.push(Span::styled("  ", Theme::bg()));
@@ -1748,7 +1934,7 @@ mod tests {
 
     #[test]
     fn empty_session_shows_welcome_tips() {
-        // Tall enough for chat pane to show welcome title + a tip row.
+        // Tall enough for chat pane to show welcome title + tips + try.
         let backend = TestBackend::new(72, 28);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new("one");
@@ -1769,12 +1955,22 @@ mod tests {
             "empty session should show welcome title, got:\n{flat}"
         );
         assert!(
-            flat.contains("tips") || flat.contains("commands"),
-            "empty session should show guidance, got:\n{flat}"
+            flat.contains("tips") && flat.contains("Shift+Tab"),
+            "empty session should show advanced tips only, got:\n{flat}"
         );
+        // Model lives on prompt meta — not duplicated in the welcome body.
         assert!(
             flat.contains("mock-model"),
-            "empty session should surface current model, got:\n{flat}"
+            "prompt meta should surface current model, got:\n{flat}"
+        );
+        assert!(
+            flat.contains("press 1") || flat.contains("[1]"),
+            "empty session should offer try shortcuts, got:\n{flat}"
+        );
+        // Tips list advanced keys only — model switch lives on the status strip.
+        assert!(
+            flat.contains("Ctrl+J") && !flat.contains("/help more") && !flat.contains("/model"),
+            "welcome tips must not restate status/help chrome, got:\n{flat}"
         );
 
         // Once a message exists, welcome leaves the transcript.
@@ -1937,16 +2133,23 @@ mod tests {
             "meta must not dump api/host or middle-dot soup: {meta_row}"
         );
 
-        // Status: short key+label pairs.
-        assert!(status_row.contains("enter"), "send key: {status_row}");
+        // Status: sparse core keys only (full catalog via `?` help).
         assert!(
-            status_row.contains("cmd") || status_row.contains("/"),
-            "commands: {status_row}"
+            status_row.contains("Ctrl+G") || status_row.contains("settings"),
+            "settings key: {status_row}"
+        );
+        assert!(
+            status_row.contains("Ctrl+L") || status_row.contains("model"),
+            "model key: {status_row}"
+        );
+        assert!(
+            status_row.contains('?') || status_row.contains("help"),
+            "help key: {status_row}"
         );
         assert!(
             !status_row.contains("ctrl+c")
                 && !status_row.contains("ctrl+p")
-                && !status_row.contains("ctrl+l")
+                && !status_row.contains("hist")
                 && !status_row.contains(" · "),
             "idle status should stay sparse: {status_row}"
         );
@@ -1956,9 +2159,10 @@ mod tests {
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (left, right) = status_spans(app);
 
+    // Left is sparse core keys; give the right side enough room for usage / ctx %.
     let row = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(8), Constraint::Length(12)])
+        .constraints([Constraint::Min(8), Constraint::Length(28)])
         .split(area);
 
     frame.render_widget(Paragraph::new(Line::from(left)).style(Theme::bg()), row[0]);
@@ -1987,7 +2191,8 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         let mut left = vec![Span::raw("  ")];
         left.extend(pair("↑↓", " nav  "));
         left.extend(pair("enter", " select  "));
-        left.extend(pair("esc", " close"));
+        left.extend(pair("esc", " close  "));
+        left.extend(pair("Ctrl+C", " close"));
         return (left, Vec::new());
     }
 
@@ -2002,30 +2207,22 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
 
     if app.busy {
         let mut left = vec![Span::raw("  ")];
-        // Soft cancel vs hard exit — Ctrl+C must never be "just stop".
-        left.extend(pair("q/esc", " stop  "));
-        left.extend(pair("^c", " quit  "));
-        left.extend(pair("ctrl+s", " steer"));
+        // Soft cancel vs hard exit — single Ctrl+C never exits (double-tap quit).
+        left.extend(pair("esc", " stop  "));
+        left.extend(pair("Ctrl+C", "×2 quit  "));
+        left.extend(pair("Ctrl+S", " steer"));
         let right = vec![Span::styled("working  ", Theme::status_faint())];
         return (left, right);
     }
 
-    // Idle: common actions + usage / thinking on the right.
+    // Idle: core chrome only — full catalog is `?` help float.
+    // Unified Ctrl+ notation (matches tips / help float; never mix with ^).
     let mut left = vec![Span::raw("  ")];
-    left.extend(pair("enter", " send  "));
-    left.extend(pair("/", " cmd  "));
-    left.extend(pair("^j", " nl  "));
-    left.extend(pair("↑↓", " hist  "));
-    left.extend(pair("esc", " clear"));
-    if app.can_scroll() {
-        left.push(Span::raw("  "));
-        left.extend(pair("pgup", " scroll"));
-    }
-    // Mouse on: drag selects in-app → OSC 52 clipboard (not terminal native select).
-    if app.mouse_capture {
-        left.push(Span::raw("  "));
-        left.extend(pair("drag", " copy"));
-    }
+    left.extend(pair("Ctrl+G", " settings"));
+    left.push(Span::styled("  │  ", Theme::status_faint()));
+    left.extend(pair("Ctrl+L", " model"));
+    left.push(Span::styled("  │  ", Theme::status_faint()));
+    left.extend(pair("?", " help"));
 
     let mut right = Vec::new();
     if app.thinking_level != "off" {
@@ -2037,12 +2234,24 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         ));
     }
     // Prefer precise provider I/O tokens when available.
-    if app.usage_input > 0 || app.usage_output > 0 {
+    if app.usage_input > 0
+        || app.usage_output > 0
+        || app.usage_cache_read > 0
+        || app.usage_cache_write > 0
+    {
         let mut usage = format!(
             "↑{} ↓{}  ",
             format_tokens(app.usage_input as usize),
             format_tokens(app.usage_output as usize)
         );
+        // Cache R = read hits, W = creation/write (Anthropic).
+        if app.usage_cache_read > 0 || app.usage_cache_write > 0 {
+            usage.push_str(&format!(
+                "cR{} cW{}  ",
+                format_tokens(app.usage_cache_read as usize),
+                format_tokens(app.usage_cache_write as usize)
+            ));
+        }
         if app.usage_cost_usd > 0.0 {
             if app.usage_cost_usd < 0.01 {
                 usage.push_str(&format!("${:.4}  ", app.usage_cost_usd));

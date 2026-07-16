@@ -1,10 +1,83 @@
 //! Image helpers shared by tools, TUI paste, and providers.
+//!
+//! ## Storage model (Codex-style)
+//! - **Local / session**: file path only (`~/.one/agent/media/…` or workspace)
+//! - **API**: providers read path → base64 / data-URL at request time
 
 use base64::Engine;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hard cap for raw image bytes accepted into agent context.
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
+
+/// `~/.one/agent/media` — durable store for pasted / clipboard images.
+pub fn media_dir() -> PathBuf {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".one").join("agent").join("media")
+}
+
+/// Extension for a supported image MIME type.
+pub fn ext_for_mime(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        "image/bmp" => "bmp",
+        _ => "bin",
+    }
+}
+
+/// Write raw image bytes into the media store. Returns `(absolute_path, mime)`.
+///
+/// `mime_hint` is ignored when magic bytes sniff succeeds (always required).
+pub fn store_image_bytes(bytes: &[u8], _mime_hint: Option<&str>) -> Result<(PathBuf, String), String> {
+    if bytes.is_empty() {
+        return Err("image is empty".into());
+    }
+    if bytes.len() > MAX_IMAGE_BYTES {
+        return Err(format!(
+            "image too large ({} bytes > {} max)",
+            bytes.len(),
+            MAX_IMAGE_BYTES
+        ));
+    }
+    // Always require a real image signature.
+    let mime = mime_from_bytes(bytes)
+        .ok_or_else(|| "not a supported image (png/jpeg/gif/webp/bmp)".to_string())?
+        .to_string();
+
+    let dir = media_dir();
+    std::fs::create_dir_all(&dir).map_err(|e| format!("create media dir: {e}"))?;
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let name = format!(
+        "{nanos:x}_{:x}.{}",
+        std::process::id(),
+        ext_for_mime(&mime)
+    );
+    let path = dir.join(name);
+    std::fs::write(&path, bytes).map_err(|e| format!("write media: {e}"))?;
+    Ok((path, mime))
+}
+
+/// Decode base64 and store into the media dir.
+pub fn store_image_base64(data_b64: &str, mime_hint: Option<&str>) -> Result<(PathBuf, String), String> {
+    let bytes = decode_base64(data_b64).map_err(|e| format!("base64: {e}"))?;
+    store_image_bytes(&bytes, mime_hint)
+}
+
+/// Copy an existing image file into the media store (stable path for sessions).
+pub fn import_image_file(src: &Path) -> Result<(PathBuf, String), String> {
+    let bytes = std::fs::read(src).map_err(|e| format!("read {}: {e}", src.display()))?;
+    let hint = mime_from_path(src);
+    store_image_bytes(&bytes, hint)
+}
 
 /// Prompt placeholder for image id 1 (deleting this token detaches the image).
 pub const IMAGE_TOKEN: &str = "[图片.img]";
@@ -373,9 +446,8 @@ pub fn approx_decoded_len(b64: &str) -> usize {
     b64.len().saturating_mul(3) / 4
 }
 
-/// Compact UI / transcript label, e.g. `[image · image/png · 12KB]`.
-pub fn image_label(mime_type: &str, data_b64: &str) -> String {
-    let bytes = approx_decoded_len(data_b64);
+/// Compact UI / transcript label from byte length, e.g. `[image · png · 12KB]`.
+pub fn image_label_bytes(mime_type: &str, bytes: usize) -> String {
     let size = if bytes < 1024 {
         format!("{bytes}B")
     } else {
@@ -385,6 +457,17 @@ pub fn image_label(mime_type: &str, data_b64: &str) -> String {
         .strip_prefix("image/")
         .unwrap_or(mime_type);
     format!("[image · {short} · {size}]")
+}
+
+/// Compact UI / transcript label from base64 payload length.
+pub fn image_label(mime_type: &str, data_b64: &str) -> String {
+    image_label_bytes(mime_type, approx_decoded_len(data_b64))
+}
+
+/// Label for a local image file (uses on-disk size when available).
+pub fn image_label_path(mime_type: &str, path: &Path) -> String {
+    let bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+    image_label_bytes(mime_type, bytes)
 }
 
 /// Parse a `data:image/...;base64,...` URI into (mime, raw base64 payload).
@@ -433,8 +516,10 @@ pub fn load_image_file(path: &Path) -> Result<(String, String), String> {
     Ok((mime, encode_base64(&bytes)))
 }
 
-/// If `text` is a single existing image path (quoted or bare), load it.
-pub fn try_load_image_path_paste(text: &str) -> Option<(String, String, String)> {
+/// If `text` is a single existing image path (quoted or bare), import into media store.
+///
+/// Returns `(mime, media_path, original_name)`.
+pub fn try_load_image_path_paste(text: &str) -> Option<(String, PathBuf, String)> {
     let t = text.trim().trim_matches(|c| c == '"' || c == '\'');
     if t.is_empty() || t.contains('\n') {
         return None;
@@ -450,13 +535,13 @@ pub fn try_load_image_path_paste(text: &str) -> Option<(String, String, String)>
     if !path.is_file() {
         return None;
     }
-    let (mime, data) = load_image_file(path).ok()?;
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("image")
         .to_string();
-    Some((mime, data, name))
+    let (media, mime) = import_image_file(path).ok()?;
+    Some((mime, media, name))
 }
 
 #[cfg(test)]

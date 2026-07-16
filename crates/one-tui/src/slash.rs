@@ -71,6 +71,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "manually compact context",
     },
     SlashCommand {
+        name: "/skills",
+        usage: "/skills [enable|disable <name>]",
+        description: "manage skills · enable/disable (bare = panel)",
+    },
+    SlashCommand {
         name: "/skill",
         usage: "/skill:name [args]",
         description: "force-load skill (else agent auto-reads when relevant)",
@@ -287,10 +292,7 @@ pub fn popup_rows(input: &str, catalog: &[ModelChoice]) -> Vec<PopupRow> {
     match popup_kind(input) {
         Some(PopupKind::Commands) => command_rows(input),
         Some(PopupKind::Models) => {
-            let query = input
-                .strip_prefix("/model")
-                .unwrap_or("")
-                .trim_start();
+            let query = input.strip_prefix("/model").unwrap_or("").trim_start();
             filter_models_grouped(catalog, query)
         }
         None => Vec::new(),
@@ -369,15 +371,21 @@ mod tests {
             })
             .collect();
         assert_eq!(headers, vec!["openai", "opencode"]);
-        assert!(rows.iter().any(|r| matches!(r, PopupRow::Model(m) if m.id == "gpt-4o")));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, PopupRow::Model(m) if m.id == "gpt-4o")));
     }
 
     #[test]
     fn filter_by_provider_prefix() {
         let rows = filter_models_grouped(&sample_catalog(), "open");
         // both openai and opencode match "open"
-        assert!(rows.iter().any(|r| matches!(r, PopupRow::Header(p) if p == "openai")));
-        assert!(rows.iter().any(|r| matches!(r, PopupRow::Header(p) if p == "opencode")));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, PopupRow::Header(p) if p == "openai")));
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, PopupRow::Header(p) if p == "opencode")));
     }
 
     #[test]

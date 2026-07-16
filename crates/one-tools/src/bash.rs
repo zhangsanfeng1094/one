@@ -102,7 +102,9 @@ For long-running work (tests, builds, dev servers) set run_in_background=true: \
 returns a task_id immediately so you can continue other tools. \
 When the task finishes, a [Background task completed] notice is injected into the conversation. \
 Use bash_output to poll/wait for output, bash_kill to stop a task. \
-Omit run_in_background (or false) for short commands whose result you need before acting."
+Omit run_in_background (or false) for short commands whose result you need before acting. \
+Stdout/stderr returned to the model are capped (~2000 lines / 50KB; large output \
+is spilled to disk with a ~4KB head preview + path for read/grep)."
             ),
             parameters: json!({
                 "type": "object",
@@ -244,9 +246,24 @@ Omit run_in_background (or false) for short commands whose result you need befor
             )
         };
         let mut output = format!("exit {code_label}\n{sandbox_line}");
+        let mut truncated = false;
+        let mut spill_path: Option<String> = None;
         if !body.is_empty() {
+            // Claude-style: large stdout/stderr → full file on disk + head preview.
+            // (Head preview matches Claude Code; tail is available via PreviewStyle::Tail.)
+            let presented = crate::truncate::present_tool_output(
+                body.trim_end(),
+                "bash",
+                &self.cwd,
+                crate::truncate::PreviewStyle::Head,
+            );
+            truncated = presented.truncated;
+            spill_path = presented
+                .spill_path
+                .as_ref()
+                .map(|p| p.display().to_string());
             output.push('\n');
-            output.push_str(body.trim_end());
+            output.push_str(&presented.text);
         }
 
         Ok(ToolOutput::text_with_details(
@@ -258,6 +275,8 @@ Omit run_in_background (or false) for short commands whose result you need befor
                 "background": false,
                 "sandboxed": sandboxed,
                 "sandboxMode": self.sandbox_mode.as_str(),
+                "truncated": truncated,
+                "fullOutputPath": spill_path,
             }),
         ))
     }

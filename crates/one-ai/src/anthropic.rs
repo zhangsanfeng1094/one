@@ -12,11 +12,18 @@ mod inner {
     use serde_json::{json, Value};
 
     const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+    const DEFAULT_BASE: &str = "https://api.anthropic.com";
 
     pub struct AnthropicProvider {
         client: Client,
         api_key: String,
         model: String,
+        /// API root without trailing slash (e.g. `https://api.anthropic.com` or a proxy).
+        base_url: String,
+        /// Pi `AnthropicMessagesCompat` resolved flags.
+        compat: crate::compat::ResolvedAnthropicCompat,
+        /// Sticky session id when `send_session_affinity_headers` is on.
+        session_id: String,
     }
 
     impl AnthropicProvider {
@@ -28,10 +35,37 @@ mod inner {
         }
 
         pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
+            Self::with_base(api_key, model, DEFAULT_BASE)
+        }
+
+        pub fn with_base(
+            api_key: impl Into<String>,
+            model: impl Into<String>,
+            base_url: impl Into<String>,
+        ) -> Self {
+            let base = base_url.into().trim_end_matches('/').to_string();
             Self {
                 client: Client::new(),
                 api_key: api_key.into(),
                 model: model.into(),
+                base_url: base,
+                compat: crate::compat::ResolvedAnthropicCompat::default(),
+                session_id: crate::cache::new_session_affinity_id(),
+            }
+        }
+
+        pub fn with_compat(mut self, compat: crate::compat::ResolvedAnthropicCompat) -> Self {
+            self.compat = compat;
+            self
+        }
+
+        fn messages_url(&self) -> String {
+            // Accept either `https://api.anthropic.com` or `…/v1`.
+            let base = self.base_url.trim_end_matches('/');
+            if base.ends_with("/v1") {
+                format!("{base}/messages")
+            } else {
+                format!("{base}/v1/messages")
             }
         }
     }
@@ -56,12 +90,35 @@ mod inner {
             on_event: &mut (dyn FnMut(StreamEvent) + Send),
             abort: Option<&AtomicBool>,
         ) -> Result<CompletionResponse> {
-            let body = build_request_body(&request, &self.model, true);
-            let response = self
+            let body = build_request_body(&request, &self.model, true, &self.compat);
+            crate::cache::record_cache_debug(
+                "anthropic",
+                "request",
+                Some(&body),
+                None,
+                Some(json!({
+                    "model": self.model,
+                    "base_url": self.base_url,
+                    "long_cache": self.compat.supports_long_cache_retention,
+                    "cache_on_tools": self.compat.supports_cache_control_on_tools,
+                })),
+            );
+            let mut req = self
                 .client
-                .post("https://api.anthropic.com/v1/messages")
+                .post(self.messages_url())
                 .header("x-api-key", &self.api_key)
-                .header("anthropic-version", "2023-06-01")
+                .header("anthropic-version", "2023-06-01");
+            // Legacy fine-grained tool streaming when eager tool input is unsupported.
+            if !self.compat.supports_eager_tool_input_streaming && !request.tools.is_empty() {
+                req = req.header(
+                    "anthropic-beta",
+                    "fine-grained-tool-streaming-2025-05-14",
+                );
+            }
+            if self.compat.send_session_affinity_headers {
+                req = req.header("x-session-affinity", &self.session_id);
+            }
+            let response = req
                 .json(&body)
                 .send()
                 .await
@@ -70,6 +127,13 @@ mod inner {
             if !response.status().is_success() {
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
+                crate::cache::record_cache_debug(
+                    "anthropic",
+                    "error",
+                    Some(&body),
+                    None,
+                    Some(json!({ "status": status.as_u16(), "body_head": text.chars().take(500).collect::<String>() })),
+                );
                 return Err(OneError::Provider(format!("anthropic {status}: {text}")));
             }
 
@@ -264,6 +328,18 @@ mod inner {
                 stop_reason = StopReason::ToolUse;
             }
 
+            crate::cache::record_cache_debug(
+                "anthropic",
+                "response",
+                Some(&body),
+                Some(&usage),
+                Some(json!({
+                    "model": self.model,
+                    "stop_reason": format!("{stop_reason:?}"),
+                    "aborted": aborted,
+                })),
+            );
+
             Ok(CompletionResponse {
                 provider: self.name().to_string(),
                 model: self.model.clone(),
@@ -364,36 +440,81 @@ mod inner {
         }
     }
 
-    fn build_request_body(request: &CompletionRequest, model: &str, stream: bool) -> Value {
-        let tools: Vec<Value> = request
+    fn build_request_body(
+        request: &CompletionRequest,
+        model: &str,
+        stream: bool,
+        compat: &crate::compat::ResolvedAnthropicCompat,
+    ) -> Value {
+        let cache = crate::cache::anthropic_cache_control(compat.supports_long_cache_retention);
+
+        let mut tools: Vec<Value> = request
             .tools
             .iter()
             .map(|tool| {
-                json!({
+                let mut t = json!({
                     "name": tool.name,
                     "description": tool.description,
                     "input_schema": tool.parameters,
-                })
+                });
+                // Per-tool eager input streaming (default true in Pi).
+                if compat.supports_eager_tool_input_streaming {
+                    t["eager_input_streaming"] = json!(true);
+                }
+                t
             })
             .collect();
 
-        let messages: Vec<Value> = request
+        let mut messages: Vec<Value> = request
             .messages
             .iter()
-            .filter_map(map_message)
+            .filter_map(|m| map_message(m, compat))
             .collect();
+        // Stabilize string→block shape for *all* turns, then place breakpoints.
+        // (Only marking the last message as blocks would flip wire shape next turn
+        // and invalidate the conversation prefix.)
+        crate::cache::apply_anthropic_message_cache(
+            &mut messages,
+            &mut tools,
+            &cache,
+            compat.supports_cache_control_on_tools,
+        );
+
+        // System as content blocks with cache_control (string form cannot carry breakpoints).
+        let system = if request.system_prompt.trim().is_empty() {
+            Value::Null
+        } else {
+            crate::cache::anthropic_system_with_cache(&request.system_prompt, &cache)
+        };
 
         let mut body = json!({
             "model": model,
             "max_tokens": 8192,
-            "system": request.system_prompt,
             "messages": messages,
             "tools": tools,
             "stream": stream,
         });
+        if !system.is_null() {
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("system".into(), system);
+            }
+        }
 
-        // Map unified thinking level → Anthropic extended thinking budget.
-        let _ = crate::thinking::apply_anthropic_thinking(&mut body, request.thinking_level);
+        // Map unified thinking level → Anthropic extended thinking.
+        if compat.force_adaptive_thinking && request.thinking_level.is_enabled() {
+            // Adaptive thinking (Claude Opus 4.7+ style): type adaptive + output_config.effort.
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("thinking".into(), json!({ "type": "adaptive" }));
+                if let Some(effort) = request.thinking_level.effort() {
+                    obj.insert(
+                        "output_config".into(),
+                        json!({ "effort": effort }),
+                    );
+                }
+            }
+        } else {
+            let _ = crate::thinking::apply_anthropic_thinking(&mut body, request.thinking_level);
+        }
 
         body
     }
@@ -408,7 +529,10 @@ mod inner {
         }
     }
 
-    fn map_message(message: &one_core::AgentMessage) -> Option<Value> {
+    fn map_message(
+        message: &one_core::AgentMessage,
+        compat: &crate::compat::ResolvedAnthropicCompat,
+    ) -> Option<Value> {
         match message {
             one_core::AgentMessage::User(user) => Some(json!({
                 "role": "user",
@@ -451,6 +575,14 @@ mod inner {
                                     "type": "thinking",
                                     "thinking": thinking,
                                     "signature": sig,
+                                }));
+                            } else if compat.allow_empty_signature {
+                                // Some Anthropic-compatible proxies emit empty signatures
+                                // and still expect thinking blocks on replay.
+                                blocks.push(json!({
+                                    "type": "thinking",
+                                    "thinking": thinking,
+                                    "signature": "",
                                 }));
                             } else if !thinking.is_empty() {
                                 // Missing signature (aborted stream / non-Anthropic origin):
@@ -506,6 +638,117 @@ mod inner {
         },
         #[serde(other)]
         Other,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use one_core::message::{UserContent, UserMessage};
+        use one_core::tool::ToolDefinition;
+
+        #[test]
+        fn request_body_injects_cache_control() {
+            let req = CompletionRequest {
+                system_prompt: "you are helpful".into(),
+                messages: vec![one_core::AgentMessage::User(UserMessage {
+                    content: UserContent::Text("hi".into()),
+                    timestamp: 0,
+                })],
+                tools: vec![
+                    ToolDefinition {
+                        name: "read".into(),
+                        description: "read".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                    ToolDefinition {
+                        name: "bash".into(),
+                        description: "bash".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                ],
+                thinking_level: one_core::agent::ThinkingLevel::Off,
+            };
+            let body = build_request_body(
+                &req,
+                "claude-test",
+                false,
+                &crate::compat::ResolvedAnthropicCompat::default(),
+            );
+
+            // system is content blocks with cache_control
+            assert_eq!(body["system"][0]["type"], "text");
+            assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
+
+            // last tool marked
+            let tools = body["tools"].as_array().unwrap();
+            assert!(tools[0].get("cache_control").is_none());
+            assert_eq!(tools[1]["cache_control"]["type"], "ephemeral");
+
+            // last message marked; user text kept
+            let msgs = body["messages"].as_array().unwrap();
+            let content = &msgs[0]["content"];
+            assert_eq!(content[0]["text"], "hi");
+            assert_eq!(content[0]["cache_control"]["type"], "ephemeral");
+        }
+
+        #[test]
+        fn multi_turn_prefix_shape_stable() {
+            let compat = crate::compat::ResolvedAnthropicCompat::default();
+            let turn1 = CompletionRequest {
+                system_prompt: "sys".into(),
+                messages: vec![one_core::AgentMessage::User(UserMessage {
+                    content: UserContent::Text("hi".into()),
+                    timestamp: 0,
+                })],
+                tools: vec![],
+                thinking_level: one_core::agent::ThinkingLevel::Off,
+            };
+            let body1 = build_request_body(&turn1, "m", false, &compat);
+
+            let turn2 = CompletionRequest {
+                system_prompt: "sys".into(),
+                messages: vec![
+                    one_core::AgentMessage::User(UserMessage {
+                        content: UserContent::Text("hi".into()),
+                        timestamp: 0,
+                    }),
+                    one_core::AgentMessage::Assistant(one_core::message::AssistantMessage {
+                        content: vec![ContentBlock::Text {
+                            text: "yo".into(),
+                        }],
+                        provider: "anthropic".into(),
+                        model: "m".into(),
+                        stop_reason: StopReason::Stop,
+                        timestamp: 0,
+                    }),
+                ],
+                tools: vec![],
+                thinking_level: one_core::agent::ThinkingLevel::Off,
+            };
+            let body2 = build_request_body(&turn2, "m", false, &compat);
+
+            // First user message must stay a text-block array (not flip back to string).
+            assert!(body1["messages"][0]["content"].is_array());
+            assert!(body2["messages"][0]["content"].is_array());
+            assert_eq!(body1["messages"][0]["content"][0]["text"], "hi");
+            assert_eq!(body2["messages"][0]["content"][0]["text"], "hi");
+            // System text unchanged across turns.
+            assert_eq!(body1["system"][0]["text"], body2["system"][0]["text"]);
+        }
+
+        #[test]
+        fn long_retention_adds_ttl() {
+            let mut compat = crate::compat::ResolvedAnthropicCompat::default();
+            compat.supports_long_cache_retention = true;
+            let req = CompletionRequest {
+                system_prompt: "sys".into(),
+                messages: vec![],
+                tools: vec![],
+                thinking_level: one_core::agent::ThinkingLevel::Off,
+            };
+            let body = build_request_body(&req, "m", false, &compat);
+            assert_eq!(body["system"][0]["cache_control"]["ttl"], "1h");
+        }
     }
 
     fn map_response(payload: AnthropicResponse) -> (Vec<ContentBlock>, StopReason) {
@@ -565,5 +808,21 @@ impl AnthropicProvider {
         Err(one_core::error::OneError::Provider(
             "rebuild with --features http-providers to enable Anthropic".to_string(),
         ))
+    }
+
+    pub fn new(_api_key: impl Into<String>, _model: impl Into<String>) -> Self {
+        Self
+    }
+
+    pub fn with_base(
+        _api_key: impl Into<String>,
+        _model: impl Into<String>,
+        _base_url: impl Into<String>,
+    ) -> Self {
+        Self
+    }
+
+    pub fn with_compat(self, _compat: crate::compat::ResolvedAnthropicCompat) -> Self {
+        self
     }
 }

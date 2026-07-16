@@ -13,6 +13,7 @@ pub mod plan;
 pub mod read;
 pub mod sandbox;
 pub mod tasks;
+pub mod truncate;
 pub mod write;
 #[cfg(feature = "network")]
 pub mod web_fetch;
@@ -43,6 +44,12 @@ pub use plan::{
 };
 pub use read::ReadTool;
 pub use tasks::BackgroundTaskRegistry;
+pub use truncate::{
+    apply_head_default, apply_tail_default, format_size, max_inline_output_chars,
+    present_file_read, present_tool_output, spill_full_output, truncate_head, truncate_line,
+    truncate_tail, DEFAULT_BASH_MAX_OUTPUT_CHARS, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
+    DEFAULT_SPILL_PREVIEW_CHARS, GREP_MAX_LINE_LENGTH, PreviewStyle, PresentedOutput,
+};
 pub use write::WriteTool;
 #[cfg(feature = "network")]
 pub use web_fetch::WebFetchTool;

@@ -75,3 +75,4 @@ cargo run --example status_extension -p one-ext
 1. **dylib 动态加载**：编译为 `.so`，运行时加载
 2. **WASM 沙箱**：安全隔离的扩展执行
 3. **TS 兼容层**：评估 QuickJS 运行官方扩展的可行性
+4. **Package / Suite 引用扩展**：领域套件通过 manifest 声明 `extensions.load`，与 skills/profile 一并装配；不另起 Plugin 运行时。见 [package-suites.md](./package-suites.md)

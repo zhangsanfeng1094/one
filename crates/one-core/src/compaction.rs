@@ -1,5 +1,12 @@
 use crate::message::{AgentMessage, ContentBlock, UserContent};
 
+/// Fraction of the model context window at which auto-compact fires.
+pub const DEFAULT_COMPACT_RATIO: f64 = 0.70;
+/// Floor so tiny windows still allow a bit of room before compacting.
+pub const MIN_COMPACT_THRESHOLD: usize = 16_000;
+/// Used when `context_window` is unknown (0).
+pub const FALLBACK_COMPACT_THRESHOLD: usize = 80_000;
+
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
     pub enabled: bool,
@@ -13,17 +20,51 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
-            token_threshold: 80_000,
+            token_threshold: FALLBACK_COMPACT_THRESHOLD,
             keep_recent_messages: 12,
             max_summary_chars: 6_000,
         }
     }
 }
 
+impl CompactionConfig {
+    /// Build config with threshold ≈ `ratio * context_window` (default 70%).
+    ///
+    /// When `context_window` is 0, keeps [`FALLBACK_COMPACT_THRESHOLD`].
+    pub fn from_context_window(context_window: usize) -> Self {
+        Self {
+            token_threshold: threshold_for_context_window(context_window),
+            ..Default::default()
+        }
+    }
+}
+
+/// Compact when estimated/observed tokens reach this many of the model window.
+pub fn threshold_for_context_window(context_window: usize) -> usize {
+    if context_window == 0 {
+        return FALLBACK_COMPACT_THRESHOLD;
+    }
+    let raw = ((context_window as f64) * DEFAULT_COMPACT_RATIO).round() as usize;
+    // Leave a little headroom under the hard window for the summary turn + tools.
+    let capped = raw.min(context_window.saturating_sub(4_096).max(MIN_COMPACT_THRESHOLD));
+    capped.max(MIN_COMPACT_THRESHOLD)
+}
+
 pub fn estimate_tokens(messages: &[AgentMessage]) -> usize {
     let chars: usize = messages.iter().map(message_chars).sum();
     // ~4 chars/token heuristic (same as common rough estimates).
     chars / 4
+}
+
+/// Prefer provider-reported last-prompt size when available; else char estimate.
+pub fn tokens_for_compaction(
+    messages: &[AgentMessage],
+    last_prompt_tokens: Option<u64>,
+) -> usize {
+    match last_prompt_tokens {
+        Some(n) if n > 0 => n as usize,
+        _ => estimate_tokens(messages),
+    }
 }
 
 fn message_chars(message: &AgentMessage) -> usize {
@@ -61,7 +102,13 @@ fn message_chars(message: &AgentMessage) -> usize {
 }
 
 pub fn should_compact(messages: &[AgentMessage], config: &CompactionConfig) -> bool {
-    config.enabled && estimate_tokens(messages) >= config.token_threshold
+    should_compact_tokens(estimate_tokens(messages), config)
+}
+
+/// Same as [`should_compact`] but with an already-resolved token count
+/// (e.g. from [`tokens_for_compaction`]).
+pub fn should_compact_tokens(tokens: usize, config: &CompactionConfig) -> bool {
+    config.enabled && tokens >= config.token_threshold
 }
 
 /// Split messages into (older to summarize, recent to keep).
@@ -283,5 +330,38 @@ mod tests {
         let (older, recent) = split_for_compaction(&messages, &config).unwrap();
         assert_eq!(recent.len(), 2);
         assert!(!older.is_empty());
+    }
+
+    #[test]
+    fn threshold_from_context_window() {
+        assert_eq!(
+            threshold_for_context_window(0),
+            FALLBACK_COMPACT_THRESHOLD
+        );
+        let t = threshold_for_context_window(200_000);
+        assert_eq!(t, 140_000); // 70%
+        assert!(should_compact_tokens(140_000, &CompactionConfig::from_context_window(200_000)));
+        assert!(!should_compact_tokens(
+            100_000,
+            &CompactionConfig::from_context_window(200_000)
+        ));
+    }
+
+    #[test]
+    fn prefers_observed_prompt_tokens() {
+        let messages = vec![AgentMessage::user_text("short")];
+        // Char estimate is tiny; observed says we're already huge.
+        let tokens = tokens_for_compaction(&messages, Some(90_000));
+        assert_eq!(tokens, 90_000);
+        assert!(should_compact_tokens(
+            tokens,
+            &CompactionConfig {
+                token_threshold: 80_000,
+                ..Default::default()
+            }
+        ));
+        // Zero observed → fall back to estimate.
+        let est = tokens_for_compaction(&messages, Some(0));
+        assert_eq!(est, estimate_tokens(&messages));
     }
 }

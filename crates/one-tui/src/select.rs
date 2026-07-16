@@ -129,11 +129,7 @@ impl SelectPrompt {
                 "Yes, and don't ask again for anything (always-approve mode)",
                 "Auto-approve all tool asks for the rest of this process",
             ),
-            SelectOption::new(
-                "once",
-                "Yes, proceed",
-                "Allow this single tool call",
-            ),
+            SelectOption::new("once", "Yes, proceed", "Allow this single tool call"),
             SelectOption::new(
                 "session",
                 "Yes, and don't ask again for this",
@@ -148,8 +144,7 @@ impl SelectPrompt {
         let mut p = Self::single("Permission required", body, options);
         p.type_on_ids.insert("deny".into());
         p.ctrl_o_id = Some("always".into());
-        p.footer_hint =
-            "↑↓/1-4:select  Enter:confirm  Ctrl+o:always-approve  Esc:cancel".into();
+        p.footer_hint = "↑↓/1-4:select  Enter:confirm  Ctrl+o:always-approve  Esc:cancel".into();
         p.other_label = "Feedback for the model (Enter empty to skip)".into();
         p
     }
@@ -272,10 +267,7 @@ impl SelectPrompt {
                     }
                 }
                 ids.sort();
-                Some(SelectResult::Confirmed {
-                    ids,
-                    other: None,
-                })
+                Some(SelectResult::Confirmed { ids, other: None })
             }
         }
     }
@@ -285,11 +277,7 @@ impl SelectPrompt {
             SelectPhase::Typing { buffer } => buffer.trim().to_string(),
             SelectPhase::List => String::new(),
         };
-        let other = if text.is_empty() {
-            None
-        } else {
-            Some(text)
-        };
+        let other = if text.is_empty() { None } else { Some(text) };
 
         // Typing after focusing a type_on id (e.g. deny) or Other row.
         if self.is_other_row(self.selected) || self.allow_other && other.is_some() {
@@ -315,10 +303,7 @@ impl SelectPrompt {
                     other,
                 };
             }
-            return SelectResult::Confirmed {
-                ids: vec![],
-                other,
-            };
+            return SelectResult::Confirmed { ids: vec![], other };
         }
 
         // type_on option (deny with optional feedback)
@@ -337,6 +322,24 @@ impl SelectPrompt {
             SelectPhase::Typing { .. } => self.handle_typing_key(key),
             SelectPhase::List => self.handle_list_key(key),
         }
+    }
+
+    /// Whether free-text typing currently owns keyboard focus.
+    pub fn is_typing(&self) -> bool {
+        matches!(self.phase, SelectPhase::Typing { .. })
+    }
+
+    /// Paste into the free-text buffer. Returns `true` if consumed (typing phase).
+    pub fn handle_paste(&mut self, text: &str) -> bool {
+        let SelectPhase::Typing { buffer } = &mut self.phase else {
+            return false;
+        };
+        for ch in text.chars() {
+            if !ch.is_control() {
+                buffer.push(ch);
+            }
+        }
+        true
     }
 
     fn handle_typing_key(&mut self, key: KeyEvent) -> Option<SelectResult> {
@@ -594,7 +597,10 @@ mod tests {
     #[test]
     fn cancel_esc() {
         let mut p = sample_single();
-        assert_eq!(p.handle_key(key(KeyCode::Esc)), Some(SelectResult::Cancelled));
+        assert_eq!(
+            p.handle_key(key(KeyCode::Esc)),
+            Some(SelectResult::Cancelled)
+        );
     }
 
     #[test]

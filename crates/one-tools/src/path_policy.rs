@@ -1,9 +1,11 @@
 //! Workspace path boundary for file tools.
 //!
 //! Default mode (`WorkspaceWrite`) only allows paths under the working directory
-//! (plus `--add-dir` roots). Agent home (`~/.one/agent`) is readable so skills
-//! and plans can still be loaded. Use `FullAccess` / `--full-access` to disable
-//! the boundary (container / trusted environments only).
+//! (plus `--add-dir` roots). Always-readable roots cover Agent Skills progressive
+//! disclosure ([agentskills.io](https://agentskills.io)): agent home, cross-client
+//! `~/.agents/skills`, and compat harness skill dirs (`~/.codex/skills`, etc.).
+//! Use `FullAccess` / `--full-access` to disable the boundary (container / trusted
+//! environments only).
 
 use std::path::{Component, Path, PathBuf};
 
@@ -18,7 +20,7 @@ pub enum AccessKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum SandboxMode {
     /// Paths must fall under workspace roots (cwd + add-dir).
-    /// Agent dir is readable for skills/plans.
+    /// Skill discovery roots + agent home are readable (plans / SKILL.md).
     #[default]
     WorkspaceWrite,
     /// No path boundary (dangerous on a host machine).
@@ -65,12 +67,17 @@ impl PathPolicy {
     pub fn workspace(cwd: impl Into<PathBuf>) -> Self {
         let cwd = normalize_existing_dir(cwd.into());
         let mut readable_roots = Vec::new();
-        // Skills / builtin-skills / plans live under agent dir.
-        let agent = default_agent_dir();
-        if agent.exists() {
-            readable_roots.push(normalize_existing_dir(agent));
-        } else {
-            readable_roots.push(clean_path(&agent));
+        // agentskills.io permission allowlist: skill roots are read-only by default
+        // so the model can `read` catalog `location` paths (and bundled resources).
+        for root in default_skill_readable_roots() {
+            let p = if root.exists() {
+                normalize_existing_dir(root)
+            } else {
+                clean_path(&root)
+            };
+            if !readable_roots.iter().any(|r| r == &p) {
+                readable_roots.push(p);
+            }
         }
         Self {
             cwd,
@@ -123,6 +130,18 @@ impl PathPolicy {
         let p = normalize_existing_dir(path.into());
         if !self.readable_roots.iter().any(|r| r == &p) {
             self.readable_roots.push(p);
+        }
+        self
+    }
+
+    /// Batch-add always-readable roots (skill discovery dirs / package dirs).
+    pub fn with_readable_roots<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        for path in paths {
+            self = self.with_readable_root(path);
         }
         self
     }
@@ -214,10 +233,34 @@ impl PathPolicy {
 
 fn default_agent_dir() -> PathBuf {
     // Mirror one_session::agent_dir without taking a dependency on one-session.
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
+    let home = dirs_home();
     home.join(".one").join("agent")
+}
+
+fn dirs_home() -> PathBuf {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// Default read-only skill roots (Codex / agentskills convention).
+///
+/// Keep in sync with `one_resources::skill_discovery_dirs` user roots.
+/// Runtime also merges discovered package dirs via [`PathPolicy::with_readable_roots`].
+fn default_skill_readable_roots() -> Vec<PathBuf> {
+    let home = dirs_home();
+    let agent = default_agent_dir();
+    vec![
+        agent.clone(),
+        agent.join("skills"),
+        agent.join("builtin-skills"),
+        // Cross-client shared install location (agentskills.io).
+        home.join(".agents").join("skills"),
+        // Client-native / compat harnesses (lower discovery precedence, still readable).
+        home.join(".claude").join("skills"),
+        home.join(".codex").join("skills"),
+        home.join(".grok").join("skills"),
+    ]
 }
 
 fn normalize_existing_dir(path: PathBuf) -> PathBuf {
@@ -408,5 +451,52 @@ mod tests {
             Some(SandboxMode::FullAccess)
         );
         assert!(SandboxMode::parse("nope").is_none());
+    }
+
+    #[test]
+    fn skill_roots_readable_not_writable() {
+        let dir = temp_dir();
+        let policy = PathPolicy::workspace(dir.clone());
+
+        // Default policy includes ~/.agents/skills as a readable root (agentskills.io).
+        if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+            let agents_skill = home
+                .join(".agents")
+                .join("skills")
+                .join("x")
+                .join("SKILL.md");
+            policy
+                .check(&agents_skill, AccessKind::Read)
+                .expect("default skill root should be readable");
+            let write_err = policy
+                .check(&agents_skill, AccessKind::Write)
+                .expect_err("skill root must stay read-only");
+            assert!(write_err.contains("outside workspace"), "{write_err}");
+
+            let codex_skill = home
+                .join(".codex")
+                .join("skills")
+                .join("git-weekly-summary")
+                .join("SKILL.md");
+            policy
+                .check(&codex_skill, AccessKind::Read)
+                .expect("compat ~/.codex/skills should be readable");
+        }
+
+        let extra = temp_dir();
+        let skill_md = extra.join("my-skill").join("SKILL.md");
+        std::fs::create_dir_all(skill_md.parent().unwrap()).unwrap();
+        std::fs::write(&skill_md, "---\nname: t\ndescription: d\n---\n").unwrap();
+        let policy = PathPolicy::workspace(dir.clone()).with_readable_root(extra.clone());
+        policy
+            .resolve(skill_md.to_str().unwrap(), AccessKind::Read)
+            .expect("allowlisted skill package is readable");
+        let write_err = policy
+            .resolve(skill_md.to_str().unwrap(), AccessKind::Write)
+            .expect_err("readable skill root is not writable");
+        assert!(write_err.contains("outside workspace"), "{write_err}");
+
+        let _ = std::fs::remove_dir_all(&extra);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

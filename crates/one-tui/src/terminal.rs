@@ -22,8 +22,7 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen,
-    LeaveAlternateScreen,
+    disable_raw_mode, enable_raw_mode, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use crossterm::Command;
 use crossterm::ExecutableCommand;
@@ -207,6 +206,8 @@ impl TerminalSession {
     }
 
     pub fn draw(&mut self, app: &mut App) -> Result<()> {
+        // Finalize clipboard image pastes before paint so chips leave "loading".
+        app.poll_image_jobs();
         app.mouse_capture = self.mouse_want;
         self.terminal.draw(|frame| ui::draw(frame, app))?;
         self.flush_clipboard(app);
@@ -214,6 +215,8 @@ impl TerminalSession {
     }
 
     fn tick_blink(&mut self, app: &mut App) -> bool {
+        // Also poll here so jobs complete even when idle without redraw churn.
+        app.poll_image_jobs();
         if self.last_blink.elapsed() >= CURSOR_BLINK {
             app.toggle_cursor();
             self.last_blink = Instant::now();
@@ -243,9 +246,7 @@ impl TerminalSession {
 
         if self.select_release_at.is_some() {
             match mouse.kind {
-                MouseEventKind::ScrollUp
-                | MouseEventKind::ScrollDown
-                | MouseEventKind::Down(_) => {
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown | MouseEventKind::Down(_) => {
                     self.arm_mouse_if_wanted();
                 }
                 _ => {}
@@ -308,7 +309,7 @@ impl TerminalSession {
             return true;
         }
         // Ctrl+Shift+C or plain `y` when selection active → OSC 52 copy.
-        // (Ctrl+C alone remains force-quit when busy / unused when idle.)
+        // (Plain Ctrl+C is progressive dismiss / double-tap quit in App.)
         if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.modifiers.contains(KeyModifiers::SHIFT)
@@ -331,9 +332,8 @@ impl TerminalSession {
     }
 
     pub async fn wait_action(&mut self, app: &mut App) -> Result<RunOutcome> {
-        if self.mouse_want {
-            app.set_notice("drag: copy text · wheel: scroll · Ctrl+Shift+M: mouse off");
-        }
+        // Mouse tips live on the empty-state footer / help — do not spam a
+        // floating toast every idle wait (steals focus from the prompt).
 
         loop {
             self.maybe_rearm_after_select();

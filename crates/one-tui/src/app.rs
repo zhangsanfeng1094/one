@@ -13,15 +13,32 @@ use crate::message::{
 use crate::slash::{self, ModelChoice, PopupKind, PopupRow};
 use crate::tool_view;
 
+/// Empty-session sample prompts — keys `1`–`3` run these when input is empty.
+pub const WELCOME_TRY_PROMPTS: &[&str] = &[
+    "list files in this directory",
+    "explain how the agent loop works",
+    "fix the failing tests",
+];
+
 /// Image attachment bound to a prompt placeholder token (`[图片.img]` / `[图片.N.img]`).
 ///
+/// Stored as a **local file path** (Codex-style); base64 is only produced when
+/// the provider builds the API request.
+///
 /// Deleting the token from the input detaches the image (uniform with normal editing).
+///
+/// While `loading` is true, the chip is already visible but the media file is
+/// still being captured (clipboard / PowerShell) — do not submit yet.
 #[derive(Debug, Clone)]
 pub struct PendingImage {
     pub id: u32,
     pub mime_type: String,
-    pub data: String,
+    /// Absolute path under `~/.one/agent/media` or an imported image file.
+    /// Empty while `loading`.
+    pub path: PathBuf,
     pub name: String,
+    /// Clipboard / import still in flight (optimistic chip already shown).
+    pub loading: bool,
 }
 
 impl PendingImage {
@@ -30,8 +47,19 @@ impl PendingImage {
     }
 
     pub fn label(&self) -> String {
-        one_core::image::image_label(&self.mime_type, &self.data)
+        if self.loading {
+            "[image · … · loading]".to_string()
+        } else {
+            one_core::image::image_label_path(&self.mime_type, &self.path)
+        }
     }
+}
+
+/// Background clipboard/image import job (placeholder chip already in the input).
+struct ImagePasteJob {
+    id: u32,
+    report_err: bool,
+    rx: std::sync::mpsc::Receiver<Result<(String, PathBuf, String), String>>,
 }
 
 /// Long pasted text bound to `[文本.txt]` / `[文本.N.txt]` (same atomic delete UX as images).
@@ -56,7 +84,7 @@ pub enum RunOutcome {
     Prompt(String),
     FollowUp(String),
     Steer(String),
-    /// Cycle agent mode Plan ↔ Build (Space on empty input).
+    /// Cycle agent mode Plan ↔ Build (Shift+Tab / BackTab).
     CycleAgentMode,
     /// Esc Esc on empty input — CLI should open the rewind menu.
     OpenRewind,
@@ -109,6 +137,10 @@ pub enum ConfigOp {
     SettingSet {
         key: String,
         value: String,
+    },
+    /// Toggle skill enabled flag (path to SKILL.md).
+    SkillToggle {
+        path: String,
     },
 }
 
@@ -237,6 +269,10 @@ impl RunOutcome {
 /// Longer than a typical key-repeat delay so a deliberate double-tap is easy.
 const ESC_DOUBLE_MS: u128 = 900;
 
+/// Max interval between Ctrl+C presses for confirm-quit (second tap).
+/// Same window as Esc double-tap so the muscle memory stays consistent.
+const CTRL_C_DOUBLE_MS: u128 = 900;
+
 const STATUS_IDLE: &str = "";
 const STATUS_BUSY: &str = "";
 /// How long toast stays visible unless replaced.
@@ -319,6 +355,8 @@ pub struct App {
     pub settings_provider_field_rows: Vec<(String, String)>,
     /// Model rows for Settings → Models (`provider:id`, detail).
     pub settings_model_rows: Vec<(String, String)>,
+    /// Skills manager rows: `(path, label, detail, enabled)`.
+    pub skills_rows: Vec<(String, String, String, bool)>,
     /// Ephemeral toast (top-right). **Not** chat context, **not** agent messages.
     pub toast: Option<Toast>,
     /// Centered floating secondary menu (Settings, commands, sessions, …).
@@ -329,6 +367,8 @@ pub struct App {
     pub current_model: String,
     /// Provider id while in Settings → Provider → Models hierarchy.
     pub settings_provider_focus: String,
+    /// When true, thinkingFormat / maxTokensField / cycle_compat apply to the focused **model**.
+    pub settings_compat_on_model: bool,
     /// Model spec (`provider:id`) while on model detail page.
     pub settings_model_focus: String,
     /// Draft for Settings → Add model form (in-float, never leaves Settings).
@@ -346,6 +386,10 @@ pub struct App {
     pub usage_input: u64,
     /// Provider-reported cumulative output tokens.
     pub usage_output: u64,
+    /// Provider-reported cumulative cache-read tokens (0 = none / unknown).
+    pub usage_cache_read: u64,
+    /// Provider-reported cumulative cache-write / creation tokens.
+    pub usage_cache_write: u64,
     /// Optional rough USD cost estimate (0 = unknown / not shown).
     pub usage_cost_usd: f64,
     /// Optional context window for % display (0 = unknown).
@@ -358,9 +402,11 @@ pub struct App {
     force_quit_pending: bool,
     /// Images still referenced by tokens in `input`.
     pub pending_images: Vec<PendingImage>,
+    /// In-flight clipboard / import jobs (chip already shown).
+    image_jobs: Vec<ImagePasteJob>,
     /// Long text pastes still referenced by `[文本.….txt]` tokens in `input`.
     pub pending_texts: Vec<PendingText>,
-    /// Images committed on submit (input is cleared; CLI takes these for the agent).
+    /// Images committed on submit: `(mime, path)` for the agent.
     committed_images: Vec<(String, String)>,
     /// Next image token id (1-based).
     next_image_id: u32,
@@ -374,6 +420,8 @@ pub struct App {
     history_draft: String,
     /// Timestamp of the last Esc press (for double-Esc rewind / clear).
     last_esc_at: Option<Instant>,
+    /// Timestamp of the last Ctrl+C that armed confirm-quit (double-tap to exit).
+    last_ctrl_c_at: Option<Instant>,
     /// Optional on-disk history file (project-scoped). Written on each push.
     history_persist_path: Option<PathBuf>,
     /// Optional callback-less persist via path — CLI sets this after load.
@@ -440,11 +488,13 @@ impl App {
             settings_provider_rows: Vec::new(),
             settings_provider_field_rows: Vec::new(),
             settings_model_rows: Vec::new(),
+            skills_rows: Vec::new(),
             toast: None,
             float: None,
             current_provider: String::new(),
             current_model: String::new(),
             settings_provider_focus: String::new(),
+            settings_compat_on_model: false,
             settings_model_focus: String::new(),
             model_draft: None,
             settings_form_edit: None,
@@ -453,6 +503,8 @@ impl App {
             usage_tokens: 0,
             usage_input: 0,
             usage_output: 0,
+            usage_cache_read: 0,
+            usage_cache_write: 0,
             usage_cost_usd: 0.0,
             context_window: 0,
             turn_started: None,
@@ -461,6 +513,7 @@ impl App {
             abort_pending: false,
             force_quit_pending: false,
             pending_images: Vec::new(),
+            image_jobs: Vec::new(),
             pending_texts: Vec::new(),
             committed_images: Vec::new(),
             next_image_id: 1,
@@ -469,6 +522,7 @@ impl App {
             history_index: None,
             history_draft: String::new(),
             last_esc_at: None,
+            last_ctrl_c_at: None,
             history_persist_path: None,
             history_cwd: None,
             approval: None,
@@ -681,6 +735,30 @@ impl App {
         self.clear_notice();
     }
 
+    /// Populate skills manager rows (path, label, detail, enabled).
+    pub fn set_skills_rows(&mut self, rows: Vec<(String, String, String, bool)>) {
+        self.skills_rows = rows;
+    }
+
+    /// Open skills enable/disable panel (`/skills`).
+    pub fn open_skills_float(&mut self) {
+        self.close_float();
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::skills_manager(&self.skills_rows));
+        self.clear_notice();
+    }
+
+    /// Re-open skills panel after a toggle (keeps rows already updated by CLI).
+    pub fn reopen_skills_float(&mut self) {
+        let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
+        self.float = Some(FloatMenu::skills_manager(&self.skills_rows));
+        if let Some(f) = self.float.as_mut() {
+            let max = f.filtered_entries().len().saturating_sub(1);
+            f.selected = prev_selected.min(max);
+        }
+        self.clear_notice();
+    }
+
     /// Start in-float field edit (search bar). Never opens the yellow docked select.
     pub fn start_settings_inline_edit(
         &mut self,
@@ -731,6 +809,18 @@ impl App {
     pub fn open_settings_provider_api(&mut self, id: &str) {
         self.settings_provider_focus = id.to_string();
         self.float = Some(FloatMenu::settings_provider_api(id));
+        self.clear_notice();
+    }
+
+    pub fn open_settings_thinking_format(&mut self, scope: &str, on_model: bool) {
+        self.settings_compat_on_model = on_model;
+        self.float = Some(FloatMenu::settings_thinking_format(scope));
+        self.clear_notice();
+    }
+
+    pub fn open_settings_max_tokens_field(&mut self, scope: &str, on_model: bool) {
+        self.settings_compat_on_model = on_model;
+        self.float = Some(FloatMenu::settings_max_tokens_field(scope));
         self.clear_notice();
     }
 
@@ -819,8 +909,22 @@ impl App {
                 self.open_settings_providers(&self.settings_provider_rows.clone());
                 true
             }
-            FloatKind::SettingsProviderApi | FloatKind::SettingsRemoteModels => {
-                self.reopen_settings_provider_detail();
+            FloatKind::SettingsProviderApi
+            | FloatKind::SettingsRemoteModels
+            | FloatKind::SettingsThinkingFormat
+            | FloatKind::SettingsMaxTokensField => {
+                if self.settings_compat_on_model && !self.settings_model_focus.is_empty() {
+                    let spec = self.settings_model_focus.clone();
+                    let detail = self
+                        .settings_model_rows
+                        .iter()
+                        .find(|(k, _)| k == &spec)
+                        .map(|(_, d)| d.clone())
+                        .unwrap_or_default();
+                    self.open_settings_model_detail(&spec, &detail);
+                } else {
+                    self.reopen_settings_provider_detail();
+                }
                 true
             }
             FloatKind::SettingsModels => {
@@ -841,6 +945,11 @@ impl App {
                 self.settings_form_edit = None;
                 let p = self.settings_provider_focus.clone();
                 self.open_settings_models_for_provider(&p);
+                true
+            }
+            FloatKind::Skills => {
+                // Same as Thinking: Esc returns to Settings root.
+                self.open_settings_float();
                 true
             }
             FloatKind::Thinking => {
@@ -987,7 +1096,7 @@ impl App {
         self.history_draft.clear();
     }
 
-    /// Take and clear images committed on the last submit (for the agent).
+    /// Take and clear images committed on the last submit: `(mime, path)`.
     pub fn take_pending_images(&mut self) -> Vec<(String, String)> {
         if !self.committed_images.is_empty() {
             return std::mem::take(&mut self.committed_images);
@@ -1003,7 +1112,7 @@ impl App {
         order
             .into_iter()
             .filter_map(|id| by_id.remove(&id))
-            .map(|img| (img.mime_type, img.data))
+            .map(|img| (img.mime_type, img.path.display().to_string()))
             .collect()
     }
 
@@ -1032,20 +1141,179 @@ impl App {
         self.input.push(' ');
     }
 
-    /// Attach image and insert `[图片.img]` / `[图片.N.img]` into the input (deletable as text).
-    pub fn attach_image(&mut self, mime_type: String, data: String, name: String) {
+    /// Attach a ready local image file and insert `[图片.img]` into the input.
+    pub fn attach_image_path(&mut self, mime_type: String, path: PathBuf, name: String) {
         let id = self.next_image_id;
         self.next_image_id = self.next_image_id.saturating_add(1).max(2);
         let token = one_core::image::image_token(id);
-        let label = one_core::image::image_label(&mime_type, &data);
+        let label = one_core::image::image_label_path(&mime_type, &path);
         self.pending_images.push(PendingImage {
             id,
             mime_type,
-            data,
+            path,
             name: name.clone(),
+            loading: false,
         });
         self.insert_chip_token(&token);
         self.set_notice(format!("attached {name}  {token}  {label}"));
+    }
+
+    /// Attach from base64: write into media store, then path-based attach.
+    pub fn attach_image(&mut self, mime_type: String, data: String, name: String) {
+        match one_core::image::store_image_base64(&data, Some(&mime_type)) {
+            Ok((path, mime)) => self.attach_image_path(mime, path, name),
+            Err(err) => self.set_notice(format!("image attach failed: {err}")),
+        }
+    }
+
+    /// True while any image chip is still loading from clipboard / import.
+    pub fn has_loading_images(&self) -> bool {
+        self.pending_images.iter().any(|i| i.loading) || !self.image_jobs.is_empty()
+    }
+
+    /// Insert an optimistic loading chip immediately (before disk/clipboard work).
+    fn begin_loading_image(&mut self, name: &str) -> u32 {
+        let id = self.next_image_id;
+        self.next_image_id = self.next_image_id.saturating_add(1).max(2);
+        let token = one_core::image::image_token(id);
+        self.pending_images.push(PendingImage {
+            id,
+            mime_type: "image/*".into(),
+            path: PathBuf::new(),
+            name: name.to_string(),
+            loading: true,
+        });
+        self.insert_chip_token(&token);
+        self.cursor_on = true;
+        self.set_notice(format!("pasting {token}…"));
+        id
+    }
+
+    /// Remove a chip + pending entry by id (failed paste / user abandoned load).
+    fn remove_pending_image(&mut self, id: u32) {
+        self.pending_images.retain(|i| i.id != id);
+        let token = one_core::image::image_token(id);
+        if let Some(pos) = self.input.find(&token) {
+            let mut start = pos;
+            let mut end = pos + token.len();
+            // insert_chip_token writes ` token ` — peel one trailing space.
+            if self.input[end..].starts_with(' ') {
+                end += 1;
+            }
+            // And one leading space when not at start.
+            if start > 0 && self.input.as_bytes().get(start - 1) == Some(&b' ') {
+                start -= 1;
+            }
+            self.input.replace_range(start..end, "");
+        }
+    }
+
+    /// Apply a finished load onto an existing loading chip (or drop on error).
+    fn finish_loading_image(
+        &mut self,
+        id: u32,
+        result: Result<(String, PathBuf, String), String>,
+        report_err: bool,
+    ) {
+        match result {
+            Ok((mime, path, name)) => {
+                if let Some(img) = self.pending_images.iter_mut().find(|i| i.id == id) {
+                    img.mime_type = mime;
+                    img.path = path;
+                    img.name = name.clone();
+                    img.loading = false;
+                    let label = img.label();
+                    let token = img.token();
+                    self.set_notice(format!("attached {name}  {token}  {label}"));
+                }
+            }
+            Err(err) => {
+                self.remove_pending_image(id);
+                if report_err {
+                    self.set_notice(format!(
+                        "paste failed · {err} · copy a screenshot, or paste a path"
+                    ));
+                } else {
+                    // Quiet probe (e.g. empty bracketed paste) — chip already removed.
+                    self.clear_notice();
+                }
+            }
+        }
+    }
+
+    /// Poll background image jobs; call every frame from the terminal loop.
+    pub fn poll_image_jobs(&mut self) {
+        if self.image_jobs.is_empty() {
+            return;
+        }
+        let mut still = Vec::new();
+        let jobs = std::mem::take(&mut self.image_jobs);
+        for job in jobs {
+            match job.rx.try_recv() {
+                Ok(result) => {
+                    self.finish_loading_image(job.id, result, job.report_err);
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    still.push(job);
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    self.finish_loading_image(
+                        job.id,
+                        Err("image paste cancelled".into()),
+                        job.report_err,
+                    );
+                }
+            }
+        }
+        self.image_jobs = still;
+    }
+
+    /// Try host-clipboard bitmap paste (WSL PowerShell / wl-paste / xclip).
+    ///
+    /// Shows a loading chip **immediately**, then fills path in the background
+    /// so the UI never freezes on PowerShell / host tools.
+    ///
+    /// Returns `true` when a job was started (chip visible). Call
+    /// [`Self::poll_image_jobs`] each frame to finalize.
+    pub fn try_paste_clipboard_image(&mut self, report_err: bool) -> bool {
+        // Don't steal focus from select/float free-text.
+        if self.select.is_some() || self.float_open() {
+            return false;
+        }
+        let id = self.begin_loading_image("clipboard.png");
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.image_jobs.push(ImagePasteJob {
+            id,
+            report_err,
+            rx,
+        });
+        std::thread::spawn(move || {
+            let _ = tx.send(crate::clipboard::paste_image());
+        });
+        true
+    }
+
+    /// Fast check: text looks like an existing image file path (no copy yet).
+    fn quick_image_path_candidate(&self, text: &str) -> Option<PathBuf> {
+        let path = crate::clipboard::normalize_pasted_path(text)
+            .or_else(|| {
+                let t = text.trim().trim_matches(|c| c == '"' || c == '\'');
+                Some(PathBuf::from(t))
+            })?;
+        if !one_core::image::is_image_path(&path) {
+            return None;
+        }
+        path.is_file().then_some(path)
+    }
+
+    /// Resolve pasted text to an imported media image `(mime, path, name)`.
+    fn load_image_from_pasted_path_static(text: &str) -> Option<(String, PathBuf, String)> {
+        if let Some(v) = one_core::image::try_load_image_path_paste(text) {
+            return Some(v);
+        }
+        let path = crate::clipboard::normalize_pasted_path(text)?;
+        let s = path.to_str()?;
+        one_core::image::try_load_image_path_paste(s)
     }
 
     /// Collapse a long paste into `[文本.txt]` (body kept until submit / delete).
@@ -1104,6 +1372,11 @@ impl App {
     pub fn set_usage_io(&mut self, input: u64, output: u64) {
         self.usage_input = input;
         self.usage_output = output;
+    }
+
+    pub fn set_usage_cache(&mut self, read: u64, write: u64) {
+        self.usage_cache_read = read;
+        self.usage_cache_write = write;
     }
 
     pub fn set_usage_cost_usd(&mut self, cost: f64) {
@@ -1244,9 +1517,54 @@ impl App {
 
     /// Put text into the input for re-edit (after rewind). Does not submit.
     pub fn set_input_for_edit(&mut self, text: impl Into<String>) {
+        self.set_input_for_edit_with_images(text, Vec::new());
+    }
+
+    /// Rewind / restore a prompt with real image **paths** (not display labels).
+    ///
+    /// `images` is `(mime_type, path)` in chip order; input should already
+    /// contain matching `[图片.img]` tokens (from `UserContent::for_reedit`).
+    pub fn set_input_for_edit_with_images(
+        &mut self,
+        text: impl Into<String>,
+        images: Vec<(String, String)>,
+    ) {
         self.input = text.into();
         self.pending_images.clear();
+        self.image_jobs.clear();
         self.pending_texts.clear();
+        self.committed_images.clear();
+        self.next_image_id = 1;
+        for (i, (mime_type, path)) in images.into_iter().enumerate() {
+            let id = (i as u32).saturating_add(1);
+            let path = PathBuf::from(path);
+            let name = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("image")
+                .to_string();
+            self.pending_images.push(PendingImage {
+                id,
+                mime_type,
+                path,
+                name,
+                loading: false,
+            });
+            self.next_image_id = id.saturating_add(1).max(2);
+        }
+        // If input has no chips but we have images, append chips.
+        if !self.pending_images.is_empty()
+            && one_core::image::image_token_ids_in(&self.input).is_empty()
+        {
+            for img in &self.pending_images {
+                let token = one_core::image::image_token(img.id);
+                if !self.input.is_empty() && !self.input.ends_with(|c: char| c.is_whitespace()) {
+                    self.input.push(' ');
+                }
+                self.input.push_str(&token);
+                self.input.push(' ');
+            }
+        }
         self.leave_history_browse();
         self.cursor_on = true;
     }
@@ -1354,6 +1672,11 @@ impl App {
             "/settings" => {
                 self.input.clear();
                 self.open_settings_float();
+                return RunOutcome::Noop;
+            }
+            "/skills" => {
+                self.input.clear();
+                self.open_skills_float();
                 return RunOutcome::Noop;
             }
             "/thinking" => {
@@ -2059,15 +2382,73 @@ impl App {
     }
 
     pub fn handle_paste(&mut self, text: &str) {
-        // Image paste: data-URI or a single filesystem path to png/jpeg/gif/webp/bmp.
-        if let Some((mime, data)) = one_core::image::parse_data_uri(text) {
-            self.attach_image(mime, data, "paste".into());
+        // Docked select free-text phase owns paste (never the main prompt).
+        if let Some(prompt) = self.select.as_mut() {
+            if prompt.handle_paste(text) {
+                self.cursor_on = true;
+                self.clear_notice();
+                return;
+            }
+            // List phase: swallow paste so it does not leak into the main input.
+            return;
+        }
+
+        // Center float (Settings field edit / search filter) owns paste.
+        if self.float_open() {
+            if let Some(f) = self.float.as_mut() {
+                f.paste_search(text);
+            }
+            self.cursor_on = true;
+            self.clear_notice();
+            return;
+        }
+
+        // Empty bracketed paste: terminal cannot deliver bitmaps — try host clipboard
+        // (screenshot / browser copy-as-image). Codex does the same via keybind.
+        if text.trim().is_empty() {
+            // Quiet: no error toast if clipboard has no image (chip removed on fail).
+            let _ = self.try_paste_clipboard_image(false);
             self.cursor_on = true;
             return;
         }
-        if let Some((mime, data, name)) = one_core::image::try_load_image_path_paste(text) {
-            self.attach_image(mime, data, name);
-            self.cursor_on = true;
+
+        // data-URI → optimistic chip, media write on a worker thread.
+        if let Some((mime, data)) = one_core::image::parse_data_uri(text) {
+            let id = self.begin_loading_image("paste.png");
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.image_jobs.push(ImagePasteJob {
+                id,
+                report_err: true,
+                rx,
+            });
+            std::thread::spawn(move || {
+                let r = one_core::image::store_image_base64(&data, Some(&mime)).map(
+                    |(path, mime)| (mime, path, "paste.png".into()),
+                );
+                let _ = tx.send(r);
+            });
+            return;
+        }
+        // Path paste: bare / quoted / file:// / Windows→WSL — chip first, import async.
+        if let Some(src) = self.quick_image_path_candidate(text) {
+            let name = src
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("image")
+                .to_string();
+            let id = self.begin_loading_image(&name);
+            let (tx, rx) = std::sync::mpsc::channel();
+            self.image_jobs.push(ImagePasteJob {
+                id,
+                report_err: true,
+                rx,
+            });
+            let text = text.to_string();
+            std::thread::spawn(move || {
+                let r = Self::load_image_from_pasted_path_static(&text)
+                    .ok_or_else(|| "not an image path".to_string());
+                let _ = tx.send(r);
+            });
             return;
         }
 
@@ -2096,6 +2477,11 @@ impl App {
         self.clear_notice();
     }
 
+    /// Main prompt caret is only active when no overlay owns keyboard focus.
+    pub fn prompt_focused(&self) -> bool {
+        self.select.is_none() && !self.float_open()
+    }
+
     /// How many visual lines the prompt input currently needs (capped).
     pub fn input_line_count(&self) -> usize {
         let n = self.input.split('\n').count().max(1);
@@ -2106,6 +2492,14 @@ impl App {
         if matches!(key.kind, crossterm::event::KeyEventKind::Release) {
             return RunOutcome::Noop;
         }
+
+        // Progressive Ctrl+C: dismiss overlay / clear draft / double-tap quit.
+        // Handled before select/float so Settings (and other floats) always react.
+        if Self::is_ctrl_c(key) {
+            return self.handle_ctrl_c();
+        }
+        // Any other key cancels a pending "press again to quit".
+        self.last_ctrl_c_at = None;
 
         // Docked select (model / field edit / ask) captures keys before float.
         if self.select.is_some() {
@@ -2125,7 +2519,6 @@ impl App {
         }
 
         match key.code {
-            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => RunOutcome::Quit,
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) && self.busy => {
                 self.submit_steer()
             }
@@ -2156,6 +2549,19 @@ impl App {
                 self.open_settings_float();
                 RunOutcome::Noop
             }
+            // Ctrl+V / Alt+V / Ctrl+Alt+V → host clipboard image (Codex-style).
+            // Bracketed paste only carries text; bitmaps need PowerShell/wl-paste/xclip.
+            // Prefer Ctrl+Alt+V under WSL when the terminal swallows Ctrl+V for text paste.
+            KeyCode::Char(c)
+                if c.eq_ignore_ascii_case(&'v')
+                    && key
+                        .modifiers
+                        .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+            {
+                self.leave_history_browse();
+                let _ = self.try_paste_clipboard_image(true);
+                RunOutcome::Noop
+            }
             // Ctrl+J → insert newline (multi-line compose)
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.leave_history_browse();
@@ -2173,15 +2579,6 @@ impl App {
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.toggle_show_thinking();
                 RunOutcome::Noop
-            }
-            // Space on empty input → cycle Plan / Build (thinking is settings-only).
-            KeyCode::Char(' ')
-                if self.input.is_empty()
-                    && !self.busy
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                RunOutcome::CycleAgentMode
             }
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.submit_followup(),
             // Shift+Enter → newline (when terminal reports SHIFT)
@@ -2209,7 +2606,27 @@ impl App {
                     self.open_settings_float();
                     return RunOutcome::Noop;
                 }
+                if t == "/skills" || t == "/skills " {
+                    self.input.clear();
+                    self.open_skills_float();
+                    return RunOutcome::Noop;
+                }
                 self.submit_prompt()
+            }
+            // Shift+Tab (BackTab) → cycle Plan / Build. Plain Tab remains completion.
+            KeyCode::BackTab => {
+                if self.busy {
+                    RunOutcome::Noop
+                } else {
+                    RunOutcome::CycleAgentMode
+                }
+            }
+            KeyCode::Tab if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                if self.busy {
+                    RunOutcome::Noop
+                } else {
+                    RunOutcome::CycleAgentMode
+                }
             }
             // Tab → slash complete, else path / @file completion.
             KeyCode::Tab => {
@@ -2249,6 +2666,33 @@ impl App {
                 self.clamp_slash_selection();
                 self.cursor_on = true;
                 self.clear_notice();
+                RunOutcome::Noop
+            }
+            // `?` on empty input → help catalog (status strip points here).
+            KeyCode::Char('?')
+                if self.input.is_empty()
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.open_help_float();
+                RunOutcome::Noop
+            }
+            // Empty welcome: `1`–`3` run sample prompts (matches try list).
+            KeyCode::Char(ch @ '1'..='3')
+                if self.messages.is_empty()
+                    && self.input.is_empty()
+                    && !self.busy
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let idx = (ch as u8 - b'1') as usize;
+                if let Some(prompt) = WELCOME_TRY_PROMPTS.get(idx) {
+                    self.leave_history_browse();
+                    self.input = (*prompt).to_string();
+                    self.cursor_on = true;
+                    self.clear_notice();
+                    return self.submit_prompt();
+                }
                 RunOutcome::Noop
             }
             KeyCode::Char(ch)
@@ -2302,6 +2746,118 @@ impl App {
         }
     }
 
+    fn is_ctrl_c(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+    }
+
+    /// Ctrl+F — fetch remote models. Also accept legacy ASCII ACK (0x06).
+    fn is_ctrl_f(key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('f') | KeyCode::Char('F') => {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+            }
+            // Some hosts deliver Ctrl+letter as a bare control char.
+            KeyCode::Char('\u{06}') => true,
+            _ => false,
+        }
+    }
+
+    fn float_allows_fetch_models(kind: FloatKind) -> bool {
+        matches!(
+            kind,
+            FloatKind::SettingsModels
+                | FloatKind::SettingsProviderDetail
+                | FloatKind::SettingsRemoteModels
+        )
+    }
+
+    /// Emit `ProviderFetchModels` for the focused settings provider.
+    fn provider_fetch_models_outcome(&mut self) -> RunOutcome {
+        let id = self.settings_provider_focus.clone();
+        if id.is_empty() {
+            self.set_notice("no provider selected");
+            RunOutcome::Noop
+        } else {
+            RunOutcome::ConfigOp(ConfigOp::ProviderFetchModels { id })
+        }
+    }
+
+    /// Progressive Ctrl+C — never exit on a single accidental press.
+    ///
+    /// | State | 1st Ctrl+C | 2nd (within ~900ms) |
+    /// |-------|------------|---------------------|
+    /// | float open (Settings, …) | close float + arm quit | quit |
+    /// | select open (model / approval) | cancel select + arm quit | quit |
+    /// | input non-empty | clear draft + arm quit | quit |
+    /// | otherwise | arm quit + toast | quit |
+    ///
+    /// Idle → `RunOutcome::Quit`; busy → `request_force_quit` (soft cancel stays Esc).
+    fn handle_ctrl_c(&mut self) -> RunOutcome {
+        let now = Instant::now();
+
+        // 1) Close any center float entirely (Settings / commands / sessions / …).
+        if self.float_open() {
+            self.settings_inline_op = None;
+            self.settings_form_edit = None;
+            self.model_draft = None;
+            self.close_float();
+            self.arm_ctrl_c_quit(now);
+            self.set_notice("Ctrl+C again to quit");
+            return RunOutcome::Noop;
+        }
+
+        // 2) Cancel docked select (model / approval / ask_user).
+        if self.select.is_some() {
+            let _ = self.apply_select_result(crate::select::SelectResult::Cancelled);
+            self.arm_ctrl_c_quit(now);
+            self.set_notice("Ctrl+C again to quit");
+            return RunOutcome::Noop;
+        }
+
+        // 3) Clear non-empty input draft (SIGINT-style line cancel).
+        if !self.input.is_empty() {
+            self.input.clear();
+            self.pending_images.clear();
+            self.pending_texts.clear();
+            self.leave_history_browse();
+            self.cursor_on = true;
+            self.arm_ctrl_c_quit(now);
+            self.set_notice("input cleared · Ctrl+C again to quit");
+            return RunOutcome::Noop;
+        }
+
+        // 4) Double-tap confirm quit.
+        let double = self
+            .last_ctrl_c_at
+            .map(|t| now.duration_since(t).as_millis() <= CTRL_C_DOUBLE_MS)
+            .unwrap_or(false);
+        if double {
+            self.last_ctrl_c_at = None;
+            return self.confirm_ctrl_c_quit();
+        }
+        self.arm_ctrl_c_quit(now);
+        self.set_notice("Ctrl+C again to quit");
+        RunOutcome::Noop
+    }
+
+    fn arm_ctrl_c_quit(&mut self, now: Instant) {
+        self.last_ctrl_c_at = Some(now);
+    }
+
+    fn confirm_ctrl_c_quit(&mut self) -> RunOutcome {
+        if self.busy {
+            self.request_force_quit();
+            self.set_notice("force quit…");
+            RunOutcome::Noop
+        } else {
+            RunOutcome::Quit
+        }
+    }
+
     /// Esc behavior (idle):
     ///
     /// | Input | Esc |
@@ -2346,26 +2902,56 @@ impl App {
         let editing = self.settings_inline_op.is_some()
             || self.settings_form_edit.is_some()
             || self.float.as_ref().map(|f| f.edit_mode).unwrap_or(false);
+        // Search/edit bar owns ←→ when typing a value or a non-empty filter.
+        let text_focus = editing || self.float.as_ref().is_some_and(|f| !f.search.is_empty());
+
+        // Ctrl+F → GET {base}/models for the focused provider.
+        // Works on provider detail, local model list, and remote results (re-fetch).
+        // Accepts 'f'/'F'+CONTROL and legacy ASCII 0x06 (some terminals).
+        if !editing
+            && Self::is_ctrl_f(key)
+            && self
+                .float
+                .as_ref()
+                .is_some_and(|f| Self::float_allows_fetch_models(f.kind))
+        {
+            return self.provider_fetch_models_outcome();
+        }
 
         match key.code {
-            KeyCode::Char('f')
-                if key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !editing
-                    && self
-                        .float
-                        .as_ref()
-                        .is_some_and(|f| f.kind == FloatKind::SettingsModels) =>
-            {
-                let id = self.settings_provider_focus.clone();
-                if id.is_empty() {
-                    self.set_notice("no provider selected");
-                    RunOutcome::Noop
-                } else {
-                    RunOutcome::ConfigOp(ConfigOp::ProviderFetchModels { id })
+            // ←→ / Home / End move the search/edit caret while text has focus.
+            KeyCode::Left if text_focus => {
+                if let Some(f) = self.float.as_mut() {
+                    f.move_search_cursor(-1);
                 }
+                RunOutcome::Noop
             }
-            // Esc / ← : cancel field edit, else one level up.
-            KeyCode::Esc | KeyCode::Left => {
+            KeyCode::Right if text_focus => {
+                if let Some(f) = self.float.as_mut() {
+                    f.move_search_cursor(1);
+                }
+                RunOutcome::Noop
+            }
+            KeyCode::Home if text_focus => {
+                if let Some(f) = self.float.as_mut() {
+                    f.search_cursor_home();
+                }
+                RunOutcome::Noop
+            }
+            KeyCode::End if text_focus => {
+                if let Some(f) = self.float.as_mut() {
+                    f.search_cursor_end();
+                }
+                RunOutcome::Noop
+            }
+            // Esc / ← (nav only): cancel field edit, else one level up.
+            KeyCode::Esc => {
+                if !self.settings_go_back() {
+                    self.close_float();
+                }
+                RunOutcome::Noop
+            }
+            KeyCode::Left if !text_focus => {
                 if !self.settings_go_back() {
                     self.close_float();
                 }
@@ -2383,7 +2969,7 @@ impl App {
                 }
                 RunOutcome::Noop
             }
-            KeyCode::Backspace | KeyCode::Delete => {
+            KeyCode::Backspace => {
                 let empty = self
                     .float
                     .as_ref()
@@ -2395,6 +2981,12 @@ impl App {
                     }
                 } else if let Some(f) = self.float.as_mut() {
                     f.pop_search();
+                }
+                RunOutcome::Noop
+            }
+            KeyCode::Delete => {
+                if let Some(f) = self.float.as_mut() {
+                    f.delete_search_forward();
                 }
                 RunOutcome::Noop
             }
@@ -2520,14 +3112,30 @@ impl App {
                 self.confirm_settings_provider_detail(&entry.item.id)
             }
             FloatKind::SettingsProviderApi => self.confirm_settings_provider_api(&entry.item.id),
+            FloatKind::SettingsThinkingFormat => {
+                self.confirm_settings_thinking_format(&entry.item.id)
+            }
+            FloatKind::SettingsMaxTokensField => {
+                self.confirm_settings_max_tokens_field(&entry.item.id)
+            }
             FloatKind::SettingsRemoteModels => self.confirm_settings_remote_models(&entry.item.id),
             FloatKind::SettingsModels => self.confirm_settings_models(&entry.item.id),
             FloatKind::SettingsModelDetail => self.confirm_settings_model_detail(&entry.item.id),
             FloatKind::SettingsModelAdd => self.confirm_settings_model_add(&entry.item.id),
+            FloatKind::Skills => self.confirm_skills_toggle(&entry.item.id),
             FloatKind::Help | FloatKind::Commands | FloatKind::Custom => {
                 self.dispatch_command_item(&entry.item.id, &entry.item.hint)
             }
         }
+    }
+
+    fn confirm_skills_toggle(&mut self, id: &str) -> RunOutcome {
+        if id == "_empty" || id.is_empty() {
+            return RunOutcome::Noop;
+        }
+        RunOutcome::ConfigOp(ConfigOp::SkillToggle {
+            path: id.to_string(),
+        })
     }
 
     fn confirm_settings_root(&mut self, id: &str) -> RunOutcome {
@@ -2549,6 +3157,10 @@ impl App {
                     key: "sandbox".into(),
                     value: "cycle".into(),
                 })
+            }
+            "skills" => {
+                self.open_skills_float();
+                RunOutcome::Noop
             }
             "providers" => {
                 self.open_settings_providers(&self.settings_provider_rows.clone());
@@ -2590,17 +3202,10 @@ impl App {
                 self.open_settings_models_for_provider(&focus);
                 RunOutcome::Noop
             }
-            "set_provider_type" => {
-                let initial = self.provider_detail_field_value(&focus, "provider_type");
-                self.start_settings_inline_edit(
-                    format!("provider_set:{focus}:provider_type"),
-                    "providerType",
-                    if initial == "default/unset" {
-                        ""
-                    } else {
-                        &initial
-                    },
-                );
+            "fetch_models" => self.provider_fetch_models_outcome(),
+            "set_provider_type" | "set_api" => {
+                // Fixed protocol enum — select, never free-text.
+                self.open_settings_provider_api(&focus);
                 RunOutcome::Noop
             }
             "set_base_url" => {
@@ -2610,10 +3215,6 @@ impl App {
                     "base_url",
                     if initial == "unset" { "" } else { &initial },
                 );
-                RunOutcome::Noop
-            }
-            "set_api" => {
-                self.open_settings_provider_api(&focus);
                 RunOutcome::Noop
             }
             "set_api_key" => {
@@ -2638,8 +3239,100 @@ impl App {
                 );
                 RunOutcome::Noop
             }
+            "set_thinking_format" => {
+                self.open_settings_thinking_format(&focus, false);
+                RunOutcome::Noop
+            }
+            "set_max_tokens_field" => {
+                self.open_settings_max_tokens_field(&focus, false);
+                RunOutcome::Noop
+            }
+            "clear_compat" => RunOutcome::ConfigOp(ConfigOp::ProviderSet {
+                id: focus,
+                key: "compat".into(),
+                value: "clear".into(),
+            }),
+            id if id.starts_with("cycle_compat:") => {
+                let key = id.trim_start_matches("cycle_compat:").to_string();
+                // Field rows store camelCase labels: `compat.supportsDeveloperRole`.
+                let current = self
+                    .provider_detail_fields(&focus)
+                    .into_iter()
+                    .find(|(k, _)| {
+                        let kn = k.trim_start_matches("compat.");
+                        kn.eq_ignore_ascii_case(&key)
+                            || kn.replace('_', "")
+                                .eq_ignore_ascii_case(&key.replace('_', ""))
+                    })
+                    .map(|(_, v)| v)
+                    .unwrap_or_else(|| "auto".into());
+                let next = cycle_tri_display(&current);
+                RunOutcome::ConfigOp(ConfigOp::ProviderSet {
+                    id: focus,
+                    key,
+                    value: next.to_string(),
+                })
+            }
             "rm_provider" => RunOutcome::ConfigOp(ConfigOp::ProviderRm { id: focus }),
             _ => RunOutcome::Noop,
+        }
+    }
+
+    fn confirm_settings_thinking_format(&mut self, id: &str) -> RunOutcome {
+        let Some(value) = id.strip_prefix("tf:") else {
+            return RunOutcome::Noop;
+        };
+        if self.settings_compat_on_model {
+            let spec = self.settings_model_focus.clone();
+            if spec.is_empty() {
+                self.set_notice("no model selected");
+                return RunOutcome::Noop;
+            }
+            RunOutcome::ConfigOp(ConfigOp::ModelSet {
+                spec,
+                key: "thinking_format".into(),
+                value: value.to_string(),
+            })
+        } else {
+            let provider = self.settings_provider_focus.clone();
+            if provider.is_empty() {
+                self.set_notice("no provider selected");
+                return RunOutcome::Noop;
+            }
+            RunOutcome::ConfigOp(ConfigOp::ProviderSet {
+                id: provider,
+                key: "thinking_format".into(),
+                value: value.to_string(),
+            })
+        }
+    }
+
+    fn confirm_settings_max_tokens_field(&mut self, id: &str) -> RunOutcome {
+        let Some(value) = id.strip_prefix("mt:") else {
+            return RunOutcome::Noop;
+        };
+        if self.settings_compat_on_model {
+            let spec = self.settings_model_focus.clone();
+            if spec.is_empty() {
+                self.set_notice("no model selected");
+                return RunOutcome::Noop;
+            }
+            RunOutcome::ConfigOp(ConfigOp::ModelSet {
+                spec,
+                key: "max_tokens_field".into(),
+                value: value.to_string(),
+            })
+        } else {
+            let provider = self.settings_provider_focus.clone();
+            if provider.is_empty() {
+                self.set_notice("no provider selected");
+                return RunOutcome::Noop;
+            }
+            RunOutcome::ConfigOp(ConfigOp::ProviderSet {
+                id: provider,
+                key: "max_tokens_field".into(),
+                value: value.to_string(),
+            })
         }
     }
 
@@ -2652,6 +3345,7 @@ impl App {
             self.set_notice("no provider selected");
             return RunOutcome::Noop;
         }
+        // Writes both `api` and `providerType` (canonical protocol string).
         RunOutcome::ConfigOp(ConfigOp::ProviderSet {
             id: provider,
             key: "api".into(),
@@ -2677,6 +3371,7 @@ impl App {
 
     fn confirm_settings_models(&mut self, id: &str) -> RunOutcome {
         match id {
+            "fetch_models" => self.provider_fetch_models_outcome(),
             "add_model" => {
                 // Stay inside Settings float — form with id + optional fields.
                 self.open_settings_model_add();
@@ -2744,6 +3439,94 @@ impl App {
                 );
                 RunOutcome::Noop
             }
+            "set_reasoning" => {
+                // Cycle unset → true → false → unset via empty/true/false.
+                let detail = self
+                    .settings_model_rows
+                    .iter()
+                    .find(|(k, _)| k == &focus)
+                    .map(|(_, d)| d.as_str())
+                    .unwrap_or("");
+                let current = detail
+                    .split("reasoning=")
+                    .nth(1)
+                    .map(|s| s.split_whitespace().next().unwrap_or("unset"))
+                    .unwrap_or("unset");
+                let next = match current {
+                    "true" | "yes" | "1" => "false",
+                    "false" | "no" | "0" => "",
+                    _ => "true",
+                };
+                RunOutcome::ConfigOp(ConfigOp::ModelSet {
+                    spec: focus,
+                    key: "reasoning".into(),
+                    value: next.to_string(),
+                })
+            }
+            "set_thinking_level_map" => {
+                let detail = self
+                    .settings_model_rows
+                    .iter()
+                    .find(|(k, _)| k == &focus)
+                    .map(|(_, d)| d.clone())
+                    .unwrap_or_default();
+                let initial = detail
+                    .split("map=")
+                    .nth(1)
+                    .map(|s| s.trim())
+                    .filter(|s| *s != "(none)" && !s.is_empty())
+                    .unwrap_or("");
+                self.start_settings_inline_edit(
+                    format!("model_set:{focus}:thinking_level_map"),
+                    "thinkingLevelMap",
+                    initial,
+                );
+                RunOutcome::Noop
+            }
+            "set_thinking_format" => {
+                self.open_settings_thinking_format(&focus, true);
+                RunOutcome::Noop
+            }
+            "set_max_tokens_field" => {
+                self.open_settings_max_tokens_field(&focus, true);
+                RunOutcome::Noop
+            }
+            "clear_compat" => RunOutcome::ConfigOp(ConfigOp::ModelSet {
+                spec: focus,
+                key: "compat".into(),
+                value: "clear".into(),
+            }),
+            id if id.starts_with("cycle_compat:") => {
+                let key = id.trim_start_matches("cycle_compat:").to_string();
+                let detail = self
+                    .settings_model_rows
+                    .iter()
+                    .find(|(k, _)| k == &focus)
+                    .map(|(_, d)| d.as_str())
+                    .unwrap_or("");
+                // Best-effort read from detail line for the two common keys.
+                let current = if key.contains("developer") {
+                    detail
+                        .split("devRole=")
+                        .nth(1)
+                        .map(|s| s.split_whitespace().next().unwrap_or("auto"))
+                        .unwrap_or("auto")
+                } else if key.contains("reasoning_effort") {
+                    detail
+                        .split("effort=")
+                        .nth(1)
+                        .map(|s| s.split_whitespace().next().unwrap_or("auto"))
+                        .unwrap_or("auto")
+                } else {
+                    "auto"
+                };
+                let next = cycle_tri_display(current);
+                RunOutcome::ConfigOp(ConfigOp::ModelSet {
+                    spec: focus,
+                    key,
+                    value: next.to_string(),
+                })
+            }
             "rm_model" => RunOutcome::ConfigOp(ConfigOp::ModelRm { spec: focus }),
             _ => RunOutcome::Noop,
         }
@@ -2777,6 +3560,10 @@ impl App {
                 self.messages.clear();
                 self.chat_scroll = 0;
                 self.set_notice("chat cleared");
+                RunOutcome::Noop
+            }
+            "skills" => {
+                self.open_skills_float();
                 RunOutcome::Noop
             }
             // These need runtime data → emit slash so CLI opens the right float.
@@ -2821,13 +3608,13 @@ impl App {
             return;
         }
 
-        // Ctrl+C always force-quits — even when a float is open or the turn is wedged.
-        // Soft cancel is `q` (empty input) / Esc; do not repurpose Ctrl+C as cancel.
-        if matches!(key.code, KeyCode::Char('c')) && key.modifiers.contains(KeyModifiers::CONTROL) {
-            self.request_force_quit();
-            self.set_notice("force quit…");
+        // Same progressive Ctrl+C as idle: dismiss overlay / clear steer draft /
+        // double-tap force-quit. Soft cancel is Esc only.
+        if Self::is_ctrl_c(key) {
+            let _ = self.handle_ctrl_c();
             return;
         }
+        self.last_ctrl_c_at = None;
 
         // Docked select (permission / ask_user / model) takes focus over steer / abort.
         if self.select.is_some() {
@@ -2846,16 +3633,6 @@ impl App {
         }
 
         match key.code {
-            // `q` cancels the running turn when the steer buffer is empty.
-            // (While typing a steer/follow-up, bare `q` is a normal character.)
-            KeyCode::Char('q')
-                if self.input.is_empty()
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.request_abort();
-                self.set_notice("interrupting…");
-            }
             KeyCode::Esc => {
                 self.request_abort();
                 self.set_notice("interrupting…");
@@ -2920,6 +3697,10 @@ impl App {
     fn submit_prompt(&mut self) -> RunOutcome {
         // Keep multi-line body; only trim ends.
         self.sync_pending_chips();
+        if self.has_loading_images() {
+            self.set_notice("still pasting image… · wait a moment");
+            return RunOutcome::Noop;
+        }
         let text = self.input.trim().to_string();
         if text.is_empty() {
             return RunOutcome::Noop;
@@ -2933,7 +3714,7 @@ impl App {
         }
         if text == "/help" {
             self.set_notice(
-                "/session /resume /new /model · paste → [图片.img]/[文本.txt] · Ctrl+J nl",
+                "/session /resume /new /model · Ctrl+V image · paste path/[文本.txt] · Ctrl+J nl",
             );
             return RunOutcome::Noop;
         }
@@ -2960,7 +3741,7 @@ impl App {
             return RunOutcome::Prompt(text);
         }
 
-        // Stage images for the agent (input will be cleared).
+        // Stage image paths for the agent (input will be cleared).
         let img_order = one_core::image::image_token_ids_in(&text);
         let mut img_by_id: std::collections::HashMap<u32, PendingImage> = self
             .pending_images
@@ -2970,7 +3751,8 @@ impl App {
         self.committed_images = img_order
             .into_iter()
             .filter_map(|id| img_by_id.remove(&id))
-            .map(|img| (img.mime_type, img.data))
+            .filter(|img| !img.loading && !img.path.as_os_str().is_empty())
+            .map(|img| (img.mime_type, img.path.display().to_string()))
             .collect();
 
         // Expand `[文本.txt]` bodies for the model; strip image tokens (sent as blocks).
@@ -3232,6 +4014,7 @@ fn is_ui_slash(text: &str) -> bool {
             | "/thinking"
             | "/compact"
             | "/settings"
+            | "/skills"
             | "/tree"
             | "/rewind"
             | "/export"
@@ -3244,6 +4027,15 @@ fn is_ui_slash(text: &str) -> bool {
             | "/act"
             | "/build"
     )
+}
+
+/// Cycle tri-state display: auto → true → false → auto.
+fn cycle_tri_display(current: &str) -> &'static str {
+    match current.trim().to_ascii_lowercase().as_str() {
+        "true" | "yes" | "1" | "on" => "false",
+        "false" | "no" | "0" | "off" => "auto",
+        _ => "true",
+    }
 }
 
 /// Parse Settings field-edit op + typed value into a [`ConfigOp`].
@@ -3367,13 +4159,48 @@ mod tests {
     }
 
     #[test]
-    fn settings_provider_detail_ctrl_f_no_longer_fetches() {
+    fn settings_provider_detail_ctrl_f_fetches_remote_models() {
         let mut app = App::new("test");
         app.open_settings_provider_detail("proxy", "1 model");
 
         let out = app.handle_key(key(KeyCode::Char('f'), KeyModifiers::CONTROL));
 
-        assert!(matches!(out, RunOutcome::Noop), "got {out:?}");
+        assert!(matches!(
+            out,
+            RunOutcome::ConfigOp(ConfigOp::ProviderFetchModels { id }) if id == "proxy"
+        ));
+    }
+
+    #[test]
+    fn settings_models_ctrl_shift_f_and_legacy_ack_fetch() {
+        let mut app = App::new("test");
+        app.open_settings_models_for_provider("proxy");
+
+        // Uppercase F + CONTROL (some terminals / Caps Lock).
+        let out = app.handle_key(key(KeyCode::Char('F'), KeyModifiers::CONTROL));
+        assert!(matches!(
+            out,
+            RunOutcome::ConfigOp(ConfigOp::ProviderFetchModels { id }) if id == "proxy"
+        ));
+
+        // Legacy Ctrl+F as ASCII ACK (0x06).
+        let out = app.handle_key(key(KeyCode::Char('\u{06}'), KeyModifiers::NONE));
+        assert!(matches!(
+            out,
+            RunOutcome::ConfigOp(ConfigOp::ProviderFetchModels { id }) if id == "proxy"
+        ));
+    }
+
+    #[test]
+    fn settings_models_enter_on_fetch_row() {
+        let mut app = App::new("test");
+        app.open_settings_models_for_provider("proxy");
+        // First row is "Fetch remote models".
+        let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(
+            out,
+            RunOutcome::ConfigOp(ConfigOp::ProviderFetchModels { id }) if id == "proxy"
+        ));
     }
 
     #[test]
@@ -3400,9 +4227,8 @@ mod tests {
         assert!(entries
             .iter()
             .any(|e| e.item.id == "set_base_url" && e.item.detail == "https://proxy.example/v1"));
-        assert!(entries
-            .iter()
-            .any(|e| e.item.id == "set_api" && e.item.detail == "openai-completions"));
+        // api is merged into the protocol select row (no separate set_api row).
+        assert!(!entries.iter().any(|e| e.item.id == "set_api"));
     }
 
     #[test]
@@ -3440,7 +4266,7 @@ mod tests {
         let api_index = f
             .filtered_entries()
             .iter()
-            .position(|e| e.item.id == "set_api")
+            .position(|e| e.item.id == "set_provider_type")
             .unwrap();
         f.selected = api_index;
 
@@ -3457,6 +4283,14 @@ mod tests {
             .filtered_entries()
             .iter()
             .any(|e| e.item.id == "api:openai-completions"));
+        assert!(f
+            .filtered_entries()
+            .iter()
+            .any(|e| e.item.id == "api:anthropic-messages"));
+        assert!(f
+            .filtered_entries()
+            .iter()
+            .any(|e| e.item.id == "api:gemini-generate-content"));
     }
 
     #[test]
@@ -3636,25 +4470,223 @@ mod tests {
     }
 
     #[test]
+    fn question_mark_on_empty_input_opens_help() {
+        let mut app = App::new("test");
+        assert!(app.input.is_empty());
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(app.float_open());
+        assert_eq!(
+            app.float.as_ref().map(|f| f.kind),
+            Some(crate::float::FloatKind::Help)
+        );
+        // With draft text, `?` is a normal character.
+        app.close_float();
+        app.input = "what".into();
+        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(!app.float_open());
+        assert_eq!(app.input, "what?");
+    }
+
+    #[test]
+    fn paste_into_float_edit_does_not_touch_main_input() {
+        let mut app = App::new("test");
+        app.input = "draft".into();
+        app.float = Some(FloatMenu::settings_provider_detail(
+            "linuxdo",
+            "custom",
+            &[("base_url".into(), "unset".into())],
+        ));
+        app.start_settings_inline_edit("provider_set:linuxdo:base_url", "base_url", "");
+        assert!(app.float_open());
+        assert!(!app.prompt_focused());
+
+        app.handle_paste("https://api.example.com/v1\n");
+        assert_eq!(app.input, "draft", "main prompt must stay untouched");
+        let search = app.float.as_ref().map(|f| f.search.clone()).unwrap();
+        assert_eq!(search, "https://api.example.com/v1");
+        assert!(app.float.as_ref().is_some_and(|f| f.edit_mode));
+    }
+
+    #[test]
+    fn float_edit_left_right_moves_cursor_not_back() {
+        let mut app = App::new("test");
+        app.float = Some(FloatMenu::settings_provider_detail(
+            "linuxdo",
+            "custom",
+            &[],
+        ));
+        app.start_settings_inline_edit(
+            "provider_set:linuxdo:base_url",
+            "base_url",
+            "https://api.example.com",
+        );
+        let end = app.float.as_ref().unwrap().search_cursor;
+        assert_eq!(end, "https://api.example.com".chars().count());
+
+        // Left must move caret, not leave edit mode / pop the float.
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+        assert!(app.float_open());
+        assert!(app.settings_inline_op.is_some());
+        assert!(app.float.as_ref().is_some_and(|f| f.edit_mode));
+        assert_eq!(app.float.as_ref().unwrap().search_cursor, end - 3);
+
+        // Insert in the middle (caret is 3 chars before end → before "com").
+        app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert_eq!(
+            app.float.as_ref().map(|f| f.search.as_str()),
+            Some("https://api.example.Xcom")
+        );
+
+        // Home / End
+        app.handle_key(key(KeyCode::Home, KeyModifiers::NONE));
+        assert_eq!(app.float.as_ref().unwrap().search_cursor, 0);
+        app.handle_key(key(KeyCode::End, KeyModifiers::NONE));
+        assert_eq!(
+            app.float.as_ref().unwrap().search_cursor,
+            app.float.as_ref().unwrap().search.chars().count()
+        );
+
+        // Esc still cancels edit (not left).
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(app.settings_inline_op.is_none());
+        assert!(app.float.as_ref().is_some_and(|f| !f.edit_mode));
+    }
+
+    #[test]
+    fn paste_into_float_filter_does_not_touch_main_input() {
+        let mut app = App::new("test");
+        app.input = "hello".into();
+        app.open_settings_providers(&[("linuxdo".into(), "ok".into())]);
+        app.handle_paste("linu");
+        assert_eq!(app.input, "hello");
+        assert_eq!(app.float.as_ref().map(|f| f.search.as_str()), Some("linu"));
+    }
+
+    fn drain_image_jobs(app: &mut App) {
+        for _ in 0..200 {
+            app.poll_image_jobs();
+            if !app.has_loading_images() {
+                return;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        panic!("image job did not finish");
+    }
+
+    #[test]
     fn paste_data_uri_inserts_image_token() {
         let mut app = App::new("test");
         let uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
         app.handle_paste(uri);
+        // Chip appears immediately (loading).
         assert!(
             app.input.contains(one_core::image::IMAGE_TOKEN),
             "input={}",
             app.input
         );
+        drain_image_jobs(&mut app);
         assert_eq!(app.pending_images.len(), 1);
         assert_eq!(app.pending_images[0].mime_type, "image/png");
+        assert!(!app.pending_images[0].loading);
         let taken = app.take_pending_images();
         assert_eq!(taken.len(), 1);
     }
 
     #[test]
+    fn set_input_for_edit_with_images_restores_chips() {
+        let mut app = App::new("test");
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let (path, mime) = one_core::image::store_image_base64(b64, Some("image/png")).unwrap();
+        let token = one_core::image::image_token(1);
+        app.set_input_for_edit_with_images(
+            format!("这个是什么 {token} "),
+            vec![(mime.clone(), path.display().to_string())],
+        );
+        assert!(app.input.contains(&token));
+        assert_eq!(app.pending_images.len(), 1);
+        assert_eq!(app.pending_images[0].mime_type, "image/png");
+        let taken = app.take_pending_images();
+        assert_eq!(taken.len(), 1);
+        // Simulate submit path: chips present → committed on submit_prompt.
+        app.set_input_for_edit_with_images(
+            format!("再看 {token}"),
+            vec![(mime, path.display().to_string())],
+        );
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match outcome {
+            RunOutcome::Prompt(p) => {
+                assert!(p.contains("再看"), "{p}");
+                // Image tokens stripped for agent text; bytes go via take_pending_images.
+                assert!(!p.contains("[image ·"), "{p}");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+        let imgs = app.take_pending_images();
+        assert_eq!(imgs.len(), 1);
+    }
+
+    #[test]
+    fn paste_image_path_file_attaches() {
+        let dir = std::env::temp_dir().join(format!("one-tui-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("dot.png");
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let bytes = one_core::image::decode_base64(b64).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+
+        let mut app = App::new("test");
+        app.handle_paste(path.to_str().unwrap());
+        assert!(app.input.contains(one_core::image::IMAGE_TOKEN));
+        drain_image_jobs(&mut app);
+        assert_eq!(app.pending_images.len(), 1);
+        assert_eq!(app.pending_images[0].mime_type, "image/png");
+        assert!(!app.pending_images[0].loading);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ctrl_v_image_key_shows_placeholder_immediately() {
+        let mut app = App::new("test");
+        let key = KeyEvent::new(KeyCode::Char('v'), KeyModifiers::CONTROL);
+        let _ = app.handle_key(key);
+        // Optimistic chip appears before clipboard work finishes (do not wait
+        // for PowerShell — it can hang for seconds under WSL).
+        assert!(
+            app.input.contains(one_core::image::IMAGE_TOKEN),
+            "expected loading chip in input, got {}",
+            app.input
+        );
+        assert!(
+            app.pending_images.iter().any(|i| i.loading),
+            "expected loading pending image"
+        );
+        assert!(app.has_loading_images());
+        let toast = app.toast.as_ref().map(|t| t.text.as_str()).unwrap_or("");
+        assert!(
+            toast.contains("pasting"),
+            "expected pasting toast, got {toast:?}"
+        );
+        // Abandon in-flight job (dropping app closes the channel).
+    }
+
+    #[test]
+    fn submit_blocked_while_image_loading() {
+        let mut app = App::new("test");
+        let _ = app.begin_loading_image("x.png");
+        assert!(app.has_loading_images());
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(matches!(outcome, RunOutcome::Noop));
+        let toast = app.toast.as_ref().map(|t| t.text.as_str()).unwrap_or("");
+        assert!(toast.contains("pasting") || toast.contains("still"), "{toast}");
+    }
+
+    #[test]
     fn deleting_image_token_detaches() {
         let mut app = App::new("test");
-        app.attach_image("image/png".into(), "aaaa".into(), "shot.png".into());
+        let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        app.attach_image("image/png".into(), tiny.into(), "shot.png".into());
         assert_eq!(app.pending_images.len(), 1);
         // User deletes the whole token from input.
         app.input = "hello only".into();
@@ -3666,7 +4698,8 @@ mod tests {
     fn backspace_removes_image_token_atomically() {
         let mut app = App::new("test");
         app.input = "hello".into();
-        app.attach_image("image/png".into(), "aaaa".into(), "shot.png".into());
+        let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        app.attach_image("image/png".into(), tiny.into(), "shot.png".into());
         // input is "hello [图片.img] "
         assert!(app.input.contains(one_core::image::IMAGE_TOKEN));
         assert_eq!(app.pending_images.len(), 1);
@@ -3719,7 +4752,8 @@ mod tests {
     #[test]
     fn submit_image_only_prompt() {
         let mut app = App::new("test");
-        app.attach_image("image/png".into(), "aaaa".into(), "shot.png".into());
+        let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        app.attach_image("image/png".into(), tiny.into(), "shot.png".into());
         match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
             RunOutcome::Prompt(t) => assert!(t.is_empty(), "token should be stripped, got {t}"),
             other => panic!("unexpected {other:?}"),
@@ -3744,28 +4778,27 @@ mod tests {
     }
 
     #[test]
-    fn busy_q_and_esc_abort_ctrl_c_force_quits() {
+    fn busy_esc_aborts_ctrl_c_force_quits() {
         let mut app = App::new("test");
         app.begin_busy();
 
-        // Soft cancel: empty-input `q`.
-        app.handle_busy_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert!(app.take_abort());
-        assert!(!app.force_quit_pending());
-
-        // Soft cancel: Esc.
+        // Soft cancel: Esc only (`q` is a normal character).
         app.handle_busy_key(key(KeyCode::Esc, KeyModifiers::NONE));
         assert!(app.take_abort());
         assert!(!app.force_quit_pending());
 
-        // While composing steer text, bare `q` is a normal character.
-        app.handle_busy_key(key(KeyCode::Char('h'), KeyModifiers::NONE));
+        // Bare `q` is steer/follow-up text, not abort.
         app.handle_busy_key(key(KeyCode::Char('q'), KeyModifiers::NONE));
-        assert_eq!(app.input, "hq");
+        assert_eq!(app.input, "q");
         assert!(!app.take_abort());
         assert!(!app.force_quit_pending());
 
-        // Force quit: Ctrl+C — never soft-cancel only.
+        // First Ctrl+C clears steer draft (does not force-quit).
+        app.handle_busy_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert!(app.input.is_empty());
+        assert!(!app.force_quit_pending());
+
+        // Second Ctrl+C force-quits — never soft-cancel only.
         app.handle_busy_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(app.force_quit_pending());
         assert!(app.take_force_quit());
@@ -3774,12 +4807,76 @@ mod tests {
     }
 
     #[test]
-    fn idle_ctrl_c_quits() {
+    fn idle_ctrl_c_requires_double_tap_to_quit() {
         let mut app = App::new("test");
         match app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
-            RunOutcome::Quit => {}
-            other => panic!("expected Quit, got {other:?}"),
+            RunOutcome::Noop => {}
+            other => panic!("expected Noop (arm quit), got {other:?}"),
         }
+        match app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+            RunOutcome::Quit => {}
+            other => panic!("expected Quit on second Ctrl+C, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_c_closes_settings_then_quits() {
+        let mut app = App::new("test");
+        app.open_settings_float();
+        assert!(app.float_open());
+
+        match app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+            RunOutcome::Noop => {}
+            other => panic!("expected Noop (close float), got {other:?}"),
+        }
+        assert!(!app.float_open());
+
+        match app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+            RunOutcome::Quit => {}
+            other => panic!("expected Quit on second Ctrl+C, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_c_clears_input_then_quits() {
+        let mut app = App::new("test");
+        app.input = "draft text".into();
+
+        match app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+            RunOutcome::Noop => {}
+            other => panic!("expected Noop (clear input), got {other:?}"),
+        }
+        assert!(app.input.is_empty());
+
+        match app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)) {
+            RunOutcome::Quit => {}
+            other => panic!("expected Quit on second Ctrl+C, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ctrl_c_quit_arm_disarmed_by_other_key() {
+        let mut app = App::new("test");
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            RunOutcome::Noop
+        ));
+        // Typing cancels the pending quit arm.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            RunOutcome::Noop
+        ));
+        // Next Ctrl+C clears the typed char (does not quit — arm was disarmed).
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            RunOutcome::Noop
+        ));
+        assert!(app.input.is_empty());
+        // Clearing re-arms: one more Ctrl+C quits.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+            RunOutcome::Quit
+        ));
     }
 
     #[test]
@@ -3925,6 +5022,34 @@ mod tests {
     }
 
     #[test]
+    fn shift_tab_cycles_agent_mode_space_does_not() {
+        let mut app = App::new("test");
+        // Empty-input Space used to cycle modes — now it types a space.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE)),
+            RunOutcome::Noop
+        ));
+        assert_eq!(app.input, " ");
+        app.input.clear();
+
+        // Crossterm reports Shift+Tab as BackTab.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            RunOutcome::CycleAgentMode
+        ));
+        // Some terminals send Tab+SHIFT instead.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Tab, KeyModifiers::SHIFT)),
+            RunOutcome::CycleAgentMode
+        ));
+        // Plain Tab is still completion, not mode cycle.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Tab, KeyModifiers::NONE)),
+            RunOutcome::Noop
+        ));
+    }
+
+    #[test]
     fn tool_lifecycle() {
         let mut app = App::new("test");
         app.push_tool_call("bash", "ls");
@@ -3985,6 +5110,28 @@ mod tests {
         );
         let out = last.tool_output.as_deref().unwrap_or("");
         assert!(out.contains('+') || out.contains("Updated"), "{out}");
+    }
+
+    #[test]
+    fn welcome_try_keys_submit_sample_prompts() {
+        let mut app = App::new("test");
+        assert!(app.messages.is_empty());
+        assert!(app.input.is_empty());
+
+        let out = app.handle_key(key(KeyCode::Char('1'), KeyModifiers::NONE));
+        match out {
+            RunOutcome::Prompt(p) => {
+                assert_eq!(p, WELCOME_TRY_PROMPTS[0]);
+            }
+            other => panic!("expected Prompt from try key, got {other:?}"),
+        }
+        assert!(app.input.is_empty(), "submit should clear input");
+        // submit_prompt already pushed the user turn — digits no longer shortcut.
+        assert!(!app.messages.is_empty());
+
+        let out2 = app.handle_key(key(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(matches!(out2, RunOutcome::Noop));
+        assert_eq!(app.input, "2");
     }
 
     #[test]

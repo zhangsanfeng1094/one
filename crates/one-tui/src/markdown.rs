@@ -428,10 +428,8 @@ impl Writer {
 
     fn rule(&mut self) {
         let w = self.width.min(48).max(8);
-        self.lines.push(Line::from(Span::styled(
-            "─".repeat(w),
-            Theme::meta(),
-        )));
+        self.lines
+            .push(Line::from(Span::styled("─".repeat(w), Theme::meta())));
         self.lines.push(Line::from(""));
     }
 
@@ -503,9 +501,8 @@ impl Writer {
         let wrapped = wrap_runs(&self.runs, budget);
         self.runs.clear();
         if wrapped.is_empty() {
-            self.lines.push(Line::from(vec![
-                Span::styled(full_prefix, Theme::meta()),
-            ]));
+            self.lines
+                .push(Line::from(vec![Span::styled(full_prefix, Theme::meta())]));
             return;
         }
         let hang = " ".repeat(display_width(&full_prefix));
@@ -929,7 +926,7 @@ mod tests {
         let joined: String = lines
             .iter()
             .flat_map(|l| l.spans.iter())
-            .filter(|sp| sp.content.contains('[') )
+            .filter(|sp| sp.content.contains('['))
             .map(|sp| format!("{:?}:{}", sp.style.bg, sp.content))
             .collect::<Vec<_>>()
             .join("|");
@@ -948,8 +945,14 @@ mod tests {
         assert!(s.contains("[ ]"), "unchecked rewrite: {s}");
         assert!(s.contains("1"), "circled digit rewrite: {s}");
         assert!(s.contains("2"), "keycap digit rewrite: {s}");
-        assert!(s.contains("first") && s.contains("second") && s.contains("done"), "{s}");
-        assert!(!s.contains('☑') && !s.contains('☐') && !s.contains('①'), "{s}");
+        assert!(
+            s.contains("first") && s.contains("second") && s.contains("done"),
+            "{s}"
+        );
+        assert!(
+            !s.contains('☑') && !s.contains('☐') && !s.contains('①'),
+            "{s}"
+        );
     }
 
     #[test]
@@ -1026,7 +1029,10 @@ mod debug_plain {
     #[test]
     fn plain_paragraph_not_empty() {
         let lines = render("Hello world, this is a plain reply.", 40);
-        let s: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string())).collect();
+        let s: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
         eprintln!("PLAIN=>{s:?}");
         assert!(!s.trim().is_empty(), "got empty: {lines:?}");
         assert!(s.contains("Hello"), "{s}");
@@ -1036,7 +1042,10 @@ mod debug_plain {
     fn streaming_partial_not_empty() {
         // incomplete markdown mid-stream
         let lines = render("Here is some **bold and more text without close", 40);
-        let s: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string())).collect();
+        let s: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
         eprintln!("PARTIAL=>{s:?}");
         assert!(s.contains("Here") || s.contains("bold"), "{s}");
     }
@@ -1044,7 +1053,10 @@ mod debug_plain {
     #[test]
     fn chinese_not_empty() {
         let lines = render("你好，这是一段中文回复。", 40);
-        let s: String = lines.iter().flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string())).collect();
+        let s: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref().to_string()))
+            .collect();
         eprintln!("ZH=>{s:?}");
         assert!(s.contains("你好"), "{s}");
     }

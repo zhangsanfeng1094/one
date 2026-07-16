@@ -198,7 +198,10 @@ pub fn truncate_tool_output_for_ui(output: &str, max_chars: usize) -> String {
     if trimmed.len() <= max_chars {
         return trimmed.to_string();
     }
-    let mut out = trimmed.chars().take(max_chars.saturating_sub(20)).collect::<String>();
+    let mut out = trimmed
+        .chars()
+        .take(max_chars.saturating_sub(20))
+        .collect::<String>();
     out.push_str("\n… (truncated in UI · full result still in model context)");
     out
 }

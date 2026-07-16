@@ -32,11 +32,44 @@ impl Theme {
     }
 
     pub fn border() -> Style {
-        Style::default().fg(Self::BORDER)
+        // Always paint panel bg on border cells — prevents chat bleed-through.
+        Style::default().fg(Self::BORDER).bg(Self::PANEL)
     }
 
     pub fn title() -> Style {
-        Style::default().fg(Self::MUTED)
+        Style::default().fg(Self::MUTED).bg(Self::PANEL)
+    }
+
+    /// Float footer keybinding strip (on border bottom title).
+    pub fn float_footer() -> Style {
+        Style::default()
+            .fg(Self::MUTED)
+            .bg(Self::PANEL)
+            .add_modifier(Modifier::ITALIC)
+    }
+
+    /// Action chip in float rows — `[edit]` / `[select]` looks clickable.
+    pub fn float_action() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::BORDER_ACTIVE)
+    }
+
+    pub fn float_action_selected() -> Style {
+        Style::default()
+            .bg(Self::ELEMENT)
+            .fg(Self::MUTED)
+            .add_modifier(Modifier::DIM)
+    }
+
+    /// Active filter field (user is typing a query).
+    pub fn float_filter_active() -> Style {
+        Style::default()
+            .bg(Self::ELEMENT)
+            .fg(Self::FG)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn float_filter_label() -> Style {
+        Style::default().bg(Self::ELEMENT).fg(Self::MUTED)
     }
 
     pub fn status() -> Style {
@@ -101,13 +134,54 @@ impl Theme {
         style.add_modifier(m)
     }
 
-    /// Prompt left rail — agent color (primary peach).
+    /// Prompt left rail — agent color (primary peach). Interaction focus only.
     pub fn prompt_bar() -> Style {
         Style::default().fg(Self::PRIMARY)
     }
 
     pub fn prompt_bar_busy() -> Style {
         Style::default().fg(Self::WARNING)
+    }
+
+    /// Mode / agent name on the meta strip (Build · Plan).
+    /// Copper — identity tag, deliberately *not* PRIMARY so selection stays unique.
+    pub fn mode_label() -> Style {
+        Style::default().fg(Color::Rgb(0xa8, 0x86, 0x68))
+    }
+
+    /// Float list / section text while in-float value edit owns focus.
+    pub fn float_dim() -> Style {
+        Style::default()
+            .bg(Self::PANEL)
+            .fg(Self::MUTED)
+            .add_modifier(Modifier::DIM)
+    }
+
+    pub fn float_dim_desc() -> Style {
+        Style::default()
+            .bg(Self::PANEL)
+            .fg(Self::BORDER_ACTIVE)
+            .add_modifier(Modifier::DIM)
+    }
+
+    /// In-float editor label (`api_key:`) — claims the sole focus color.
+    pub fn float_edit_label() -> Style {
+        Style::default()
+            .bg(Self::ELEMENT)
+            .fg(Self::PRIMARY)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn float_edit_text() -> Style {
+        Style::default()
+            .bg(Self::ELEMENT)
+            .fg(Self::FG)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Internal hairlines (search/list split, section rules) — below outer border.
+    pub fn hairline() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::BORDER)
     }
 
     /// Streaming caret in assistant text.
@@ -212,9 +286,7 @@ impl Theme {
     }
 
     pub fn table_header() -> Style {
-        Style::default()
-            .fg(Self::FG)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::FG).add_modifier(Modifier::BOLD)
     }
 
     pub fn table_cell() -> Style {
@@ -266,9 +338,7 @@ impl Theme {
     }
 
     pub fn tool_name_done() -> Style {
-        Style::default()
-            .fg(Self::FG)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::FG).add_modifier(Modifier::BOLD)
     }
 
     pub fn tool_name_error() -> Style {
@@ -355,9 +425,7 @@ impl Theme {
     }
 
     pub fn tool_group_title() -> Style {
-        Style::default()
-            .fg(Self::FG)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::FG).add_modifier(Modifier::BOLD)
     }
 
     /// Number / check badge on a solid chip (terminal-safe; avoids ☑/① tofu).

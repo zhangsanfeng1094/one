@@ -62,6 +62,7 @@ docs/            设计与使用文档
 - [CLI 参考](docs/cli.md)
 - [Session 格式](docs/session-format.md)
 - [扩展系统](docs/extensions.md)
+- [Package / Suite 设计（草案，未实现）](docs/package-suites.md)
 - [开发指南](docs/development.md)
 - [路线图](docs/roadmap.md)
 

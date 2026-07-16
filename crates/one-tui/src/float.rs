@@ -51,6 +51,10 @@ pub enum FloatKind {
     SettingsProviderDetail,
     /// Provider-level API enum picker.
     SettingsProviderApi,
+    /// Provider/model thinkingFormat picker.
+    SettingsThinkingFormat,
+    /// Provider/model maxTokensField picker.
+    SettingsMaxTokensField,
     /// Remote model ids fetched from the provider.
     SettingsRemoteModels,
     /// Model list under Settings.
@@ -59,6 +63,8 @@ pub enum FloatKind {
     SettingsModelDetail,
     /// Add-model form under a provider (stays in Settings float).
     SettingsModelAdd,
+    /// Skills manager — list + enable/disable (Codex-style).
+    Skills,
     /// Generic custom list.
     Custom,
 }
@@ -69,6 +75,8 @@ pub struct FloatMenu {
     pub kind: FloatKind,
     pub title: String,
     pub search: String,
+    /// Char-index caret into `search` (0..=search.chars().count()).
+    pub search_cursor: usize,
     pub sections: Vec<FloatSection>,
     /// Index into flattened **selectable** items (not headers).
     pub selected: usize,
@@ -100,6 +108,7 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -149,6 +158,7 @@ impl FloatMenu {
             selected: levels.iter().position(|l| *l == current).unwrap_or(0),
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -179,6 +189,7 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -205,6 +216,7 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -236,6 +248,7 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -261,6 +274,7 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -295,6 +309,12 @@ impl FloatMenu {
                             "workspace-write / full-access",
                             "cycle",
                         ),
+                        item(
+                            "skills",
+                            "Skills",
+                            "enable / disable discovered skills",
+                            "/skills",
+                        ),
                     ],
                 },
                 FloatSection {
@@ -318,6 +338,64 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Skills manager: rows are `(path, label, detail, enabled)`.
+    pub fn skills_manager(rows: &[(String, String, String, bool)]) -> Self {
+        let mut enabled_items = Vec::new();
+        let mut disabled_items = Vec::new();
+        for (path, label, detail, on) in rows {
+            let item = FloatItem {
+                id: path.clone(),
+                label: label.clone(),
+                detail: detail.clone(),
+                hint: if *on {
+                    "on · Enter off".into()
+                } else {
+                    "off · Enter on".into()
+                },
+            };
+            if *on {
+                enabled_items.push(item);
+            } else {
+                disabled_items.push(item);
+            }
+        }
+        let mut sections = Vec::new();
+        if !enabled_items.is_empty() {
+            sections.push(FloatSection {
+                title: format!("Enabled ({})", enabled_items.len()),
+                items: enabled_items,
+            });
+        }
+        if !disabled_items.is_empty() {
+            sections.push(FloatSection {
+                title: format!("Disabled ({})", disabled_items.len()),
+                items: disabled_items,
+            });
+        }
+        if sections.is_empty() {
+            sections.push(FloatSection {
+                title: "Skills".into(),
+                items: vec![item(
+                    "_empty",
+                    "(no skills discovered)",
+                    "add SKILL.md under .agents/skills or ~/.one/agent/skills",
+                    "",
+                )],
+            });
+        }
+        Self {
+            kind: FloatKind::Skills,
+            title: "Skills".into(),
+            search: String::new(),
+            sections,
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -348,6 +426,7 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -359,34 +438,117 @@ impl FloatMenu {
                 .map(|(_, v)| v.clone())
                 .unwrap_or_else(|| fallback.to_string())
         };
-        let provider_type = field_value("provider_type", "default/unset");
+        // `provider_type` and `api` are the same fixed protocol field (mirrored).
+        let provider_type = {
+            let t = field_value("provider_type", "default/unset");
+            if t == "default/unset" {
+                field_value("api", "default/unset")
+            } else {
+                t
+            }
+        };
         let base_url = field_value("base_url", "unset");
-        let api = field_value("api", "default/unset");
         let api_key = field_value("api_key", "unset");
         let default_model = field_value("default_model", "unset");
+        let thinking_format = field_value("thinking_format", "auto");
+        let max_tokens_field = field_value("max_tokens_field", "auto");
+        let compat_summary = field_value("compat", "auto (detect)");
+        // Models is a top-level nav row (no section chrome); Connection / Danger
+        // are section headers — three-column key · value · [action] in the list.
+        let models_detail = if detail.trim().is_empty() {
+            "list · add · edit".to_string()
+        } else {
+            detail.to_string()
+        };
+
+        let mut compat_items = vec![
+            item(
+                "set_thinking_format",
+                "thinkingFormat",
+                &thinking_format,
+                "select",
+            ),
+            item(
+                "set_max_tokens_field",
+                "maxTokensField",
+                &max_tokens_field,
+                "select",
+            ),
+        ];
+        // Common Pi compat bools — Enter cycles auto → true → false.
+        for (label, key) in [
+            ("supportsDeveloperRole", "supports_developer_role"),
+            ("supportsReasoningEffort", "supports_reasoning_effort"),
+            ("supportsUsageInStreaming", "supports_usage_in_streaming"),
+            ("supportsStrictMode", "supports_strict_mode"),
+            ("requiresToolResultName", "requires_tool_result_name"),
+            (
+                "requiresAssistantAfterToolResult",
+                "requires_assistant_after_tool_result",
+            ),
+            ("requiresThinkingAsText", "requires_thinking_as_text"),
+            (
+                "requiresReasoningContent",
+                "requires_reasoning_content_on_assistant_messages",
+            ),
+            ("forceAdaptiveThinking", "force_adaptive_thinking"),
+            ("allowEmptySignature", "allow_empty_signature"),
+        ] {
+            let display = fields
+                .iter()
+                .find(|(k, _)| k == &format!("compat.{label}") || k.ends_with(&format!(":{key}")) || k.ends_with(&format!("compat.{label}")))
+                .map(|(_, v)| v.clone())
+                .or_else(|| {
+                    // provider_field_rows uses `id:compat.Label`
+                    fields
+                        .iter()
+                        .find(|(k, _)| k.contains(&format!("compat.{label}")))
+                        .map(|(_, v)| v.clone())
+                })
+                .unwrap_or_else(|| "auto".into());
+            compat_items.push(item(
+                &format!("cycle_compat:{key}"),
+                label,
+                &display,
+                "cycle",
+            ));
+        }
+        compat_items.push(item(
+            "clear_compat",
+            "Clear compat overrides",
+            &compat_summary,
+            "reset",
+        ));
+
         Self {
             kind: FloatKind::SettingsProviderDetail,
             title: format!("Provider · {id}"),
             search: String::new(),
             sections: vec![
                 FloatSection {
-                    title: detail.into(),
-                    items: vec![item(
-                        "models",
-                        "Models",
-                        "list · add · edit under this provider",
-                        "→",
-                    )],
+                    title: String::new(),
+                    items: vec![
+                        item("models", "Models", &models_detail, "→"),
+                        item(
+                            "fetch_models",
+                            "Fetch & import remote models",
+                            "GET /models → batch add · Ctrl+F",
+                            "fetch",
+                        ),
+                    ],
                 },
                 FloatSection {
                     title: "Connection".into(),
                     items: vec![
-                        item("set_provider_type", "providerType", &provider_type, "edit"),
+                        item("set_provider_type", "protocol", &provider_type, "select"),
                         item("set_base_url", "base_url", &base_url, "edit"),
-                        item("set_api", "api", &api, "select"),
                         item("set_api_key", "api_key", &api_key, "edit"),
                         item("set_default_model", "default_model", &default_model, "edit"),
                     ],
+                },
+                FloatSection {
+                    title: "Compat (Pi)".into(),
+                    items: compat_items,
                 },
                 FloatSection {
                     title: "Danger".into(),
@@ -401,28 +563,106 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
+    /// Thinking format picker (provider or model scope — caller handles confirm).
+    pub fn settings_thinking_format(scope: &str) -> Self {
+        Self {
+            kind: FloatKind::SettingsThinkingFormat,
+            title: format!("thinkingFormat · {scope}"),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: "How reasoning/thinking is encoded on the wire".into(),
+                items: vec![
+                    item("tf:auto", "auto", "detect from provider / baseUrl", ""),
+                    item("tf:openai", "openai", "reasoning_effort", ""),
+                    item("tf:openrouter", "openrouter", "reasoning: { effort }", ""),
+                    item("tf:deepseek", "deepseek", "thinking: { type } + effort", ""),
+                    item("tf:together", "together", "reasoning: { enabled }", ""),
+                    item("tf:zai", "zai", "thinking enabled/disabled", ""),
+                    item("tf:qwen", "qwen", "enable_thinking bool", ""),
+                    item(
+                        "tf:qwen-chat-template",
+                        "qwen-chat-template",
+                        "chat_template_kwargs",
+                        "",
+                    ),
+                    item("tf:chat-template", "chat-template", "custom kwargs", ""),
+                    item("tf:string-thinking", "string-thinking", "thinking: string", ""),
+                    item("tf:ant-ling", "ant-ling", "reasoning: { effort }", ""),
+                ],
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    pub fn settings_max_tokens_field(scope: &str) -> Self {
+        Self {
+            kind: FloatKind::SettingsMaxTokensField,
+            title: format!("maxTokensField · {scope}"),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: "Field name for max output tokens".into(),
+                items: vec![
+                    item("mt:auto", "auto", "detect from provider / URL", ""),
+                    item(
+                        "mt:max_completion_tokens",
+                        "max_completion_tokens",
+                        "OpenAI modern",
+                        "",
+                    ),
+                    item("mt:max_tokens", "max_tokens", "legacy / local proxies", ""),
+                ],
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Fixed protocol picker — drives LLM request/response codecs.
     pub fn settings_provider_api(provider: &str) -> Self {
         Self {
             kind: FloatKind::SettingsProviderApi,
-            title: format!("Provider API · {provider}"),
+            title: format!("Protocol · {provider}"),
             search: String::new(),
             sections: vec![FloatSection {
-                title: "Wire API".into(),
+                title: "Wire protocol (select, not free-text)".into(),
                 items: vec![
-                    item("api:", "default/unset", "clear provider-level api", ""),
                     item(
-                        "api:openai-responses",
-                        "openai-responses",
-                        "OpenAI Responses API",
+                        "api:",
+                        "default/unset",
+                        "inherit built-in default for this provider",
                         "",
                     ),
                     item(
                         "api:openai-completions",
                         "openai-completions",
-                        "Chat Completions compatible",
+                        "OpenAI Chat Completions · widest compatible",
+                        "",
+                    ),
+                    item(
+                        "api:openai-responses",
+                        "openai-responses",
+                        "OpenAI Responses API · first-party OpenAI",
+                        "",
+                    ),
+                    item(
+                        "api:anthropic-messages",
+                        "anthropic-messages",
+                        "Anthropic Messages API · Claude",
+                        "",
+                    ),
+                    item(
+                        "api:gemini-generate-content",
+                        "gemini-generate-content",
+                        "Gemini native generateContent / streamGenerateContent",
                         "",
                     ),
                 ],
@@ -430,6 +670,7 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -454,13 +695,20 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
     /// Models for **one** provider (second level under Provider detail).
     pub fn settings_models_for_provider(provider: &str, rows: &[(String, String)]) -> Self {
         let prefix = format!("{provider}:");
-        let mut items: Vec<FloatItem> = rows
+        let mut items: Vec<FloatItem> = vec![item(
+            "fetch_models",
+            "Fetch & import remote models",
+            "GET /models → batch write models.json",
+            "Ctrl+F",
+        )];
+        let model_items: Vec<FloatItem> = rows
             .iter()
             .filter(|(spec, _)| spec == provider || spec.starts_with(&prefix))
             .map(|(spec, detail)| {
@@ -476,7 +724,8 @@ impl FloatMenu {
                 }
             })
             .collect();
-        let n = items.len();
+        let n = model_items.len();
+        items.extend(model_items);
         items.push(item(
             "add_model",
             "+ Add model",
@@ -488,32 +737,118 @@ impl FloatMenu {
             title: format!("Models · {provider}"),
             search: String::new(),
             sections: vec![FloatSection {
-                title: format!("{n} · Esc/← back to provider"),
+                title: format!("{n} · Ctrl+F import all · Esc/← back"),
                 items,
             }],
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
     pub fn settings_model_detail(spec: &str, detail: &str) -> Self {
         let short = spec.split_once(':').map(|(_, id)| id).unwrap_or(spec);
+        // detail may be multi-line "name · ctx · reasoning=… · map=…"
+        let field = |prefix: &str, default: &str| {
+            detail
+                .split(prefix)
+                .nth(1)
+                .map(|s| s.split_whitespace().next().unwrap_or(default))
+                .unwrap_or(default)
+                .to_string()
+        };
+        let reasoning = field("reasoning=", "unset");
+        let tlm = {
+            let raw = detail.split("map=").nth(1).map(str::trim).unwrap_or("");
+            if raw.is_empty() {
+                "(none)".to_string()
+            } else {
+                // map value may contain commas; take until next known token or end.
+                raw.split(" devRole=")
+                    .next()
+                    .unwrap_or(raw)
+                    .trim()
+                    .to_string()
+            }
+        };
+        let thinking_format = field("format=", "auto");
+        let dev_role = field("devRole=", "auto");
+        let effort = field("effort=", "auto");
         Self {
             kind: FloatKind::SettingsModelDetail,
             title: format!("Model · {short}"),
             search: String::new(),
-            sections: vec![FloatSection {
-                title: detail.into(),
-                items: vec![
-                    item("set_name", "name", short, "edit"),
-                    item("set_ctx", "context_window", "e.g. 128000", "edit"),
-                    item("rm_model", "Delete model", "remove from models.json", "rm"),
-                ],
-            }],
+            sections: vec![
+                FloatSection {
+                    title: detail.into(),
+                    items: vec![
+                        item("set_name", "name", short, "edit"),
+                        item("set_ctx", "context_window", "e.g. 128000", "edit"),
+                        item("set_reasoning", "reasoning", &reasoning, "cycle"),
+                        item(
+                            "set_thinking_level_map",
+                            "thinkingLevelMap",
+                            &tlm,
+                            "edit",
+                        ),
+                        item(
+                            "set_thinking_format",
+                            "thinkingFormat",
+                            &thinking_format,
+                            "select",
+                        ),
+                        item(
+                            "set_max_tokens_field",
+                            "maxTokensField",
+                            "auto / override",
+                            "select",
+                        ),
+                    ],
+                },
+                FloatSection {
+                    title: "Compat overrides (model > provider)".into(),
+                    items: vec![
+                        item(
+                            "cycle_compat:supports_developer_role",
+                            "supportsDeveloperRole",
+                            &dev_role,
+                            "cycle",
+                        ),
+                        item(
+                            "cycle_compat:supports_reasoning_effort",
+                            "supportsReasoningEffort",
+                            &effort,
+                            "cycle",
+                        ),
+                        item(
+                            "cycle_compat:requires_reasoning_content_on_assistant_messages",
+                            "requiresReasoningContent",
+                            "auto",
+                            "cycle",
+                        ),
+                        item(
+                            "clear_compat",
+                            "Clear model compat",
+                            "inherit provider",
+                            "reset",
+                        ),
+                    ],
+                },
+                FloatSection {
+                    title: "Danger".into(),
+                    items: vec![item(
+                        "rm_model",
+                        "Delete model",
+                        "remove from models.json",
+                        "rm",
+                    )],
+                },
+            ],
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -579,6 +914,7 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -629,6 +965,7 @@ impl FloatMenu {
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
+            search_cursor: 0,
         }
     }
 
@@ -665,23 +1002,33 @@ impl FloatMenu {
         self.edit_mode = true;
         self.edit_label = label.into();
         self.search = initial.into();
+        self.search_cursor = self.search.chars().count();
     }
 
     pub fn end_edit(&mut self) {
         self.edit_mode = false;
         self.edit_label.clear();
         self.search.clear();
+        self.search_cursor = 0;
     }
 
     /// Rows for rendering: headers injected when section changes.
+    /// Empty section titles are skipped (top-level nav rows like Models).
     pub fn render_rows(&self) -> Vec<FloatRenderRow> {
         let entries = self.filtered_entries();
         let mut rows = Vec::new();
-        let mut last_section = String::new();
+        let mut last_section: Option<String> = None;
         for (i, e) in entries.iter().enumerate() {
-            if e.section_title != last_section {
-                rows.push(FloatRenderRow::Header(e.section_title.clone()));
-                last_section = e.section_title.clone();
+            let sec = e.section_title.as_str();
+            let section_changed = match &last_section {
+                None => true,
+                Some(prev) => prev != sec,
+            };
+            if section_changed {
+                if !sec.is_empty() {
+                    rows.push(FloatRenderRow::Header(e.section_title.clone()));
+                }
+                last_section = Some(e.section_title.clone());
             }
             rows.push(FloatRenderRow::Item {
                 entry_index: i,
@@ -719,18 +1066,108 @@ impl FloatMenu {
         entries.get(self.selected).cloned()
     }
 
+    fn clamp_search_cursor(&mut self) {
+        let len = self.search.chars().count();
+        if self.search_cursor > len {
+            self.search_cursor = len;
+        }
+    }
+
+    /// Byte index in `search` for the current char cursor.
+    fn search_byte_at_cursor(&self) -> usize {
+        self.search
+            .chars()
+            .take(self.search_cursor)
+            .map(|c| c.len_utf8())
+            .sum()
+    }
+
+    /// Left/right caret movement inside the search/edit bar.
+    pub fn move_search_cursor(&mut self, delta: isize) {
+        let len = self.search.chars().count() as isize;
+        let next = (self.search_cursor as isize + delta).clamp(0, len);
+        self.search_cursor = next as usize;
+    }
+
+    pub fn search_cursor_home(&mut self) {
+        self.search_cursor = 0;
+    }
+
+    pub fn search_cursor_end(&mut self) {
+        self.search_cursor = self.search.chars().count();
+    }
+
+    /// Split `search` at the caret for rendering: (before, after).
+    pub fn search_split_at_cursor(&self) -> (&str, &str) {
+        let idx = self.search_byte_at_cursor().min(self.search.len());
+        // Ensure char boundary (cursor is char-based, so this should already be).
+        let idx = if self.search.is_char_boundary(idx) {
+            idx
+        } else {
+            self.search.len()
+        };
+        (&self.search[..idx], &self.search[idx..])
+    }
+
     pub fn push_search(&mut self, ch: char) {
-        if !ch.is_control() {
-            self.search.push(ch);
+        if ch.is_control() {
+            return;
+        }
+        let idx = self.search_byte_at_cursor();
+        self.search.insert(idx, ch);
+        self.search_cursor += 1;
+        if !self.edit_mode {
             self.selected = 0;
             self.clamp_selected();
         }
     }
 
+    /// Insert pasted text at the caret (control chars dropped).
+    pub fn paste_search(&mut self, text: &str) {
+        let cleaned: String = text.chars().filter(|c| !c.is_control()).collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        let idx = self.search_byte_at_cursor();
+        let n = cleaned.chars().count();
+        self.search.insert_str(idx, &cleaned);
+        self.search_cursor += n;
+        if !self.edit_mode {
+            self.selected = 0;
+            self.clamp_selected();
+        }
+    }
+
+    /// Backspace: delete the character before the caret.
     pub fn pop_search(&mut self) {
-        self.search.pop();
-        self.selected = 0;
-        self.clamp_selected();
+        if self.search_cursor == 0 {
+            return;
+        }
+        self.search_cursor -= 1;
+        let idx = self.search_byte_at_cursor();
+        if idx < self.search.len() {
+            self.search.remove(idx);
+        }
+        if !self.edit_mode {
+            self.selected = 0;
+            self.clamp_selected();
+        }
+    }
+
+    /// Delete: remove the character under/after the caret.
+    pub fn delete_search_forward(&mut self) {
+        if self.search_cursor >= self.search.chars().count() {
+            return;
+        }
+        let idx = self.search_byte_at_cursor();
+        if idx < self.search.len() {
+            self.search.remove(idx);
+        }
+        self.clamp_search_cursor();
+        if !self.edit_mode {
+            self.selected = 0;
+            self.clamp_selected();
+        }
     }
 }
 
@@ -800,6 +1237,12 @@ fn default_command_sections() -> Vec<FloatSection> {
                     "Compact Context",
                     "summarize older turns",
                     "/compact",
+                ),
+                item(
+                    "skills",
+                    "Manage Skills",
+                    "list · enable · disable",
+                    "/skills",
                 ),
                 item(
                     "skill",

@@ -1,6 +1,6 @@
 //! Tool transcript helpers: grouping, edit/write previews, diff line paint.
 
-use crate::message::{ToolStatus, Message, MessageRole};
+use crate::message::{Message, MessageRole, ToolStatus};
 
 /// Max tools shown as a single collapsed “N tools” chip before forcing expand.
 pub const COLLAPSE_GROUP_MIN: usize = 3;
@@ -153,7 +153,10 @@ pub fn format_edit_diff(path: &str, old: &str, new: &str) -> String {
 pub fn write_preview_from_args(args: &str) -> Option<String> {
     let path = json_field(args, "path")?;
     let content = json_field(args, "content").unwrap_or_default();
-    let n = content.lines().count().max(if content.is_empty() { 0 } else { 1 });
+    let n = content
+        .lines()
+        .count()
+        .max(if content.is_empty() { 0 } else { 1 });
     let bytes = content.len();
     let mut out = format!("Wrote {bytes} bytes → {path} ({n} lines)\n");
     // Preview first few lines as + adds (new file body).
@@ -348,12 +351,15 @@ pub fn summarize_tool_special(
                 .unwrap_or("?");
             let running = status == "running";
             let failed = is_error || matches!(status, "timed_out" | "killed" | "failed");
-            let summary = if output.starts_with("Background tasks:") || output.starts_with("No background")
-            {
-                format!("list · {}", truncate(output.lines().next().unwrap_or("ps"), 40))
-            } else {
-                format!("{status} · {task_id}")
-            };
+            let summary =
+                if output.starts_with("Background tasks:") || output.starts_with("No background") {
+                    format!(
+                        "list · {}",
+                        truncate(output.lines().next().unwrap_or("ps"), 40)
+                    )
+                } else {
+                    format!("{status} · {task_id}")
+                };
             // Expand finished snapshots so bg results are visible without an extra click.
             Some((summary, !running || failed, None))
         }
@@ -438,8 +444,7 @@ mod tests {
     #[test]
     fn bash_exit_summary() {
         let (s, expand, _) =
-            summarize_tool_special("bash", r#"{"command":"false"}"#, "exit 1\nboom", true)
-                .unwrap();
+            summarize_tool_special("bash", r#"{"command":"false"}"#, "exit 1\nboom", true).unwrap();
         assert!(s.contains("exit 1"), "{s}");
         assert!(expand);
 

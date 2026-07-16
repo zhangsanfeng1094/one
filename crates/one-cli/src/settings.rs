@@ -9,6 +9,20 @@ use serde::{Deserialize, Serialize};
 
 use crate::preferences;
 
+/// Per-skill enable/disable (Codex `[[skills.config]]` equivalent).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkillConfigEntry {
+    /// Absolute path to `SKILL.md`.
+    pub path: String,
+    /// When false, skill is hidden from catalog and not force-loadable.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
 /// User settings — single source for durable interactive preferences.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -29,6 +43,53 @@ pub struct Settings {
     pub permissions: Option<one_tools::PermissionRules>,
     /// Run bash under bubblewrap when sandbox is workspace-write (default true).
     pub bash_sandbox: Option<bool>,
+    /// Skills enable/disable list (like Codex `[[skills.config]]`).
+    /// Omitted paths default to enabled.
+    pub skills_config: Option<Vec<SkillConfigEntry>>,
+}
+
+impl Settings {
+    pub fn skills_config_entries(&self) -> Vec<one_resources::SkillConfigEntry> {
+        self.skills_config
+            .as_ref()
+            .map(|entries| {
+                entries
+                    .iter()
+                    .map(|e| one_resources::SkillConfigEntry {
+                        path: e.path.clone(),
+                        enabled: e.enabled,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    pub fn set_skill_enabled(&mut self, path: &std::path::Path, enabled: bool) {
+        let mut entries = self.skills_config.clone().unwrap_or_default();
+        let mut rs: Vec<one_resources::SkillConfigEntry> = entries
+            .iter()
+            .map(|e| one_resources::SkillConfigEntry {
+                path: e.path.clone(),
+                enabled: e.enabled,
+            })
+            .collect();
+        one_resources::set_skill_enabled(&mut rs, path, enabled);
+        entries = rs
+            .into_iter()
+            .map(|e| SkillConfigEntry {
+                path: e.path,
+                enabled: e.enabled,
+            })
+            .collect();
+        // Drop entries that are enabled (default) to keep the file tidy —
+        // only persist explicit disables (and re-enables that were previously disabled).
+        // Keep both true and false so user intent is explicit like Codex.
+        self.skills_config = if entries.is_empty() {
+            None
+        } else {
+            Some(entries)
+        };
+    }
 }
 
 fn settings_path() -> PathBuf {
@@ -261,9 +322,23 @@ mod tests {
                 ask: vec![],
             }),
             bash_sandbox: Some(true),
+            skills_config: Some(vec![SkillConfigEntry {
+                path: "/tmp/s/SKILL.md".into(),
+                enabled: false,
+            }]),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn skill_toggle_persists_path() {
+        let mut s = Settings::default();
+        s.set_skill_enabled(std::path::Path::new("/tmp/x/SKILL.md"), false);
+        assert_eq!(s.skills_config.as_ref().unwrap().len(), 1);
+        assert!(!s.skills_config.as_ref().unwrap()[0].enabled);
+        s.set_skill_enabled(std::path::Path::new("/tmp/x/SKILL.md"), true);
+        assert!(s.skills_config.as_ref().unwrap()[0].enabled);
     }
 }

@@ -106,6 +106,12 @@ pub struct CompletionRequest {
 }
 
 /// Token accounting returned by providers (when available).
+///
+/// Field semantics (important for cost / totals):
+/// - **Anthropic**: `input_tokens` excludes cache; `cache_read` / `cache_write` are disjoint.
+/// - **OpenAI**: `input_tokens` (`prompt_tokens`) **includes** `cache_read_tokens` as a subset.
+/// - `total()` is therefore **input + output only** (never double-counts OpenAI cache).
+/// - Use [`prompt_tokens_expanded`] for Anthropic-style full prompt size.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
     pub input_tokens: u64,
@@ -115,11 +121,23 @@ pub struct TokenUsage {
 }
 
 impl TokenUsage {
+    /// Input + output as reported (OpenAI-safe; no cache double-count).
     pub fn total(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+
+    /// Anthropic-style expanded prompt size: input + cache_read + cache_write.
+    ///
+    /// Do **not** use for OpenAI (where `cache_read` is already inside `input_tokens`).
+    pub fn prompt_tokens_expanded(&self) -> u64 {
         self.input_tokens
-            .saturating_add(self.output_tokens)
             .saturating_add(self.cache_read_tokens)
             .saturating_add(self.cache_write_tokens)
+    }
+
+    /// Non-cached input tokens when `cache_read` is a **subset** of `input` (OpenAI).
+    pub fn uncached_input_tokens(&self) -> u64 {
+        self.input_tokens.saturating_sub(self.cache_read_tokens)
     }
 
     pub fn add_assign(&mut self, other: &TokenUsage) {
@@ -134,7 +152,25 @@ impl TokenUsage {
     }
 
     pub fn is_zero(&self) -> bool {
-        self.total() == 0
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_write_tokens == 0
+    }
+
+    /// Best-effort size of the **prompt/context** for this completion (for compaction).
+    ///
+    /// Anthropic reports cache fields disjoint from `input_tokens`; OpenAI folds
+    /// cache hits into `input_tokens`. Prefer expanded size when write-cache is set.
+    pub fn context_size_tokens(&self) -> u64 {
+        if self.is_zero() {
+            return 0;
+        }
+        if self.cache_write_tokens > 0 {
+            self.prompt_tokens_expanded()
+        } else {
+            self.input_tokens
+        }
     }
 }
 
@@ -181,6 +217,9 @@ pub struct Agent {
     pub is_busy: bool,
     /// Cumulative provider-reported tokens for this process/session.
     pub token_usage: TokenUsage,
+    /// Last completion's prompt/context size (not cumulative). 0 if unknown.
+    /// Used by compaction to prefer API usage over char/4 estimates.
+    pub last_prompt_tokens: u64,
     tools: Vec<Arc<dyn Tool>>,
     listeners: Vec<EventListener>,
     steering_queue: Arc<Mutex<Vec<String>>>,
@@ -200,6 +239,7 @@ impl Agent {
             messages: Vec::new(),
             is_busy: false,
             token_usage: TokenUsage::default(),
+            last_prompt_tokens: 0,
             tools,
             listeners: Vec::new(),
             steering_queue: Arc::new(Mutex::new(Vec::new())),
@@ -314,7 +354,7 @@ impl Agent {
         self.run(provider).await
     }
 
-    /// Prompt with text + optional image attachments `(mime_type, base64)`.
+    /// Prompt with text + local image files `(mime_type, path)`.
     pub async fn prompt_with_images(
         &mut self,
         provider: &dyn LlmProvider,
@@ -383,6 +423,10 @@ impl Agent {
 
             if !response.usage.is_zero() {
                 self.token_usage.add_assign(&response.usage);
+                let ctx = response.usage.context_size_tokens();
+                if ctx > 0 {
+                    self.last_prompt_tokens = ctx;
+                }
             }
 
             if self.is_aborted() || response.stop_reason == StopReason::Aborted {
@@ -672,6 +716,42 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_usage_total_does_not_double_count_cache() {
+        let u = TokenUsage {
+            input_tokens: 1000,
+            output_tokens: 50,
+            cache_read_tokens: 800, // OpenAI: subset of input
+            cache_write_tokens: 0,
+        };
+        assert_eq!(u.total(), 1050);
+        assert_eq!(u.uncached_input_tokens(), 200);
+        assert_eq!(u.prompt_tokens_expanded(), 1800); // Anthropic-style only
+        // OpenAI-style: context size is input (cache already inside).
+        assert_eq!(u.context_size_tokens(), 1000);
+    }
+
+    #[test]
+    fn context_size_tokens_anthropic_style() {
+        let u = TokenUsage {
+            input_tokens: 200,
+            output_tokens: 10,
+            cache_read_tokens: 800,
+            cache_write_tokens: 50,
+        };
+        assert_eq!(u.context_size_tokens(), 1050); // input + read + write
+    }
+
+    #[test]
+    fn token_usage_is_zero_sees_cache_only() {
+        let u = TokenUsage {
+            cache_read_tokens: 10,
+            ..Default::default()
+        };
+        assert!(!u.is_zero());
+        assert_eq!(u.total(), 0);
+    }
 
     #[tokio::test]
     async fn abort_stops_agent_run() {

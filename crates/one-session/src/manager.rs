@@ -236,12 +236,28 @@ impl SessionManager {
     }
 
     /// Full user-message text for a session entry (for restoring into the input).
+    ///
+    /// Prefer [`Self::user_prompt_for_edit`] when images must survive re-send —
+    /// this returns display labels for images (`[image · png · NKB]`), which are
+    /// **not** vision payloads if submitted again.
     pub fn user_prompt_text(&self, entry_id: &str) -> Option<String> {
         match self.get_entry(entry_id)? {
             SessionEntry::Message {
                 message: AgentMessage::User(user),
                 ..
             } => Some(user.content.as_display_text()),
+            _ => None,
+        }
+    }
+
+    /// Restore a user prompt for re-edit: input text (with `[图片.img]` chips) +
+    /// real image `(mime, base64)` payloads in order.
+    pub fn user_prompt_for_edit(&self, entry_id: &str) -> Option<(String, Vec<(String, String)>)> {
+        match self.get_entry(entry_id)? {
+            SessionEntry::Message {
+                message: AgentMessage::User(user),
+                ..
+            } => Some(user.content.for_reedit()),
             _ => None,
         }
     }
@@ -413,7 +429,12 @@ impl SessionManager {
     }
 
     pub fn load_messages_into(&self, messages: &mut Vec<AgentMessage>) {
-        messages.extend(self.build_session_context().messages);
+        let mut loaded = self.build_session_context().messages;
+        // If a prior turn was re-submitted as display labels only
+        // (`这个是什么\n[image · png · 43KB]`), swap back the real multimodal
+        // content from any entry in the file (including disconnected roots).
+        rehydrate_image_placeholders(&mut loaded, &self.entries);
+        messages.extend(loaded);
     }
 
     async fn persist_header(&self) -> Result<()> {
@@ -449,9 +470,50 @@ fn first_line_preview(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Replace plain-text user turns that are only `as_display_text` snapshots of a
+/// real multimodal turn with the original `UserContent::Blocks` (images included).
+///
+/// Happens when `/rewind` or prompt-history re-submitted `[image · png · NKB]`
+/// labels instead of base64, or when a leaf branch only has that text form.
+pub(crate) fn rehydrate_image_placeholders(
+    messages: &mut [AgentMessage],
+    entries: &[SessionEntry],
+) {
+    use std::collections::HashMap;
+
+    let mut by_display: HashMap<String, one_core::message::UserContent> = HashMap::new();
+    for entry in entries {
+        if let SessionEntry::Message {
+            message: AgentMessage::User(user),
+            ..
+        } = entry
+        {
+            if user.content.has_images() {
+                by_display.insert(user.content.as_display_text(), user.content.clone());
+            }
+        }
+    }
+    if by_display.is_empty() {
+        return;
+    }
+
+    for msg in messages.iter_mut() {
+        if let AgentMessage::User(user) = msg {
+            if !user.content.looks_like_image_placeholder_text() {
+                continue;
+            }
+            let key = user.content.as_display_text();
+            if let Some(real) = by_display.get(&key) {
+                user.content = real.clone();
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::entries::{new_entry_base, new_session_header, SessionEntry};
     use one_core::message::AgentMessage;
 
     #[test]
@@ -471,6 +533,87 @@ mod tests {
 
         info.preview = None;
         assert_eq!(info.display_label(), "abcdef012345");
+    }
+
+    #[test]
+    fn rehydrate_swaps_display_label_text_for_real_image_blocks() {
+        use one_core::message::{TextOrImage, UserContent, UserMessage};
+
+        let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let (media_path, mime) =
+            one_core::image::store_image_base64(tiny, Some("image/png")).unwrap();
+        let real = UserContent::Blocks(vec![
+            TextOrImage::Text {
+                text: "这个是什么".into(),
+            },
+            TextOrImage::image_path(mime.clone(), media_path.display().to_string()),
+        ]);
+        let display = real.as_display_text();
+        assert!(display.contains("[image ·"), "{display}");
+
+        let u_real = new_entry_base(None);
+        let a1 = new_entry_base(Some(u_real.id.clone()));
+        // Disconnected re-submit as plain text (the bug).
+        let u_bad = new_entry_base(None);
+        let a2 = new_entry_base(Some(u_bad.id.clone()));
+
+        let entries = vec![
+            SessionEntry::Message {
+                base: u_real,
+                message: AgentMessage::User(UserMessage {
+                    content: real.clone(),
+                    timestamp: 1,
+                }),
+            },
+            SessionEntry::Message {
+                base: a1,
+                message: AgentMessage::assistant_text("mock", "v1", "saw image"),
+            },
+            SessionEntry::Message {
+                base: u_bad,
+                message: AgentMessage::User(UserMessage {
+                    content: UserContent::Text(display.clone()),
+                    timestamp: 2,
+                }),
+            },
+            SessionEntry::Message {
+                base: a2.clone(),
+                message: AgentMessage::assistant_text("mock", "v1", "only label"),
+            },
+        ];
+
+        // Active leaf is the bad branch only.
+        let mut msgs = vec![
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text(display),
+                timestamp: 2,
+            }),
+            AgentMessage::assistant_text("mock", "v1", "only label"),
+        ];
+        rehydrate_image_placeholders(&mut msgs, &entries);
+        match &msgs[0] {
+            AgentMessage::User(u) => {
+                assert!(u.content.has_images(), "should restore image blocks");
+                assert_eq!(u.content.image_paths().len(), 1);
+                assert_eq!(u.content.as_plain_text(), "这个是什么");
+            }
+            _ => panic!("expected user"),
+        }
+
+        // user_prompt_for_edit keeps chips + paths
+        let header = new_session_header("/tmp");
+        let mut jsonl = serde_json::to_string(&header).unwrap() + "\n";
+        for e in &entries {
+            jsonl.push_str(&serde_json::to_string(e).unwrap());
+            jsonl.push('\n');
+        }
+        let sm = SessionManager::from_jsonl(&jsonl).unwrap();
+        let real_id = entries[0].id().to_string();
+        let (text, imgs) = sm.user_prompt_for_edit(&real_id).unwrap();
+        assert!(text.contains(one_core::image::IMAGE_TOKEN) || text.contains("[图片"), "{text}");
+        assert_eq!(imgs.len(), 1);
+        assert_eq!(imgs[0].0, "image/png");
+        assert!(std::path::Path::new(&imgs[0].1).is_file());
     }
 
     #[test]

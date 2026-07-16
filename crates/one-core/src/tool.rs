@@ -45,13 +45,36 @@ impl ToolOutput {
         }
     }
 
-    /// Image-only tool result (vision models). `data` is standard base64.
-    pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+    /// Image tool result from a local path.
+    pub fn image_path(mime_type: impl Into<String>, path: impl Into<String>) -> Self {
         Self {
-            content: vec![TextOrImage::Image {
-                data: data.into(),
-                mime_type: mime_type.into(),
-            }],
+            content: vec![TextOrImage::image_path(mime_type, path)],
+            details: None,
+        }
+    }
+
+    /// Image from an existing file path with tool details JSON.
+    pub fn image_path_with_details(
+        mime_type: impl Into<String>,
+        path: impl Into<String>,
+        details: Value,
+    ) -> Self {
+        Self {
+            content: vec![TextOrImage::image_path(mime_type, path)],
+            details: Some(details),
+        }
+    }
+
+    /// Decode base64 → media file → path block (data-URI paste / tests).
+    ///
+    /// Panics if bytes are not a supported image (callers must pass valid raster data).
+    pub fn image(data: impl Into<String>, mime_type: impl Into<String>) -> Self {
+        let data = data.into();
+        let mime = mime_type.into();
+        let block = TextOrImage::image_from_base64(&data, Some(&mime))
+            .unwrap_or_else(|e| panic!("ToolOutput::image: {e}"));
+        Self {
+            content: vec![block],
             details: None,
         }
     }
@@ -61,11 +84,12 @@ impl ToolOutput {
         mime_type: impl Into<String>,
         details: Value,
     ) -> Self {
+        let data = data.into();
+        let mime = mime_type.into();
+        let block = TextOrImage::image_from_base64(&data, Some(&mime))
+            .unwrap_or_else(|e| panic!("ToolOutput::image_with_details: {e}"));
         Self {
-            content: vec![TextOrImage::Image {
-                data: data.into(),
-                mime_type: mime_type.into(),
-            }],
+            content: vec![block],
             details: Some(details),
         }
     }

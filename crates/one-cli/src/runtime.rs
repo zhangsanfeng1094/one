@@ -6,15 +6,15 @@ use one_core::agent::{
     Agent, AgentConfig, CompletionRequest, LlmProvider, ThinkingLevel,
 };
 use one_core::compaction::{
-    compact_messages, is_context_overflow_error, should_compact, split_for_compaction,
-    summarization_prompt, CompactionConfig,
+    compact_messages, is_context_overflow_error, should_compact_tokens, split_for_compaction,
+    summarization_prompt, tokens_for_compaction, CompactionConfig,
 };
 use one_core::error::OneError;
 use one_core::events::AgentEvent;
 use one_core::message::AgentMessage;
 use one_core::tool::Tool;
 use one_ext::{discover_extensions, ExtensionContext, ExtensionEvent, ExtensionRuntime};
-use one_resources::ResourceLoader;
+use one_resources::{skill_allowlist_roots, ResourceLoader};
 use one_session::{agent_dir, SessionInfo, SessionManager};
 use one_tools::{
     coding_tools_with_options, plan_mode_system_overlay, plan_mode_tools_with_policy,
@@ -91,6 +91,8 @@ pub struct AppRuntime {
     /// Human-in-the-loop channel for `ask_user` select prompts.
     pub hitl: HitlChannel,
     ask_user_handler: Arc<dyn AskUserHandler>,
+    /// Active model context window (tokens). 0 = unknown → fallback compact threshold.
+    context_window: usize,
 }
 
 impl AppRuntime {
@@ -98,7 +100,7 @@ impl AppRuntime {
         let cwd = cli.cwd.canonicalize().unwrap_or_else(|_| cli.cwd.clone());
         let agent_dir = agent_dir();
 
-        let resources = ResourceLoader::discover(&cwd, &agent_dir).await?;
+        let mut resources = ResourceLoader::discover(&cwd, &agent_dir).await?;
         let extensions = discover_extensions(&agent_dir).await?;
         extensions
             .load_all(&ExtensionContext {
@@ -108,10 +110,14 @@ impl AppRuntime {
             .await?;
 
         let user_settings = crate::settings::load();
+        // Codex-style skills enable/disable (settings.skills_config).
+        resources.apply_skills_config(&user_settings.skills_config_entries());
         let auto_approve =
             cli.auto_approve || user_settings.auto_approve.unwrap_or(false);
 
-        let path_policy = build_path_policy(&cwd, cli, &user_settings);
+        // agentskills.io: allowlist skill dirs so progressive disclosure `read` works
+        // (Codex-compatible: ~/.agents/skills + client skill homes + package dirs).
+        let path_policy = build_path_policy(&cwd, cli, &user_settings, &resources);
         // Optional settings kill-switch for OS bash sandbox.
         if user_settings.bash_sandbox == Some(false) {
             std::env::set_var("ONE_BASH_SANDBOX", "0");
@@ -273,6 +279,7 @@ impl AppRuntime {
             permission_gate,
             hitl,
             ask_user_handler,
+            context_window: 0,
         };
 
         // Restore plan path + mode from session custom entry if present.
@@ -613,26 +620,40 @@ impl AppRuntime {
         Ok(output)
     }
 
+    /// Update the model context window used for auto-compact thresholds.
+    pub fn set_context_window(&mut self, window: usize) {
+        self.context_window = window;
+    }
+
     /// Compact when over threshold, or when `force` (e.g. context overflow recovery).
+    ///
+    /// Threshold is ~70% of [`Self::context_window`] when known; otherwise 80k.
+    /// Token pressure prefers last provider-reported prompt size over char/4 estimate.
     pub async fn maybe_compact(
         &mut self,
         provider: &dyn LlmProvider,
         force: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let config = CompactionConfig::default();
-        let messages = {
+        let config = CompactionConfig::from_context_window(self.context_window);
+        let (messages, last_prompt) = {
             let agent = self.agent.lock().await;
-            agent.messages.clone()
+            (agent.messages.clone(), agent.last_prompt_tokens)
         };
+        let observed = if last_prompt > 0 {
+            Some(last_prompt)
+        } else {
+            None
+        };
+        let tokens = tokens_for_compaction(&messages, observed);
 
-        if !force && !should_compact(&messages, &config) {
+        if !force && !should_compact_tokens(tokens, &config) {
             return Ok(());
         }
         if split_for_compaction(&messages, &config).is_none() {
             return Ok(());
         }
 
-        let tokens_before = one_core::estimate_tokens(&messages) as u64;
+        let tokens_before = tokens as u64;
         let summary = self
             .summarize_for_compaction(provider, &messages, &config)
             .await;
@@ -656,6 +677,9 @@ impl AppRuntime {
 
         let mut agent = self.agent.lock().await;
         agent.messages = kept;
+        // After compact the buffer is much smaller; clear stale API size so the
+        // next turn re-estimates until a new completion reports usage.
+        agent.last_prompt_tokens = 0;
         agent.messages.insert(
             0,
             AgentMessage::assistant_text(provider.name(), provider.model(), &summary),
@@ -712,7 +736,10 @@ impl AppRuntime {
     pub async fn reload_extensions(&mut self) -> Result<Vec<String>, Box<dyn std::error::Error>> {
         let agent_dir = agent_dir();
         // Reload resources (skills/prompts/AGENTS) + extensions.
-        self.resources = ResourceLoader::discover(&self.cwd, &agent_dir).await?;
+        let mut resources = ResourceLoader::discover(&self.cwd, &agent_dir).await?;
+        let user_settings = crate::settings::load();
+        resources.apply_skills_config(&user_settings.skills_config_entries());
+        self.resources = resources;
         self.extensions = discover_extensions(&agent_dir).await?;
         self.extensions
             .load_all(&ExtensionContext {
@@ -752,6 +779,45 @@ impl AppRuntime {
             }
         }
         Ok(self.extensions.names())
+    }
+
+    /// Re-apply skills enable/disable from settings and rebuild system prompt.
+    pub async fn reapply_skills_config(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let user_settings = crate::settings::load();
+        self.resources
+            .apply_skills_config(&user_settings.skills_config_entries());
+        self.base_system_prompt = self
+            .resources
+            .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
+        match self.mode {
+            AgentMode::Plan => {
+                let path = self
+                    .plan_path
+                    .clone()
+                    .unwrap_or_else(new_plan_path);
+                let mut agent = self.agent.lock().await;
+                agent.config.system_prompt =
+                    format!("{}{}", self.base_system_prompt, plan_mode_system_overlay(&path));
+            }
+            AgentMode::Act => {
+                let mut agent = self.agent.lock().await;
+                agent.config.system_prompt = self.base_system_prompt.clone();
+            }
+        }
+        Ok(())
+    }
+
+    /// Toggle a skill on/off (persists to settings.json), returns new enabled state.
+    pub async fn set_skill_enabled(
+        &mut self,
+        path: &std::path::Path,
+        enabled: bool,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let mut s = crate::settings::load();
+        s.set_skill_enabled(path, enabled);
+        crate::settings::save(&s)?;
+        self.reapply_skills_config().await?;
+        Ok(enabled)
     }
 
     pub async fn new_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -919,13 +985,16 @@ fn new_plan_path() -> PathBuf {
         .join(format!("{}.md", Uuid::new_v4()))
 }
 
-/// Build path policy from CLI + settings.
+/// Build path policy from CLI + settings + discovered skills.
 ///
 /// Priority: `--full-access` / CLI `--add-dir` override settings; settings fill gaps.
+/// Skill discovery roots and package dirs are always readable (not writable) so
+/// the model can load `SKILL.md` / bundled resources without `--add-dir`.
 fn build_path_policy(
     cwd: &std::path::Path,
     cli: &Cli,
     settings: &crate::settings::Settings,
+    resources: &ResourceLoader,
 ) -> PathPolicy {
     let mode = if cli.full_access {
         SandboxMode::FullAccess
@@ -949,5 +1018,11 @@ fn build_path_policy(
     if !extras.is_empty() {
         policy = policy.with_additional_dirs(extras);
     }
+
+    // Progressive disclosure allowlist (agentskills.io / Codex).
+    let skill_roots =
+        skill_allowlist_roots(cwd, &resources.agent_dir, resources.all_skills());
+    policy = policy.with_readable_roots(skill_roots);
+
     policy
 }

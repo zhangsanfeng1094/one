@@ -62,6 +62,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut providers = ProviderSet::build(&cli)?;
     let mut runtime = AppRuntime::build(&cli).await?;
+    // Drive auto-compact threshold from model/settings context_window (~70%).
+    runtime.set_context_window(providers.context_window());
 
     if cli.share {
         #[cfg(feature = "network")]

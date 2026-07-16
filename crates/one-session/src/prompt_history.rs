@@ -148,7 +148,13 @@ async fn seed_from_sessions(cwd: &Path) -> Vec<String> {
                 ..
             } = entry
             {
-                let text = user.content.as_display_text();
+                // Never seed `[image · png · NKB]` labels — re-sending them loses
+                // vision. Multimodal turns contribute plain text only (or skip).
+                let text = if user.content.has_images() {
+                    user.content.as_plain_text()
+                } else {
+                    user.content.as_display_text()
+                };
                 let text = text.trim();
                 if text.is_empty() {
                     continue;

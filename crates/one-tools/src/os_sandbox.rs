@@ -5,7 +5,7 @@
 //! - system paths (`/usr`, `/bin`, …) read-only
 //! - `$HOME` read-only (cargo/npm caches, rustup)
 //! - workspace + `--add-dir` roots **read-write**
-//! - agent dir (`~/.one/agent`) read-only for skills
+//! - skill roots (`~/.one/agent`, `~/.agents/skills`, compat `~/.codex/skills`, …) RO
 //! - network shared (no `--unshare-net`) so package managers work
 //!
 //! `full-access` disables wrapping. If `bwrap` is missing, commands run unsandboxed

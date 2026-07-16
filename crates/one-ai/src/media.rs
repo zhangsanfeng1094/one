@@ -1,4 +1,7 @@
 //! Shared multimodal content mapping for providers.
+//!
+//! Image blocks store a local **path** only. API payloads need base64 / data-URLs —
+//! resolve at the edge via [`TextOrImage::resolved_base64`].
 
 use one_core::message::{TextOrImage, UserContent, UserMessage};
 use serde_json::{json, Value};
@@ -49,14 +52,17 @@ fn anthropic_content_block(block: &TextOrImage) -> Option<Value> {
                 Some(json!({ "type": "text", "text": text }))
             }
         }
-        TextOrImage::Image { data, mime_type } => Some(json!({
-            "type": "image",
-            "source": {
-                "type": "base64",
-                "media_type": mime_type,
-                "data": data,
-            }
-        })),
+        TextOrImage::Image { .. } => {
+            let (mime_type, data) = block.resolved_base64().ok()?;
+            Some(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": mime_type,
+                    "data": data,
+                }
+            }))
+        }
     }
 }
 
@@ -68,10 +74,7 @@ pub fn openai_chat_user_content(user: &UserMessage) -> Value {
             if !blocks.iter().any(|b| matches!(b, TextOrImage::Image { .. })) {
                 return json!(user.content.as_plain_text());
             }
-            let parts: Vec<Value> = blocks
-                .iter()
-                .filter_map(openai_chat_part)
-                .collect();
+            let parts: Vec<Value> = blocks.iter().filter_map(openai_chat_part).collect();
             if parts.is_empty() {
                 json!("")
             } else {
@@ -90,12 +93,15 @@ fn openai_chat_part(block: &TextOrImage) -> Option<Value> {
                 Some(json!({ "type": "text", "text": text }))
             }
         }
-        TextOrImage::Image { data, mime_type } => Some(json!({
-            "type": "image_url",
-            "image_url": {
-                "url": format!("data:{mime_type};base64,{data}")
-            }
-        })),
+        TextOrImage::Image { .. } => {
+            let (mime_type, data) = block.resolved_base64().ok()?;
+            Some(json!({
+                "type": "image_url",
+                "image_url": {
+                    "url": format!("data:{mime_type};base64,{data}")
+                }
+            }))
+        }
     }
 }
 
@@ -114,10 +120,13 @@ pub fn openai_responses_user_content(user: &UserMessage) -> Value {
                         "type": "input_text",
                         "text": text,
                     })),
-                    TextOrImage::Image { data, mime_type } => Some(json!({
-                        "type": "input_image",
-                        "image_url": format!("data:{mime_type};base64,{data}"),
-                    })),
+                    TextOrImage::Image { .. } => {
+                        let (mime_type, data) = b.resolved_base64().ok()?;
+                        Some(json!({
+                            "type": "input_image",
+                            "image_url": format!("data:{mime_type};base64,{data}"),
+                        }))
+                    }
                     _ => None,
                 })
                 .collect();
@@ -139,14 +148,11 @@ pub fn tool_result_plain(blocks: &[TextOrImage]) -> String {
         .join("\n")
 }
 
-/// Collect image blocks as (mime, data).
-pub fn collect_images(blocks: &[TextOrImage]) -> Vec<(&str, &str)> {
+/// Collect image blocks as owned `(mime, base64)` (resolves paths).
+pub fn collect_images(blocks: &[TextOrImage]) -> Vec<(String, String)> {
     blocks
         .iter()
-        .filter_map(|b| match b {
-            TextOrImage::Image { data, mime_type } => Some((mime_type.as_str(), data.as_str())),
-            _ => None,
-        })
+        .filter_map(|b| b.resolved_base64().ok())
         .collect()
 }
 
@@ -156,17 +162,13 @@ pub fn ollama_user_message(user: &UserMessage) -> Value {
         UserContent::Text(text) => json!({ "role": "user", "content": text }),
         UserContent::Blocks(blocks) => {
             let text = user.content.as_plain_text();
-            let images: Vec<&str> = blocks
+            let images: Vec<String> = blocks
                 .iter()
-                .filter_map(|b| match b {
-                    TextOrImage::Image { data, .. } => Some(data.as_str()),
-                    _ => None,
-                })
+                .filter_map(|b| b.resolved_base64().ok().map(|(_, d)| d))
                 .collect();
             if images.is_empty() {
                 json!({ "role": "user", "content": text })
             } else {
-                // Include labels so non-vision fallback still sees something.
                 let mut content = text;
                 if content.is_empty() {
                     content = blocks

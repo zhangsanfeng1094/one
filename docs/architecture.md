@@ -5,7 +5,8 @@
 1. **极简核心**：Agent loop 保持短小，复杂能力通过扩展和资源配置实现
 2. **Pi 兼容**：Session 格式、工具名称、配置目录尽量与官方 Pi 对齐
 3. **crate 分层**：每层职责单一，可独立测试和嵌入
-4. **默认工作区边界**：file tools 默认只能访问 `--cwd` + `--add-dir`；`~/.one/agent` 默认可读（skills）；`--full-access` 显式关闭
+4. **默认工作区边界**：file tools 默认只能访问 `--cwd` + `--add-dir`；skill 发现根只读（`~/.one/agent`、`~/.agents/skills`、兼容 `~/.codex|claude|grok/skills`）；`--full-access` 显式关闭
+5. **领域外置（规划中）**：编程/办公等工作流以 **Package / Suite** 装配，Core 不按领域名分支；见 [package-suites.md](./package-suites.md)（草案，暂未实现）
 
 ## Crate 依赖图
 
@@ -60,7 +61,7 @@ Entry 通过 `id` / `parentId` 构成树，`leaf` 指向当前分支位置。`br
 | 资源 | 路径 |
 |------|------|
 | AGENTS.md | `~/.one/agent/AGENTS.md` + 从 cwd 向上 |
-| Skills | 项目 `.one/skills` / `.agents/skills` → 用户 `~/.one/agent/skills` / `~/.agents/skills` → **内置** `~/.one/agent/builtin-skills`（二进制 `include_str!`，如 `create-skill`） |
+| Skills | 项目 `.one/skills` / `.agents/skills` → 用户 `~/.one/agent/skills` / **`~/.agents/skills`（跨客户端通用）** / 兼容 `~/.claude|codex|grok/skills` → **内置** `~/.one/agent/builtin-skills`；PathPolicy **只读 allowlist** 上述目录（agentskills progressive disclosure）；`skills_config` enable/disable（类 Codex） |
 | Prompts | `~/.one/agent/prompts/*.md`、`.one/prompts/*.md` |
 
 System prompt = 默认 prompt + AGENTS.md/CLAUDE.md + **skills catalog（仅 name/description/location）**。
@@ -83,6 +84,12 @@ trait Extension {
 
 与官方 Pi 的 TypeScript 扩展**不兼容**，但 API 理念相近。
 
+## Package / Suite（规划中）
+
+目标形态：启用 **coding** 包即可编程，启用 **office** 包即可办公；工具列表、skills、system overlay、权限预设由包声明式 merge，Core 只消费扁平 `RuntimeProfile`。
+
+详见 **[package-suites.md](./package-suites.md)**（设计草案，**暂不实现**）。
+
 ## 运行模式
 
 | 模式 | 入口 | 用途 |
@@ -103,5 +110,5 @@ Agent 在 **Plan** 与 **Act/Build** 之间切换：
 | Plan | 只读 + 仅可写 plan 文件 + `exit_plan_mode` | `~/.one/agent/plans/<uuid>.md` |
 | Act | 完整 coding tools + 扩展 tools | 按批准的 plan 改代码 |
 
-进入：`/plan`、`--plan`。退出并实现：`/act` / `/build`（注入 plan 正文并自动开一轮实现）。  
+进入：`/plan`、`--plan`、**Shift+Tab**。退出并实现：`/act` / `/build`（注入 plan 正文并自动开一轮实现）；Shift+Tab 再切回 Build（不自动实现）。  
 硬门控（无 bash / 不能写业务代码）+ system prompt overlay，对齐 Claude Code 工作流。

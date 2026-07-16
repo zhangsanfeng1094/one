@@ -2,14 +2,14 @@ use std::path::PathBuf;
 
 use one_ai::{
     save_models_file, MockProvider, ModelEntry, ModelRegistry, ModelsConfig, OpenaiWireApi,
-    ProviderConfig,
+    ProviderApi, ProviderConfig,
 };
 use one_core::agent::LlmProvider;
 
 #[cfg(feature = "network")]
 use one_ai::OllamaProvider;
 #[cfg(feature = "http-providers")]
-use one_ai::{AnthropicProvider, OpenAiProvider, OpenRouterProvider};
+use one_ai::{AnthropicProvider, GeminiProvider, OpenAiProvider, OpenRouterProvider};
 
 use crate::cli::{Cli, OpenaiApi, ProviderKind};
 use crate::preferences;
@@ -316,17 +316,26 @@ impl ProviderSet {
             .flat_map(|id| {
                 let provider_cfg = self.models_config.provider(&id);
                 let first_model = self.registry.list_by_provider(&id).first().copied();
-                let provider_type = provider_cfg
-                    .and_then(|p| p.provider_type.clone())
+                // Protocol is a fixed enum; providerType mirrors api when set.
+                let api = provider_cfg
+                    .and_then(|p| p.api.map(|a| a.as_str().to_string()))
+                    .or_else(|| {
+                        provider_cfg
+                            .and_then(|p| p.provider_type.clone())
+                            .and_then(|t| ProviderApi::parse(&t).map(|a| a.as_str().to_string()))
+                    })
+                    .or_else(|| {
+                        first_model
+                            .and_then(|m| m.api.as_deref())
+                            .and_then(ProviderApi::parse)
+                            .map(|a| a.as_str().to_string())
+                    })
                     .unwrap_or_else(|| "default/unset".into());
+                let provider_type = api.clone();
                 let base_url = provider_cfg
                     .and_then(|p| p.base_url.clone())
                     .or_else(|| first_model.and_then(|m| m.base_url.clone()))
                     .unwrap_or_else(|| "unset".into());
-                let api = provider_cfg
-                    .and_then(|p| p.api.map(|a| a.as_str().to_string()))
-                    .or_else(|| first_model.and_then(|m| m.api.clone()))
-                    .unwrap_or_else(|| "default/unset".into());
                 let api_key = provider_cfg
                     .and_then(|p| {
                         p.api_key_raw
@@ -339,15 +348,61 @@ impl ProviderSet {
                     .and_then(|p| p.default_model.clone())
                     .or_else(|| first_model.map(|m| m.id.clone()))
                     .unwrap_or_else(|| "unset".into());
-                [
+                let compat = provider_cfg
+                    .and_then(|p| p.compat.as_ref())
+                    .filter(|c| !c.is_empty())
+                    .map(|c| c.summary())
+                    .unwrap_or_else(|| "auto (detect)".into());
+                let thinking_format = provider_cfg
+                    .and_then(|p| p.compat.as_ref())
+                    .map(|c| c.thinking_format_display())
+                    .unwrap_or_else(|| "auto".into());
+                let max_tokens_field = provider_cfg
+                    .and_then(|p| p.compat.as_ref())
+                    .map(|c| c.max_tokens_field_display())
+                    .unwrap_or_else(|| "auto".into());
+                let mut rows = vec![
                     (format!("{id}:provider_type"), provider_type),
                     (format!("{id}:base_url"), base_url),
                     (format!("{id}:api"), api),
                     (format!("{id}:api_key"), api_key),
                     (format!("{id}:default_model"), default_model),
-                ]
+                    (format!("{id}:compat"), compat),
+                    (format!("{id}:thinking_format"), thinking_format),
+                    (format!("{id}:max_tokens_field"), max_tokens_field),
+                ];
+                // Expose individual tri-state bools for Settings rows.
+                for (label, key) in one_ai::COMPAT_BOOL_FIELDS {
+                    let display = provider_cfg
+                        .and_then(|p| p.compat.as_ref())
+                        .map(|c| c.get_tri(key).to_string())
+                        .unwrap_or_else(|| "auto".into());
+                    rows.push((format!("{id}:compat.{label}"), display));
+                }
+                rows
             })
             .collect()
+    }
+
+    /// Effective resolved compat summary for active or named provider (debug / UI).
+    pub fn provider_compat_summary(&self, id: &str) -> String {
+        let p = self.models_config.provider(id);
+        match p.and_then(|p| p.compat.as_ref()) {
+            Some(c) if !c.is_empty() => c.summary(),
+            _ => "auto (detect from baseUrl / provider id)".into(),
+        }
+    }
+
+    /// Cycle a provider-level compat tri-state bool; returns new display value.
+    pub fn provider_cycle_compat(&mut self, id: &str, key: &str) -> Result<String, String> {
+        let mut cfg = self.models_config.clone();
+        cfg.ensure_provider(id);
+        let p = cfg.provider_mut(id).expect("ensured");
+        let mut c = p.compat.clone().unwrap_or_default();
+        let next = c.cycle_tri(key)?;
+        p.compat = if c.is_empty() { None } else { Some(c) };
+        self.commit_config(cfg)?;
+        Ok(next.to_string())
     }
 
     /// Rows for `/models [provider]`.
@@ -367,9 +422,36 @@ impl ProviderSet {
                     .context_window
                     .map(|n| format!(" ctx={n}"))
                     .unwrap_or_default();
+                let reasoning = match m.reasoning {
+                    Some(true) => " reasoning=true",
+                    Some(false) => " reasoning=false",
+                    None => "",
+                };
+                let format = m
+                    .compat
+                    .as_ref()
+                    .map(|c| format!(" format={}", c.thinking_format_display()))
+                    .unwrap_or_default();
+                let map = m
+                    .thinking_level_map
+                    .as_ref()
+                    .filter(|map| !map.is_empty())
+                    .map(|map| format!(" map={}", one_ai::format_thinking_level_map(map)))
+                    .unwrap_or_default();
+                let compat_bits = m
+                    .compat
+                    .as_ref()
+                    .map(|c| {
+                        format!(
+                            " devRole={} effort={}",
+                            c.get_tri("supports_developer_role"),
+                            c.get_tri("supports_reasoning_effort")
+                        )
+                    })
+                    .unwrap_or_default();
                 (
                     format!("{}:{}", m.provider, m.id),
-                    format!("{}{ctx}{mark}", m.name),
+                    format!("{}{ctx}{reasoning}{format}{map}{compat_bits}{mark}", m.name),
                 )
             })
             .collect()
@@ -392,6 +474,9 @@ impl ProviderSet {
             api: p.api.map(|a| a.as_str().to_string()),
             base_url: p.base_url.clone(),
             api_key: None,
+            reasoning: None,
+            thinking_level_map: None,
+            compat: p.compat.clone(),
         });
         apply_model_kv(&mut entry, kv)?;
         // If model sets base/api and provider lacks them, lift.
@@ -416,6 +501,78 @@ impl ProviderSet {
         self.commit_config(cfg)?;
         Ok(format!(
             "model `{provider}:{id}` saved · {}",
+            models_json_path().display()
+        ))
+    }
+
+    /// Batch upsert remote model ids under one provider (single write to models.json).
+    ///
+    /// `models` rows are `(id, name_or_detail)` as returned by [`Self::remote_model_rows`].
+    /// Existing models keep `context_window` / compat; name is refreshed when remote
+    /// provides a real display name (not the placeholder `"remote"`).
+    pub fn model_add_batch(
+        &mut self,
+        provider: &str,
+        models: &[(String, String)],
+    ) -> Result<String, String> {
+        let provider = validate_id(provider, "provider")?;
+        if models.is_empty() {
+            return Ok(format!("no remote models to import for `{provider}`"));
+        }
+
+        let mut cfg = self.models_config.clone();
+        cfg.ensure_provider(&provider);
+        let p = cfg.provider(&provider).cloned().unwrap_or_default();
+
+        let mut added = 0usize;
+        let mut updated = 0usize;
+        let mut skipped = 0usize;
+
+        for (raw_id, detail) in models {
+            let id = raw_id.trim();
+            if id.is_empty() || id.chars().any(|c| c.is_whitespace()) {
+                skipped += 1;
+                continue;
+            }
+            let remote_name = detail.trim();
+            let name = if remote_name.is_empty() || remote_name == "remote" {
+                id.to_string()
+            } else {
+                remote_name.to_string()
+            };
+
+            let existing = cfg.find_model(&provider, id).cloned();
+            if let Some(mut entry) = existing {
+                if remote_name != "" && remote_name != "remote" {
+                    entry.name = name;
+                }
+                cfg.upsert_model(entry);
+                updated += 1;
+            } else {
+                cfg.upsert_model(ModelEntry {
+                    provider: provider.clone(),
+                    id: id.to_string(),
+                    name,
+                    context_window: None,
+                    api: p.api.map(|a| a.as_str().to_string()),
+                    base_url: p.base_url.clone(),
+                    api_key: None,
+                    reasoning: None,
+                    thinking_level_map: None,
+                    compat: p.compat.clone(),
+                });
+                added += 1;
+            }
+        }
+
+        self.commit_config(cfg)?;
+        let skip = if skipped > 0 {
+            format!(" · skipped {skipped} invalid")
+        } else {
+            String::new()
+        };
+        Ok(format!(
+            "imported {added} new · {updated} existing for `{provider}`{skip} · {}",
             models_json_path().display()
         ))
     }
@@ -548,13 +705,12 @@ pub fn parse_kv_args(args: &[&str]) -> Result<Vec<(String, String)>, String> {
 
 fn apply_provider_kv(p: &mut ProviderConfig, kv: &[(String, String)]) -> Result<(), String> {
     for (key, value) in kv {
-        match key.trim().to_ascii_lowercase().as_str() {
+        let key_raw = key.trim();
+        let key_l = key_raw.to_ascii_lowercase();
+        match key_l.as_str() {
             "provider_type" | "provider-type" | "providertype" | "type" => {
-                p.provider_type = if value.is_empty() {
-                    None
-                } else {
-                    Some(value.clone())
-                };
+                // Same fixed protocol set as `api` — select, never free-form.
+                apply_provider_api(p, value)?;
             }
             "base_url" | "base-url" | "baseurl" | "url" => {
                 p.base_url = if value.is_empty() {
@@ -564,13 +720,7 @@ fn apply_provider_kv(p: &mut ProviderConfig, kv: &[(String, String)]) -> Result<
                 };
             }
             "api" => {
-                if value.is_empty() {
-                    p.api = None;
-                } else {
-                    p.api = Some(OpenaiWireApi::parse(value).ok_or_else(|| {
-                        format!("invalid api `{value}` (openai-completions|openai-responses)")
-                    })?);
-                }
+                apply_provider_api(p, value)?;
             }
             "api_key" | "api-key" | "apikey" | "key" => {
                 if value.is_empty() {
@@ -588,9 +738,42 @@ fn apply_provider_kv(p: &mut ProviderConfig, kv: &[(String, String)]) -> Result<
                     Some(value.clone())
                 };
             }
+            "compat" | "compat_clear" | "compat-clear" | "clear_compat" => {
+                if value.is_empty()
+                    || value.eq_ignore_ascii_case("clear")
+                    || value.eq_ignore_ascii_case("null")
+                    || value.eq_ignore_ascii_case("none")
+                {
+                    p.compat = None;
+                } else {
+                    // Full JSON object replacement.
+                    let c: one_ai::CompatConfig = serde_json::from_str(value)
+                        .map_err(|e| format!("compat JSON: {e}"))?;
+                    p.compat = if c.is_empty() { None } else { Some(c) };
+                }
+            }
+            "thinking_format" | "thinkingformat" | "thinking-format" => {
+                let mut c = p.compat.clone().unwrap_or_default();
+                c.set_thinking_format(value)?;
+                p.compat = if c.is_empty() { None } else { Some(c) };
+            }
+            "max_tokens_field" | "maxtokensfield" | "max-tokens-field" => {
+                let mut c = p.compat.clone().unwrap_or_default();
+                c.set_max_tokens_field(value)?;
+                p.compat = if c.is_empty() { None } else { Some(c) };
+            }
+            other if other.starts_with("compat.")
+                || other.starts_with("compat_")
+                || is_compat_field(other) =>
+            {
+                let mut c = p.compat.clone().unwrap_or_default();
+                apply_compat_field(&mut c, key_raw, value)?;
+                p.compat = if c.is_empty() { None } else { Some(c) };
+            }
             other => {
                 return Err(format!(
-                    "unknown provider field `{other}` · known: provider_type base_url api api_key default_model"
+                    "unknown provider field `{other}` · known: provider_type base_url api api_key default_model \
+                     thinking_format max_tokens_field compat.* (supportsDeveloperRole, …)"
                 ));
             }
         }
@@ -598,9 +781,81 @@ fn apply_provider_kv(p: &mut ProviderConfig, kv: &[(String, String)]) -> Result<
     Ok(())
 }
 
+fn is_compat_field(key: &str) -> bool {
+    let n = one_ai::normalize_compat_key(key);
+    matches!(
+        n.as_str(),
+        "supports_developer_role"
+            | "supports_reasoning_effort"
+            | "supports_usage_in_streaming"
+            | "supports_store"
+            | "requires_tool_result_name"
+            | "requires_assistant_after_tool_result"
+            | "requires_thinking_as_text"
+            | "requires_reasoning_content_on_assistant_messages"
+            | "supports_strict_mode"
+            | "thinking_format"
+            | "max_tokens_field"
+            | "force_adaptive_thinking"
+            | "allow_empty_signature"
+            | "supports_eager_tool_input_streaming"
+            | "zai_tool_stream"
+            | "open_router_routing"
+    )
+}
+
+fn apply_compat_field(
+    c: &mut one_ai::CompatConfig,
+    key: &str,
+    value: &str,
+) -> Result<(), String> {
+    let n = one_ai::normalize_compat_key(key);
+    match n.as_str() {
+        "thinking_format" => c.set_thinking_format(value),
+        "max_tokens_field" => c.set_max_tokens_field(value),
+        "open_router_routing" => {
+            if value.trim().is_empty() || value.eq_ignore_ascii_case("clear") {
+                c.openai.open_router_routing = None;
+            } else {
+                let v: serde_json::Value = serde_json::from_str(value)
+                    .map_err(|e| format!("openRouterRouting JSON: {e}"))?;
+                c.openai.open_router_routing = Some(v);
+            }
+            Ok(())
+        }
+        _ => c.set_tri(key, value),
+    }
+}
+
+/// Set wire protocol from a fixed enum string; mirrors onto `api` + `provider_type`.
+fn apply_provider_api(p: &mut ProviderConfig, value: &str) -> Result<(), String> {
+    if value.is_empty() {
+        p.api = None;
+        p.provider_type = None;
+        return Ok(());
+    }
+    let api = ProviderApi::parse(value).ok_or_else(|| {
+        format!(
+            "invalid api `{value}` · choose: openai-completions | openai-responses | anthropic-messages | gemini-generate-content"
+        )
+    })?;
+    p.api = Some(api);
+    p.provider_type = Some(api.as_str().to_string());
+    Ok(())
+}
+
+fn parse_bool(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Ok(true),
+        "0" | "false" | "no" | "off" => Ok(false),
+        other => Err(format!("expected bool, got `{other}`")),
+    }
+}
+
 fn apply_model_kv(m: &mut ModelEntry, kv: &[(String, String)]) -> Result<(), String> {
     for (key, value) in kv {
-        match key.trim().to_ascii_lowercase().as_str() {
+        let key_raw = key.trim();
+        match key_raw.to_ascii_lowercase().as_str() {
             "name" => {
                 m.name = if value.is_empty() {
                     m.id.clone()
@@ -622,10 +877,12 @@ fn apply_model_kv(m: &mut ModelEntry, kv: &[(String, String)]) -> Result<(), Str
                 if value.is_empty() {
                     m.api = None;
                 } else {
-                    let _ = OpenaiWireApi::parse(value).ok_or_else(|| {
-                        format!("invalid api `{value}` (openai-completions|openai-responses)")
+                    let api = ProviderApi::parse(value).ok_or_else(|| {
+                        format!(
+                            "invalid api `{value}` · choose: openai-completions | openai-responses | anthropic-messages | gemini-generate-content"
+                        )
                     })?;
-                    m.api = Some(value.clone());
+                    m.api = Some(api.as_str().to_string());
                 }
             }
             "base_url" | "base-url" | "baseurl" | "url" => {
@@ -643,9 +900,58 @@ fn apply_model_kv(m: &mut ModelEntry, kv: &[(String, String)]) -> Result<(), Str
                     Some(one_ai::resolve_secret(value))
                 };
             }
+            "reasoning" | "reason" => {
+                if value.is_empty() {
+                    m.reasoning = None;
+                } else {
+                    m.reasoning = Some(parse_bool(value)?);
+                }
+            }
+            "thinking_level_map"
+            | "thinkinglevelmap"
+            | "thinking-level-map"
+            | "thinking_map" => {
+                if value.is_empty() || value.eq_ignore_ascii_case("clear") {
+                    m.thinking_level_map = None;
+                } else {
+                    let map = one_ai::parse_thinking_level_map(value)?;
+                    m.thinking_level_map = if map.is_empty() { None } else { Some(map) };
+                }
+            }
+            "compat" | "compat_clear" | "clear_compat" => {
+                if value.is_empty()
+                    || value.eq_ignore_ascii_case("clear")
+                    || value.eq_ignore_ascii_case("null")
+                {
+                    m.compat = None;
+                } else {
+                    let c: one_ai::CompatConfig = serde_json::from_str(value)
+                        .map_err(|e| format!("compat JSON: {e}"))?;
+                    m.compat = if c.is_empty() { None } else { Some(c) };
+                }
+            }
+            "thinking_format" | "thinkingformat" | "thinking-format" => {
+                let mut c = m.compat.clone().unwrap_or_default();
+                c.set_thinking_format(value)?;
+                m.compat = if c.is_empty() { None } else { Some(c) };
+            }
+            "max_tokens_field" | "maxtokensfield" | "max-tokens-field" => {
+                let mut c = m.compat.clone().unwrap_or_default();
+                c.set_max_tokens_field(value)?;
+                m.compat = if c.is_empty() { None } else { Some(c) };
+            }
+            other if other.starts_with("compat.")
+                || other.starts_with("compat_")
+                || is_compat_field(other) =>
+            {
+                let mut c = m.compat.clone().unwrap_or_default();
+                apply_compat_field(&mut c, key_raw, value)?;
+                m.compat = if c.is_empty() { None } else { Some(c) };
+            }
             other => {
                 return Err(format!(
-                    "unknown model field `{other}` · known: name ctx api base_url api_key"
+                    "unknown model field `{other}` · known: name ctx api base_url api_key reasoning \
+                     thinking_level_map thinking_format compat.*"
                 ));
             }
         }
@@ -659,6 +965,12 @@ struct Resolved {
     openai_api: OpenaiApi,
     base_url: Option<String>,
     api_key: Option<String>,
+    /// Fully resolved Pi `compat` for OpenAI-compatible chat/completions.
+    openai_compat: one_ai::ResolvedOpenAiCompat,
+    /// Anthropic Messages compat (forceAdaptiveThinking, etc.).
+    anthropic_compat: one_ai::ResolvedAnthropicCompat,
+    /// Pi `reasoning` flag for the selected model.
+    reasoning_model: bool,
 }
 
 fn resolve_initial_provider(
@@ -751,13 +1063,18 @@ fn resolve_settings(cli: &Cli, cfg: &ModelsConfig, provider_id: &str) -> Resolve
         api
     } else if let Some(api) = model_entry
         .and_then(|m| m.api.as_deref())
-        .and_then(OpenaiWireApi::parse)
+        .and_then(ProviderApi::parse)
     {
         wire_to_cli(api)
     } else if let Some(api) = provider_cfg.and_then(|p| p.api) {
         wire_to_cli(api)
+    } else if let Some(api) = provider_cfg
+        .and_then(|p| p.provider_type.as_deref())
+        .and_then(ProviderApi::parse)
+    {
+        wire_to_cli(api)
     } else if let Ok(env) = std::env::var("ONE_OPENAI_API") {
-        OpenaiWireApi::parse(&env)
+        ProviderApi::parse(&env)
             .map(wire_to_cli)
             .unwrap_or_else(|| default_wire_for(provider_id))
     } else {
@@ -778,18 +1095,60 @@ fn resolve_settings(cli: &Cli, cfg: &ModelsConfig, provider_id: &str) -> Resolve
         .or_else(|| provider_cfg.and_then(|p| p.api_key.clone()))
         .or_else(|| env_api_key_for(provider_id));
 
+    let base_for_detect = base_url
+        .clone()
+        .unwrap_or_else(|| default_base_for_detect(provider_id).to_string());
+
+    // Merge provider-level + model-level compat, then resolve against auto-detect.
+    let partial = match (
+        provider_cfg.and_then(|p| p.compat.as_ref()),
+        model_entry.and_then(|m| m.compat.as_ref()),
+    ) {
+        (Some(p), Some(m)) => p.merge_override(m),
+        (Some(p), None) => p.clone(),
+        (None, Some(m)) => m.clone(),
+        (None, None) => one_ai::CompatConfig::default(),
+    };
+    let mut openai_compat = partial
+        .openai
+        .resolve(provider_id, &base_for_detect, &model_id);
+    if let Some(map) = model_entry.and_then(|m| m.thinking_level_map.clone()) {
+        openai_compat = openai_compat.with_thinking_level_map(map);
+    }
+    let anthropic_compat = partial.anthropic().resolve();
+    let reasoning_model = model_entry
+        .and_then(|m| m.reasoning)
+        .unwrap_or(false);
+
     Resolved {
         model: model_id,
         openai_api,
         base_url,
         api_key,
+        openai_compat,
+        anthropic_compat,
+        reasoning_model,
     }
 }
 
-fn wire_to_cli(api: OpenaiWireApi) -> OpenaiApi {
+fn default_base_for_detect(provider_id: &str) -> &'static str {
+    match provider_id {
+        "openai" => "https://api.openai.com/v1",
+        "openrouter" => "https://openrouter.ai/api/v1",
+        "deepseek" => "https://api.deepseek.com",
+        "ollama" => "http://127.0.0.1:11434/v1",
+        "anthropic" => "https://api.anthropic.com",
+        "gemini" => "https://generativelanguage.googleapis.com/v1beta",
+        _ => "",
+    }
+}
+
+fn wire_to_cli(api: ProviderApi) -> OpenaiApi {
     match api {
-        OpenaiWireApi::Completions => OpenaiApi::Completions,
-        OpenaiWireApi::Responses => OpenaiApi::Responses,
+        ProviderApi::OpenaiCompletions => OpenaiApi::Completions,
+        ProviderApi::OpenaiResponses => OpenaiApi::Responses,
+        ProviderApi::AnthropicMessages => OpenaiApi::AnthropicMessages,
+        ProviderApi::GeminiGenerateContent => OpenaiApi::GeminiGenerateContent,
     }
 }
 
@@ -821,6 +1180,8 @@ fn default_model_for(provider_id: &str) -> &'static str {
 fn default_wire_for(provider_id: &str) -> OpenaiApi {
     match provider_id {
         "openai" => OpenaiApi::Responses,
+        "anthropic" => OpenaiApi::AnthropicMessages,
+        "gemini" => OpenaiApi::GeminiGenerateContent,
         _ => OpenaiApi::Completions,
     }
 }
@@ -842,9 +1203,9 @@ fn env_base_url_for(provider_id: &str) -> Option<String> {
         "deepseek" => std::env::var("DEEPSEEK_BASE_URL")
             .ok()
             .or_else(|| Some("https://api.deepseek.com".into())),
-        "gemini" => std::env::var("GEMINI_BASE_URL")
-            .ok()
-            .or_else(|| Some("https://generativelanguage.googleapis.com/v1beta/openai".into())),
+        "gemini" => std::env::var("GEMINI_BASE_URL").ok().or_else(|| {
+            Some("https://generativelanguage.googleapis.com/v1beta".into())
+        }),
         _ => None,
     }
 }
@@ -900,6 +1261,9 @@ mod tests {
             api: Some("openai-completions".into()),
             base_url: Some("https://proxy.example/v1".into()),
             api_key: None,
+            reasoning: None,
+            thinking_level_map: None,
+            compat: None,
         });
         let mut cfg = ModelsConfig {
             registry: registry.clone(),
@@ -972,14 +1336,61 @@ mod tests {
         std::env::set_var("HOME", &home);
 
         let mut providers = provider_set_for_test();
+        // Alias `openai-compatible` normalizes to canonical `openai-completions`.
         providers
             .provider_set("proxy", "provider_type", "openai-compatible")
             .unwrap();
 
         let p = providers.models_config.provider("proxy").unwrap();
-        assert_eq!(p.provider_type.as_deref(), Some("openai-compatible"));
+        assert_eq!(p.provider_type.as_deref(), Some("openai-completions"));
+        assert_eq!(p.api, Some(ProviderApi::OpenaiCompletions));
         let saved = std::fs::read_to_string(models_json_path()).unwrap();
-        assert!(saved.contains("\"providerType\": \"openai-compatible\""));
+        assert!(saved.contains("\"providerType\": \"openai-completions\""));
+        assert!(saved.contains("\"api\": \"openai-completions\""));
+
+        providers
+            .provider_set("proxy", "api", "anthropic-messages")
+            .unwrap();
+        let p = providers.models_config.provider("proxy").unwrap();
+        assert_eq!(p.api, Some(ProviderApi::AnthropicMessages));
+        assert_eq!(p.provider_type.as_deref(), Some("anthropic-messages"));
+
+        restore_home(old_home);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn model_add_batch_imports_new_and_keeps_existing() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let home = temp_home("batch-import");
+        std::env::set_var("HOME", &home);
+
+        let mut providers = provider_set_for_test();
+        // proxy already has m1 from fixture.
+        let msg = providers
+            .model_add_batch(
+                "proxy",
+                &[
+                    ("m1".into(), "M1 Renamed".into()),
+                    ("m2".into(), "Model Two".into()),
+                    ("m3".into(), "remote".into()),
+                    ("".into(), "skip-me".into()),
+                ],
+            )
+            .unwrap();
+
+        // m1 existing · m2/m3 new · empty id skipped
+        assert!(msg.contains("2 new"), "{msg}");
+        assert!(msg.contains("1 existing"), "{msg}");
+        assert!(msg.contains("skipped 1"), "{msg}");
+
+        let m1 = providers.models_config.find_model("proxy", "m1").unwrap();
+        assert_eq!(m1.name, "M1 Renamed");
+        let m2 = providers.models_config.find_model("proxy", "m2").unwrap();
+        assert_eq!(m2.name, "Model Two");
+        let m3 = providers.models_config.find_model("proxy", "m3").unwrap();
+        assert_eq!(m3.name, "m3");
 
         restore_home(old_home);
         let _ = std::fs::remove_dir_all(home);
@@ -1007,97 +1418,151 @@ fn build_provider_llm(
     provider_id: &str,
     resolved: &Resolved,
 ) -> Result<std::sync::Arc<dyn LlmProvider>, Box<dyn std::error::Error>> {
-    match provider_id {
-        "mock" => Ok(std::sync::Arc::new(MockProvider::new())),
-        "ollama" => {
-            #[cfg(feature = "network")]
-            {
-                let host = resolved
-                    .base_url
-                    .as_deref()
-                    .map(|u| u.trim_end_matches('/').trim_end_matches("/v1").to_string())
-                    .unwrap_or_else(|| {
-                        std::env::var("OLLAMA_HOST")
-                            .unwrap_or_else(|_| "http://127.0.0.1:11434".into())
-                    });
-                Ok(std::sync::Arc::new(OllamaProvider::new(
-                    host,
-                    &resolved.model,
-                )))
-            }
-            #[cfg(not(feature = "network"))]
-            {
-                Err("Ollama requires network feature".into())
-            }
+    // Protocol drives request/response codecs. Built-in ids still get special hosts.
+    let api: ProviderApi = resolved.openai_api.into();
+
+    if provider_id == "mock" {
+        return Ok(std::sync::Arc::new(MockProvider::new()));
+    }
+
+    if provider_id == "ollama" {
+        #[cfg(feature = "network")]
+        {
+            let host = resolved
+                .base_url
+                .as_deref()
+                .map(|u| u.trim_end_matches('/').trim_end_matches("/v1").to_string())
+                .unwrap_or_else(|| {
+                    std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".into())
+                });
+            return Ok(std::sync::Arc::new(OllamaProvider::new(host, &resolved.model)));
         }
-        "anthropic" => {
-            #[cfg(feature = "http-providers")]
-            {
-                let key = resolved
-                    .api_key
-                    .clone()
-                    .ok_or("ANTHROPIC_API_KEY is not set (or pass --api-key)")?;
-                Ok(std::sync::Arc::new(AnthropicProvider::new(
-                    key,
-                    &resolved.model,
-                )))
-            }
-            #[cfg(not(feature = "http-providers"))]
-            {
-                Err("Anthropic requires --features http-providers".into())
-            }
+        #[cfg(not(feature = "network"))]
+        {
+            return Err("Ollama requires network feature".into());
         }
-        "openrouter" => {
-            #[cfg(feature = "http-providers")]
-            {
-                let key = resolved
-                    .api_key
-                    .clone()
-                    .ok_or("OPENROUTER_API_KEY is not set (or pass --api-key)")?;
-                let base = resolved
-                    .base_url
-                    .clone()
-                    .unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
-                Ok(std::sync::Arc::new(OpenRouterProvider::with_base(
-                    key,
-                    &resolved.model,
-                    base,
-                )))
-            }
-            #[cfg(not(feature = "http-providers"))]
-            {
-                Err("OpenRouter requires --features http-providers".into())
-            }
+    }
+
+    if provider_id == "openrouter" {
+        #[cfg(feature = "http-providers")]
+        {
+            let key = resolved
+                .api_key
+                .clone()
+                .ok_or("OPENROUTER_API_KEY is not set (or pass --api-key)")?;
+            let base = resolved
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://openrouter.ai/api/v1".into());
+            return Ok(std::sync::Arc::new(
+                OpenRouterProvider::with_base(key, &resolved.model, base)
+                    .with_compat(resolved.openai_compat.clone())
+                    .with_reasoning_model(resolved.reasoning_model),
+            ));
         }
-        // openai + any custom OpenAI-compatible provider (opencode, proxy, …)
-        _ => {
-            #[cfg(feature = "http-providers")]
-            {
-                let key = resolved.api_key.clone().ok_or_else(|| {
+        #[cfg(not(feature = "http-providers"))]
+        {
+            return Err("OpenRouter requires --features http-providers".into());
+        }
+    }
+
+    // Anthropic Messages protocol — built-in `anthropic` or any custom id with api=anthropic-messages.
+    if api == ProviderApi::AnthropicMessages || provider_id == "anthropic" {
+        #[cfg(feature = "http-providers")]
+        {
+            let key = resolved.api_key.clone().ok_or_else(|| {
+                if provider_id == "anthropic" {
+                    "ANTHROPIC_API_KEY is not set (or pass --api-key)".to_string()
+                } else {
                     format!(
                         "API key missing for provider `{provider_id}` \
                          (set models.json apiKey / --api-key / env)"
                     )
-                })?;
-                let base = resolved.base_url.clone().ok_or_else(|| {
-                    format!(
-                        "baseUrl missing for provider `{provider_id}` \
-                         (set models.json baseUrl / --base-url)"
-                    )
-                })?;
-                let wire: OpenaiWireApi = resolved.openai_api.into();
-                Ok(std::sync::Arc::new(
-                    OpenAiProvider::with_base(key, &resolved.model, base).with_wire_api(wire),
-                ))
-            }
-            #[cfg(not(feature = "http-providers"))]
-            {
-                Err(format!(
-                    "provider `{provider_id}` needs OpenAI-compatible HTTP \
-                         (rebuild with --features http-providers)"
-                )
-                .into())
-            }
+                }
+            })?;
+            let base = resolved
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.anthropic.com".into());
+            return Ok(std::sync::Arc::new(
+                AnthropicProvider::with_base(key, &resolved.model, base)
+                    .with_compat(resolved.anthropic_compat.clone()),
+            ));
         }
+        #[cfg(not(feature = "http-providers"))]
+        {
+            return Err("Anthropic requires --features http-providers".into());
+        }
+    }
+
+    // Gemini native generateContent — built-in `gemini` or api=gemini-generate-content.
+    // If user explicitly set openai-completions for gemini (compat endpoint), fall through.
+    if api == ProviderApi::GeminiGenerateContent
+        || (provider_id == "gemini" && !api.is_openai_wire())
+    {
+        #[cfg(feature = "http-providers")]
+        {
+            let key = resolved.api_key.clone().ok_or_else(|| {
+                if provider_id == "gemini" {
+                    "GEMINI_API_KEY / GOOGLE_API_KEY is not set (or pass --api-key)".to_string()
+                } else {
+                    format!(
+                        "API key missing for provider `{provider_id}` \
+                         (set models.json apiKey / --api-key / env)"
+                    )
+                }
+            })?;
+            let base = resolved.base_url.clone().unwrap_or_else(|| {
+                "https://generativelanguage.googleapis.com/v1beta".into()
+            });
+            return Ok(std::sync::Arc::new(GeminiProvider::with_base(
+                key,
+                &resolved.model,
+                base,
+            )));
+        }
+        #[cfg(not(feature = "http-providers"))]
+        {
+            return Err("Gemini requires --features http-providers".into());
+        }
+    }
+
+    // OpenAI Chat Completions / Responses (and OpenAI-compatible endpoints).
+    #[cfg(feature = "http-providers")]
+    {
+        let key = resolved.api_key.clone().ok_or_else(|| {
+            format!(
+                "API key missing for provider `{provider_id}` \
+                 (set models.json apiKey / --api-key / env)"
+            )
+        })?;
+        let base = resolved.base_url.clone().ok_or_else(|| {
+            format!(
+                "baseUrl missing for provider `{provider_id}` \
+                 (set models.json baseUrl / --base-url)"
+            )
+        })?;
+        let wire = match api {
+            ProviderApi::OpenaiCompletions => OpenaiWireApi::OpenaiCompletions,
+            ProviderApi::OpenaiResponses => OpenaiWireApi::OpenaiResponses,
+            ProviderApi::AnthropicMessages | ProviderApi::GeminiGenerateContent => {
+                unreachable!("handled above")
+            }
+        };
+        Ok(std::sync::Arc::new(
+            OpenAiProvider::with_base(key, &resolved.model, base)
+                .with_wire_api(wire)
+                .with_provider_id(provider_id)
+                .with_compat(resolved.openai_compat.clone())
+                .with_reasoning_model(resolved.reasoning_model),
+        ))
+    }
+    #[cfg(not(feature = "http-providers"))]
+    {
+        Err(format!(
+            "provider `{provider_id}` needs HTTP providers \
+                 (rebuild with --features http-providers)"
+        )
+        .into())
     }
 }

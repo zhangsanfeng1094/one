@@ -61,6 +61,7 @@
 
 ### Phase A 补齐（P0 体验）— 2026-07-14
 - [x] Skills（Agent Skills 标准）：XML catalog + 模型 `read` 按需加载 + 可选 `/skill:name` 强制
+- [x] Skills 管理：`/skills` 面板 + settings.skills_config enable/disable（类 Codex）
 - [x] Compaction：extractive + LLM 摘要；context overflow 重试一次
 - [x] Session UX：`/session` `/resume` `/new` `/name` + CLI `-r`
 - [x] Footer 用量：`~N tok` 估算 + thinking 标签
@@ -86,6 +87,16 @@
 - [ ] 与官方 Pi session 全量兼容性回归测试
 - [ ] 更准的 per-model pricing 表
 
+### Package / Suite（设计已写，未排期实现）
+
+> 设计见 [package-suites.md](./package-suites.md)。目标：配置编程包即可编程、配置办公包即可办公；Core 保持领域无关。
+
+- [ ] Package manifest + 目录发现 + Profile merge
+- [ ] 官方 `base` / `coding` 包（现有 tool 装配迁出）
+- [ ] `one --suite <name>` 会话级切换
+- [ ] Session 记录启用 package 版本
+- [ ] （更晚）`office-lite`、CLI bridge、`one pkg install`
+
 ---
 
 ## 非目标（与官方 Pi 保持一致）
@@ -95,7 +106,7 @@
 
 ## Plan Mode（已内置 MVP）
 
-- `/plan`、`--plan`，或 **空输入时 Space**：硬只读工具 + 仅可写 plan 文件 + `exit_plan_mode`
-- `/act` / `/build`：批准计划并切到 Build 模式开始实现；Space 再按一次仅回到 Build（不自动实现）
+- `/plan`、`--plan`，或 **Shift+Tab**：硬只读工具 + 仅可写 plan 文件 + `exit_plan_mode`
+- `/act` / `/build`：批准计划并切到 Build 模式开始实现；Shift+Tab 再按一次仅回到 Build（不自动实现）
 - 计划落盘：`~/.one/agent/plans/<uuid>.md`
 - Thinking 深度不占用快捷键，用 `/settings thinking …`

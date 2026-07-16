@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::compat::{CompatConfig, ThinkingLevelMap};
 use crate::openai::OpenaiWireApi;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +19,20 @@ pub struct ModelEntry {
     /// Optional resolved API key override (usually lives on provider).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
+    /// Whether the model supports extended thinking / reasoning (Pi `reasoning`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<bool>,
+    /// Pi `thinkingLevelMap` — remap/disable agent thinking levels per model.
+    #[serde(
+        default,
+        rename = "thinkingLevelMap",
+        alias = "thinking_level_map",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub thinking_level_map: Option<ThinkingLevelMap>,
+    /// Pi-style `compat` overrides (merged with provider-level + auto-detect).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compat: Option<CompatConfig>,
 }
 
 /// Provider-level settings from `models.json` `providers` block.
@@ -32,6 +47,8 @@ pub struct ProviderConfig {
     /// Original `apiKey` string from file (e.g. `$OPENAI_API_KEY`) for round-trip save.
     pub api_key_raw: Option<String>,
     pub default_model: Option<String>,
+    /// Provider-level `compat` defaults applied to all models under this provider.
+    pub compat: Option<CompatConfig>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -51,6 +68,9 @@ impl ModelRegistry {
                     api: None,
                     base_url: None,
                     api_key: None,
+                    reasoning: None,
+                    thinking_level_map: None,
+                    compat: None,
                 },
                 ModelEntry {
                     provider: "anthropic".into(),
@@ -60,6 +80,9 @@ impl ModelRegistry {
                     api: None,
                     base_url: None,
                     api_key: None,
+                    reasoning: Some(true),
+                    thinking_level_map: None,
+                    compat: None,
                 },
                 ModelEntry {
                     provider: "openai".into(),
@@ -69,6 +92,9 @@ impl ModelRegistry {
                     api: Some("openai-responses".into()),
                     base_url: Some("https://api.openai.com/v1".into()),
                     api_key: None,
+                    reasoning: None,
+                    thinking_level_map: None,
+                    compat: None,
                 },
                 ModelEntry {
                     provider: "openai".into(),
@@ -78,6 +104,9 @@ impl ModelRegistry {
                     api: Some("openai-responses".into()),
                     base_url: Some("https://api.openai.com/v1".into()),
                     api_key: None,
+                    reasoning: None,
+                    thinking_level_map: None,
+                    compat: None,
                 },
                 ModelEntry {
                     provider: "ollama".into(),
@@ -87,6 +116,9 @@ impl ModelRegistry {
                     api: Some("openai-completions".into()),
                     base_url: Some("http://127.0.0.1:11434/v1".into()),
                     api_key: None,
+                    reasoning: None,
+                    thinking_level_map: None,
+                    compat: None,
                 },
                 ModelEntry {
                     provider: "openrouter".into(),
@@ -96,6 +128,9 @@ impl ModelRegistry {
                     api: Some("openai-completions".into()),
                     base_url: Some("https://openrouter.ai/api/v1".into()),
                     api_key: None,
+                    reasoning: Some(true),
+                    thinking_level_map: None,
+                    compat: None,
                 },
                 ModelEntry {
                     provider: "deepseek".into(),
@@ -105,6 +140,9 @@ impl ModelRegistry {
                     api: Some("openai-completions".into()),
                     base_url: Some("https://api.deepseek.com".into()),
                     api_key: None,
+                    reasoning: None,
+                    thinking_level_map: None,
+                    compat: None,
                 },
                 ModelEntry {
                     provider: "deepseek".into(),
@@ -114,28 +152,37 @@ impl ModelRegistry {
                     api: Some("openai-completions".into()),
                     base_url: Some("https://api.deepseek.com".into()),
                     api_key: None,
+                    reasoning: Some(true),
+                    thinking_level_map: None,
+                    compat: None,
                 },
                 ModelEntry {
                     provider: "gemini".into(),
                     id: "gemini-2.5-flash".into(),
                     name: "Gemini 2.5 Flash".into(),
                     context_window: Some(1_000_000),
-                    api: Some("openai-completions".into()),
+                    api: Some("gemini-generate-content".into()),
                     base_url: Some(
-                        "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+                        "https://generativelanguage.googleapis.com/v1beta".into(),
                     ),
                     api_key: None,
+                    reasoning: Some(true),
+                    thinking_level_map: None,
+                    compat: None,
                 },
                 ModelEntry {
                     provider: "gemini".into(),
                     id: "gemini-2.5-pro".into(),
                     name: "Gemini 2.5 Pro".into(),
                     context_window: Some(1_000_000),
-                    api: Some("openai-completions".into()),
+                    api: Some("gemini-generate-content".into()),
                     base_url: Some(
-                        "https://generativelanguage.googleapis.com/v1beta/openai".into(),
+                        "https://generativelanguage.googleapis.com/v1beta".into(),
                     ),
                     api_key: None,
+                    reasoning: Some(true),
+                    thinking_level_map: None,
+                    compat: None,
                 },
             ],
         }
@@ -152,7 +199,7 @@ impl ModelRegistry {
             ("deepseek", "DeepSeek (OpenAI-compat)", "DEEPSEEK_API_KEY"),
             (
                 "gemini",
-                "Google Gemini (OpenAI-compat)",
+                "Google Gemini (generateContent)",
                 "GEMINI_API_KEY / GOOGLE_API_KEY",
             ),
         ]

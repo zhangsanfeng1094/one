@@ -17,7 +17,7 @@
 | Agent loop | ⭐⭐⭐⭐ | prompt → LLM → tool → loop；steer / follow-up / abort 已有 |
 | 内置 tools | ⭐⭐⭐⭐⭐ | 7 coding tools + `web_search` / `web_fetch`（Pi 则靠 skill） |
 | Session JSONL 树 | ⭐⭐⭐⭐ | v3 子集 + 迁移 + branch；fork/clone/交互式 tree UI 弱 |
-| Providers | ⭐⭐ | Mock/Anthropic/OpenAI/Ollama/OpenRouter；缺 OAuth 与大量内置厂商 |
+| Providers | ⭐⭐⭐ | Mock/Anthropic/OpenAI/Ollama/OpenRouter + `compat`（Pi 形 models.json）；缺 OAuth 与大量内置厂商 |
 | Interactive TUI | ⭐⭐ | 可用，但编辑器/快捷键/footer/主题远弱于 Pi |
 | 扩展系统 | ⭐ | Rust trait + 实验性 dylib；**不兼容** TS 扩展 / 无 npm 包生态 |
 | Skills / Prompts | ⭐⭐ | prompts 可展开；skills **仅发现、未接入运行时** |
@@ -61,7 +61,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 | AGENTS.md 上下文 | ✅ | ✅ | 另支持 CLAUDE.md？**未确认/可能无** |
 | Prompt templates `/name` | ✅ | ✅ | `expand_prompt` |
 | Steer / Follow-up 队列 | Enter / Alt+Enter | Ctrl+S / Alt+Enter | 快捷键不同；delivery mode 配置无 |
-| Abort | Escape | `q` / Esc 取消生成；Ctrl+C 强制退出 | busy 下 Ctrl+C 不再误绑为 soft abort |
+| Abort | Escape | Esc 取消生成；Ctrl+C 渐进退出（关浮层/清输入/双击退出） | 单次 Ctrl+C 不退出，防误触 |
 | models.json 自定义 | `~/.pi/agent/models.json` | `~/.one/agent/models.json` | providers 块 + legacy 扁平列表 |
 | OpenAI Responses + Completions | ✅ | ✅ | 对齐 Pi `api` 字段语义 |
 | HTML export / Gist share | ✅ | ✅ | `--export` / `--share` / `/export` |
@@ -79,9 +79,9 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 |------|---------|----------|------|
 | **OAuth 订阅登录** | `/login`：Claude Pro/Max、ChatGPT、Copilot | 仅 API key | 大量用户无法「开箱即用」 |
 | **Provider 覆盖** | 30+ 内置（Gemini、Bedrock、Azure、xAI、Groq、DeepSeek、MiniMax…） | mock / anthropic / openai / ollama / openrouter | 非 OpenRouter 路径要自己拼 models.json |
-| **TUI 编辑器** | 多行、Shift+Enter、`@` 文件模糊搜索、Tab 路径补全、Ctrl+G 外部编辑器、图片粘贴 | 单行输入为主；paste 把换行压成空格；无 `@` / 路径补全 / 图片 | 交互质感差一档 |
+| **TUI 编辑器** | 多行、Shift+Enter、`@` 文件模糊搜索、Tab 路径补全、Ctrl+G 外部编辑器、图片粘贴 | 多行 + `@`/Tab 路径 + 图片粘贴（路径/data-URI/**剪贴板位图 Ctrl+V**） | 质感接近；OAuth/footer 仍差 |
 | **Footer / 用量** | token↑↓、cache R/W、cost、context %、model、cwd | 基础状态条 | 无法判断上下文压力与费用 |
-| **Thinking level** | Shift+Tab 循环；session `thinking_level_change` | `/settings` / `/thinking`（无 Shift+Tab；Space 用于 Plan/Build） | 已接线 |
+| **Thinking level** | Shift+Tab 循环；session `thinking_level_change` | `/settings` / `/thinking`；**Shift+Tab 用于 Plan/Build** | 已接线 |
 | **Session 管理 UX** | `/resume` 选择历史、`/new`、`/name`、`/session` 详情、`-r` | 仅 `--continue` / `--session` | 多任务切换困难 |
 | **`/compact` 手动 + 智能自动压缩** | LLM 摘要；overflow 恢复重试；可自定义 instructions | 字符/4 估算；把旧消息 `Debug` 拼成 summary（**非模型摘要**） | 长会话质量不可用 |
 | **Skills 真正生效** | catalog + 模型 `read` SKILL.md + 可选 `/skill:name` | ✅ progressive disclosure（XML catalog + location + force-load） | 已对齐标准路径 |
@@ -198,7 +198,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 
 | 项 | Pi | One |
 |----|----|-----|
-| 路径边界 | 靠环境隔离 | **默认 workspace-write**：file tools 限 cwd + `--add-dir`；`--full-access` 关闭 |
+| 路径边界 | 靠环境隔离 | **默认 workspace-write**：file tools 限 cwd + `--add-dir`；skill 发现根只读 allowlist（`.agents/skills` 等）；`--full-access` 关闭 |
 | 权限弹窗 | **刻意不做**（容器 / 扩展自行处理） | 交互 Ask 弹窗（y/a/n）；print 模式 fail-closed；`-y` 自动批 |
 | 细粒度规则 | 扩展自行 | `permissions.allow/deny/ask`（Claude 式 `Bash(git push *)`） |
 | Bash OS 沙箱 | 靠环境隔离 | **bubblewrap**（workspace RW / home RO）；无 bwrap 时降级 |
@@ -220,7 +220,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 | dylib 扩展 | feature 有 | 仅 `status` 名硬编码，不是通用插件 ABI |
 | `/tree` | 能切 branch | 无交互树视图、无 branch_summary 用户流 |
 | Thinking 类型 | ContentBlock / StreamEvent / session entry | ✅ level + signature replay + TUI 折叠 Ctrl+T |
-| 图片消息类型 | `TextOrImage::Image` | ✅ read 出图 + provider 发图 + 粘贴路径/data-URI（无剪贴板位图协议） |
+| 图片消息类型 | `TextOrImage::Image { path }` | ✅ 只存 path；发 API 再读文件→base64；无 session 内联 base64 |
 | Markdown 渲染 | TUI 有表格等 | 差分渲染 / 同步输出 / flicker 控制弱于 pi-tui |
 | 文档 | 有一套 | 与代码漂移（export/migrate/reload 状态不一致） |
 

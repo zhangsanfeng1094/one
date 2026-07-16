@@ -2,9 +2,7 @@ use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
 use one_core::error::Result;
-use one_core::image::{
-    encode_base64, is_image_path, mime_from_bytes, mime_from_path, MAX_IMAGE_BYTES,
-};
+use one_core::image::{is_image_path, mime_from_bytes, mime_from_path, MAX_IMAGE_BYTES};
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
@@ -40,6 +38,7 @@ impl Tool for ReadTool {
             description: format!(
                 "Read a file from the filesystem. Text files return numbered lines; \
                  image files (png/jpeg/gif/webp/bmp) return image content for vision models. \
+                 Text output is capped (~2000 lines / 50KB from the requested window; use offset/limit for slices). \
                  Allowed: {scope}."
             ),
             parameters: json!({
@@ -47,7 +46,7 @@ impl Tool for ReadTool {
                 "properties": {
                     "path": { "type": "string", "description": "File path" },
                     "offset": { "type": "integer", "description": "1-based line offset (text only)" },
-                    "limit": { "type": "integer", "description": "Maximum lines to read (text only)" }
+                    "limit": { "type": "integer", "description": "Maximum lines to read (text only; still subject to 50KB cap)" }
                 },
                 "required": ["path"]
             }),
@@ -85,8 +84,12 @@ impl Tool for ReadTool {
 
         let lines: Vec<&str> = content.lines().collect();
         let start = offset.saturating_sub(1);
-        let end = limit.map(|limit| start + limit as usize).unwrap_or(lines.len());
-        let slice = &lines[start..end.min(lines.len())];
+        // Cap explicit limit at DEFAULT_MAX_LINES so a huge limit cannot flood context.
+        let max_window = limit
+            .map(|n| (n as usize).min(crate::truncate::DEFAULT_MAX_LINES))
+            .unwrap_or(crate::truncate::DEFAULT_MAX_LINES);
+        let end = (start + max_window).min(lines.len());
+        let slice = &lines[start..end];
 
         let numbered = slice
             .iter()
@@ -95,9 +98,30 @@ impl Tool for ReadTool {
             .collect::<Vec<_>>()
             .join("\n");
 
+        // Cap by lines/bytes; Claude-style PARTIAL view tells model how to continue.
+        let presented = crate::truncate::present_file_read(&numbered, lines.len(), offset);
+        // Also note when the file continues past this window even if bytes fit.
+        let mut text = presented.text;
+        let more_in_file = end < lines.len();
+        if more_in_file && !text.contains("PARTIAL view") {
+            text.push_str(&format!(
+                "\n\n--- PARTIAL view ---\n\
+                 window ends at line {end} of {} total. \
+                 Continue with offset={} (or use grep).",
+                lines.len(),
+                end + 1
+            ));
+        }
+
         Ok(ToolOutput::text_with_details(
-            numbered,
-            json!({ "path": path, "lines": slice.len() }),
+            text,
+            json!({
+                "path": path,
+                "lines": end.saturating_sub(start),
+                "offset": offset,
+                "fileLines": lines.len(),
+                "truncated": presented.truncated || more_in_file,
+            }),
         ))
     }
 }
@@ -142,10 +166,10 @@ async fn read_image(path: &str, resolved: &Path) -> Result<ToolOutput> {
             )
         })?;
 
-    let data = encode_base64(&bytes);
-    Ok(ToolOutput::image_with_details(
-        data,
+    // Keep the workspace path (no media copy) — file is durable in the project.
+    Ok(ToolOutput::image_path_with_details(
         mime,
+        resolved.display().to_string(),
         json!({
             "path": path,
             "mimeType": mime,

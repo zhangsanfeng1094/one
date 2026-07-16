@@ -550,7 +550,16 @@ fn format_output_body(stdout: &str, stderr: &str, max_chars: usize) -> String {
         body.push_str(stderr.trim_end());
         body.push('\n');
     }
-    truncate_chars(&body, max_chars)
+    // Claude-style spill when huge; head preview + full path under tool-outputs.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let presented = crate::truncate::present_tool_output(
+        &body,
+        "bash_output",
+        &cwd,
+        crate::truncate::PreviewStyle::Head,
+    );
+    // Honor caller's max_chars as an extra safety net on the model-facing text.
+    truncate_chars(&presented.text, max_chars)
 }
 
 pub fn truncate_chars(s: &str, max: usize) -> String {

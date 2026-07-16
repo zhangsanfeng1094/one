@@ -13,23 +13,40 @@ pub enum ProviderKind {
     Gemini,
 }
 
-/// OpenAI-compatible wire protocol (Pi-style `api` field).
+/// Wire protocol for request/response encoding (Pi-style `api` field).
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
 pub enum OpenaiApi {
-    /// `POST /v1/chat/completions` — widest compatibility.
-    #[value(name = "openai-completions", alias = "completions", alias = "chat")]
+    /// `POST {base}/chat/completions` — widest OpenAI-compatible surface.
+    #[value(
+        name = "openai-completions",
+        alias = "completions",
+        alias = "chat",
+        alias = "openai-compatible"
+    )]
     Completions,
-    /// `POST /v1/responses` — default for first-party OpenAI (like Pi).
+    /// `POST {base}/responses` — default for first-party OpenAI (like Pi).
     #[default]
     #[value(name = "openai-responses", alias = "responses")]
     Responses,
+    /// `POST {base}/v1/messages` — Anthropic Messages API.
+    #[value(name = "anthropic-messages", alias = "anthropic", alias = "messages")]
+    AnthropicMessages,
+    /// `POST {base}/models/{model}:generateContent` — Gemini native.
+    #[value(
+        name = "gemini-generate-content",
+        alias = "gemini",
+        alias = "generate-content"
+    )]
+    GeminiGenerateContent,
 }
 
-impl From<OpenaiApi> for one_ai::OpenaiWireApi {
+impl From<OpenaiApi> for one_ai::ProviderApi {
     fn from(value: OpenaiApi) -> Self {
         match value {
-            OpenaiApi::Completions => one_ai::OpenaiWireApi::Completions,
-            OpenaiApi::Responses => one_ai::OpenaiWireApi::Responses,
+            OpenaiApi::Completions => one_ai::ProviderApi::OpenaiCompletions,
+            OpenaiApi::Responses => one_ai::ProviderApi::OpenaiResponses,
+            OpenaiApi::AnthropicMessages => one_ai::ProviderApi::AnthropicMessages,
+            OpenaiApi::GeminiGenerateContent => one_ai::ProviderApi::GeminiGenerateContent,
         }
     }
 }
@@ -78,8 +95,8 @@ pub struct Cli {
     #[arg(long, short = 'm')]
     pub model: Option<String>,
 
-    /// OpenAI wire API: `openai-responses` (default) or `openai-completions`.
-    /// Also set via env `ONE_OPENAI_API` or `models.json` field `api`.
+    /// Wire protocol: `openai-responses` | `openai-completions` | `anthropic-messages` | `gemini-generate-content`.
+    /// Also set via env `ONE_OPENAI_API` or `models.json` `api` / `providerType`.
     #[arg(long = "openai-api", value_enum)]
     pub openai_api: Option<OpenaiApi>,
 
