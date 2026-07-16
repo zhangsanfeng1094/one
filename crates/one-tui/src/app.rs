@@ -95,6 +95,8 @@ pub enum RunOutcome {
     },
     /// Settings UI mutation (providers / models.json).
     ConfigOp(ConfigOp),
+    /// Open MCP manager; CLI refreshes live status first.
+    OpenMcpPanel,
     Quit,
     Noop,
 }
@@ -141,6 +143,10 @@ pub enum ConfigOp {
     /// Toggle skill enabled flag (path to SKILL.md).
     SkillToggle {
         path: String,
+    },
+    /// Toggle MCP server enabled (server name).
+    McpToggle {
+        name: String,
     },
 }
 
@@ -258,6 +264,7 @@ impl RunOutcome {
             RunOutcome::FollowUp(t) | RunOutcome::Steer(t) => !t.is_empty(),
             RunOutcome::CycleAgentMode
             | RunOutcome::OpenRewind
+            | RunOutcome::OpenMcpPanel
             | RunOutcome::SwitchModel { .. }
             | RunOutcome::ConfigOp(_)
             | RunOutcome::Quit => true,
@@ -357,6 +364,14 @@ pub struct App {
     pub settings_model_rows: Vec<(String, String)>,
     /// Skills manager rows: `(path, label, detail, enabled)`.
     pub skills_rows: Vec<(String, String, String, bool)>,
+    /// MCP manager rows: `(name, label, detail, enabled)`.
+    pub mcp_rows: Vec<(String, String, String, bool)>,
+    /// Short MCP summary for Settings root.
+    pub mcp_summary: String,
+    /// Status-bar / prompt-meta chip, e.g. `MCP 4/5…`. Empty = hidden.
+    pub mcp_chip_text: String,
+    /// 0=hide 1=loading 2=ok 3=partial 4=error
+    pub mcp_chip_kind: u8,
     /// Ephemeral toast (top-right). **Not** chat context, **not** agent messages.
     pub toast: Option<Toast>,
     /// Centered floating secondary menu (Settings, commands, sessions, …).
@@ -489,6 +504,10 @@ impl App {
             settings_provider_field_rows: Vec::new(),
             settings_model_rows: Vec::new(),
             skills_rows: Vec::new(),
+            mcp_rows: Vec::new(),
+            mcp_summary: "none".into(),
+            mcp_chip_text: String::new(),
+            mcp_chip_kind: 0,
             toast: None,
             float: None,
             current_provider: String::new(),
@@ -727,10 +746,11 @@ impl App {
     pub fn open_settings_float(&mut self) {
         self.close_float();
         self.clear_select_prompt();
-        self.float = Some(FloatMenu::settings_root(
+        self.float = Some(FloatMenu::settings_root_with_mcp(
             &self.thinking_level,
             &self.current_provider,
             &self.current_model,
+            &self.mcp_summary,
         ));
         self.clear_notice();
     }
@@ -738,6 +758,31 @@ impl App {
     /// Populate skills manager rows (path, label, detail, enabled).
     pub fn set_skills_rows(&mut self, rows: Vec<(String, String, String, bool)>) {
         self.skills_rows = rows;
+    }
+
+    /// Populate MCP manager rows + settings summary.
+    pub fn set_mcp_rows(
+        &mut self,
+        rows: Vec<(String, String, String, bool)>,
+        summary: impl Into<String>,
+    ) {
+        self.mcp_rows = rows;
+        self.mcp_summary = summary.into();
+    }
+
+    /// Status-bar chip: `text` empty hides it. `kind`: 1 loading · 2 ok · 3 partial · 4 error.
+    pub fn set_mcp_chip(&mut self, text: impl Into<String>, kind: u8) {
+        self.mcp_chip_text = text.into();
+        self.mcp_chip_kind = if self.mcp_chip_text.is_empty() {
+            0
+        } else {
+            kind
+        };
+    }
+
+    pub fn clear_mcp_chip(&mut self) {
+        self.mcp_chip_text.clear();
+        self.mcp_chip_kind = 0;
     }
 
     /// Open skills enable/disable panel (`/skills`).
@@ -752,6 +797,25 @@ impl App {
     pub fn reopen_skills_float(&mut self) {
         let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
         self.float = Some(FloatMenu::skills_manager(&self.skills_rows));
+        if let Some(f) = self.float.as_mut() {
+            let max = f.filtered_entries().len().saturating_sub(1);
+            f.selected = prev_selected.min(max);
+        }
+        self.clear_notice();
+    }
+
+    /// Open MCP status / enable-disable panel (`/mcp` or Settings → MCP).
+    pub fn open_mcp_float(&mut self) {
+        self.close_float();
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::mcp_manager(&self.mcp_rows));
+        self.clear_notice();
+    }
+
+    /// Re-open MCP panel after a toggle.
+    pub fn reopen_mcp_float(&mut self) {
+        let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
+        self.float = Some(FloatMenu::mcp_manager(&self.mcp_rows));
         if let Some(f) = self.float.as_mut() {
             let max = f.filtered_entries().len().saturating_sub(1);
             f.selected = prev_selected.min(max);
@@ -949,6 +1013,10 @@ impl App {
             }
             FloatKind::Skills => {
                 // Same as Thinking: Esc returns to Settings root.
+                self.open_settings_float();
+                true
+            }
+            FloatKind::Mcp => {
                 self.open_settings_float();
                 true
             }
@@ -1678,6 +1746,10 @@ impl App {
                 self.input.clear();
                 self.open_skills_float();
                 return RunOutcome::Noop;
+            }
+            "/mcp" => {
+                self.input.clear();
+                return RunOutcome::OpenMcpPanel;
             }
             "/thinking" => {
                 self.input.clear();
@@ -2611,6 +2683,10 @@ impl App {
                     self.open_skills_float();
                     return RunOutcome::Noop;
                 }
+                if t == "/mcp" || t == "/mcp " {
+                    self.input.clear();
+                    return RunOutcome::OpenMcpPanel;
+                }
                 self.submit_prompt()
             }
             // Shift+Tab (BackTab) → cycle Plan / Build. Plain Tab remains completion.
@@ -3123,6 +3199,7 @@ impl App {
             FloatKind::SettingsModelDetail => self.confirm_settings_model_detail(&entry.item.id),
             FloatKind::SettingsModelAdd => self.confirm_settings_model_add(&entry.item.id),
             FloatKind::Skills => self.confirm_skills_toggle(&entry.item.id),
+            FloatKind::Mcp => self.confirm_mcp_toggle(&entry.item.id),
             FloatKind::Help | FloatKind::Commands | FloatKind::Custom => {
                 self.dispatch_command_item(&entry.item.id, &entry.item.hint)
             }
@@ -3135,6 +3212,15 @@ impl App {
         }
         RunOutcome::ConfigOp(ConfigOp::SkillToggle {
             path: id.to_string(),
+        })
+    }
+
+    fn confirm_mcp_toggle(&mut self, id: &str) -> RunOutcome {
+        if id == "_empty" || id.is_empty() {
+            return RunOutcome::Noop;
+        }
+        RunOutcome::ConfigOp(ConfigOp::McpToggle {
+            name: id.to_string(),
         })
     }
 
@@ -3161,6 +3247,10 @@ impl App {
             "skills" => {
                 self.open_skills_float();
                 RunOutcome::Noop
+            }
+            "mcp" => {
+                self.close_float();
+                RunOutcome::OpenMcpPanel
             }
             "providers" => {
                 self.open_settings_providers(&self.settings_provider_rows.clone());
@@ -3565,6 +3655,10 @@ impl App {
             "skills" => {
                 self.open_skills_float();
                 RunOutcome::Noop
+            }
+            "mcp" => {
+                self.close_float();
+                RunOutcome::OpenMcpPanel
             }
             // These need runtime data → emit slash so CLI opens the right float.
             "resume" | "session" | "tree" | "rewind" | "new" | "name" | "export" | "compact"
@@ -4015,6 +4109,7 @@ fn is_ui_slash(text: &str) -> bool {
             | "/compact"
             | "/settings"
             | "/skills"
+            | "/mcp"
             | "/tree"
             | "/rewind"
             | "/export"

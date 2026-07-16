@@ -14,6 +14,7 @@ use one_core::events::AgentEvent;
 use one_core::message::AgentMessage;
 use one_core::tool::Tool;
 use one_ext::{discover_extensions, ExtensionContext, ExtensionEvent, ExtensionRuntime};
+use one_mcp::McpManager;
 use one_resources::{skill_allowlist_roots, ResourceLoader};
 use one_session::{agent_dir, SessionInfo, SessionManager};
 use one_tools::{
@@ -93,6 +94,11 @@ pub struct AppRuntime {
     ask_user_handler: Arc<dyn AskUserHandler>,
     /// Active model context window (tokens). 0 = unknown → fallback compact threshold.
     context_window: usize,
+    /// MCP platform runtime (stdio / HTTP servers → tools).
+    /// Connections are process-scoped and **survive `/new`**.
+    pub mcp: McpManager,
+    /// Last applied MCP tool generation (re-sync when background load advances).
+    mcp_tools_generation: u64,
 }
 
 impl AppRuntime {
@@ -173,6 +179,33 @@ impl AppRuntime {
         if !start_plan {
             tools.extend(extensions.tools());
         }
+
+        // MCP: Grok-style — load config sync, connect servers in background.
+        // Do not block TUI / first paint on cold `npx` downloads.
+        // Plan mode still starts the pool (so /act gets tools) but does not register them yet.
+        let disable_mcp = cli.no_mcp
+            || std::env::var_os("ONE_DISABLE_MCP").is_some_and(|v| v != "0" && v != "false");
+        let mcp = if disable_mcp {
+            McpManager::empty()
+        } else {
+            match McpManager::spawn(&cwd) {
+                Ok(m) => {
+                    if m.is_loading() {
+                        tracing::info!("MCP background connect started");
+                    }
+                    m
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "MCP config load failed; continuing without MCP");
+                    McpManager::empty()
+                }
+            }
+        };
+        // Snapshot whatever is already ready (usually empty right after spawn).
+        if !start_plan {
+            tools.extend(mcp.tools());
+        }
+        let mcp_tools_generation = mcp.generation();
 
         let base_system_prompt =
             resources.build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
@@ -280,6 +313,8 @@ impl AppRuntime {
             hitl,
             ask_user_handler,
             context_window: 0,
+            mcp,
+            mcp_tools_generation,
         };
 
         // Restore plan path + mode from session custom entry if present.
@@ -378,8 +413,9 @@ impl AppRuntime {
         if self.mode == AgentMode::Act {
             return Ok(());
         }
-        self.apply_act_tools_and_prompt().await?;
+        // Flip mode before rebuild so MCP tools are included.
         self.mode = AgentMode::Act;
+        self.apply_act_tools_and_prompt().await?;
         {
             let mut state = self.plan_exit.lock().expect("plan exit lock");
             state.clear();
@@ -427,6 +463,17 @@ impl AppRuntime {
             .resources
             .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
 
+        self.rebuild_act_tools().await?;
+        let mut agent = self.agent.lock().await;
+        agent.config.system_prompt = self.base_system_prompt.clone();
+        if !self.read_only {
+            agent.set_notification_queue(self.bg_registry.notification_queue());
+        }
+        Ok(())
+    }
+
+    /// Rebuild the Act-mode tool list (builtin + extensions + current MCP snapshot).
+    async fn rebuild_act_tools(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let mut tools: Vec<Arc<dyn Tool>> = if self.read_only {
             read_only_tools_with_ask(
                 self.path_policy.clone(),
@@ -441,13 +488,56 @@ impl AppRuntime {
             })
         };
         tools.extend(self.extensions.tools());
+        // MCP tools only outside Plan mode (external side effects).
+        if self.mode != AgentMode::Plan {
+            tools.extend(self.mcp.tools());
+        }
+        self.mcp_tools_generation = self.mcp.generation();
 
         let mut agent = self.agent.lock().await;
         agent.set_tools(tools);
-        agent.config.system_prompt = self.base_system_prompt.clone();
-        if !self.read_only {
-            agent.set_notification_queue(self.bg_registry.notification_queue());
+        Ok(())
+    }
+
+    /// If background MCP load advanced, re-apply tools onto the agent.
+    ///
+    /// Called before each prompt so tools that finished mid-session become
+    /// available on the next turn without reconnecting (Grok shared-pool model).
+    pub async fn sync_mcp_tools(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.mcp.is_disabled() {
+            return Ok(());
         }
+        if self.mode == AgentMode::Plan {
+            // Stay off MCP tools in plan mode even if pool is ready.
+            return Ok(());
+        }
+        let gen = self.mcp.generation();
+        if gen == self.mcp_tools_generation {
+            return Ok(());
+        }
+        tracing::debug!(
+            from = self.mcp_tools_generation,
+            to = gen,
+            tools = self.mcp.tool_count(),
+            "syncing MCP tools into agent"
+        );
+        self.rebuild_act_tools().await
+    }
+
+    /// Optional notice for TUI when MCP is still loading / just became ready.
+    pub fn mcp_status_line(&self) -> Option<String> {
+        self.mcp.status_line()
+    }
+
+    /// Enable/disable an MCP server (persists + reconnects or drops tools).
+    pub async fn set_mcp_server_enabled(
+        &mut self,
+        name: &str,
+        enabled: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.mcp.set_server_enabled(name, enabled).await?;
+        // Reflect tool list change on the agent immediately.
+        self.sync_mcp_tools().await?;
         Ok(())
     }
 
@@ -569,6 +659,23 @@ impl AppRuntime {
         provider: &dyn LlmProvider,
         text: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // MCP async load (Grok-style):
+        // - If still loading and no tools yet, wait up to 45s for the *first*
+        //   server so `-p` / cold start don't race empty tool lists.
+        // - Once any tools exist, proceed immediately (more servers trickle in
+        //   and attach on subsequent turns via generation sync).
+        if self.mcp.is_loading() && self.mcp.tool_count() == 0 {
+            let deadline =
+                tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+            while self.mcp.is_loading()
+                && self.mcp.tool_count() == 0
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        self.sync_mcp_tools().await?;
+
         let text = self.resources.resolve_prompt(text);
         self.maybe_compact(provider, false).await?;
 
@@ -821,9 +928,14 @@ impl AppRuntime {
     }
 
     pub async fn new_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // New conversation only — MCP connection pool is process-scoped (Grok-style).
         self.session = Some(SessionManager::create(&self.cwd).await?);
-        let mut agent = self.agent.lock().await;
-        agent.messages.clear();
+        {
+            let mut agent = self.agent.lock().await;
+            agent.messages.clear();
+        }
+        // Ensure any MCP servers that finished loading attach to this clean slate.
+        self.sync_mcp_tools().await?;
         Ok(())
     }
 

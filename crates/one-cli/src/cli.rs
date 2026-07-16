@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
+
+use crate::mcp_cmd::McpCli;
 
 #[derive(Debug, Clone, ValueEnum)]
 pub enum ProviderKind {
@@ -155,4 +157,18 @@ pub struct Cli {
     /// Upload session export to GitHub Gist (requires GITHUB_TOKEN).
     #[arg(long)]
     pub share: bool,
+
+    /// Do not connect MCP servers for this session.
+    #[arg(long = "no-mcp")]
+    pub no_mcp: bool,
+
+    /// Optional subcommands (`one mcp …`).
+    #[command(subcommand)]
+    pub command: Option<Commands>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum Commands {
+    /// Manage MCP servers (list / add / remove / doctor)
+    Mcp(McpCli),
 }

@@ -17,9 +17,12 @@ one-cli
  ├── one-resources    (AGENTS.md / skills / prompts)
  ├── one-ext          (扩展 runtime)
  ├── one-tools        (内置 tools)
+ ├── one-mcp          (MCP 客户端 · 平台基础能力，rmcp)
  ├── one-ai           (LLM providers)
- └── one-core         (Agent loop / messages / events)
+ └── one-core         (Agent loop / messages / events / Tool trait)
 ```
+
+**MCP 分层**：协议与子进程在 `one-mcp`；`one-core` 只认 `Tool`。产品上 MCP 是 L0 基础能力（默认由 runtime 装配），不是 Package/扩展插件。详见 [mcp.md](./mcp.md)。
 
 ## Agent Loop
 
@@ -40,7 +43,8 @@ one-cli
 - `LlmProvider`：统一 `complete` / `complete_streaming`
 - `ThinkingLevel`：统一 off/low/medium/high；各 provider 经 `one_ai::thinking` 映射到 budget / effort / think
 - `ContentBlock::Thinking`：thinking 正文 + 可选 `signature`（多轮回传）+ `redacted`
-- `Tool`：异步执行，返回 `ToolOutput`（内置含 `web_search` / `web_fetch`，`network` feature）
+- `Tool`：异步执行，返回 `ToolOutput`（内置含 `web_search` / `web_fetch`，`network` feature；**MCP tools 同接口**）
+- `McpManager`（`one-mcp`）：按配置连接 MCP server（stdio / streamable HTTP），展开为 `Arc<dyn Tool>`，与内置 tools 一并交给 Agent
 - `PathPolicy` / `SandboxMode`（`one-tools`）：路径 canonicalize 后校验 workspace 根；`workspace-write`（默认）vs `full-access`
 - `ToolGate`（`one-core`）+ `PermissionGate`（`one-cli`）：工具执行前 allow/deny/ask；交互弹窗或 fail-closed
 - `PermissionRules`：Claude 式 `Bash(git push *)` / `Write(**/.env*)` 规则

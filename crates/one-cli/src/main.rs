@@ -1,6 +1,7 @@
 mod approval;
 mod cli;
 mod hitl;
+mod mcp_cmd;
 mod modes;
 mod preferences;
 mod provider;
@@ -11,19 +12,53 @@ use clap::Parser;
 use one_session::export_html;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, RunMode};
+use crate::cli::{Cli, Commands, RunMode};
 use crate::provider::ProviderSet;
 use crate::runtime::AppRuntime;
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn init_tracing(interactive_tui: bool) {
+    let filter = EnvFilter::from_default_env();
+    if interactive_tui {
+        let log_dir = one_session::agent_dir().join("logs");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let path = log_dir.join("one.log");
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+        {
+            tracing_subscriber::fmt()
+                .with_env_filter(filter)
+                .with_writer(std::sync::Mutex::new(file))
+                .with_target(true)
+                .with_ansi(false)
+                .init();
+            return;
+        }
+    }
     tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
+        .with_env_filter(filter)
         .with_target(false)
         .without_time()
         .init();
+}
 
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // Interactive TUI owns the terminal — never print tracing to stderr
+    // (MCP background connect would otherwise corrupt the alternate screen).
+    let interactive_tui = matches!(cli.mode, RunMode::Interactive)
+        && cli.print.is_none()
+        && cli.command.is_none()
+        && !cli.list_models
+        && !cli.list_providers;
+    init_tracing(interactive_tui);
+
+    if let Some(Commands::Mcp(mcp)) = cli.command {
+        return mcp_cmd::run_mcp(mcp).await;
+    }
 
     if cli.list_providers {
         let set = ProviderSet::build(&cli)?;

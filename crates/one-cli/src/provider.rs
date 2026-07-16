@@ -125,6 +125,8 @@ impl ProviderSet {
             list_providers: false,
             auto_approve: false,
             share: false,
+            no_mcp: false,
+            command: None,
         };
 
         let resolved = resolve_settings(&cli, &self.models_config, &provider_id);

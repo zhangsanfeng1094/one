@@ -76,6 +76,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "manage skills · enable/disable (bare = panel)",
     },
     SlashCommand {
+        name: "/mcp",
+        usage: "/mcp [enable|disable <name>]",
+        description: "MCP servers · status · enable/disable (bare = panel)",
+    },
+    SlashCommand {
         name: "/skill",
         usage: "/skill:name [args]",
         description: "force-load skill (else agent auto-reads when relevant)",

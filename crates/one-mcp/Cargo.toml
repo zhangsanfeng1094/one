@@ -1,0 +1,34 @@
+[package]
+name = "one-mcp"
+description = "One MCP client: platform foundation capability (rmcp)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+one-core.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Official MCP SDK — quarantined here so one-core stays thin.
+# reqwest 0.13 is pulled only by this crate (workspace uses 0.12 elsewhere).
+rmcp = { version = "2.2", default-features = false, features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+    "reqwest",
+] }
+http = "1"
+regex = "1"
+parking_lot = "0.12"
+# Only for read-only Codex compat (`~/.codex/config.toml`); One native stays JSON.
+toml = "0.8"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }

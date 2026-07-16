@@ -7,6 +7,7 @@ members = [
     "crates/one-session",
     "crates/one-resources",
     "crates/one-ext",
+    "crates/one-mcp",
     "crates/one-tui",
     "crates/one-cli",
 ]
@@ -24,6 +25,7 @@ one-tools = { path = "crates/one-tools" }
 one-session = { path = "crates/one-session" }
 one-resources = { path = "crates/one-resources" }
 one-ext = { path = "crates/one-ext" }
+one-mcp = { path = "crates/one-mcp" }
 one-tui = { path = "crates/one-tui" }
 
 async-trait = "0.1"

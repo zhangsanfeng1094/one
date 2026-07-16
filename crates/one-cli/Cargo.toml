@@ -24,6 +24,7 @@ one-tools.workspace = true
 one-session.workspace = true
 one-resources.workspace = true
 one-ext.workspace = true
+one-mcp.workspace = true
 one-tui.workspace = true
 async-trait.workspace = true
 clap.workspace = true

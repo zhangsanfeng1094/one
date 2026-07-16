@@ -332,10 +332,21 @@ impl TerminalSession {
     }
 
     pub async fn wait_action(&mut self, app: &mut App) -> Result<RunOutcome> {
+        self.wait_action_with(app, |_| {}).await
+    }
+
+    /// Like [`wait_action`], but `on_poll` runs every idle frame (~50ms).
+    /// Used to refresh live status chips (e.g. MCP 4/5) without a keypress.
+    pub async fn wait_action_with(
+        &mut self,
+        app: &mut App,
+        mut on_poll: impl FnMut(&mut App),
+    ) -> Result<RunOutcome> {
         // Mouse tips live on the empty-state footer / help — do not spam a
         // floating toast every idle wait (steals focus from the prompt).
 
         loop {
+            on_poll(app);
             self.maybe_rearm_after_select();
             self.tick_blink(app);
             self.draw(app)?;

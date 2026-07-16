@@ -65,6 +65,8 @@ pub enum FloatKind {
     SettingsModelAdd,
     /// Skills manager — list + enable/disable (Codex-style).
     Skills,
+    /// MCP servers — status + enable/disable.
+    Mcp,
     /// Generic custom list.
     Custom,
 }
@@ -283,6 +285,16 @@ impl FloatMenu {
     /// Hierarchy: Settings → Providers → Provider → Models → Model
     /// (no standalone global Models entry).
     pub fn settings_root(thinking: &str, provider: &str, model: &str) -> Self {
+        Self::settings_root_with_mcp(thinking, provider, model, "open /mcp")
+    }
+
+    /// Settings root with live MCP status line.
+    pub fn settings_root_with_mcp(
+        thinking: &str,
+        provider: &str,
+        model: &str,
+        mcp_summary: &str,
+    ) -> Self {
         Self {
             kind: FloatKind::Settings,
             title: "Settings".into(),
@@ -315,6 +327,12 @@ impl FloatMenu {
                             "enable / disable discovered skills",
                             "/skills",
                         ),
+                        item(
+                            "mcp",
+                            "MCP",
+                            mcp_summary,
+                            "/mcp",
+                        ),
                     ],
                 },
                 FloatSection {
@@ -335,6 +353,65 @@ impl FloatMenu {
                     ],
                 },
             ],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// MCP manager: rows are `(name, label, detail, enabled)`.
+    ///
+    /// Keep labels coarse — no connection URLs, transports, or raw errors.
+    pub fn mcp_manager(rows: &[(String, String, String, bool)]) -> Self {
+        let mut on_items = Vec::new();
+        let mut off_items = Vec::new();
+        for (id, label, detail, on) in rows {
+            let item = FloatItem {
+                id: id.clone(),
+                label: label.clone(),
+                detail: detail.clone(),
+                hint: if *on {
+                    "on".into()
+                } else {
+                    "off".into()
+                },
+            };
+            if *on {
+                on_items.push(item);
+            } else {
+                off_items.push(item);
+            }
+        }
+        let mut sections = Vec::new();
+        if !on_items.is_empty() {
+            sections.push(FloatSection {
+                title: format!("On ({})", on_items.len()),
+                items: on_items,
+            });
+        }
+        if !off_items.is_empty() {
+            sections.push(FloatSection {
+                title: format!("Off ({})", off_items.len()),
+                items: off_items,
+            });
+        }
+        if sections.is_empty() {
+            sections.push(FloatSection {
+                title: "MCP".into(),
+                items: vec![item(
+                    "_empty",
+                    "(none)",
+                    "add servers with `one mcp add` · Enter toggles",
+                    "",
+                )],
+            });
+        }
+        Self {
+            kind: FloatKind::Mcp,
+            title: "MCP".into(),
+            search: String::new(),
+            sections,
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
@@ -1243,6 +1320,12 @@ fn default_command_sections() -> Vec<FloatSection> {
                     "Manage Skills",
                     "list · enable · disable",
                     "/skills",
+                ),
+                item(
+                    "mcp",
+                    "MCP Servers",
+                    "status · enable · disable",
+                    "/mcp",
                 ),
                 item(
                     "skill",

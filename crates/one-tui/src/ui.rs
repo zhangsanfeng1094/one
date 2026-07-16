@@ -581,6 +581,7 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         | FloatKind::SettingsModelDetail => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Back ",
         FloatKind::SettingsModelAdd => " ↑/↓ Fields  ·  Enter Edit/Save  ·  Esc Back ",
         FloatKind::Skills => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Close ",
+        FloatKind::Mcp => " ↑/↓  ·  Enter on/off  ·  Esc ",
         FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
     };
     base.into()
@@ -1792,6 +1793,14 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Theme::status_faint(),
         ));
     }
+    // Live MCP progress chip (e.g. MCP 4/5…) — coarse, no connection noise.
+    if !app.mcp_chip_text.is_empty() {
+        meta_spans.push(Span::styled("  ", Theme::bg()));
+        meta_spans.push(Span::styled(
+            app.mcp_chip_text.clone(),
+            mcp_chip_style(app.mcp_chip_kind),
+        ));
+    }
     if app.busy {
         meta_spans.push(Span::styled("  running", Theme::status_faint()));
     }
@@ -1800,6 +1809,16 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Paragraph::new(Line::from(meta_spans)).style(Theme::bg()),
         meta_area,
     );
+}
+
+fn mcp_chip_style(kind: u8) -> Style {
+    match kind {
+        1 => Theme::status().fg(Theme::INFO),            // loading
+        2 => Theme::status_faint(),                      // all ok — quiet
+        3 => Theme::status().fg(Theme::WARNING),         // partial
+        4 => Theme::status().fg(Theme::ERROR),           // error
+        _ => Theme::status_faint(),
+    }
 }
 
 /// Terminal columns occupied by `s` (fullwidth / CJK = 2) as u16 for layout.
@@ -2211,7 +2230,14 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         left.extend(pair("esc", " stop  "));
         left.extend(pair("Ctrl+C", "×2 quit  "));
         left.extend(pair("Ctrl+S", " steer"));
-        let right = vec![Span::styled("working  ", Theme::status_faint())];
+        let mut right = Vec::new();
+        if !app.mcp_chip_text.is_empty() {
+            right.push(Span::styled(
+                format!("{}  ", app.mcp_chip_text),
+                mcp_chip_style(app.mcp_chip_kind),
+            ));
+        }
+        right.push(Span::styled("working  ", Theme::status_faint()));
         return (left, right);
     }
 
@@ -2225,6 +2251,13 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     left.extend(pair("?", " help"));
 
     let mut right = Vec::new();
+    // MCP progress on the right (mirrors prompt meta) — always visible when configured.
+    if !app.mcp_chip_text.is_empty() {
+        right.push(Span::styled(
+            format!("{}  ", app.mcp_chip_text),
+            mcp_chip_style(app.mcp_chip_kind),
+        ));
+    }
     if app.thinking_level != "off" {
         // Default is collapsed; only badge when the user opted into full bodies.
         let vis = if app.show_thinking { "·full" } else { "" };

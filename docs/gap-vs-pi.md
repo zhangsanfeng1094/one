@@ -13,7 +13,7 @@
 
 | 维度 | 对齐程度 | 说明 |
 |------|----------|------|
-| 哲学与定位 | ⭐⭐⭐⭐ | 极简核心 + tools + 可扩展；不内置 MCP / 子 agent；**Plan Mode 已内置（Pi 无）** |
+| 哲学与定位 | ⭐⭐⭐⭐ | 极简核心 + tools + 可扩展；**MCP 定为平台基础能力（设计中，未实现）** / 不内置子 agent；**Plan Mode 已内置（Pi 无）** |
 | Agent loop | ⭐⭐⭐⭐ | prompt → LLM → tool → loop；steer / follow-up / abort 已有 |
 | 内置 tools | ⭐⭐⭐⭐⭐ | 7 coding tools + `web_search` / `web_fetch`（Pi 则靠 skill） |
 | Session JSONL 树 | ⭐⭐⭐⭐ | v3 子集 + 迁移 + branch；fork/clone/交互式 tree UI 弱 |
@@ -67,7 +67,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 | HTML export / Gist share | ✅ | ✅ | `--export` / `--share` / `/export` |
 | Session v1/v2 → v3 迁移 | ✅ | ✅ | `one-session::migrate` |
 | 只读模式 | 工具 allowlist | `--read-only` | Pi 用 `--tools` / `--exclude-tools` 更细 |
-| 非目标一致 | 无 MCP / 无子 agent / 无 plan mode | 无 MCP / 无子 agent；**有 Plan Mode** | One 额外做了 bash 沙箱 + 内置 Plan |
+| 非目标一致 | 无 MCP / 无子 agent / 无 plan mode | **MCP 基础能力（设计中）** / 无子 agent；**有 Plan Mode** | One 偏离 Pi：内置 MCP + bash 沙箱 + Plan |
 
 ---
 
@@ -266,11 +266,12 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 5. 安装脚本 + self-update  
 6. 与官方 Pi session 样例的兼容性测试集
 
-### 明确不追（与 Pi 一致）
+### 明确不追 / 已改决策
 
-- 内置 MCP  
-- 内置 sub-agent orchestrator  
-- 内置 plan mode / todo 工具  
+- ~~内置 MCP~~ → **改为平台基础能力**（见 [mcp.md](./mcp.md)）  
+- 内置 sub-agent orchestrator（仍不追，可另开）  
+- ~~内置 plan mode~~ → **已做 MVP**  
+
 
 ---
 

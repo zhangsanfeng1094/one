@@ -87,6 +87,18 @@
 - [ ] 与官方 Pi session 全量兼容性回归测试
 - [ ] 更准的 per-model pricing 表
 
+### MCP（平台基础能力，设计见 [mcp.md](./mcp.md)）
+
+> 产品：与 session / 内置 tools 同级，**不**走 Package/扩展插件路径。  
+> 实现：独立 crate `one-mcp`，runtime 默认装配；`one-core` 不依赖 `rmcp`。
+
+- [x] M1：`one-mcp` + stdio client + `McpTool` + runtime 合并 tools（`rmcp`）
+- [x] M2：`~/.one/agent/mcp.json` + 项目 `.one/mcp.json` + `one mcp list/add/remove/doctor`
+- [x] M3：Streamable HTTP、超时、大输出截断
+- [ ] M4：OAuth / 凭证（按需）
+- [x] Plan mode 不注册 MCP tools（/act 后恢复）
+- [ ] M5：`/reload` 热更新 MCP 连接
+
 ### Package / Suite（设计已写，未排期实现）
 
 > 设计见 [package-suites.md](./package-suites.md)。目标：配置编程包即可编程、配置办公包即可办公；Core 保持领域无关。
@@ -99,10 +111,10 @@
 
 ---
 
-## 非目标（与官方 Pi 保持一致）
+## 非目标
 
-- 不内置 MCP
-- 不内置子 Agent orchestrator
+- 不内置子 Agent orchestrator（与 Pi 一致；可另开需求）
+- ~~不内置 MCP~~ → **已改：MCP 为平台基础能力**（见 [mcp.md](./mcp.md)，实现未开始）
 
 ## Plan Mode（已内置 MVP）
 

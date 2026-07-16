@@ -77,7 +77,7 @@ docs/            设计与使用文档
 | Compaction | ✅ LLM | ✅ LLM + overflow 重试 |
 | Thinking level | ✅ | ✅ `/settings thinking` / `/thinking` · stream · Ctrl+T · multi-provider |
 | TypeScript 扩展 | ✅ | ❌（Rust 扩展） |
-| MCP 内置 | ❌ | ❌ |
+| MCP 内置 | ❌ | ✅ 平台基础能力（`one-mcp` / `rmcp`，见 docs/mcp.md） |
 | Interactive TUI | ✅ 完整 | ✅ 可用（多行/用量 footer） |
 | OAuth 登录 | ✅ | 🔜 计划中 |
 

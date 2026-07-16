@@ -130,6 +130,44 @@ fn refresh_skills_rows(app: &mut App, runtime: &AppRuntime) {
     app.set_skills_rows(rows);
 }
 
+fn refresh_mcp_rows(app: &mut App, runtime: &AppRuntime) {
+    // Keep the panel high-level: name + coarse status only (no source/URL/errors).
+    let rows: Vec<(String, String, String, bool)> = runtime
+        .mcp
+        .server_rows()
+        .into_iter()
+        .map(|r| {
+            let label = r.name.clone();
+            let detail = match r.status.as_str() {
+                "ok" => r.detail, // e.g. "3 tools"
+                "off" => "off".into(),
+                "error" => "unavailable".into(),
+                "…" | "loading" => "starting…".into(),
+                _ => r.detail,
+            };
+            (r.name, label, detail, r.enabled)
+        })
+        .collect();
+    app.set_mcp_rows(rows, runtime.mcp.settings_summary());
+    refresh_mcp_chip(app, runtime);
+}
+
+/// Update the status-bar / prompt-meta chip (`MCP 4/5…`) from live manager state.
+fn refresh_mcp_chip(app: &mut App, runtime: &AppRuntime) {
+    match runtime.mcp.progress_handle().chip() {
+        Some(chip) => {
+            let kind = match chip.kind {
+                one_mcp::McpChipKind::Loading => 1,
+                one_mcp::McpChipKind::Ok => 2,
+                one_mcp::McpChipKind::Partial => 3,
+                one_mcp::McpChipKind::Error => 4,
+            };
+            app.set_mcp_chip(chip.text, kind);
+        }
+        None => app.clear_mcp_chip(),
+    }
+}
+
 async fn apply_config_op(
     runtime: &mut AppRuntime,
     providers: &mut ProviderSet,
@@ -308,6 +346,21 @@ async fn apply_config_op(
                 Err(err) => app.set_notice(format!("skill: {err}")),
             }
         }
+        ConfigOp::McpToggle { name } => {
+            let currently_on = runtime.mcp.is_server_enabled(&name);
+            let new_enabled = !currently_on;
+            match runtime.set_mcp_server_enabled(&name, new_enabled).await {
+                Ok(()) => {
+                    refresh_mcp_rows(app, runtime);
+                    app.set_notice(format!(
+                        "mcp `{name}` → {}",
+                        if new_enabled { "enabled" } else { "disabled" }
+                    ));
+                    app.reopen_mcp_float();
+                }
+                Err(err) => app.set_notice(format!("mcp: {err}")),
+            }
+        }
     }
 }
 
@@ -349,6 +402,7 @@ pub async fn run_interactive(
 
     // Skills: model sees catalog only; force-load via /skill:name is optional.
     refresh_skills_rows(&mut app, runtime);
+    refresh_mcp_rows(&mut app, runtime);
     let visible = runtime.resources.model_visible_skills();
     let total = runtime.resources.all_skills().len();
     let disabled = total.saturating_sub(visible.len());
@@ -435,7 +489,10 @@ pub async fn run_interactive(
 
     loop {
         match terminal
-            .wait_action(&mut app)
+            .wait_action_with(&mut app, |app| {
+                // Live MCP 4/5 chip while servers connect in the background.
+                refresh_mcp_chip(app, runtime);
+            })
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?
         {
@@ -527,6 +584,13 @@ pub async fn run_interactive(
             }
             RunOutcome::SwitchModel { provider, model } => {
                 apply_switch_model(runtime, providers, &mut app, &provider, model).await?;
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            RunOutcome::OpenMcpPanel => {
+                refresh_mcp_rows(&mut app, runtime);
+                app.open_mcp_float();
                 terminal
                     .draw(&mut app)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -680,6 +744,7 @@ async fn run_turn_streaming(
             |app| {
                 drain_events(app, &events);
                 drain_hitl(app, &gate, &hitl);
+                refresh_mcp_chip(app, runtime);
                 if app.take_abort() {
                     cancel_hitl(app, &gate, &hitl);
                     runtime.abort();
@@ -948,7 +1013,12 @@ async fn handle_slash(
             app.messages.clear();
             app.chat_scroll = 0;
             app.set_agent_label(runtime.mode().label());
-            app.set_notice("new session");
+            // MCP pool is kept; tools may still be loading in background.
+            let notice = match runtime.mcp_status_line() {
+                Some(mcp) => format!("new session · {mcp}"),
+                None => "new session".into(),
+            };
+            app.set_notice(notice);
             refresh_usage(app, runtime).await;
             Ok(SlashAction::Consumed)
         }
@@ -1140,6 +1210,63 @@ async fn handle_slash(
                 other => {
                     app.set_notice(format!(
                         "unknown /skills {other} · try: /skills | enable|disable <name> | list"
+                    ));
+                    Ok(SlashAction::Consumed)
+                }
+            }
+        }
+        Some("/mcp") => {
+            refresh_mcp_rows(app, runtime);
+            let sub = parts.get(1).copied().unwrap_or("");
+            match sub {
+                "" | "list" | "status" => {
+                    if matches!(sub, "list" | "status") {
+                        let rows: Vec<(String, String)> = runtime
+                            .mcp
+                            .server_rows()
+                            .into_iter()
+                            .map(|r| {
+                                let status = match r.status.as_str() {
+                                    "ok" => "ok",
+                                    "off" => "off",
+                                    "error" => "error",
+                                    _ => "…",
+                                };
+                                (r.name, status.into())
+                            })
+                            .collect();
+                        if rows.is_empty() {
+                            app.set_notice("no MCP servers · /mcp");
+                        } else {
+                            app.open_info_float("MCP", &rows);
+                        }
+                    } else {
+                        app.open_mcp_float();
+                    }
+                    Ok(SlashAction::Consumed)
+                }
+                "enable" | "on" | "disable" | "off" => {
+                    let name = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
+                    if name.is_empty() {
+                        app.set_notice(format!("usage: /mcp {sub} <server>"));
+                        return Ok(SlashAction::Consumed);
+                    }
+                    let enable = matches!(sub, "enable" | "on");
+                    match runtime.set_mcp_server_enabled(&name, enable).await {
+                        Ok(()) => {
+                            refresh_mcp_rows(app, runtime);
+                            app.set_notice(format!(
+                                "mcp `{name}` → {}",
+                                if enable { "enabled" } else { "disabled" }
+                            ));
+                        }
+                        Err(err) => app.set_notice(format!("mcp: {err}")),
+                    }
+                    Ok(SlashAction::Consumed)
+                }
+                other => {
+                    app.set_notice(format!(
+                        "unknown /mcp {other} · try: /mcp | enable|disable <name> | list"
                     ));
                     Ok(SlashAction::Consumed)
                 }
