@@ -41,6 +41,16 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "switch model (bare = select above input · Ctrl+L)",
     },
     SlashCommand {
+        name: "/login",
+        usage: "/login [provider]",
+        description: "login · bare opens TUI picker (Codex / OpenCode …)",
+    },
+    SlashCommand {
+        name: "/logout",
+        usage: "/logout [provider|all]",
+        description: "logout · bare opens TUI picker of stored creds",
+    },
+    SlashCommand {
         name: "/settings",
         usage: "/settings [key value]",
         description: "settings panel (Ctrl+G) or set key value",

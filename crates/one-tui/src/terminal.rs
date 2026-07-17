@@ -450,6 +450,51 @@ impl TerminalSession {
         self.restore()
     }
 
+    /// Temporarily leave alternate screen + raw mode so the user can use a normal
+    /// terminal (e.g. OAuth login with stdin prompts). Call [`resume`] after.
+    pub fn suspend(&mut self) -> Result<()> {
+        if self.restored {
+            return Ok(());
+        }
+        let backend = self.terminal.backend_mut();
+        if self.mouse_armed || self.mouse_want {
+            let _ = backend.execute(DisableBasicMouse);
+            self.mouse_armed = false;
+        }
+        let _ = backend.execute(DisableAlternateScroll);
+        let _ = backend.execute(crossterm::event::DisableBracketedPaste);
+        let _ = backend.execute(LeaveAlternateScreen);
+        disable_raw_mode()?;
+        let _ = backend.execute(crossterm::cursor::Show);
+        let _ = self.terminal.show_cursor();
+        let _ = io::stdout().flush();
+        // Mark restored so Drop won't double-tear-down if we panic mid-suspend;
+        // resume() clears this flag.
+        self.restored = true;
+        Ok(())
+    }
+
+    /// Re-enter alternate screen after [`suspend`].
+    pub fn resume(&mut self) -> Result<()> {
+        enable_raw_mode()?;
+        let backend = self.terminal.backend_mut();
+        backend.execute(EnterAlternateScreen)?;
+        backend.execute(Clear(ClearType::All))?;
+        apply_input_modes(backend, self.mouse_want)?;
+        self.mouse_armed = self.mouse_want;
+        backend.execute(crossterm::cursor::Hide)?;
+        let _ = backend.flush();
+        self.terminal.clear()?;
+        self.restored = false;
+        self.select_release_at = None;
+        self.left_down = false;
+        // Drop any key/mouse events queued while suspended (login typing, etc.).
+        while event::poll(Duration::from_millis(0)).unwrap_or(false) {
+            let _ = event::read();
+        }
+        Ok(())
+    }
+
     fn restore(&mut self) -> Result<()> {
         if self.restored {
             return Ok(());

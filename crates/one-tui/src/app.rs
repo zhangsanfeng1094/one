@@ -1751,6 +1751,20 @@ impl App {
         self.clear_notice();
     }
 
+    /// `/login` provider picker — rows: `(id, label, detail, logged_in)`.
+    pub fn open_login_float(&mut self, rows: &[(String, String, String, bool)]) {
+        self.close_float();
+        self.float = Some(FloatMenu::login_picker(rows));
+        self.clear_notice();
+    }
+
+    /// `/logout` picker — rows: `(id, label, detail)`.
+    pub fn open_logout_float(&mut self, rows: &[(String, String, String)]) {
+        self.close_float();
+        self.float = Some(FloatMenu::logout_picker(rows));
+        self.clear_notice();
+    }
+
     /// `(id, label, detail, hint)` — id is used for `/resume <id>`.
     pub fn open_sessions_float(&mut self, sessions: &[(String, String, String, String)]) {
         self.float = Some(FloatMenu::sessions_picker(sessions));
@@ -2759,6 +2773,14 @@ impl App {
         // Any other key cancels a pending "press again to quit".
         self.last_ctrl_c_at = None;
 
+        // Help: handle before select/float so one chord always opens the catalog.
+        // Primary is Alt+H (Ctrl chords are often eaten once by IME / terminal).
+        if Self::is_help_key(key) {
+            self.select = None;
+            self.open_help_float();
+            return RunOutcome::Noop;
+        }
+
         // Docked select (model / field edit / ask) captures keys before float.
         if self.select.is_some() {
             if let Some(prompt) = self.select.as_mut() {
@@ -2938,6 +2960,7 @@ impl App {
                 }
                 self.handle_esc()
             }
+            // Help chord is handled early via `is_help_key` (before select/float).
             // `/` inserts into input and shows docked command list (not center float).
             KeyCode::Char('/')
                 if self.input.is_empty()
@@ -2949,15 +2972,6 @@ impl App {
                 self.slash_selected = 0;
                 self.clamp_slash_selection();
                 self.clear_notice();
-                RunOutcome::Noop
-            }
-            // `?` on empty input → help catalog (status strip points here).
-            KeyCode::Char('?')
-                if self.input.is_empty()
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
-            {
-                self.open_help_float();
                 RunOutcome::Noop
             }
             // Empty welcome: `1`–`3` run sample prompts (matches try list).
@@ -2981,7 +2995,9 @@ impl App {
             }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    // Never insert C0 controls (e.g. bare Ctrl+K = 0x0B) into the draft.
+                    && !ch.is_control() =>
             {
                 self.leave_history_browse();
                 self.insert_input_char(ch);
@@ -3054,6 +3070,38 @@ impl App {
             }
             // Some hosts deliver Ctrl+letter as a bare control char.
             KeyCode::Char('\u{06}') => true,
+            _ => false,
+        }
+    }
+
+    /// Help catalog (status strip: `Alt+H help`).
+    ///
+    /// Accepts:
+    /// - **primary** `Alt+H` / `Alt+h` (usually not stolen by IME; works first press)
+    /// - silent fallbacks: `Ctrl+K` (+ legacy VT `0x0B`), `F1`, `Ctrl+/`, `Ctrl+_`, US `0x1F`
+    fn is_help_key(key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('h') | KeyCode::Char('H')
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                true
+            }
+            KeyCode::Char('k') | KeyCode::Char('K')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                true
+            }
+            // ASCII VT — classic Ctrl+K encoding without a CONTROL flag.
+            KeyCode::Char('\u{0b}') => true,
+            KeyCode::F(1) => true,
+            KeyCode::Char('/') | KeyCode::Char('_')
+                if key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                true
+            }
+            KeyCode::Char('\u{1f}') => true,
             _ => false,
         }
     }
@@ -3378,6 +3426,23 @@ impl App {
                 self.close_float();
                 self.input.clear();
                 RunOutcome::Prompt(format!("/thinking {}", entry.item.id))
+            }
+            FloatKind::Login => {
+                if entry.item.id == "_empty" || entry.item.id.is_empty() {
+                    return RunOutcome::Noop;
+                }
+                self.close_float();
+                self.input.clear();
+                // Re-enter slash path with an explicit provider → suspend + login flow.
+                RunOutcome::Prompt(format!("/login {}", entry.item.id))
+            }
+            FloatKind::Logout => {
+                if entry.item.id == "_empty" || entry.item.id.is_empty() {
+                    return RunOutcome::Noop;
+                }
+                self.close_float();
+                self.input.clear();
+                RunOutcome::Prompt(format!("/logout {}", entry.item.id))
             }
             FloatKind::Sessions => {
                 self.close_float();
@@ -3886,6 +3951,17 @@ impl App {
                 self.open_thinking_float();
                 RunOutcome::Noop
             }
+            "login" => {
+                // CLI fills rows then opens float; emit slash so status can be attached.
+                self.close_float();
+                self.input.clear();
+                RunOutcome::Prompt("/login".into())
+            }
+            "logout" => {
+                self.close_float();
+                self.input.clear();
+                RunOutcome::Prompt("/logout".into())
+            }
             "quit" | "exit" => {
                 self.close_float();
                 RunOutcome::Quit
@@ -3956,6 +4032,13 @@ impl App {
         }
         self.last_ctrl_c_at = None;
 
+        // Help works while busy (same chord encodings as idle).
+        if Self::is_help_key(key) {
+            self.select = None;
+            self.open_help_float();
+            return;
+        }
+
         // Docked select (permission / ask_user / model) takes focus over steer / abort.
         if self.select.is_some() {
             if let Some(prompt) = self.select.as_mut() {
@@ -3991,7 +4074,8 @@ impl App {
             }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !ch.is_control() =>
             {
                 self.insert_input_char(ch);
             }
@@ -4817,22 +4901,68 @@ mod tests {
     }
 
     #[test]
-    fn question_mark_on_empty_input_opens_help() {
+    fn alt_h_opens_help_even_with_draft() {
         let mut app = App::new("test");
-        assert!(app.input.is_empty());
-        app.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE));
+        app.input = "draft".into();
+        app.input_cursor = app.input.chars().count();
+        app.handle_key(key(KeyCode::Char('h'), KeyModifiers::ALT));
         assert!(app.float_open());
         assert_eq!(
             app.float.as_ref().map(|f| f.kind),
             Some(crate::float::FloatKind::Help)
         );
-        // With draft text, `?` is a normal character.
-        app.close_float();
-        app.input = "what".into();
-        app.input_cursor = app.input.chars().count();
+        assert_eq!(app.input, "draft", "Alt+H must not mutate the draft");
+    }
+
+    #[test]
+    fn alt_h_uppercase_opens_help() {
+        let mut app = App::new("test");
+        app.handle_key(key(KeyCode::Char('H'), KeyModifiers::ALT));
+        assert!(app.float_open());
+        assert_eq!(
+            app.float.as_ref().map(|f| f.kind),
+            Some(crate::float::FloatKind::Help)
+        );
+    }
+
+    #[test]
+    fn help_fallback_chords_still_open_help() {
+        // Silent fallbacks (still work, not shown on status strip).
+        let cases = [
+            (KeyCode::Char('k'), KeyModifiers::CONTROL),
+            (KeyCode::Char('K'), KeyModifiers::CONTROL),
+            (KeyCode::Char('\u{0b}'), KeyModifiers::NONE),
+            (KeyCode::F(1), KeyModifiers::NONE),
+            (KeyCode::Char('/'), KeyModifiers::CONTROL),
+            (KeyCode::Char('_'), KeyModifiers::CONTROL),
+            (KeyCode::Char('\u{1f}'), KeyModifiers::NONE),
+        ];
+        for (code, mods) in cases {
+            let mut app = App::new("test");
+            app.handle_key(key(code, mods));
+            assert!(app.float_open(), "expected help for {code:?} {mods:?}");
+            assert_eq!(
+                app.float.as_ref().map(|f| f.kind),
+                Some(crate::float::FloatKind::Help)
+            );
+        }
+    }
+
+    #[test]
+    fn question_mark_is_plain_text() {
+        let mut app = App::new("test");
         app.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE));
         assert!(!app.float_open());
-        assert_eq!(app.input, "what?");
+        assert_eq!(app.input, "?");
+    }
+
+    #[test]
+    fn bare_slash_still_opens_slash_menu() {
+        let mut app = App::new("test");
+        app.handle_key(key(KeyCode::Char('/'), KeyModifiers::NONE));
+        assert!(!app.float_open());
+        assert_eq!(app.input, "/");
+        assert!(app.slash_menu_visible());
     }
 
     #[test]

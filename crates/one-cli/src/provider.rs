@@ -1,15 +1,18 @@
 use std::path::PathBuf;
 
 use one_ai::{
-    save_models_file, MockProvider, ModelEntry, ModelRegistry, ModelsConfig, OpenaiWireApi,
-    ProviderApi, ProviderConfig,
+    save_models_file, AuthStorage, MockProvider, ModelEntry, ModelRegistry, ModelsConfig,
+    OpenaiWireApi, ProviderApi, ProviderConfig, PROVIDER_OPENAI_CODEX, PROVIDER_OPENCODE,
+    PROVIDER_OPENCODE_GO, PROVIDER_XAI,
 };
 use one_core::agent::LlmProvider;
 
 #[cfg(feature = "network")]
 use one_ai::OllamaProvider;
 #[cfg(feature = "http-providers")]
-use one_ai::{AnthropicProvider, GeminiProvider, OpenAiProvider, OpenRouterProvider};
+use one_ai::{
+    AnthropicProvider, GeminiProvider, OpenAiCodexProvider, OpenAiProvider, OpenRouterProvider,
+};
 
 use crate::cli::{Cli, OpenaiApi, ProviderKind};
 use crate::preferences;
@@ -62,6 +65,14 @@ impl ProviderSet {
         self.inner.clone()
     }
 
+    /// Reload `models.json` into this set (e.g. after OAuth login seeded Codex models).
+    pub fn reload_models_config(&mut self) {
+        let (models_config, config_warning) = load_config();
+        self.registry = models_config.registry.clone();
+        self.models_config = models_config;
+        self.config_warning = config_warning;
+    }
+
     /// Switch by free-form provider name + optional model.
     /// Accepts built-ins (`openai`) and custom entries from models.json (`opencode`).
     pub fn switch_named(
@@ -80,6 +91,7 @@ impl ProviderSet {
             "ollama" => ProviderKind::Ollama,
             "anthropic" => ProviderKind::Anthropic,
             "openai" => ProviderKind::Openai,
+            "openai-codex" | "codex" | "chatgpt" => ProviderKind::OpenaiCodex,
             "openrouter" => ProviderKind::Openrouter,
             "deepseek" => ProviderKind::Deepseek,
             "gemini" => ProviderKind::Gemini,
@@ -967,6 +979,10 @@ struct Resolved {
     openai_api: OpenaiApi,
     base_url: Option<String>,
     api_key: Option<String>,
+    /// ChatGPT account id for openai-codex OAuth.
+    account_id: Option<String>,
+    /// Auth provenance label (oauth / auth.json / env / --api-key).
+    auth_source: Option<String>,
     /// Fully resolved Pi `compat` for OpenAI-compatible chat/completions.
     openai_compat: one_ai::ResolvedOpenAiCompat,
     /// Anthropic Messages compat (forceAdaptiveThinking, etc.).
@@ -1026,6 +1042,7 @@ fn kind_from_provider_id(provider_id: &str, cfg: &ModelsConfig) -> ProviderKind 
         "ollama" => ProviderKind::Ollama,
         "anthropic" => ProviderKind::Anthropic,
         "openai" => ProviderKind::Openai,
+        "openai-codex" | "codex" | "chatgpt" => ProviderKind::OpenaiCodex,
         "openrouter" => ProviderKind::Openrouter,
         "deepseek" => ProviderKind::Deepseek,
         "gemini" => ProviderKind::Gemini,
@@ -1090,12 +1107,46 @@ fn resolve_settings(cli: &Cli, cfg: &ModelsConfig, provider_id: &str) -> Resolve
         .or_else(|| provider_cfg.and_then(|p| p.base_url.clone()))
         .or_else(|| env_base_url_for(provider_id));
 
-    let api_key = cli
+    let mut api_key = cli
         .api_key
         .clone()
         .or_else(|| model_entry.and_then(|m| m.api_key.clone()))
         .or_else(|| provider_cfg.and_then(|p| p.api_key.clone()))
         .or_else(|| env_api_key_for(provider_id));
+    let mut account_id = None;
+    let mut auth_source = None;
+    let mut base_url = base_url;
+
+    // AuthStorage (`~/.one/agent/auth.json`) — OAuth / stored keys, with refresh.
+    // CLI --api-key already filled above wins over stored credentials.
+    if cli.api_key.is_none() {
+        if let Ok(storage) = AuthStorage::create() {
+            // Normalize aliases so `codex` resolves the same credential as `openai-codex`.
+            let auth_provider = match provider_id {
+                "codex" | "chatgpt" => PROVIDER_OPENAI_CODEX,
+                "zen" | "opencode-zen" => PROVIDER_OPENCODE,
+                "go" => PROVIDER_OPENCODE_GO,
+                "grok" | "supergrok" | "xai-oauth" => PROVIDER_XAI,
+                other => other,
+            };
+            if let Ok(Some(auth)) = storage.resolve_api_key_blocking(auth_provider) {
+                if api_key.is_none() {
+                    api_key = auth.api_key;
+                    auth_source = auth.source;
+                }
+                if base_url.is_none() {
+                    base_url = auth.base_url;
+                }
+                account_id = auth.headers.get("chatgpt-account-id").cloned().or_else(|| {
+                    storage
+                        .get(auth_provider)
+                        .and_then(|c| c.as_oauth().and_then(|o| o.account_id.clone()))
+                });
+            }
+        }
+    } else {
+        auth_source = Some("--api-key".into());
+    }
 
     let base_for_detect = base_url
         .clone()
@@ -1127,6 +1178,8 @@ fn resolve_settings(cli: &Cli, cfg: &ModelsConfig, provider_id: &str) -> Resolve
         openai_api,
         base_url,
         api_key,
+        account_id,
+        auth_source,
         openai_compat,
         anthropic_compat,
         reasoning_model,
@@ -1136,11 +1189,15 @@ fn resolve_settings(cli: &Cli, cfg: &ModelsConfig, provider_id: &str) -> Resolve
 fn default_base_for_detect(provider_id: &str) -> &'static str {
     match provider_id {
         "openai" => "https://api.openai.com/v1",
+        "openai-codex" | "codex" | "chatgpt" => "https://chatgpt.com/backend-api",
         "openrouter" => "https://openrouter.ai/api/v1",
         "deepseek" => "https://api.deepseek.com",
         "ollama" => "http://127.0.0.1:11434/v1",
         "anthropic" => "https://api.anthropic.com",
         "gemini" => "https://generativelanguage.googleapis.com/v1beta",
+        PROVIDER_OPENCODE | "zen" | "opencode-zen" => "https://opencode.ai/zen/v1",
+        PROVIDER_OPENCODE_GO | "go" => "https://opencode.ai/zen/go/v1",
+        PROVIDER_XAI | "grok" | "supergrok" => "https://cli-chat-proxy.grok.com/v1",
         _ => "",
     }
 }
@@ -1160,6 +1217,7 @@ fn provider_id_of(kind: &ProviderKind) -> &'static str {
         ProviderKind::Ollama => "ollama",
         ProviderKind::Anthropic => "anthropic",
         ProviderKind::Openai => "openai",
+        ProviderKind::OpenaiCodex => PROVIDER_OPENAI_CODEX,
         ProviderKind::Openrouter => "openrouter",
         ProviderKind::Deepseek => "deepseek",
         ProviderKind::Gemini => "gemini",
@@ -1172,6 +1230,10 @@ fn default_model_for(provider_id: &str) -> &'static str {
         "ollama" => "llama3.2",
         "anthropic" => "claude-sonnet-4-20250514",
         "openai" => "gpt-4o",
+        "openai-codex" | "codex" | "chatgpt" => one_ai::OPENAI_CODEX_DEFAULT_MODEL,
+        PROVIDER_OPENCODE | "zen" | "opencode-zen" => one_ai::OPENCODE_ZEN_DEFAULT_MODEL,
+        PROVIDER_OPENCODE_GO | "go" => one_ai::OPENCODE_GO_DEFAULT_MODEL,
+        PROVIDER_XAI | "grok" | "supergrok" => one_ai::XAI_DEFAULT_MODEL,
         "openrouter" => "anthropic/claude-sonnet-4",
         "deepseek" => "deepseek-chat",
         "gemini" => "gemini-2.5-flash",
@@ -1182,8 +1244,11 @@ fn default_model_for(provider_id: &str) -> &'static str {
 fn default_wire_for(provider_id: &str) -> OpenaiApi {
     match provider_id {
         "openai" => OpenaiApi::Responses,
+        "openai-codex" | "codex" | "chatgpt" => OpenaiApi::Responses,
         "anthropic" => OpenaiApi::AnthropicMessages,
         "gemini" => OpenaiApi::GeminiGenerateContent,
+        PROVIDER_XAI | "grok" | "supergrok" => OpenaiApi::Responses,
+        PROVIDER_OPENCODE | PROVIDER_OPENCODE_GO | "zen" | "go" => OpenaiApi::Completions,
         _ => OpenaiApi::Completions,
     }
 }
@@ -1208,6 +1273,11 @@ fn env_base_url_for(provider_id: &str) -> Option<String> {
         "gemini" => std::env::var("GEMINI_BASE_URL").ok().or_else(|| {
             Some("https://generativelanguage.googleapis.com/v1beta".into())
         }),
+        PROVIDER_OPENCODE | "zen" | "opencode-zen" => Some("https://opencode.ai/zen/v1".into()),
+        PROVIDER_OPENCODE_GO | "go" => Some("https://opencode.ai/zen/go/v1".into()),
+        PROVIDER_XAI | "grok" | "supergrok" => {
+            Some("https://cli-chat-proxy.grok.com/v1".into())
+        }
         _ => None,
     }
 }
@@ -1222,6 +1292,12 @@ fn env_api_key_for(provider_id: &str) -> Option<String> {
             .ok()
             .or_else(|| std::env::var("GOOGLE_API_KEY").ok()),
         "ollama" => Some("ollama".into()),
+        PROVIDER_OPENCODE | PROVIDER_OPENCODE_GO | "zen" | "go" => std::env::var("OPENCODE_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("OPENCODE_ZEN_API_KEY").ok()),
+        PROVIDER_XAI | "grok" | "supergrok" => std::env::var("XAI_API_KEY")
+            .ok()
+            .or_else(|| std::env::var("XAI_OAUTH_TOKEN").ok()),
         _ => None,
     }
 }
@@ -1468,6 +1544,34 @@ fn build_provider_llm(
         }
     }
 
+    // OpenAI Codex (ChatGPT OAuth subscription).
+    if provider_id == PROVIDER_OPENAI_CODEX
+        || provider_id == "codex"
+        || provider_id == "chatgpt"
+    {
+        #[cfg(feature = "http-providers")]
+        {
+            let key = resolved.api_key.clone().ok_or_else(|| {
+                "openai-codex: not logged in · run `one login` (or /login in TUI)".to_string()
+            })?;
+            let account = resolved.account_id.clone().unwrap_or_default();
+            let base = resolved
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://chatgpt.com/backend-api".into());
+            return Ok(std::sync::Arc::new(OpenAiCodexProvider::with_base(
+                key,
+                &resolved.model,
+                account,
+                base,
+            )));
+        }
+        #[cfg(not(feature = "http-providers"))]
+        {
+            return Err("openai-codex requires --features http-providers".into());
+        }
+    }
+
     // Anthropic Messages protocol — built-in `anthropic` or any custom id with api=anthropic-messages.
     if api == ProviderApi::AnthropicMessages || provider_id == "anthropic" {
         #[cfg(feature = "http-providers")]
@@ -1475,6 +1579,14 @@ fn build_provider_llm(
             let key = resolved.api_key.clone().ok_or_else(|| {
                 if provider_id == "anthropic" {
                     "ANTHROPIC_API_KEY is not set (or pass --api-key)".to_string()
+                } else if matches!(
+                    provider_id,
+                    PROVIDER_OPENCODE | PROVIDER_OPENCODE_GO | "zen" | "go"
+                ) {
+                    format!(
+                        "{provider_id}: not logged in · run `one login {provider_id}` \
+                         (or set OPENCODE_API_KEY)"
+                    )
                 } else {
                     format!(
                         "API key missing for provider `{provider_id}` \
@@ -1533,10 +1645,25 @@ fn build_provider_llm(
     #[cfg(feature = "http-providers")]
     {
         let key = resolved.api_key.clone().ok_or_else(|| {
-            format!(
-                "API key missing for provider `{provider_id}` \
-                 (set models.json apiKey / --api-key / env)"
-            )
+            if matches!(
+                provider_id,
+                PROVIDER_OPENCODE | PROVIDER_OPENCODE_GO | "zen" | "go"
+            ) {
+                format!(
+                    "{provider_id}: not logged in · run `one login {provider_id}` \
+                     (or set OPENCODE_API_KEY)"
+                )
+            } else if matches!(provider_id, PROVIDER_XAI | "grok" | "supergrok") {
+                format!(
+                    "{provider_id}: not logged in · run `one login xai` \
+                     (or set XAI_API_KEY)"
+                )
+            } else {
+                format!(
+                    "API key missing for provider `{provider_id}` \
+                     (set models.json apiKey / --api-key / env)"
+                )
+            }
         })?;
         let base = resolved.base_url.clone().ok_or_else(|| {
             format!(
@@ -1551,12 +1678,21 @@ fn build_provider_llm(
                 unreachable!("handled above")
             }
         };
+        let mut extra = std::collections::BTreeMap::new();
+        if matches!(provider_id, PROVIDER_XAI | "grok" | "supergrok")
+            || base.contains("cli-chat-proxy.grok.com")
+            || base.contains("api.x.ai")
+        {
+            extra = one_ai::auth::xai_cli_headers();
+            extra.insert("x-grok-model-override".into(), resolved.model.clone());
+        }
         Ok(std::sync::Arc::new(
             OpenAiProvider::with_base(key, &resolved.model, base)
                 .with_wire_api(wire)
                 .with_provider_id(provider_id)
                 .with_compat(resolved.openai_compat.clone())
-                .with_reasoning_model(resolved.reasoning_model),
+                .with_reasoning_model(resolved.reasoning_model)
+                .with_extra_headers(extra),
         ))
     }
     #[cfg(not(feature = "http-providers"))]

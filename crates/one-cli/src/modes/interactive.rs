@@ -429,6 +429,8 @@ enum SlashAction {
     Consumed,
     /// Run a full agent turn with this text as the user prompt.
     Prompt(String),
+    /// OAuth login/logout — needs TerminalSession suspend (see main loop).
+    LoginLogout { is_login: bool, args: Vec<String> },
 }
 
 pub async fn run_interactive(
@@ -573,6 +575,24 @@ pub async fn run_interactive(
                         }
                     }
                     SlashAction::Consumed => {
+                        refresh_usage(&mut app, runtime).await;
+                        terminal
+                            .draw(&mut app)
+                            .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                    }
+                    SlashAction::LoginLogout { is_login, args } => {
+                        if is_login {
+                            handle_login_slash(
+                                runtime,
+                                providers,
+                                &mut app,
+                                &mut terminal,
+                                &args,
+                            )
+                            .await?;
+                        } else {
+                            handle_logout_slash(providers, &mut app, &args).await?;
+                        }
                         refresh_usage(&mut app, runtime).await;
                         terminal
                             .draw(&mut app)
@@ -1447,6 +1467,30 @@ async fn handle_slash(
             apply_switch_model(runtime, providers, app, &provider_name, model).await?;
             Ok(SlashAction::Consumed)
         }
+        Some("/login") => {
+            let args: Vec<String> = parts.iter().skip(1).map(|s| (*s).to_string()).collect();
+            // Bare `/login` (or only flags) → TUI float picker. With provider id → suspend login.
+            let has_provider = args.iter().any(|a| !a.starts_with('-'));
+            if !has_provider {
+                app.open_login_float(&login_provider_rows());
+                return Ok(SlashAction::Consumed);
+            }
+            Ok(SlashAction::LoginLogout {
+                is_login: true,
+                args,
+            })
+        }
+        Some("/logout") => {
+            let args: Vec<String> = parts.iter().skip(1).map(|s| (*s).to_string()).collect();
+            if args.is_empty() {
+                app.open_logout_float(&logout_provider_rows());
+                return Ok(SlashAction::Consumed);
+            }
+            Ok(SlashAction::LoginLogout {
+                is_login: false,
+                args,
+            })
+        }
         Some("/thinking") => {
             if parts.get(1).is_none() {
                 // Bare /thinking → secondary level picker float.
@@ -1662,4 +1706,178 @@ fn rebuild_tui_from_agent(app: &mut App, messages: &[AgentMessage]) {
             _ => {}
         }
     }
+}
+
+/// Rows for TUI login float: `(id, label, detail, logged_in)`.
+fn login_provider_rows() -> Vec<(String, String, String, bool)> {
+    let storage = one_ai::AuthStorage::create().ok();
+    one_ai::oauth_provider_catalog()
+        .iter()
+        .map(|p| {
+            let logged_in = storage
+                .as_ref()
+                .map(|s| s.has_auth(p.id))
+                .unwrap_or(false);
+            (
+                p.id.to_string(),
+                p.name.to_string(),
+                p.description.to_string(),
+                logged_in,
+            )
+        })
+        .collect()
+}
+
+/// Rows for TUI logout float: `(id, label, detail)`.
+fn logout_provider_rows() -> Vec<(String, String, String)> {
+    let Ok(storage) = one_ai::AuthStorage::create() else {
+        return Vec::new();
+    };
+    storage
+        .list()
+        .into_iter()
+        .map(|id| {
+            let status = storage.get_auth_status(&id);
+            let kind = status.label.unwrap_or_else(|| "stored".into());
+            let name = one_ai::oauth_provider_catalog()
+                .iter()
+                .find(|p| p.id == id)
+                .map(|p| p.name.to_string())
+                .unwrap_or_else(|| id.clone());
+            (id, name, format!("type={kind}"))
+        })
+        .collect()
+}
+
+async fn handle_login_slash(
+    runtime: &mut AppRuntime,
+    providers: &mut ProviderSet,
+    app: &mut App,
+    terminal: &mut TerminalSession,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut prefer_device = false;
+    let mut prefer_browser = false;
+    // None → interactive catalog picker (Codex / OpenCode Zen / Go …).
+    let mut provider: Option<String> = None;
+    for p in args {
+        match p.as_str() {
+            "--device-code" | "device" | "device-code" => prefer_device = true,
+            "--browser" | "browser" => prefer_browser = true,
+            "openai-codex" | "codex" | "chatgpt" => {
+                provider = Some(one_ai::PROVIDER_OPENAI_CODEX.to_string());
+            }
+            "opencode" | "zen" | "opencode-zen" => {
+                provider = Some(one_ai::PROVIDER_OPENCODE.to_string());
+            }
+            "opencode-go" | "go" => {
+                provider = Some(one_ai::PROVIDER_OPENCODE_GO.to_string());
+            }
+            "xai" | "grok" | "supergrok" | "xai-oauth" => {
+                provider = Some(one_ai::PROVIDER_XAI.to_string());
+            }
+            other if !other.starts_with('-') => provider = Some(other.to_string()),
+            _ => {}
+        }
+    }
+
+    // Suspend TUI: OAuth / API-key paste need a normal terminal.
+    // Running login inside the alternate screen freezes the UI (no redraw / input).
+    terminal
+        .suspend()
+        .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+
+    eprintln!();
+    eprintln!("── one login ──────────────────────────────────────────");
+    eprintln!("  Suspended TUI for login. Complete the flow below.");
+    if let Some(ref p) = provider {
+        eprintln!("  Provider: {p}");
+    } else {
+        eprintln!("  Provider: (pick from list)");
+    }
+    eprintln!("───────────────────────────────────────────────────────");
+    eprintln!();
+
+    let login = crate::cli::LoginCli {
+        provider,
+        device_code: prefer_device,
+        browser: prefer_browser,
+    };
+    let login_result = crate::auth_cmd::run_login(login).await;
+
+    // Always resume TUI, even on failure.
+    if let Err(e) = terminal.resume() {
+        if let Err(login_err) = &login_result {
+            eprintln!("login also failed: {login_err}");
+        }
+        return Err(format!("failed to resume TUI after login: {e}").into());
+    }
+
+    match login_result {
+        Ok(provider) => {
+            // run_login already seeded models.json; reload in-memory catalog.
+            providers.reload_models_config();
+            refresh_model_catalog(app, providers);
+            let default = match provider.as_str() {
+                one_ai::PROVIDER_OPENCODE => one_ai::OPENCODE_ZEN_DEFAULT_MODEL,
+                one_ai::PROVIDER_OPENCODE_GO => one_ai::OPENCODE_GO_DEFAULT_MODEL,
+                one_ai::PROVIDER_XAI => one_ai::XAI_DEFAULT_MODEL,
+                _ => one_ai::OPENAI_CODEX_DEFAULT_MODEL,
+            };
+            apply_switch_model(
+                runtime,
+                providers,
+                app,
+                &provider,
+                Some(default.to_string()),
+            )
+            .await?;
+            app.set_notice(format!(
+                "✓ logged in · {} / {}",
+                providers.provider_id,
+                providers.as_llm().model()
+            ));
+        }
+        Err(e) => {
+            app.set_notice(format!("login failed: {e}"));
+        }
+    }
+    Ok(())
+}
+
+async fn handle_logout_slash(
+    _providers: &mut ProviderSet,
+    app: &mut App,
+    args: &[String],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let storage = one_ai::AuthStorage::create()?;
+    let arg = args
+        .first()
+        .map(|s| s.as_str())
+        .unwrap_or(one_ai::PROVIDER_OPENAI_CODEX);
+    if arg == "all" {
+        let list = storage.list();
+        if list.is_empty() {
+            app.set_notice("no stored credentials");
+            return Ok(());
+        }
+        for p in list {
+            let _ = storage.logout(&p);
+        }
+        app.set_notice("logged out all providers");
+        return Ok(());
+    }
+    let provider = match arg {
+        "codex" | "chatgpt" | "openai-codex" => one_ai::PROVIDER_OPENAI_CODEX,
+        "zen" | "opencode-zen" => one_ai::PROVIDER_OPENCODE,
+        "go" => one_ai::PROVIDER_OPENCODE_GO,
+        "grok" | "supergrok" | "xai-oauth" => one_ai::PROVIDER_XAI,
+        other => other,
+    };
+    if storage.logout(provider)? {
+        app.set_notice(format!("logged out `{provider}`"));
+    } else {
+        app.set_notice(format!("no credential for `{provider}`"));
+    }
+    Ok(())
 }

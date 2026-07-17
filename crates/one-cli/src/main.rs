@@ -1,4 +1,5 @@
 mod approval;
+mod auth_cmd;
 mod cli;
 mod hitl;
 mod mcp_cmd;
@@ -58,6 +59,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     if let Some(Commands::Mcp(mcp)) = cli.command {
         return mcp_cmd::run_mcp(mcp).await;
+    }
+    if let Some(Commands::Login(login)) = cli.command {
+        auth_cmd::run_login(login).await?;
+        return Ok(());
+    }
+    if let Some(Commands::Logout(logout)) = cli.command {
+        return auth_cmd::run_logout(logout).await;
     }
 
     if cli.list_providers {

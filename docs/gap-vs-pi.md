@@ -77,7 +77,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 
 | 差距 | 官方 Pi | One 现状 | 影响 |
 |------|---------|----------|------|
-| **OAuth 订阅登录** | `/login`：Claude Pro/Max、ChatGPT、Copilot | 仅 API key | 大量用户无法「开箱即用」 |
+| **OAuth 订阅登录** | `/login`：Claude Pro/Max、ChatGPT、Copilot | ✅ Codex OAuth + OpenCode Zen/Go key（`one login opencode-go`）；Claude/Copilot 待做 | OpenCode 官方为控制台 key，非第三方 OAuth client |
 | **Provider 覆盖** | 30+ 内置（Gemini、Bedrock、Azure、xAI、Groq、DeepSeek、MiniMax…） | mock / anthropic / openai / ollama / openrouter | 非 OpenRouter 路径要自己拼 models.json |
 | **TUI 编辑器** | 多行、Shift+Enter、`@` 文件模糊搜索、Tab 路径补全、Ctrl+G 外部编辑器、图片粘贴 | 多行 + `@`/Tab 路径 + 图片粘贴（路径/data-URI/**剪贴板位图 Ctrl+V**） | 质感接近；OAuth/footer 仍差 |
 | **Footer / 用量** | token↑↓、cache R/W、cost、context %、model、cwd | 基础状态条 | 无法判断上下文压力与费用 |
@@ -153,7 +153,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 | `/export` | ✅ | ✅ |
 | `/reload` | ✅ 资源全量 | ✅ 扩展热重载 |
 | `/quit` | ✅ | ✅ |
-| `/login` `/logout` | ✅ | ❌ |
+| `/login` `/logout` | ✅ | ✅ Codex（Anthropic/Copilot 待） |
 | `/settings` | ✅ | ❌ |
 | `/scoped-models` | ✅ | ❌ |
 | `/resume` `/new` `/name` `/session` | ✅ | ❌（`-n` CLI 有） |
@@ -176,7 +176,7 @@ RPC/SDK  ██░░░░░░░░░░░░░░░░░░  10%
 | Ollama | ✅ | ✅（network feature） |
 | OpenRouter | ✅ | ✅（http-providers） |
 | Google / Vertex / Bedrock / Azure | ✅ | ❌（可经 OpenRouter 或自建 OpenAI 兼容） |
-| OAuth（Claude / Codex / Copilot） | ✅ | ❌ |
+| OAuth（Claude / Codex / Copilot / OpenCode） | ✅ | 🟨 Codex ✅ · OpenCode Zen/Go ✅ · Claude/Copilot 待 |
 | Thinking / reasoning blocks | ✅ 完整 | ✅ level + stream + UI + multi-provider wire |
 | Token / cost 统计 | ✅ | ❌ |
 | 跨 provider 上下文 handoff | ✅ | 未做专项 |

@@ -565,6 +565,8 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         FloatKind::Tree => " ↑/↓ Navigate  ·  Enter Branch  ·  Esc Back ",
         FloatKind::Rewind => " ↑/↓ Navigate  ·  Enter Edit  ·  Esc Back ",
         FloatKind::Thinking => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Back ",
+        FloatKind::Login => " ↑/↓ Navigate  ·  Enter Login  ·  Esc Close ",
+        FloatKind::Logout => " ↑/↓ Navigate  ·  Enter Logout  ·  Esc Close ",
         FloatKind::Help => " ↑/↓ Navigate  ·  Enter Open  ·  Esc Back ",
         FloatKind::Models => " ↑/↓ Navigate  ·  Enter Switch  ·  Esc Back ",
         FloatKind::Settings => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
@@ -1717,7 +1719,7 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Theme::prompt_bar()
     };
 
-    // Keep placeholder quiet — keybindings live on the sparse status strip / `?` help.
+    // Keep placeholder quiet — keybindings live on the sparse status strip / Alt+H help.
     let placeholder = if app.busy {
         "steer or follow-up…"
     } else {
@@ -2213,7 +2215,7 @@ mod tests {
             "meta must not dump api/host or middle-dot soup: {meta_row}"
         );
 
-        // Status: sparse core keys only (full catalog via `?` help).
+        // Status: sparse core keys only (full catalog via Alt+H help).
         assert!(
             status_row.contains("Ctrl+G") || status_row.contains("settings"),
             "settings key: {status_row}"
@@ -2223,7 +2225,7 @@ mod tests {
             "model key: {status_row}"
         );
         assert!(
-            status_row.contains('?') || status_row.contains("help"),
+            status_row.contains("Alt+H") || status_row.contains("help"),
             "help key: {status_row}"
         );
         assert!(
@@ -2302,14 +2304,14 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         return (left, right);
     }
 
-    // Idle: core chrome only — full catalog is `?` help float.
-    // Unified Ctrl+ notation (matches tips / help float; never mix with ^).
+    // Idle: core chrome only — full catalog is Alt+H help float.
+    // Unified Ctrl+/Alt+ notation (matches tips / help float; never mix with ^).
     let mut left = vec![Span::raw("  ")];
     left.extend(pair("Ctrl+G", " settings"));
     left.push(Span::styled("  │  ", Theme::status_faint()));
     left.extend(pair("Ctrl+L", " model"));
     left.push(Span::styled("  │  ", Theme::status_faint()));
-    left.extend(pair("?", " help"));
+    left.extend(pair("Alt+H", " help"));
 
     let mut right = Vec::new();
     // MCP progress on the right (mirrors prompt meta) — always visible when configured.

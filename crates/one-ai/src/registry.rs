@@ -184,7 +184,10 @@ impl ModelRegistry {
                     thinking_level_map: None,
                     compat: None,
                 },
-            ],
+            ]
+            .into_iter()
+            .chain(crate::openai_codex_models::openai_codex_model_entries())
+            .collect(),
         }
     }
 
@@ -194,6 +197,26 @@ impl ModelRegistry {
             ("mock", "Mock (offline)", "—"),
             ("anthropic", "Anthropic Messages", "ANTHROPIC_API_KEY"),
             ("openai", "OpenAI Responses/Completions", "OPENAI_API_KEY"),
+            (
+                "openai-codex",
+                "ChatGPT Codex (OAuth)",
+                "/login · auth.json",
+            ),
+            (
+                "opencode",
+                "OpenCode Zen",
+                "OPENCODE_API_KEY /login opencode",
+            ),
+            (
+                "opencode-go",
+                "OpenCode Go (subscription)",
+                "OPENCODE_API_KEY /login opencode-go",
+            ),
+            (
+                "xai",
+                "xAI Grok (SuperGrok OAuth)",
+                "XAI_API_KEY /login xai",
+            ),
             ("ollama", "Ollama local", "—"),
             ("openrouter", "OpenRouter", "OPENROUTER_API_KEY"),
             ("deepseek", "DeepSeek (OpenAI-compat)", "DEEPSEEK_API_KEY"),

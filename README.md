@@ -81,7 +81,7 @@ docs/            架构活文档与专题设计
 | TypeScript 扩展 | ✅ | ❌（Rust 扩展） |
 | MCP 内置 | ❌ | ✅ 平台基础能力（`one-mcp` / `rmcp`，见 docs/mcp.md） |
 | Interactive TUI | ✅ 完整 | ✅ 可用（多行/用量 footer） |
-| OAuth 登录 | ✅ | 🔜 计划中 |
+| OAuth 登录 | ✅ | ✅ Codex OAuth + OpenCode Zen/Go 订阅 key（`one login` / `/login`） |
 
 更细的差距分析见 [docs/gap-vs-pi.md](docs/gap-vs-pi.md)。
 

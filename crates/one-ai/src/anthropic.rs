@@ -108,6 +108,13 @@ mod inner {
                 .post(self.messages_url())
                 .header("x-api-key", &self.api_key)
                 .header("anthropic-version", "2023-06-01");
+            // OpenCode Zen/Go Messages path accepts x-api-key; also send Bearer + client tags.
+            if self.base_url.contains("opencode.ai") {
+                req = req
+                    .bearer_auth(&self.api_key)
+                    .header("x-opencode-client", "one")
+                    .header("x-opencode-session", &self.session_id);
+            }
             // Legacy fine-grained tool streaming when eager tool input is unsupported.
             if !self.compat.supports_eager_tool_input_streaming && !request.tools.is_empty() {
                 req = req.header(

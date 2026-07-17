@@ -10,6 +10,9 @@ pub enum ProviderKind {
     Ollama,
     Anthropic,
     Openai,
+    /// ChatGPT Plus/Pro subscription via OAuth (`/login`).
+    #[value(name = "openai-codex", alias = "codex", alias = "chatgpt")]
+    OpenaiCodex,
     Openrouter,
     Deepseek,
     Gemini,
@@ -171,4 +174,36 @@ pub struct Cli {
 pub enum Commands {
     /// Manage MCP servers (list / add / remove / doctor)
     Mcp(McpCli),
+    /// Subscription / OAuth login (Codex, OpenCode Zen/Go, …)
+    Login(LoginCli),
+    /// Clear stored OAuth / API credentials
+    Logout(LogoutCli),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct LoginCli {
+    /// Provider id: `openai-codex` | `opencode` | `opencode-go`
+    /// (aliases: codex, chatgpt, zen, go).
+    /// Omit to pick interactively from the catalog.
+    #[arg(value_name = "PROVIDER")]
+    pub provider: Option<String>,
+
+    /// Codex only: device-code flow (headless / remote).
+    #[arg(long = "device-code")]
+    pub device_code: bool,
+
+    /// Codex only: force browser PKCE flow (skip method prompt).
+    #[arg(long = "browser")]
+    pub browser: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct LogoutCli {
+    /// Provider id to clear. Default: openai-codex.
+    #[arg(default_value = "openai-codex")]
+    pub provider: String,
+
+    /// Remove all stored credentials.
+    #[arg(long)]
+    pub all: bool,
 }

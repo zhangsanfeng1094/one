@@ -80,6 +80,10 @@ pub enum FloatKind {
     Mcp,
     /// Import MCP servers from Claude / Codex / Cursor.
     McpImport,
+    /// Subscription / OAuth login provider picker (`/login`).
+    Login,
+    /// Logout provider picker (`/logout`).
+    Logout,
     /// Generic custom list.
     Custom,
 }
@@ -134,6 +138,79 @@ impl FloatMenu {
     /// `/help` — browse commands; confirm drills into secondary UI or runs.
     pub fn help_menu() -> Self {
         Self::with_sections(FloatKind::Help, "Help", default_command_sections())
+    }
+
+    /// `/login` — pick Codex / OpenCode Zen / Go (etc.) inside the TUI.
+    ///
+    /// Each row: `(id, label, detail, logged_in)`.
+    pub fn login_picker(rows: &[(String, String, String, bool)]) -> Self {
+        let items = if rows.is_empty() {
+            vec![item(
+                "_empty",
+                "(no providers)",
+                "catalog empty",
+                "",
+            )]
+        } else {
+            rows.iter()
+                .map(|(id, label, detail, logged_in)| {
+                    let hint = if *logged_in { "signed in" } else { "sign in" };
+                    FloatItem {
+                        id: id.clone(),
+                        label: label.clone(),
+                        detail: detail.clone(),
+                        hint: hint.into(),
+                        style: if *logged_in {
+                            FloatItemStyle::Normal
+                        } else {
+                            FloatItemStyle::Action
+                        },
+                    }
+                })
+                .collect()
+        };
+        Self::with_sections(
+            FloatKind::Login,
+            "Login · select provider",
+            vec![FloatSection {
+                title: "Subscription / OAuth".into(),
+                items,
+            }],
+        )
+    }
+
+    /// `/logout` — pick a stored credential (or all).
+    ///
+    /// Each row: `(id, label, detail)`.
+    pub fn logout_picker(rows: &[(String, String, String)]) -> Self {
+        let mut items: Vec<FloatItem> = rows
+            .iter()
+            .map(|(id, label, detail)| FloatItem {
+                id: id.clone(),
+                label: label.clone(),
+                detail: detail.clone(),
+                hint: "logout".into(),
+                style: FloatItemStyle::Normal,
+            })
+            .collect();
+        if items.is_empty() {
+            items.push(item("_empty", "(no credentials)", "nothing stored", ""));
+        } else {
+            items.push(action_item(
+                "all",
+                "Log out all",
+                "clear every entry in auth.json",
+                "all",
+            ));
+        }
+        Self::with_sections(
+            FloatKind::Logout,
+            "Logout · select provider",
+            vec![FloatSection {
+                title: "Stored credentials".into(),
+                items,
+            }],
+        )
     }
 
     /// `/thinking` level picker.
@@ -1423,6 +1500,23 @@ fn default_command_sections() -> Vec<FloatSection> {
                     "Reload",
                     "extensions · skills · prompts",
                     "/reload",
+                ),
+            ],
+        },
+        FloatSection {
+            title: "Account".into(),
+            items: vec![
+                item(
+                    "login",
+                    "Login",
+                    "Codex · OpenCode Zen / Go",
+                    "/login",
+                ),
+                item(
+                    "logout",
+                    "Logout",
+                    "clear stored credentials",
+                    "/logout",
                 ),
             ],
         },

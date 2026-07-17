@@ -30,6 +30,7 @@ one-tui = { path = "crates/one-tui" }
 
 async-trait = "0.1"
 base64 = "0.22"
+sha2 = "0.10"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 crossterm = "0.28"

@@ -188,6 +188,8 @@ mod inner {
         reasoning_model: bool,
         /// Sticky session id for providers that honor affinity headers.
         session_id: String,
+        /// Extra request headers (e.g. xAI Grok CLI identity).
+        extra_headers: std::collections::BTreeMap<String, String>,
     }
 
     impl OpenAiProvider {
@@ -236,6 +238,7 @@ mod inner {
                 compat,
                 reasoning_model: false,
                 session_id: crate::cache::new_session_affinity_id(),
+                extra_headers: std::collections::BTreeMap::new(),
             }
         }
 
@@ -244,6 +247,32 @@ mod inner {
             req: reqwest::RequestBuilder,
         ) -> reqwest::RequestBuilder {
             let mut req = req.bearer_auth(&self.api_key);
+            // OpenCode Zen/Go attribution (Pi sends x-opencode-client / session).
+            if self.provider_id == "opencode"
+                || self.provider_id == "opencode-go"
+                || self.base_url.contains("opencode.ai")
+            {
+                req = req
+                    .header("x-opencode-client", "one")
+                    .header("x-opencode-session", &self.session_id);
+            }
+            // xAI SuperGrok subscription proxy (Grok CLI identity).
+            if self.provider_id == "xai"
+                || self.provider_id == "grok"
+                || self.base_url.contains("cli-chat-proxy.grok.com")
+                || self.base_url.contains("api.x.ai")
+            {
+                if self.extra_headers.is_empty() {
+                    for (k, v) in crate::auth::xai_cli_headers() {
+                        req = req.header(k, v);
+                    }
+                    // Per-model cluster routing on the CLI proxy.
+                    req = req.header("x-grok-model-override", &self.model);
+                }
+            }
+            for (k, v) in &self.extra_headers {
+                req = req.header(k, v);
+            }
             if self.compat.send_session_affinity_headers {
                 use crate::compat::SessionAffinityFormat;
                 let header = match self.compat.session_affinity_format.unwrap_or_default() {
@@ -255,6 +284,15 @@ mod inner {
                 req = req.header(header, &self.session_id);
             }
             req
+        }
+
+        /// Attach extra request headers (e.g. from OAuth ModelAuth).
+        pub fn with_extra_headers(
+            mut self,
+            headers: std::collections::BTreeMap<String, String>,
+        ) -> Self {
+            self.extra_headers = headers;
+            self
         }
 
         pub fn with_wire_api(mut self, wire_api: OpenaiWireApi) -> Self {

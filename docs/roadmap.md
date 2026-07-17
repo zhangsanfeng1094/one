@@ -82,7 +82,10 @@
 
 ## 待完善 / 非阻塞 🔜
 
-- [ ] OAuth subscription 登录（Pi 官方订阅模式）
+- [x] OAuth subscription 登录 — **OpenAI Codex**（`one login` / `/login` · `~/.one/agent/auth.json`）
+- [x] OpenCode 订阅登录 — **Zen / Go**（`one login opencode` · `one login opencode-go` · API key + models seed）
+- [x] OAuth：**xAI Grok** SuperGrok（`one login xai` · browser PKCE / device code · cli-chat-proxy）
+- [ ] OAuth：Anthropic Claude Pro/Max、GitHub Copilot
 - [ ] TS 扩展兼容层（QuickJS / WASM 评估）
 - [ ] self-update 命令
 - [ ] 性能基准套件

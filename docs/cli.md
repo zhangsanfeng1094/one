@@ -20,7 +20,24 @@ one --export out.html        # 导出 session 为 HTML
 one --share                  # 上传 session 到 GitHub Gist（需 GITHUB_TOKEN）
 one --list-models            # 列出可用模型
 one --list-providers         # 列出内置 + models.json 自定义 provider
+
+# 订阅登录
+one login                    # 交互选择：Codex / xAI Grok / OpenCode …
+one login openai-codex       # ChatGPT Plus/Pro OAuth
+one login xai                # SuperGrok / X Premium+ OAuth（别名 grok）
+one login xai --browser      # 仅浏览器 PKCE（localhost:56121）
+one login xai --device-code  # 无头 device code
+one login opencode           # OpenCode Zen（控制台 API key）
+one login opencode-go        # OpenCode Go 订阅（可 import CLI auth.json）
+one logout opencode-go
+one logout --all
+one --provider openai-codex -p "hello"
+one --provider opencode-go --model deepseek-v4-flash -p "hello"
 ```
+
+凭证存 `~/.one/agent/auth.json`（`0600`）。Codex OAuth 过期自动 refresh。OpenCode 与 `OPENCODE_API_KEY` 共用。
+
+交互模式：`/login`（弹出选择）· `/login opencode-go` · `/logout` · `/model opencode-go:deepseek-v4-flash`
 
 ## 权限与路径沙箱
 
@@ -543,6 +560,7 @@ cargo run -p one-cli --features http-providers -- --provider openai -m gpt-4o
 - `↑` / `↓` 或 `Ctrl+P` / `Ctrl+N`：切换之前提交过的提示词（**按项目持久化**，新 session / 重启进程仍可召回；来自 `~/.one/agent/sessions/--cwd--/prompt_history.jsonl`，首次会从历史 session 的用户消息播种）
 - `Esc`：输入非空时**立刻**清空草稿并记入 ↑ 历史；输入为空时再按一次 `Esc`（约 0.9s 内）打开 **当前 session** 的 rewind 菜单（conversation-only，不含代码 checkpoint）
 - `/`：输入框**上方**命令列表（边打边筛 · ↑↓ 选择 · Enter 执行；同 Claude Code）
+- `Alt+H`：打开 Help 目录（同 `/help`；有草稿也能开；`Ctrl+K` / `F1` / `Ctrl+/` 仍兼容）
 - `Ctrl+L`：模型 select（输入框上方）
 - `Ctrl+G`：Settings 居中面板
 - `PageUp` / `PageDown`：滚动对话记录
