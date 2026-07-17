@@ -1,0 +1,16 @@
+# Standalone eval fixture — not part of the One workspace.
+[workspace]
+
+[package]
+name = "broken-kit"
+version = "0.2.0"
+edition = "2021"
+description = "Harder multi-module eval fixture for coding-agent harness"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "broken-kit"
+path = "src/main.rs"

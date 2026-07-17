@@ -64,9 +64,28 @@ docs/            架构活文档与专题设计
 - [Session 格式](docs/session-format.md)
 - [扩展系统](docs/extensions.md)
 - [MCP](docs/mcp.md)
+- [Harness 埋点与能力对比](docs/harness-eval.md) — `--trace` / `one bench` / 跨 agent 评测
 - [Package / Suite 设计（草案，未实现）](docs/package-suites.md)
 - [开发指南](docs/development.md)
 - [路线图](docs/roadmap.md)
+
+## Harness 轨迹（评测）
+
+```bash
+# 记录 agent 链路（turns / LLM 时延 / tools / tokens）
+one --trace ./run.jsonl -p "list files" --provider mock -y
+one trace-stats ./run.jsonl
+
+# mock 可重复的 smoke 任务包
+one bench --suite smoke
+
+# 评测（broken-kit v0.2 更难；输出在 benches/out，已 gitignore）
+./benches/run.sh smoke
+./benches/run.sh verify
+./benches/run.sh full          # 真模型，读 TUI 配置
+```
+
+详见 [docs/harness-eval.md](docs/harness-eval.md) · [benches/README.md](benches/README.md)。
 
 ## 与官方 Pi 的关系
 

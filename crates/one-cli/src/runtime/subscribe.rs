@@ -40,12 +40,21 @@ impl AppRuntime {
             AgentEvent::ToolExecutionEnd {
                 tool_call,
                 is_error,
-                ..
+                output,
             } if json => {
                 let line = serde_json::json!({
                     "type":"tool_end",
                     "name": tool_call.name,
                     "is_error": is_error,
+                    "output_bytes": output.as_text().len(),
+                });
+                println!("{line}");
+            }
+            AgentEvent::TurnEnd { turn, tool_results, .. } if json => {
+                let line = serde_json::json!({
+                    "type":"turn_end",
+                    "turn": turn,
+                    "tool_results": tool_results.len(),
                 });
                 println!("{line}");
             }

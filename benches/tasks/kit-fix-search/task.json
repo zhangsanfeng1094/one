@@ -1,0 +1,7 @@
+{
+  "id": "kit-fix-search",
+  "title": "broken-kit: fix catalog get/search/upsert",
+  "suite": "full",
+  "project": "broken-kit",
+  "test_filter": "catalog::"
+}

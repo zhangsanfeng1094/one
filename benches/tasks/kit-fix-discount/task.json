@@ -1,0 +1,7 @@
+{
+  "id": "kit-fix-discount",
+  "title": "broken-kit: fix money + promo (+ cart if needed for integration)",
+  "suite": "full",
+  "project": "broken-kit",
+  "test_filter": ["money::", "promo::"]
+}

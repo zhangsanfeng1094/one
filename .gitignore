@@ -1,3 +1,9 @@
 /target/
 **/*.rs.bk
 .DS_Store
+
+# --- harness / bench (generated; never commit) ---
+benches/out/
+benches/**/target/
+benches/projects/**/target/
+benches/projects/**/Cargo.lock

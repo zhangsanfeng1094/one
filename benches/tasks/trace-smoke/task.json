@@ -1,0 +1,5 @@
+{
+  "id": "trace-smoke",
+  "title": "Minimal prompt produces a complete run_start/run_end trace",
+  "suite": "smoke"
+}

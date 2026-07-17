@@ -165,7 +165,22 @@ pub struct Cli {
     #[arg(long = "no-mcp")]
     pub no_mcp: bool,
 
-    /// Optional subcommands (`one mcp …`).
+    /// Do not inject the skills catalog into the system prompt (or load skill roots).
+    /// Also set via env `ONE_DISABLE_SKILLS=1`. Useful for isolated harness evals.
+    #[arg(long = "no-skills")]
+    pub no_skills: bool,
+
+    /// Write agent execution trace as JSONL (turns / LLM latency / tools / usage).
+    /// Use `-` for a default path under `~/.one/agent/traces/`.
+    /// For harness eval and comparison — see `docs/harness-eval.md`.
+    #[arg(long = "trace", value_name = "PATH", num_args = 0..=1, default_missing_value = "-")]
+    pub trace: Option<PathBuf>,
+
+    /// Include full tool argument JSON in the trace (default: truncated preview only).
+    #[arg(long = "trace-full")]
+    pub trace_full: bool,
+
+    /// Optional subcommands (`one mcp …` / `one trace-stats` / `one bench`).
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -178,6 +193,48 @@ pub enum Commands {
     Login(LoginCli),
     /// Clear stored OAuth / API credentials
     Logout(LogoutCli),
+    /// Summarize a JSONL execution trace (`--trace` output)
+    #[command(name = "trace-stats")]
+    TraceStats(TraceStatsCli),
+    /// Run harness capability tasks and score them
+    Bench(BenchCli),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct TraceStatsCli {
+    /// Path to a JSONL trace file written by `--trace`.
+    pub path: PathBuf,
+
+    /// Emit machine-readable JSON instead of a text report.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct BenchCli {
+    /// Task pack root (default: `./benches/tasks` or next to the workspace).
+    #[arg(long, value_name = "DIR")]
+    pub tasks_dir: Option<PathBuf>,
+
+    /// Only run this task id (directory name under tasks_dir).
+    #[arg(long)]
+    pub task: Option<String>,
+
+    /// Suite filter: `smoke` (mock-friendly) | `all` (default: smoke).
+    #[arg(long, default_value = "smoke")]
+    pub suite: String,
+
+    /// Output directory for traces + summary (default: `./benches/out/<timestamp>`).
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+
+    /// Max turns override for bench runs.
+    #[arg(long, default_value_t = 16)]
+    pub max_turns: usize,
+
+    /// Keep temp workspaces after the run (for debugging).
+    #[arg(long)]
+    pub keep: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]

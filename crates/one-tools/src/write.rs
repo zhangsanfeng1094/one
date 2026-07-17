@@ -34,12 +34,16 @@ impl Tool for WriteTool {
         };
         ToolDefinition {
             name: "write".to_string(),
-            description: format!("Create or overwrite a file. Allowed: {scope}."),
+            description: format!(
+                "Create a new file or intentionally overwrite an entire file with `content`. \
+                 Prefer `edit` for small/localized changes — do not rewrite a whole file when \
+                 a unique string replace would suffice. Allowed: {scope}."
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string" }
+                    "path": { "type": "string", "description": "File path to create or overwrite" },
+                    "content": { "type": "string", "description": "Full new file contents" }
                 },
                 "required": ["path", "content"]
             }),

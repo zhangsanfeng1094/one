@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use one_ai::MockProvider;
 use one_core::agent::{Agent, AgentConfig};
 use one_core::tool::ToolCall;
+use one_core::{MemoryTrace, TraceEvent, TraceStats};
 use one_tools::{default_tools, plan_mode_tools, PlanExitState, WriteTool};
 use serde_json::json;
 
@@ -15,6 +16,46 @@ async fn mock_agent_lists_files_end_to_end() {
         .await
         .expect("agent run");
     assert!(output.contains("directory listing") || output.contains("mock"));
+}
+
+#[tokio::test]
+async fn mock_agent_trace_records_run_and_tools() {
+    let mem = Arc::new(MemoryTrace::new());
+    let mut agent = Agent::new(
+        AgentConfig::default(),
+        default_tools(std::env::current_dir().unwrap()),
+    );
+    agent.set_trace(Some(mem.clone()));
+    let provider = MockProvider::new();
+    let _ = agent
+        .prompt(&provider, "list files in current directory")
+        .await
+        .expect("agent run");
+
+    let events = mem.events();
+    assert!(
+        events.iter().any(|e| matches!(e, TraceEvent::RunStart { .. })),
+        "expected run_start"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, TraceEvent::LlmResponse { .. })),
+        "expected llm_response"
+    );
+    assert!(
+        events.iter().any(|e| matches!(
+            e,
+            TraceEvent::ToolStart { name, .. } if name == "bash"
+        )),
+        "expected bash tool_start"
+    );
+    assert!(
+        events.iter().any(|e| matches!(e, TraceEvent::RunEnd { .. })),
+        "expected run_end"
+    );
+    let stats = TraceStats::from_events(&events);
+    assert!(stats.turns >= 1);
+    assert!(stats.tool_calls >= 1);
+    assert!(stats.llm_calls >= 1);
 }
 
 #[tokio::test]

@@ -34,13 +34,24 @@ impl Tool for EditTool {
         };
         ToolDefinition {
             name: "edit".to_string(),
-            description: format!("Replace an exact string in a file. Allowed: {scope}."),
+            description: format!(
+                "Surgical in-place edit: replace exactly one occurrence of `old_string` with \
+                 `new_string` in an existing file. Prefer this over `write` for bugfixes and \
+                 localized changes. `old_string` must match uniquely (fails if 0 or >1 matches); \
+                 include enough surrounding context to make it unique. Allowed: {scope}."
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "old_string": { "type": "string" },
-                    "new_string": { "type": "string" }
+                    "path": { "type": "string", "description": "Existing file path" },
+                    "old_string": {
+                        "type": "string",
+                        "description": "Exact text to find (must occur exactly once)"
+                    },
+                    "new_string": {
+                        "type": "string",
+                        "description": "Replacement text"
+                    }
                 },
                 "required": ["path", "old_string", "new_string"]
             }),

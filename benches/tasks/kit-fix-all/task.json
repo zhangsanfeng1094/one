@@ -1,0 +1,6 @@
+{
+  "id": "kit-fix-all",
+  "title": "broken-kit v0.2: fix all modules until cargo test passes",
+  "suite": "full",
+  "project": "broken-kit"
+}

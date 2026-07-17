@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "type": "command", "cmd": "cargo test money:: -- --quiet", "exit_code": 0 },
+    { "type": "command", "cmd": "cargo test promo:: -- --quiet", "exit_code": 0 },
+    { "type": "max_turns", "n": 16 },
+    { "type": "max_tool_errors", "n": 6 }
+  ]
+}

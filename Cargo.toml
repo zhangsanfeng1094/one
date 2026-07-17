@@ -11,6 +11,10 @@ members = [
     "crates/one-tui",
     "crates/one-cli",
 ]
+# Eval fixtures under benches/projects/* are standalone crates.
+exclude = [
+    "benches/projects/broken-kit",
+]
 
 [workspace.package]
 version = "0.1.0"

@@ -8,10 +8,11 @@ pub mod message;
 pub mod streaming;
 pub mod tool;
 pub mod tool_gate;
+pub mod trace;
 
 pub use agent::{
     Agent, AgentConfig, CompletionRequest, CompletionResponse, LlmProvider, ThinkingLevel,
-    TokenUsage,
+    TokenUsage, TraceRunMeta,
 };
 pub use streaming::StreamEvent;
 pub use compaction::{
@@ -26,3 +27,8 @@ pub use hooks::{AgentHooks, NoopHooks};
 pub use message::{AgentMessage, AssistantMessage, StopReason, ToolResultMessage, UserMessage};
 pub use tool::{Tool, ToolCall, ToolDefinition, ToolOutput};
 pub use tool_gate::{AllowAllGate, ToolGate, ToolGateDecision};
+pub use trace::{
+    load_trace_file, new_run_id, args_preview, JsonlTraceSink, MemoryTrace, NullTrace,
+    ScoreCheckResult, SharedTrace, TraceEvent, TraceGateDecision, TraceRunStatus, TraceSink,
+    TraceStats,
+};

@@ -1,0 +1,7 @@
+{
+  "checks": [
+    { "type": "trace_status", "status": "ok" },
+    { "type": "max_turns", "n": 2 },
+    { "type": "final_text_contains", "text": "mock" }
+  ]
+}

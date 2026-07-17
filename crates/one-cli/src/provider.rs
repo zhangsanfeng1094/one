@@ -138,6 +138,9 @@ impl ProviderSet {
             auto_approve: false,
             share: false,
             no_mcp: false,
+            no_skills: false,
+            trace: None,
+            trace_full: false,
             command: None,
         };
 

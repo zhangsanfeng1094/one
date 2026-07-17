@@ -90,6 +90,7 @@ flowchart TB
 | Prompt 模板 `/name` | ✅ | `one-resources/prompts` | |
 | Compaction | ✅ | `one-core/compaction` + runtime | LLM 摘要 + overflow 重试 |
 | 四模式 Interactive/Print/JSON/RPC | ✅ | `one-cli/modes` | |
+| 执行轨迹 / harness 评测 | ✅ | `one-core/trace` + `--trace` / `one bench` | 可选 TraceSink；见 [harness-eval.md](./harness-eval.md) |
 | Plan / Act 模式 | ✅ | runtime + tools/plan | 硬工具门控 |
 | MCP 平台客户端 | ✅ | `one-mcp` | stdio + streamable HTTP；**只加载 One 配置** |
 | MCP 从其他 agent 导入 | ✅ | TUI `/mcp` · `one mcp import` | Claude/Codex/Cursor 显式导入 |

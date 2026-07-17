@@ -1,19 +1,43 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{OneError, Result};
 use crate::events::{AgentEvent, EventListener};
 use crate::hooks::AgentHooks;
 use crate::message::{
-    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
+    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, now_ms,
 };
 use crate::tool::{Tool, ToolCall, ToolOutput};
 use crate::tool_gate::{ToolGate, ToolGateDecision};
+use crate::trace::{
+    args_preview, new_run_id, SharedTrace, TraceEvent, TraceGateDecision, TraceRunStatus,
+};
 
-pub const DEFAULT_SYSTEM_PROMPT: &str = "You are an AI coding assistant. Use the provided tools to read, write, edit files, run shell commands, and search or fetch the web when you need current information. When requirements are ambiguous, use the `ask_user` tool to ask structured clarifying questions instead of guessing. Be concise and precise.";
+pub const DEFAULT_SYSTEM_PROMPT: &str = "You are an AI coding assistant. Use the provided tools to read and change files, run shell commands, and search or fetch the web when you need current information.
+
+Tool choice (prefer specialized tools over bash):
+- Explore: `ls`, `find`, `grep`, `read` — not `bash` with find/rg/cat/head/sed/awk pipelines.
+- Edit: `edit` / `write` — not shell redirection or sed/awk rewrites.
+- Run: `bash` only for real process work (build, test, git, package managers, long-running commands).
+- Never use bash echo (or similar) to talk to the user; reply in normal assistant text.
+- Do not assume host extras exist (`rg`, `tree`, `eza`, `fd`, …). The `grep` tool uses ripgrep when available; if a tool fails with missing binary, fall back to another tool or plain `grep`/`find` via bash only when needed.
+- Parallelize independent tool calls when it speeds exploration.
+
+File changes:
+- Prefer `edit` for localized fixes (change only the relevant snippet; `old_string` must uniquely match once).
+- Use `write` only for new files or intentional full-file rewrites — do not rewrite an entire file when a small edit would do.
+- Read a file before editing it when you need its current contents.
+
+Bash / sandbox:
+- Default bash runs under an OS sandbox (workspace-write): workspace is writable; home and system paths are mostly read-only. Prefer the dedicated file tools so path policy and truncation stay consistent.
+- Keep commands focused; avoid huge recursive dumps. If output is truncated or spilled to a file, read the spill instead of re-running wider.
+
+When requirements are ambiguous, use the `ask_user` tool instead of guessing. Be concise and precise. Do not load unrelated skills or docs unless they clearly help the task.";
 
 /// Reasoning / extended-thinking intensity (provider-specific mapping).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -113,11 +137,15 @@ pub struct CompletionRequest {
 /// - **OpenAI**: `input_tokens` (`prompt_tokens`) **includes** `cache_read_tokens` as a subset.
 /// - `total()` is therefore **input + output only** (never double-counts OpenAI cache).
 /// - Use [`prompt_tokens_expanded`] for Anthropic-style full prompt size.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TokenUsage {
+    #[serde(default)]
     pub input_tokens: u64,
+    #[serde(default)]
     pub output_tokens: u64,
+    #[serde(default)]
     pub cache_read_tokens: u64,
+    #[serde(default)]
     pub cache_write_tokens: u64,
 }
 
@@ -233,6 +261,18 @@ pub struct Agent {
     tool_gate: Option<Arc<dyn ToolGate>>,
     /// Optional async lifecycle hooks (extensions bridge).
     hooks: Option<Arc<dyn AgentHooks>>,
+    /// Optional execution trace sink (harness eval). Default: none (zero cost).
+    trace: Option<SharedTrace>,
+    /// Metadata for the next / current run (set by CLI/bench before `prompt`).
+    trace_meta: TraceRunMeta,
+}
+
+/// Optional labels attached to the next agent run's `run_start` event.
+#[derive(Debug, Clone, Default)]
+pub struct TraceRunMeta {
+    pub task_id: Option<String>,
+    pub agent_version: Option<String>,
+    pub config: Option<serde_json::Value>,
 }
 
 impl Agent {
@@ -251,6 +291,8 @@ impl Agent {
             abort_flag: Arc::new(AtomicBool::new(false)),
             tool_gate: None,
             hooks: None,
+            trace: None,
+            trace_meta: TraceRunMeta::default(),
         }
     }
 
@@ -270,6 +312,28 @@ impl Agent {
 
     pub fn hooks(&self) -> Option<&Arc<dyn AgentHooks>> {
         self.hooks.as_ref()
+    }
+
+    /// Install an optional execution-trace sink (harness eval / `--trace`).
+    ///
+    /// When `None` (default), tracing is a no-op with no allocations per event.
+    pub fn set_trace(&mut self, sink: Option<SharedTrace>) {
+        self.trace = sink;
+    }
+
+    pub fn trace(&self) -> Option<&SharedTrace> {
+        self.trace.as_ref()
+    }
+
+    /// Labels included on the next `run_start` (task id, version, config snapshot).
+    pub fn set_trace_meta(&mut self, meta: TraceRunMeta) {
+        self.trace_meta = meta;
+    }
+
+    fn record_trace(&self, event: TraceEvent) {
+        if let Some(sink) = &self.trace {
+            sink.record(event);
+        }
     }
 
     /// Replace the notification queue (wire shared background-task registry).
@@ -384,6 +448,21 @@ impl Agent {
 
     pub async fn run(&mut self, provider: &dyn LlmProvider) -> Result<String> {
         self.clear_abort();
+        let run_id = new_run_id();
+        let wall_start = Instant::now();
+        let meta = self.trace_meta.clone();
+
+        self.record_trace(TraceEvent::RunStart {
+            ts_ms: now_ms(),
+            run_id: run_id.clone(),
+            agent: "one".into(),
+            agent_version: meta.agent_version.clone(),
+            provider: Some(provider.name().to_string()),
+            model: Some(provider.model().to_string()),
+            task_id: meta.task_id.clone(),
+            config: meta.config.clone(),
+        });
+
         self.emit(AgentEvent::AgentStart);
         if let Some(hooks) = &self.hooks {
             hooks.on_agent_start().await;
@@ -391,10 +470,13 @@ impl Agent {
         self.is_busy = true;
         let start_len = self.messages.len();
         let mut final_text;
+        let mut turns_done = 0usize;
 
         for turn in 0..self.config.max_turns {
             if self.is_aborted() {
-                return self.finish_aborted(start_len).await;
+                return self
+                    .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                    .await;
             }
 
             self.drain_steering();
@@ -405,6 +487,18 @@ impl Agent {
                 hooks.on_turn_start(turn).await;
             }
 
+            let tools_n = self.tools.len();
+            let message_count = self.messages.len();
+            self.record_trace(TraceEvent::TurnStart {
+                ts_ms: now_ms(),
+                run_id: run_id.clone(),
+                turn,
+                message_count,
+                tools_n,
+                last_prompt_tokens: (self.last_prompt_tokens > 0)
+                    .then_some(self.last_prompt_tokens),
+            });
+
             let request = CompletionRequest {
                 system_prompt: self.config.system_prompt.clone(),
                 messages: self.messages.clone(),
@@ -412,33 +506,95 @@ impl Agent {
                 thinking_level: self.config.thinking_level,
             };
 
+            self.record_trace(TraceEvent::LlmRequest {
+                ts_ms: now_ms(),
+                run_id: run_id.clone(),
+                turn,
+                message_count: request.messages.len(),
+                tools_n: request.tools.len(),
+                system_prompt_len: request.system_prompt.len(),
+            });
+
+            let llm_start = Instant::now();
+            let ttft_ms: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
             let response = {
                 let listeners: Vec<_> = self.listeners.iter().collect();
+                let ttft = ttft_ms.clone();
+                let llm_start_for_cb = llm_start;
                 provider
                     .complete_streaming(
                         request,
-                        &mut |event| match event {
-                            crate::streaming::StreamEvent::TextDelta(delta) => {
-                                let agent_event = AgentEvent::TextDelta {
-                                    delta: delta.clone(),
-                                };
-                                for listener in &listeners {
-                                    listener(&agent_event);
-                                }
+                        &mut |event| {
+                            // First stream delta → time-to-first-token.
+                            if ttft.lock().expect("ttft").is_none() {
+                                *ttft.lock().expect("ttft") =
+                                    Some(llm_start_for_cb.elapsed().as_millis() as u64);
                             }
-                            crate::streaming::StreamEvent::ThinkingDelta(delta) => {
-                                let agent_event = AgentEvent::ThinkingDelta {
-                                    delta: delta.clone(),
-                                };
-                                for listener in &listeners {
-                                    listener(&agent_event);
+                            match event {
+                                crate::streaming::StreamEvent::TextDelta(delta) => {
+                                    let agent_event = AgentEvent::TextDelta {
+                                        delta: delta.clone(),
+                                    };
+                                    for listener in &listeners {
+                                        listener(&agent_event);
+                                    }
+                                }
+                                crate::streaming::StreamEvent::ThinkingDelta(delta) => {
+                                    let agent_event = AgentEvent::ThinkingDelta {
+                                        delta: delta.clone(),
+                                    };
+                                    for listener in &listeners {
+                                        listener(&agent_event);
+                                    }
                                 }
                             }
                         },
                         Some(&self.abort_flag),
                     )
-                    .await?
+                    .await
             };
+
+            let response = match response {
+                Ok(r) => r,
+                Err(err) => {
+                    self.record_trace(TraceEvent::RunEnd {
+                        ts_ms: now_ms(),
+                        run_id: run_id.clone(),
+                        status: TraceRunStatus::Error,
+                        turns: turns_done,
+                        wall_ms: wall_start.elapsed().as_millis() as u64,
+                        usage: self.token_usage,
+                        final_text_len: None,
+                        error: Some(err.to_string()),
+                    });
+                    self.is_busy = false;
+                    if let Some(hooks) = &self.hooks {
+                        hooks.on_agent_end().await;
+                    }
+                    return Err(err);
+                }
+            };
+
+            let latency_ms = llm_start.elapsed().as_millis() as u64;
+            let ttft = ttft_ms.lock().expect("ttft").clone();
+            let tool_calls = extract_tool_calls(&response.content);
+            let text_len = extract_text(&response.content).len();
+            let thinking_len = extract_thinking_len(&response.content);
+
+            self.record_trace(TraceEvent::LlmResponse {
+                ts_ms: now_ms(),
+                run_id: run_id.clone(),
+                turn,
+                latency_ms,
+                ttft_ms: ttft,
+                stop_reason: stop_reason_label(response.stop_reason).into(),
+                tool_calls_n: tool_calls.len(),
+                text_len,
+                thinking_len,
+                usage: response.usage,
+                provider: response.provider.clone(),
+                model: response.model.clone(),
+            });
 
             if !response.usage.is_zero() {
                 self.token_usage.add_assign(&response.usage);
@@ -447,6 +603,8 @@ impl Agent {
                     self.last_prompt_tokens = ctx;
                 }
             }
+
+            turns_done = turn + 1;
 
             if self.is_aborted() || response.stop_reason == StopReason::Aborted {
                 let assistant = AgentMessage::Assistant(AssistantMessage {
@@ -457,7 +615,9 @@ impl Agent {
                     timestamp: crate::message::now_ms(),
                 });
                 self.messages.push(assistant);
-                return self.finish_aborted(start_len).await;
+                return self
+                    .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                    .await;
             }
 
             let assistant = AgentMessage::Assistant(AssistantMessage {
@@ -469,7 +629,6 @@ impl Agent {
             });
             self.messages.push(assistant.clone());
 
-            let tool_calls = extract_tool_calls(&response.content);
             let mut tool_results = Vec::new();
 
             if tool_calls.is_empty() {
@@ -492,6 +651,16 @@ impl Agent {
                 if let Some(hooks) = &self.hooks {
                     hooks.on_agent_end().await;
                 }
+                self.record_trace(TraceEvent::RunEnd {
+                    ts_ms: now_ms(),
+                    run_id: run_id.clone(),
+                    status: TraceRunStatus::Ok,
+                    turns: turns_done,
+                    wall_ms: wall_start.elapsed().as_millis() as u64,
+                    usage: self.token_usage,
+                    final_text_len: Some(final_text.len()),
+                    error: None,
+                });
                 return Ok(final_text);
             }
 
@@ -505,21 +674,49 @@ impl Agent {
                     if let Some(hooks) = &self.hooks {
                         hooks.on_turn_end(turn).await;
                     }
-                    return self.finish_aborted(start_len).await;
+                    return self
+                        .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                        .await;
                 }
+
+                let (args_bytes, args_preview) = args_preview(&call.arguments, 240);
+                self.record_trace(TraceEvent::ToolStart {
+                    ts_ms: now_ms(),
+                    run_id: run_id.clone(),
+                    turn,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    args_bytes,
+                    args_preview,
+                });
 
                 self.emit(AgentEvent::ToolExecutionStart {
                     tool_call: call.clone(),
                 });
 
-                let (output, is_error) = match self.execute_tool(&call).await {
-                    Ok(output) => {
-                        // bash non-zero / signal → tool_result.is_error for the model + TUI.
-                        let failed = tool_output_indicates_error(&call.name, &output);
-                        (output, failed)
-                    }
-                    Err(err) => (ToolOutput::text(err.to_string()), true),
-                };
+                let tool_start = Instant::now();
+                let (output, is_error, gate_decision) =
+                    match self.execute_tool(&call, &run_id, turn).await {
+                        Ok((output, gate)) => {
+                            let failed = tool_output_indicates_error(&call.name, &output);
+                            (output, failed, gate)
+                        }
+                        Err(err) => (ToolOutput::text(err.to_string()), true, None),
+                    };
+                let duration_ms = tool_start.elapsed().as_millis() as u64;
+                let output_bytes = output.as_text().len();
+
+                self.record_trace(TraceEvent::ToolEnd {
+                    ts_ms: now_ms(),
+                    run_id: run_id.clone(),
+                    turn,
+                    call_id: call.id.clone(),
+                    name: call.name.clone(),
+                    duration_ms,
+                    is_error,
+                    output_bytes,
+                    gate: gate_decision,
+                });
 
                 if self.is_aborted() {
                     self.emit(AgentEvent::ToolExecutionEnd {
@@ -544,7 +741,9 @@ impl Agent {
                     if let Some(hooks) = &self.hooks {
                         hooks.on_turn_end(turn).await;
                     }
-                    return self.finish_aborted(start_len).await;
+                    return self
+                        .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                        .await;
                 }
 
                 self.emit(AgentEvent::ToolExecutionEnd {
@@ -582,12 +781,31 @@ impl Agent {
         if let Some(hooks) = &self.hooks {
             hooks.on_agent_end().await;
         }
+        self.record_trace(TraceEvent::RunEnd {
+            ts_ms: now_ms(),
+            run_id,
+            status: TraceRunStatus::MaxTurns,
+            turns: turns_done,
+            wall_ms: wall_start.elapsed().as_millis() as u64,
+            usage: self.token_usage,
+            final_text_len: None,
+            error: Some(format!("max turns ({})", self.config.max_turns)),
+        });
+        self.emit(AgentEvent::AgentEnd {
+            new_messages: self.messages[start_len..].to_vec(),
+        });
         Err(OneError::MaxTurns {
             max: self.config.max_turns,
         })
     }
 
-    async fn finish_aborted(&mut self, start_len: usize) -> Result<String> {
+    async fn finish_aborted(
+        &mut self,
+        start_len: usize,
+        run_id: &str,
+        wall_start: Instant,
+        turns: usize,
+    ) -> Result<String> {
         self.is_busy = false;
         self.emit(AgentEvent::AgentEnd {
             new_messages: self.messages[start_len..].to_vec(),
@@ -595,6 +813,16 @@ impl Agent {
         if let Some(hooks) = &self.hooks {
             hooks.on_agent_end().await;
         }
+        self.record_trace(TraceEvent::RunEnd {
+            ts_ms: now_ms(),
+            run_id: run_id.to_string(),
+            status: TraceRunStatus::Aborted,
+            turns,
+            wall_ms: wall_start.elapsed().as_millis() as u64,
+            usage: self.token_usage,
+            final_text_len: None,
+            error: Some("aborted".into()),
+        });
         Err(OneError::Aborted)
     }
 
@@ -632,16 +860,53 @@ impl Agent {
         true
     }
 
-    async fn execute_tool(&self, call: &ToolCall) -> Result<ToolOutput> {
+    /// Execute a tool after gate check. Returns `(output, gate_decision)`.
+    async fn execute_tool(
+        &self,
+        call: &ToolCall,
+        run_id: &str,
+        turn: usize,
+    ) -> Result<(ToolOutput, Option<TraceGateDecision>)> {
         // Gate may rewrite arguments (extension PreToolUse).
         let mut effective = call.clone();
+        let mut gate_decision = None;
         if let Some(gate) = &self.tool_gate {
             match gate.check(&effective).await {
-                ToolGateDecision::Allow => {}
+                ToolGateDecision::Allow => {
+                    gate_decision = Some(TraceGateDecision::Allow);
+                    self.record_trace(TraceEvent::Gate {
+                        ts_ms: now_ms(),
+                        run_id: run_id.to_string(),
+                        turn,
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        decision: TraceGateDecision::Allow,
+                        message: None,
+                    });
+                }
                 ToolGateDecision::Rewrite { arguments } => {
+                    gate_decision = Some(TraceGateDecision::Rewrite);
+                    self.record_trace(TraceEvent::Gate {
+                        ts_ms: now_ms(),
+                        run_id: run_id.to_string(),
+                        turn,
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        decision: TraceGateDecision::Rewrite,
+                        message: None,
+                    });
                     effective.arguments = arguments;
                 }
                 ToolGateDecision::Deny { message } => {
+                    self.record_trace(TraceEvent::Gate {
+                        ts_ms: now_ms(),
+                        run_id: run_id.to_string(),
+                        turn,
+                        call_id: call.id.clone(),
+                        name: call.name.clone(),
+                        decision: TraceGateDecision::Deny,
+                        message: Some(message.clone()),
+                    });
                     return Err(OneError::Tool {
                         tool: call.name.clone(),
                         message,
@@ -672,7 +937,7 @@ impl Agent {
                 }
             }
         }
-        result
+        result.map(|o| (o, gate_decision))
     }
 
     fn emit(&mut self, event: AgentEvent) {
@@ -759,6 +1024,26 @@ pub fn extract_text(content: &[ContentBlock]) -> String {
         })
         .collect::<Vec<_>>()
         .join("")
+}
+
+fn extract_thinking_len(content: &[ContentBlock]) -> usize {
+    content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } => Some(thinking.len()),
+            _ => None,
+        })
+        .sum()
+}
+
+fn stop_reason_label(reason: StopReason) -> &'static str {
+    match reason {
+        StopReason::Stop => "stop",
+        StopReason::Length => "length",
+        StopReason::ToolUse => "tool_use",
+        StopReason::Error => "error",
+        StopReason::Aborted => "aborted",
+    }
 }
 
 /// Helper for providers that stream text deltas to listeners.

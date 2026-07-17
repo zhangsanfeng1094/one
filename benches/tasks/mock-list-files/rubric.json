@@ -1,0 +1,9 @@
+{
+  "checks": [
+    { "type": "trace_has_tool", "name": "bash" },
+    { "type": "trace_status", "status": "ok" },
+    { "type": "max_turns", "n": 4 },
+    { "type": "max_tool_errors", "n": 1 },
+    { "type": "final_text_contains", "text": "directory" }
+  ]
+}

@@ -1,0 +1,6 @@
+{
+  "id": "kit-baseline",
+  "title": "broken-kit fixture sanity: stock tree must fail cargo test",
+  "suite": "smoke",
+  "project": "broken-kit"
+}

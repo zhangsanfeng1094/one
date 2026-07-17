@@ -136,6 +136,11 @@ impl ResourceLoader {
         }
     }
 
+    /// Drop all skills (catalog + force-load). Used by `--no-skills` / harness isolation.
+    pub fn clear_skills(&mut self) {
+        self.skills.clear();
+    }
+
     /// Append text to the system prompt overlay (plugins / extensions).
     pub fn push_system_append(&mut self, text: impl Into<String>) {
         let text = text.into();

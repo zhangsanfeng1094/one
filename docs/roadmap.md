@@ -88,7 +88,7 @@
 - [ ] OAuth：Anthropic Claude Pro/Max、GitHub Copilot
 - [ ] TS 扩展兼容层（QuickJS / WASM 评估）
 - [ ] self-update 命令
-- [ ] 性能基准套件
+- [x] 性能 / 能力基准套件 — `--trace` + `one bench` smoke（见 [harness-eval.md](./harness-eval.md)）；full 任务与跨 agent normalize 待扩展
 - [ ] TUI 差分渲染优化 / 贴图 / `@` 模糊搜索增强
 - [ ] 与官方 Pi session 全量兼容性回归测试
 - [ ] 更准的 per-model pricing 表

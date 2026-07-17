@@ -1,0 +1,7 @@
+{
+  "id": "kit-fix-cart",
+  "title": "broken-kit: fix cart checkout pipeline (needs promo+money)",
+  "suite": "full",
+  "project": "broken-kit",
+  "test_filter": "cart::"
+}

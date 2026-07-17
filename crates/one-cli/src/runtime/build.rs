@@ -43,6 +43,15 @@ impl AppRuntime {
             resources.push_system_append(overlay.clone());
         }
 
+        // Harness / isolation: omit skills catalog + skill force-load.
+        let disable_skills = cli.no_skills
+            || std::env::var_os("ONE_DISABLE_SKILLS")
+                .is_some_and(|v| v != "0" && v != "false");
+        if disable_skills {
+            tracing::info!("skills disabled (--no-skills / ONE_DISABLE_SKILLS)");
+            resources.clear_skills();
+        }
+
         let extensions = Arc::new(discovery.runtime);
         {
             let data = extensions.data().clone();
@@ -169,6 +178,31 @@ impl AppRuntime {
         // Extension PreToolUse → PermissionGate → after_tool (Codex-style pipeline).
         agent.set_tool_gate(Some(extensions.tool_gate(permission_gate.clone())));
         agent.set_hooks(Some(extensions.agent_hooks()));
+        // Optional harness trace (additive; default off).
+        if let Some(trace_path) = resolve_trace_path(cli) {
+            match one_core::JsonlTraceSink::create(&trace_path) {
+                Ok(sink) => {
+                    tracing::info!(path = %trace_path.display(), "writing agent trace");
+                    agent.set_trace(Some(std::sync::Arc::new(sink)));
+                    agent.set_trace_meta(one_core::TraceRunMeta {
+                        agent_version: Some(env!("CARGO_PKG_VERSION").into()),
+                        config: Some(serde_json::json!({
+                            "max_turns": 32,
+                            "read_only": cli.read_only,
+                            "plan": cli.plan,
+                            "auto_approve": auto_approve,
+                            "cwd": cwd.display().to_string(),
+                            "trace_full": cli.trace_full,
+                        })),
+                        task_id: None,
+                    });
+                    eprintln!("trace: {}", trace_path.display());
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, path = %trace_path.display(), "failed to open --trace file");
+                }
+            }
+        }
         // Claude-style: completed background bash → conversation notice (not TUI status bar).
         if !cli.read_only {
             agent.set_notification_queue(bg_registry.notification_queue());
@@ -280,5 +314,38 @@ impl AppRuntime {
         }
 
         Ok(runtime)
+    }
+}
+
+/// Resolve `--trace` / `ONE_TRACE` into a concrete file path.
+///
+/// - CLI `--trace` / `--trace PATH` wins
+/// - Else `ONE_TRACE=1` or `ONE_TRACE=path`
+/// - `-` or bare flag → `~/.one/agent/traces/<timestamp>.jsonl`
+fn resolve_trace_path(cli: &Cli) -> Option<std::path::PathBuf> {
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let from_cli = cli.trace.clone();
+    let from_env = std::env::var_os("ONE_TRACE").and_then(|v| {
+        let s = v.to_string_lossy();
+        if s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false") {
+            None
+        } else if s == "1" || s.eq_ignore_ascii_case("true") {
+            Some(PathBuf::from("-"))
+        } else {
+            Some(PathBuf::from(s.as_ref()))
+        }
+    });
+    let raw = from_cli.or(from_env)?;
+    if raw.as_os_str() == "-" || raw.as_os_str().is_empty() {
+        let dir = agent_dir().join("traces");
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0);
+        Some(dir.join(format!("trace_{ms}.jsonl")))
+    } else {
+        Some(raw)
     }
 }

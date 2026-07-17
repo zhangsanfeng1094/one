@@ -1,0 +1,7 @@
+{
+  "id": "kit-fix-parse",
+  "title": "broken-kit: fix schedule parse/overlap/clamp",
+  "suite": "full",
+  "project": "broken-kit",
+  "test_filter": "schedule::"
+}

@@ -1,0 +1,7 @@
+{
+  "checks": [
+    { "type": "command", "cmd": "cargo test -- --quiet", "exit_code": 0 },
+    { "type": "max_turns", "n": 32 },
+    { "type": "max_tool_errors", "n": 10 }
+  ]
+}

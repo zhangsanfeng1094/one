@@ -1,0 +1,7 @@
+{
+  "id": "kit-fix-ledger",
+  "title": "broken-kit: fix ledger holds/releases FIFO",
+  "suite": "full",
+  "project": "broken-kit",
+  "test_filter": "ledger::"
+}

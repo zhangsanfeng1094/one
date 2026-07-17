@@ -386,12 +386,12 @@ pub fn skills_catalog_xml(skills: &[Skill]) -> Option<String> {
     }
 
     let mut out = String::from(
-        "The following skills provide specialized instructions for specific tasks.\n\
-         When a task matches a skill's description, use the `read` tool to load the\n\
-         SKILL.md at the listed <location> **before** proceeding.\n\
-         Relative paths inside a skill (scripts/, references/, assets/) are relative\n\
-         to that skill's directory (parent of SKILL.md); prefer absolute paths in tool calls.\n\
-         Do not invent skill content — always read the file.\n\n\
+        "Optional skills (specialized workflows). Load a skill **only** when its description \
+         clearly matches the user's task — skip all others. Do not browse the catalog for \
+         general coding, bugfixes, or tests.\n\
+         To load: `read` the SKILL.md at <location> first; do not invent skill content.\n\
+         Relative paths inside a skill (scripts/, references/, assets/) are relative to that \
+         skill's directory (parent of SKILL.md); prefer absolute paths in tool calls.\n\n\
          <available_skills>\n",
     );
     for skill in visible {
@@ -529,7 +529,8 @@ description: >
         assert!(cat.contains("<available_skills>"));
         assert!(cat.contains("<name>review</name>"));
         assert!(cat.contains("Code review workflow"));
-        assert!(cat.contains("use the `read` tool"));
+        assert!(cat.contains("`read`"));
+        assert!(cat.contains("clearly matches"));
         assert!(!cat.contains("Secret body"));
     }
 

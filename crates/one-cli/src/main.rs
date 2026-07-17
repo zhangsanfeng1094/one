@@ -1,5 +1,6 @@
 mod approval;
 mod auth_cmd;
+mod bench_cmd;
 mod cli;
 mod hitl;
 mod mcp_cmd;
@@ -8,6 +9,7 @@ mod preferences;
 mod provider;
 mod runtime;
 mod settings;
+mod trace_cmd;
 
 use clap::Parser;
 use one_session::export_html;
@@ -66,6 +68,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(Commands::Logout(logout)) = cli.command {
         return auth_cmd::run_logout(logout).await;
+    }
+    if let Some(Commands::TraceStats(ts)) = cli.command {
+        return trace_cmd::run_trace_stats(ts);
+    }
+    if let Some(Commands::Bench(bench)) = cli.command {
+        return bench_cmd::run_bench(bench).await;
     }
 
     if cli.list_providers {

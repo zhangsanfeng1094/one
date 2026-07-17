@@ -21,6 +21,13 @@ one --share                  # 上传 session 到 GitHub Gist（需 GITHUB_TOKEN
 one --list-models            # 列出可用模型
 one --list-providers         # 列出内置 + models.json 自定义 provider
 
+# 执行轨迹 / harness 评测（见 docs/harness-eval.md）
+one --trace ./run.jsonl -p "…" -y   # 写 JSONL 链路（turns/tools/latency/tokens）
+one --trace -p "…"                  # 默认 ~/.one/agent/traces/…
+one trace-stats ./run.jsonl         # 汇总轨迹
+one bench --suite smoke             # mock 可重复任务包
+one bench --task mock-list-files
+
 # 订阅登录
 one login                    # 交互选择：Codex / xAI Grok / OpenCode …
 one login openai-codex       # ChatGPT Plus/Pro OAuth

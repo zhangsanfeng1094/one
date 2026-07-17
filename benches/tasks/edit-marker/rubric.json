@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "type": "file_contains", "path": "src/lib.rs", "text": "a * b" },
+    { "type": "command", "cmd": "cargo test --quiet", "exit_code": 0 },
+    { "type": "max_turns", "n": 12 },
+    { "type": "max_tool_errors", "n": 3 }
+  ]
+}

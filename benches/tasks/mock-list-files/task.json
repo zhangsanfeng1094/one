@@ -1,0 +1,5 @@
+{
+  "id": "mock-list-files",
+  "title": "List files via tool (mock provider)",
+  "suite": "smoke"
+}

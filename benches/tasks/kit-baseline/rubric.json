@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "type": "file_exists", "path": "src/lib.rs" },
+    { "type": "file_exists", "path": "src/money.rs" },
+    { "type": "file_exists", "path": "Cargo.toml" },
+    { "type": "command", "cmd": "cargo test -- --quiet; test $? -ne 0", "exit_code": 0 }
+  ]
+}
