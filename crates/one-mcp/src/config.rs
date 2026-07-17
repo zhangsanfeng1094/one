@@ -1,18 +1,15 @@
-//! MCP configuration loading (multi-source merge).
+//! MCP configuration loading.
 //!
-//! **One native format is JSON only** (`mcp.json`).
+//! **One owns its own config only** (runtime load):
+//! 1. User: `~/.one/agent/mcp.json`
+//! 2. Project: `.one/mcp.json` (cwd → git root; nearer wins)
 //!
-//! Priority (high → low; same name = full replacement, not field merge):
-//! 1. One project: `.one/mcp.json` (cwd → git root, cwd wins)
-//! 2. One user: `~/.one/agent/mcp.json`
-//! 3. Codex: `~/.codex/config.toml` `[mcp_servers]` (read-only TOML compat)
-//! 4. Claude: `~/.claude.json`
-//! 5. Cursor: `.cursor/mcp.json` / `~/.cursor/mcp.json`
-//! 6. Standard: project `.mcp.json`
+//! Foreign agents (Claude / Codex / Cursor / project `.mcp.json`) are **not**
+//! auto-merged. Scan them explicitly via [`scan_import_candidates`] and import
+//! into One's user `mcp.json` (TUI `/mcp` → Import, or `one mcp import`).
 //!
-//! Implemented by merging **low → high** so later layers win.
-//! Compat sources (Claude / Cursor / Codex / `.mcp.json`) are read-only —
-//! not a second One native format.
+//! Escape hatch (not recommended): `ONE_MCP_MERGE_FOREIGN=1` restores the old
+//! multi-source auto-merge for one process.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -30,8 +27,8 @@ pub const DEFAULT_TOOL_TIMEOUT_SEC: u64 = 120;
 /// Default server startup timeout (seconds).
 pub const DEFAULT_STARTUP_TIMEOUT_SEC: u64 = 30;
 
-/// Where a server entry came from (for `one mcp list` / doctor).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Where a server entry came from (for list / doctor / import UI).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConfigSourceKind {
     OneUser,
     OneProject,
@@ -52,6 +49,44 @@ impl ConfigSourceKind {
             Self::StandardMcpJson => "mcp.json",
         }
     }
+
+    pub fn is_foreign(self) -> bool {
+        matches!(
+            self,
+            Self::Codex | Self::Claude | Self::Cursor | Self::StandardMcpJson
+        )
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "one" | "one-user" | "user" => Some(Self::OneUser),
+            "one-project" | "project" => Some(Self::OneProject),
+            "codex" => Some(Self::Codex),
+            "claude" => Some(Self::Claude),
+            "cursor" => Some(Self::Cursor),
+            "mcp.json" | "standard" | "dot-mcp" => Some(Self::StandardMcpJson),
+            _ => None,
+        }
+    }
+}
+
+/// A server discovered in a foreign agent config (import candidate).
+#[derive(Debug, Clone)]
+pub struct ImportCandidate {
+    pub name: String,
+    pub source: ConfigSourceKind,
+    pub path: PathBuf,
+    pub server: McpServerConfig,
+    /// Already present in One user or project config (same name).
+    pub already_owned: bool,
+}
+
+/// Result of writing foreign servers into user `mcp.json`.
+#[derive(Debug, Clone, Default)]
+pub struct ImportReport {
+    pub imported: Vec<String>,
+    pub skipped_existing: Vec<String>,
+    pub replaced: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -291,104 +326,25 @@ fn compat_enabled(env_name: &str, default: bool) -> bool {
     }
 }
 
-/// Grok-style effective config for `cwd`.
+/// Effective config for runtime: **One-owned files only** (unless merge-foreign escape hatch).
 pub fn load_effective(cwd: &Path) -> Result<LoadedMcpConfig> {
+    if merge_foreign_enabled() {
+        tracing::warn!(
+            "ONE_MCP_MERGE_FOREIGN=1: auto-merging Claude/Codex/Cursor MCP configs \
+             (prefer explicit `one mcp import` / TUI import)"
+        );
+        return load_effective_with_foreign(cwd);
+    }
+    load_one_only(cwd)
+}
+
+/// One user + project only (default runtime path).
+pub fn load_one_only(cwd: &Path) -> Result<LoadedMcpConfig> {
     let mut cfg = McpConfig::empty();
     let mut server_sources: BTreeMap<String, ConfigSourceKind> = BTreeMap::new();
     let mut sources = Vec::new();
 
-    // Layer 1 (lowest): standard `.mcp.json` along cwd → git root (parent first).
-    for path in walk_chain_files(cwd, |dir| dir.join(".mcp.json")) {
-        if let Ok(layer) = load_file(&path) {
-            record_layer(
-                &mut cfg,
-                &mut server_sources,
-                &mut sources,
-                ConfigSourceKind::StandardMcpJson,
-                &path,
-                layer,
-            );
-        }
-    }
-
-    // Layer 2: Cursor
-    if compat_enabled("ONE_CURSOR_MCPS_ENABLED", true)
-        && compat_enabled("GROK_CURSOR_MCPS_ENABLED", true)
-    {
-        let user_cursor = dirs_home().join(".cursor").join("mcp.json");
-        if user_cursor.is_file() {
-            if let Ok(layer) = load_file(&user_cursor) {
-                record_layer(
-                    &mut cfg,
-                    &mut server_sources,
-                    &mut sources,
-                    ConfigSourceKind::Cursor,
-                    &user_cursor,
-                    layer,
-                );
-            }
-        }
-        for path in walk_chain_files(cwd, |dir| dir.join(".cursor").join("mcp.json")) {
-            if let Ok(layer) = load_file(&path) {
-                record_layer(
-                    &mut cfg,
-                    &mut server_sources,
-                    &mut sources,
-                    ConfigSourceKind::Cursor,
-                    &path,
-                    layer,
-                );
-            }
-        }
-    }
-
-    // Layer 3: Claude
-    if compat_enabled("ONE_CLAUDE_MCPS_ENABLED", true)
-        && compat_enabled("GROK_CLAUDE_MCPS_ENABLED", true)
-    {
-        let claude_path = dirs_home().join(".claude.json");
-        if claude_path.is_file() {
-            if let Ok(layer) = load_claude_json(&claude_path, cwd) {
-                record_layer(
-                    &mut cfg,
-                    &mut server_sources,
-                    &mut sources,
-                    ConfigSourceKind::Claude,
-                    &claude_path,
-                    layer,
-                );
-            }
-        }
-    }
-
-    // Layer 4: Codex (read-only TOML — not One native)
-    if compat_enabled("ONE_CODEX_MCPS_ENABLED", true) {
-        let codex_path = dirs_home().join(".codex").join("config.toml");
-        if codex_path.is_file() {
-            match load_codex_toml(&codex_path) {
-                Ok(layer) if !layer.mcp_servers.is_empty() => {
-                    record_layer(
-                        &mut cfg,
-                        &mut server_sources,
-                        &mut sources,
-                        ConfigSourceKind::Codex,
-                        &codex_path,
-                        layer,
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!(
-                        path = %codex_path.display(),
-                        error = %e,
-                        "failed to read Codex MCP config"
-                    );
-                }
-            }
-        }
-    }
-
-    // Layer 5: One user native (JSON only)
+    // User native
     let user_json = user_mcp_path();
     if user_json.is_file() {
         if let Ok(layer) = load_file(&user_json) {
@@ -403,7 +359,7 @@ pub fn load_effective(cwd: &Path) -> Result<LoadedMcpConfig> {
         }
     }
 
-    // Layer 6 (highest): One project `.one/mcp.json` chain parent→cwd
+    // Project `.one/mcp.json` chain parent→cwd (nearer wins)
     for dir in walk_dirs_to_git_root(cwd) {
         let json = dir.join(".one").join("mcp.json");
         if json.is_file() {
@@ -420,7 +376,242 @@ pub fn load_effective(cwd: &Path) -> Result<LoadedMcpConfig> {
         }
     }
 
-    // Env max output override (highest)
+    finalize_loaded(cfg, server_sources, sources)
+}
+
+/// Legacy multi-source merge (opt-in via `ONE_MCP_MERGE_FOREIGN=1`).
+fn load_effective_with_foreign(cwd: &Path) -> Result<LoadedMcpConfig> {
+    let mut cfg = McpConfig::empty();
+    let mut server_sources: BTreeMap<String, ConfigSourceKind> = BTreeMap::new();
+    let mut sources = Vec::new();
+
+    // Foreign first (low priority)
+    for layer in scan_foreign_layers(cwd) {
+        record_layer(
+            &mut cfg,
+            &mut server_sources,
+            &mut sources,
+            layer.kind,
+            &layer.path,
+            layer.config,
+        );
+    }
+
+    // One user + project on top
+    let one = load_one_only(cwd)?;
+    for (n, k) in &one.server_sources {
+        server_sources.insert(n.clone(), *k);
+    }
+    for s in &one.sources {
+        sources.push(ConfigSourceReport {
+            kind: s.kind,
+            path: s.path.clone(),
+            server_names: s.server_names.clone(),
+        });
+    }
+    cfg = cfg.merge(one.config);
+
+    finalize_loaded(cfg, server_sources, sources)
+}
+
+fn merge_foreign_enabled() -> bool {
+    compat_enabled("ONE_MCP_MERGE_FOREIGN", false)
+}
+
+struct ForeignLayer {
+    kind: ConfigSourceKind,
+    path: PathBuf,
+    config: McpConfig,
+}
+
+/// Scan foreign agent MCP configs (read-only). Does **not** write One state.
+fn scan_foreign_layers(cwd: &Path) -> Vec<ForeignLayer> {
+    let mut out = Vec::new();
+
+    // standard `.mcp.json`
+    for path in walk_chain_files(cwd, |dir| dir.join(".mcp.json")) {
+        if let Ok(config) = load_file(&path) {
+            if !config.mcp_servers.is_empty() {
+                out.push(ForeignLayer {
+                    kind: ConfigSourceKind::StandardMcpJson,
+                    path,
+                    config,
+                });
+            }
+        }
+    }
+
+    // Cursor
+    let user_cursor = dirs_home().join(".cursor").join("mcp.json");
+    if user_cursor.is_file() {
+        if let Ok(config) = load_file(&user_cursor) {
+            if !config.mcp_servers.is_empty() {
+                out.push(ForeignLayer {
+                    kind: ConfigSourceKind::Cursor,
+                    path: user_cursor,
+                    config,
+                });
+            }
+        }
+    }
+    for path in walk_chain_files(cwd, |dir| dir.join(".cursor").join("mcp.json")) {
+        if let Ok(config) = load_file(&path) {
+            if !config.mcp_servers.is_empty() {
+                out.push(ForeignLayer {
+                    kind: ConfigSourceKind::Cursor,
+                    path,
+                    config,
+                });
+            }
+        }
+    }
+
+    // Claude
+    let claude_path = dirs_home().join(".claude.json");
+    if claude_path.is_file() {
+        if let Ok(config) = load_claude_json(&claude_path, cwd) {
+            if !config.mcp_servers.is_empty() {
+                out.push(ForeignLayer {
+                    kind: ConfigSourceKind::Claude,
+                    path: claude_path,
+                    config,
+                });
+            }
+        }
+    }
+
+    // Codex
+    let codex_path = dirs_home().join(".codex").join("config.toml");
+    if codex_path.is_file() {
+        match load_codex_toml(&codex_path) {
+            Ok(config) if !config.mcp_servers.is_empty() => {
+                out.push(ForeignLayer {
+                    kind: ConfigSourceKind::Codex,
+                    path: codex_path,
+                    config,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    path = %codex_path.display(),
+                    error = %e,
+                    "codex MCP scan skipped"
+                );
+            }
+        }
+    }
+
+    out
+}
+
+/// List importable servers from other agents (for TUI / `one mcp import --list`).
+pub fn scan_import_candidates(cwd: &Path) -> Result<Vec<ImportCandidate>> {
+    let owned = load_one_only(cwd)?;
+    let owned_names: std::collections::HashSet<String> =
+        owned.config.mcp_servers.keys().cloned().collect();
+
+    let mut by_name: BTreeMap<String, ImportCandidate> = BTreeMap::new();
+    // Later layers in scan order can overwrite same name (Cursor user > project etc.).
+    // Prefer showing one row per name; keep first foreign hit unless later is more specific.
+    for layer in scan_foreign_layers(cwd) {
+        for (name, server) in layer.config.mcp_servers {
+            by_name.insert(
+                name.clone(),
+                ImportCandidate {
+                    name: name.clone(),
+                    source: layer.kind,
+                    path: layer.path.clone(),
+                    server,
+                    already_owned: owned_names.contains(&name),
+                },
+            );
+        }
+    }
+
+    let mut list: Vec<_> = by_name.into_values().collect();
+    list.sort_by(|a, b| {
+        a.source
+            .as_str()
+            .cmp(b.source.as_str())
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    Ok(list)
+}
+
+/// Copy selected foreign servers into `~/.one/agent/mcp.json`.
+///
+/// - `names`: if empty, import all candidates not already owned (unless `overwrite`)
+/// - `source_filter`: only this foreign source (`None` = any)
+/// - `overwrite`: replace existing One entries with the same name
+pub fn import_servers_to_user(
+    cwd: &Path,
+    names: &[String],
+    source_filter: Option<ConfigSourceKind>,
+    overwrite: bool,
+) -> Result<ImportReport> {
+    let candidates = scan_import_candidates(cwd)?;
+    let mut report = ImportReport::default();
+
+    let want: Option<std::collections::HashSet<String>> = if names.is_empty() {
+        None
+    } else {
+        Some(names.iter().map(|s| s.to_string()).collect())
+    };
+
+    let mut cfg = load_user_or_empty()?;
+    let mut changed = false;
+
+    for c in candidates {
+        if let Some(filter) = source_filter {
+            if c.source != filter {
+                continue;
+            }
+        }
+        if let Some(ref want) = want {
+            if !want.contains(&c.name) {
+                continue;
+            }
+        }
+
+        let exists = cfg.mcp_servers.contains_key(&c.name);
+        if exists && !overwrite {
+            // Explicit name list still requires --force to replace
+            if want.is_some() {
+                report.skipped_existing.push(c.name);
+                continue;
+            }
+            report.skipped_existing.push(c.name);
+            continue;
+        }
+
+        let mut server = c.server;
+        if server.enabled.is_none() {
+            server.enabled = Some(true);
+        }
+        cfg.disabled_servers.retain(|n| n != &c.name);
+
+        if exists {
+            report.replaced.push(c.name.clone());
+        } else {
+            report.imported.push(c.name.clone());
+        }
+        cfg.mcp_servers.insert(c.name, server);
+        changed = true;
+    }
+
+    if changed {
+        save_user_config(&cfg)?;
+    }
+    Ok(report)
+}
+
+fn finalize_loaded(
+    mut cfg: McpConfig,
+    server_sources: BTreeMap<String, ConfigSourceKind>,
+    sources: Vec<ConfigSourceReport>,
+) -> Result<LoadedMcpConfig> {
+    // Env max output override
     if let Ok(v) = std::env::var("ONE_MAX_MCP_OUTPUT_BYTES")
         .or_else(|_| std::env::var("MAX_MCP_OUTPUT_BYTES"))
         .or_else(|_| std::env::var("GROK_MAX_MCP_OUTPUT_BYTES"))
@@ -430,7 +621,7 @@ pub fn load_effective(cwd: &Path) -> Result<LoadedMcpConfig> {
         }
     }
 
-    // User-owned disable list (One UI / mcp.json) — not from Claude/Codex.
+    // User-owned disable list
     let user_disabled = load_user_or_empty()
         .map(|u| u.disabled_servers)
         .unwrap_or_default();
@@ -441,7 +632,6 @@ pub fn load_effective(cwd: &Path) -> Result<LoadedMcpConfig> {
         }
     }
 
-    // Expand env + validate
     for (name, server) in cfg.mcp_servers.iter_mut() {
         server.expand_strings();
         server.validate(name)?;
@@ -900,5 +1090,15 @@ approval_mode = "approve"
         let dirs = walk_dirs_to_git_root(Path::new("/tmp"));
         assert!(!dirs.is_empty());
         assert_eq!(dirs.last().unwrap(), Path::new("/tmp"));
+    }
+
+    #[test]
+    fn foreign_sources_marked() {
+        assert!(ConfigSourceKind::Codex.is_foreign());
+        assert!(!ConfigSourceKind::OneUser.is_foreign());
+        assert_eq!(
+            ConfigSourceKind::parse("cursor"),
+            Some(ConfigSourceKind::Cursor)
+        );
     }
 }

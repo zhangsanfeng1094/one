@@ -1,6 +1,6 @@
 [package]
 name = "one-ext"
-description = "One Rust-native extension runtime"
+description = "One Rust-native extension runtime (Codex-inspired)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -17,8 +17,12 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
+tracing.workspace = true
 libloading = { version = "0.8", optional = true }
 libc = { version = "0.2", optional = true }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full", "test-util"] }
 
 [[example]]
 name = "status_extension"

@@ -11,5 +11,6 @@ pub use error::{ResourceError, Result};
 pub use loader::{skill_allowlist_roots, skill_discovery_dirs, ResourceLoader};
 pub use prompts::PromptTemplate;
 pub use skills::{
-    apply_skills_config, set_skill_enabled, skills_catalog_xml, Skill, SkillConfigEntry,
+    apply_skills_config, discover_skills, set_skill_enabled, skills_catalog_xml, Skill,
+    SkillConfigEntry,
 };

@@ -125,6 +125,40 @@ impl ResourceLoader {
         apply_skills_config(&mut self.skills, config);
     }
 
+    /// Merge additional skills (e.g. from plugins). First-found name wins.
+    pub fn merge_skills(&mut self, extra: Vec<Skill>) {
+        let mut seen: std::collections::HashSet<String> =
+            self.skills.iter().map(|s| s.name.clone()).collect();
+        for skill in extra {
+            if seen.insert(skill.name.clone()) {
+                self.skills.push(skill);
+            }
+        }
+    }
+
+    /// Append text to the system prompt overlay (plugins / extensions).
+    pub fn push_system_append(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        match &mut self.system_append {
+            Some(existing) => {
+                existing.push_str("\n\n");
+                existing.push_str(&text);
+            }
+            None => self.system_append = Some(text),
+        }
+    }
+
+    /// Discover and merge prompts from extra directories (plugins).
+    pub async fn merge_prompt_dirs(&mut self, dirs: &[PathBuf]) -> Result<()> {
+        for dir in dirs {
+            self.prompts.extend(discover_prompts(dir).await?);
+        }
+        Ok(())
+    }
+
     /// Find skill by name (any enable state; for management / status).
     pub fn find_skill(&self, name: &str) -> Option<&Skill> {
         self.skills

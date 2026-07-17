@@ -106,7 +106,8 @@ one --full-access
 ```
 
 - 1–4 题，每题 2–4 选项；`multi_select: true` 为多选（Space 勾选）。
-- 始终可走 **Other** 键入自由文本。
+- 始终可走 **Other** 键入自由文本；**Tab** 直接跳到 Other 并进入输入。
+- 快捷键：`↑/↓` 或 `1–n` 选中 · `Enter` 确认 · `Tab` Other · `Esc` 取消。
 - 仅 Interactive 可用；print/RPC 下 fail-closed。
 
 ### 细粒度规则

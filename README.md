@@ -45,23 +45,25 @@ cargo run -p one-cli --features http-providers -- --provider anthropic -p "hello
 
 ```
 crates/
-  one-core/       Agent loop、消息类型、compaction
-  one-ai/         LLM Provider 抽象 + Mock/Anthropic/OpenAI
-  one-tools/      内置 coding tools
+  one-core/       Agent loop、Tool/ToolGate、compaction
+  one-ai/         LLM Provider 抽象 + 多厂商
+  one-tools/      内置 coding tools + PathPolicy / sandbox
   one-session/    JSONL 树形 session
-  one-resources/  AGENTS.md / skills / prompts 加载
-  one-ext/        Rust 扩展 trait + runtime
+  one-resources/  AGENTS.md / skills / prompts
+  one-mcp/        MCP 平台客户端 → Tool
+  one-ext/        扩展 runtime + plugins + hooks
   one-tui/        交互式终端 UI
-  one-cli/        CLI 入口（one 二进制）
-docs/            设计与使用文档
+  one-cli/        CLI 入口与 AppRuntime 装配（one 二进制）
+docs/            架构活文档与专题设计
 ```
 
 ## 文档
 
-- [架构设计](docs/architecture.md)
+- **[架构图（活文档）](docs/architecture.md)** — 总览、能力状态矩阵、数据流、干净度评估  
 - [CLI 参考](docs/cli.md)
 - [Session 格式](docs/session-format.md)
 - [扩展系统](docs/extensions.md)
+- [MCP](docs/mcp.md)
 - [Package / Suite 设计（草案，未实现）](docs/package-suites.md)
 - [开发指南](docs/development.md)
 - [路线图](docs/roadmap.md)

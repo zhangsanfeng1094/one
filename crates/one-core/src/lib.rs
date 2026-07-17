@@ -2,6 +2,7 @@ pub mod agent;
 pub mod compaction;
 pub mod error;
 pub mod events;
+pub mod hooks;
 pub mod image;
 pub mod message;
 pub mod streaming;
@@ -21,6 +22,7 @@ pub use compaction::{
 };
 pub use error::{OneError, Result};
 pub use events::AgentEvent;
+pub use hooks::{AgentHooks, NoopHooks};
 pub use message::{AgentMessage, AssistantMessage, StopReason, ToolResultMessage, UserMessage};
 pub use tool::{Tool, ToolCall, ToolDefinition, ToolOutput};
 pub use tool_gate::{AllowAllGate, ToolGate, ToolGateDecision};

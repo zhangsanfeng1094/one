@@ -77,7 +77,7 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     },
     SlashCommand {
         name: "/mcp",
-        usage: "/mcp [enable|disable <name>]",
+        usage: "/mcp [import|enable|disable <name>]",
         description: "MCP servers · status · enable/disable (bare = panel)",
     },
     SlashCommand {

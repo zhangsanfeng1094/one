@@ -6,6 +6,16 @@
 
 use crate::slash::ModelChoice;
 
+/// Visual role of a float row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum FloatItemStyle {
+    /// Ordinary list row (settings fields, servers, models, …).
+    #[default]
+    Normal,
+    /// Primary action (import, fetch models, …) — accent label + chip.
+    Action,
+}
+
 /// One selectable row inside a section.
 #[derive(Debug, Clone)]
 pub struct FloatItem {
@@ -15,6 +25,7 @@ pub struct FloatItem {
     pub detail: String,
     /// Right-aligned hint (shortcut / path).
     pub hint: String,
+    pub style: FloatItemStyle,
 }
 
 /// Named group of items (e.g. provider name, "Session", "Tools").
@@ -67,6 +78,8 @@ pub enum FloatKind {
     Skills,
     /// MCP servers — status + enable/disable.
     Mcp,
+    /// Import MCP servers from Claude / Codex / Cursor.
+    McpImport,
     /// Generic custom list.
     Custom,
 }
@@ -146,7 +159,8 @@ impl FloatMenu {
                     }
                     .into(),
                     hint: format!("/thinking {l}"),
-                }
+                    style: FloatItemStyle::Normal,
+}
             })
             .collect();
         Self {
@@ -174,7 +188,8 @@ impl FloatMenu {
                 label: label.clone(),
                 detail: detail.clone(),
                 hint: hint.clone(),
-            })
+                style: FloatItemStyle::Normal,
+})
             .collect();
         Self {
             kind: FloatKind::Sessions,
@@ -205,7 +220,8 @@ impl FloatMenu {
                 label: label.clone(),
                 detail: detail.clone(),
                 hint: id.chars().take(8).collect(),
-            })
+                style: FloatItemStyle::Normal,
+})
             .collect();
         Self {
             kind: FloatKind::Tree,
@@ -233,7 +249,8 @@ impl FloatMenu {
                 label: preview.clone(),
                 detail: "restore conversation before this · edit prompt".into(),
                 hint: format!("#{}", i + 1),
-            })
+                style: FloatItemStyle::Normal,
+})
             .collect();
         Self {
             kind: FloatKind::Rewind,
@@ -263,7 +280,8 @@ impl FloatMenu {
                 label: k.clone(),
                 detail: v.clone(),
                 hint: String::new(),
-            })
+                style: FloatItemStyle::Normal,
+})
             .collect();
         Self {
             kind: FloatKind::Info,
@@ -376,6 +394,7 @@ impl FloatMenu {
                 } else {
                     "off".into()
                 },
+                style: FloatItemStyle::Normal,
             };
             if *on {
                 on_items.push(item);
@@ -383,26 +402,45 @@ impl FloatMenu {
                 off_items.push(item);
             }
         }
+        let on_n = on_items.len();
+        let off_n = off_items.len();
         let mut sections = Vec::new();
-        if !on_items.is_empty() {
+        sections.push(FloatSection {
+            title: "Actions".into(),
+            items: vec![
+                action_item(
+                    "_import",
+                    "Import from other agents",
+                    "Claude · Codex · Cursor · project .mcp.json → One",
+                    "import",
+                ),
+                action_item(
+                    "_import_all",
+                    "Import all available",
+                    "copy every foreign server not already in One",
+                    "all",
+                ),
+            ],
+        });
+        if on_n > 0 {
             sections.push(FloatSection {
-                title: format!("On ({})", on_items.len()),
+                title: format!("On ({on_n})"),
                 items: on_items,
             });
         }
-        if !off_items.is_empty() {
+        if off_n > 0 {
             sections.push(FloatSection {
-                title: format!("Off ({})", off_items.len()),
+                title: format!("Off ({off_n})"),
                 items: off_items,
             });
         }
-        if sections.is_empty() {
+        if on_n == 0 && off_n == 0 {
             sections.push(FloatSection {
-                title: "MCP".into(),
+                title: "Servers".into(),
                 items: vec![item(
                     "_empty",
-                    "(none)",
-                    "add servers with `one mcp add` · Enter toggles",
+                    "(none in One)",
+                    "Import above, or `one mcp add …`",
                     "",
                 )],
             });
@@ -412,6 +450,45 @@ impl FloatMenu {
             title: "MCP".into(),
             search: String::new(),
             sections,
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Import picker: rows are `(name, label, detail, already_owned)`.
+    pub fn mcp_import(rows: &[(String, String, String, bool)]) -> Self {
+        let mut items = Vec::new();
+        for (id, label, detail, owned) in rows {
+            items.push(FloatItem {
+                id: id.clone(),
+                label: label.clone(),
+                detail: detail.clone(),
+                hint: if *owned { "owned".into() } else { "import".into() },
+                style: if *owned {
+                    FloatItemStyle::Normal
+                } else {
+                    FloatItemStyle::Action
+                },
+            });
+        }
+        if items.is_empty() {
+            items.push(item(
+                "_empty",
+                "(nothing found)",
+                "No Claude / Codex / Cursor MCP configs detected",
+                "",
+            ));
+        }
+        Self {
+            kind: FloatKind::McpImport,
+            title: "Import MCP".into(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: format!("Candidates ({})", rows.len()),
+                items,
+            }],
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
@@ -433,7 +510,8 @@ impl FloatMenu {
                 } else {
                     "off · Enter on".into()
                 },
-            };
+                style: FloatItemStyle::Normal,
+};
             if *on {
                 enabled_items.push(item);
             } else {
@@ -484,7 +562,8 @@ impl FloatMenu {
                 label: id.clone(),
                 detail: detail.clone(),
                 hint: "→".into(),
-            })
+                style: FloatItemStyle::Normal,
+})
             .collect();
         items.push(item(
             "add_provider",
@@ -606,7 +685,7 @@ impl FloatMenu {
                     title: String::new(),
                     items: vec![
                         item("models", "Models", &models_detail, "→"),
-                        item(
+                        action_item(
                             "fetch_models",
                             "Fetch & import remote models",
                             "GET /models → batch add · Ctrl+F",
@@ -759,7 +838,8 @@ impl FloatMenu {
                 label: id.clone(),
                 detail: detail.clone(),
                 hint: "add".into(),
-            })
+                style: FloatItemStyle::Normal,
+})
             .collect();
         Self {
             kind: FloatKind::SettingsRemoteModels,
@@ -779,11 +859,11 @@ impl FloatMenu {
     /// Models for **one** provider (second level under Provider detail).
     pub fn settings_models_for_provider(provider: &str, rows: &[(String, String)]) -> Self {
         let prefix = format!("{provider}:");
-        let mut items: Vec<FloatItem> = vec![item(
+        let mut items: Vec<FloatItem> = vec![action_item(
             "fetch_models",
             "Fetch & import remote models",
             "GET /models → batch write models.json",
-            "Ctrl+F",
+            "fetch",
         )];
         let model_items: Vec<FloatItem> = rows
             .iter()
@@ -798,7 +878,8 @@ impl FloatMenu {
                     label,
                     detail: detail.clone(),
                     hint: "→".into(),
-                }
+                    style: FloatItemStyle::Normal,
+}
             })
             .collect();
         let n = model_items.len();
@@ -956,6 +1037,7 @@ impl FloatMenu {
                 } else {
                     hint.into()
                 },
+                style: FloatItemStyle::Normal,
             }
         };
         Self {
@@ -1027,7 +1109,8 @@ impl FloatMenu {
                         label,
                         detail,
                         hint: m.provider.clone(),
-                    }
+                        style: FloatItemStyle::Normal,
+}
                 })
                 .collect();
             if !items.is_empty() {
@@ -1112,6 +1195,7 @@ impl FloatMenu {
                 label: e.item.label.clone(),
                 detail: e.item.detail.clone(),
                 hint: e.item.hint.clone(),
+                style: e.item.style,
             });
         }
         rows
@@ -1257,6 +1341,7 @@ pub enum FloatRenderRow {
         label: String,
         detail: String,
         hint: String,
+        style: FloatItemStyle,
     },
 }
 
@@ -1358,6 +1443,18 @@ fn item(id: &str, label: &str, detail: &str, hint: &str) -> FloatItem {
         label: label.into(),
         detail: detail.into(),
         hint: hint.into(),
+        style: FloatItemStyle::Normal,
+    }
+}
+
+/// Accent row for primary actions (import, fetch, …).
+fn action_item(id: &str, label: &str, detail: &str, hint: &str) -> FloatItem {
+    FloatItem {
+        id: id.into(),
+        label: label.into(),
+        detail: detail.into(),
+        hint: hint.into(),
+        style: FloatItemStyle::Action,
     }
 }
 

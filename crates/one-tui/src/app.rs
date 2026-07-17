@@ -97,6 +97,8 @@ pub enum RunOutcome {
     ConfigOp(ConfigOp),
     /// Open MCP manager; CLI refreshes live status first.
     OpenMcpPanel,
+    /// Open MCP import picker; CLI scans foreign agents first.
+    OpenMcpImportPanel,
     Quit,
     Noop,
 }
@@ -147,6 +149,14 @@ pub enum ConfigOp {
     /// Toggle MCP server enabled (server name).
     McpToggle {
         name: String,
+    },
+    /// Import foreign MCP server(s) into One.
+    ///
+    /// Empty `names` = import all not already owned.
+    McpImport {
+        names: Vec<String>,
+        /// Replace existing One entries with the same name.
+        force: bool,
     },
 }
 
@@ -265,6 +275,7 @@ impl RunOutcome {
             RunOutcome::CycleAgentMode
             | RunOutcome::OpenRewind
             | RunOutcome::OpenMcpPanel
+            | RunOutcome::OpenMcpImportPanel
             | RunOutcome::SwitchModel { .. }
             | RunOutcome::ConfigOp(_)
             | RunOutcome::Quit => true,
@@ -303,6 +314,11 @@ pub struct App {
     pub title: String,
     pub messages: Vec<Message>,
     pub input: String,
+    /// Char index of the software caret in `input` (0 = before first char).
+    ///
+    /// Left/Right move this; insert/backspace/delete operate at this position.
+    /// Always clamped to `input.chars().count()` after mutations.
+    pub input_cursor: usize,
     pub status: String,
     pub stream_buffer: String,
     /// Streaming thinking / reasoning buffer (separate from assistant text).
@@ -366,6 +382,8 @@ pub struct App {
     pub skills_rows: Vec<(String, String, String, bool)>,
     /// MCP manager rows: `(name, label, detail, enabled)`.
     pub mcp_rows: Vec<(String, String, String, bool)>,
+    /// MCP import candidates: `(name, label, detail, already_owned)`.
+    pub mcp_import_rows: Vec<(String, String, String, bool)>,
     /// Short MCP summary for Settings root.
     pub mcp_summary: String,
     /// Status-bar / prompt-meta chip, e.g. `MCP 4/5…`. Empty = hidden.
@@ -475,6 +493,7 @@ impl App {
             title: title.into(),
             messages: Vec::new(),
             input: String::new(),
+            input_cursor: 0,
             status: STATUS_IDLE.into(),
             stream_buffer: String::new(),
             thinking_buffer: String::new(),
@@ -505,6 +524,7 @@ impl App {
             settings_model_rows: Vec::new(),
             skills_rows: Vec::new(),
             mcp_rows: Vec::new(),
+            mcp_import_rows: Vec::new(),
             mcp_summary: "none".into(),
             mcp_chip_text: String::new(),
             mcp_chip_kind: 0,
@@ -554,6 +574,10 @@ impl App {
 
     /// Show a tool-approval modal (called from CLI while agent is busy).
     pub fn set_approval_prompt(&mut self, prompt: ApprovalPrompt) {
+        // Don't wipe an answer waiting for CLI drain, and don't re-open the same id.
+        if self.approval_answer.is_some() {
+            return;
+        }
         if self.approval.as_ref().map(|p| p.id) == Some(prompt.id) {
             return;
         }
@@ -590,7 +614,10 @@ impl App {
 
     /// Show a generic select prompt (ask_user HITL).
     pub fn set_select_prompt(&mut self, kind: SelectKind, prompt: crate::select::SelectPrompt) {
-        // Don't clobber a different in-flight prompt of another kind with same id.
+        // Don't clobber an in-flight dock, or wipe a result waiting for the CLI drain.
+        if self.select_result.is_some() {
+            return;
+        }
         if self.select_kind.as_ref() == Some(&kind) && self.select.is_some() {
             return;
         }
@@ -823,6 +850,28 @@ impl App {
         self.clear_notice();
     }
 
+    /// Store import candidates and open the import float.
+    pub fn set_mcp_import_rows(&mut self, rows: Vec<(String, String, String, bool)>) {
+        self.mcp_import_rows = rows;
+    }
+
+    pub fn open_mcp_import_float(&mut self) {
+        self.close_float();
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::mcp_import(&self.mcp_import_rows));
+        self.clear_notice();
+    }
+
+    pub fn reopen_mcp_import_float(&mut self) {
+        let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
+        self.float = Some(FloatMenu::mcp_import(&self.mcp_import_rows));
+        if let Some(f) = self.float.as_mut() {
+            let max = f.filtered_entries().len().saturating_sub(1);
+            f.selected = prev_selected.min(max);
+        }
+        self.clear_notice();
+    }
+
     /// Start in-float field edit (search bar). Never opens the yellow docked select.
     pub fn start_settings_inline_edit(
         &mut self,
@@ -1020,6 +1069,11 @@ impl App {
                 self.open_settings_float();
                 true
             }
+            FloatKind::McpImport => {
+                // Back to MCP manager (caller may refresh rows).
+                self.open_mcp_float();
+                true
+            }
             FloatKind::Thinking => {
                 // Opened from Settings — return to root rather than blank.
                 self.open_settings_float();
@@ -1123,6 +1177,7 @@ impl App {
                 let i = self.prompt_history.len() - 1;
                 self.history_index = Some(i);
                 self.input = self.prompt_history[i].clone();
+                self.input_cursor_end();
             }
             Some(0) => {
                 // Already at oldest — stay put.
@@ -1131,6 +1186,7 @@ impl App {
                 let i = i - 1;
                 self.history_index = Some(i);
                 self.input = self.prompt_history[i].clone();
+                self.input_cursor_end();
             }
         }
         self.pending_images.clear();
@@ -1152,6 +1208,7 @@ impl App {
             self.history_index = None;
             self.input = std::mem::take(&mut self.history_draft);
         }
+        self.input_cursor_end();
         self.pending_images.clear();
         self.pending_texts.clear();
         self.cursor_on = true;
@@ -1201,12 +1258,98 @@ impl App {
         self.sync_pending_chips();
     }
 
-    fn insert_chip_token(&mut self, token: &str) {
-        if !self.input.is_empty() && !self.input.ends_with(|c: char| c.is_whitespace()) {
-            self.input.push(' ');
+    fn clamp_input_cursor(&mut self) {
+        let len = self.input.chars().count();
+        if self.input_cursor > len {
+            self.input_cursor = len;
         }
-        self.input.push_str(token);
-        self.input.push(' ');
+    }
+
+    /// Move caret to end of `input` (history recall, bulk replace, chip append).
+    fn input_cursor_end(&mut self) {
+        self.input_cursor = self.input.chars().count();
+    }
+
+    fn input_cursor_home(&mut self) {
+        self.input_cursor = 0;
+    }
+
+    /// Byte index in `input` for the current char cursor.
+    fn input_byte_at_cursor(&self) -> usize {
+        self.input
+            .chars()
+            .take(self.input_cursor)
+            .map(|c| c.len_utf8())
+            .sum()
+    }
+
+    /// Left/right caret movement inside the main prompt.
+    pub fn move_input_cursor(&mut self, delta: isize) {
+        let len = self.input.chars().count() as isize;
+        let next = (self.input_cursor as isize + delta).clamp(0, len);
+        self.input_cursor = next as usize;
+        self.cursor_on = true;
+    }
+
+    /// Split `input` at the caret for rendering: (before, after).
+    pub fn input_split_at_cursor(&self) -> (&str, &str) {
+        let idx = self.input_byte_at_cursor().min(self.input.len());
+        let idx = if self.input.is_char_boundary(idx) {
+            idx
+        } else {
+            self.input.len()
+        };
+        (&self.input[..idx], &self.input[idx..])
+    }
+
+    /// Insert a character at the caret.
+    fn insert_input_char(&mut self, ch: char) {
+        if ch.is_control() && ch != '\n' {
+            return;
+        }
+        self.clamp_input_cursor();
+        let idx = self.input_byte_at_cursor();
+        self.input.insert(idx, ch);
+        self.input_cursor += 1;
+        self.cursor_on = true;
+    }
+
+    /// Insert a string at the caret (control chars other than `\n` dropped).
+    fn insert_input_str(&mut self, text: &str) {
+        let cleaned: String = text
+            .chars()
+            .filter(|c| *c == '\n' || !c.is_control())
+            .collect();
+        if cleaned.is_empty() {
+            return;
+        }
+        self.clamp_input_cursor();
+        let idx = self.input_byte_at_cursor();
+        let n = cleaned.chars().count();
+        self.input.insert_str(idx, &cleaned);
+        self.input_cursor += n;
+        self.cursor_on = true;
+    }
+
+    fn insert_chip_token(&mut self, token: &str) {
+        // Prefer a leading space when inserting mid-buffer after non-whitespace.
+        self.clamp_input_cursor();
+        let idx = self.input_byte_at_cursor();
+        let need_lead = idx > 0
+            && !self.input[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c.is_whitespace());
+        let mut piece = String::new();
+        if need_lead {
+            piece.push(' ');
+        }
+        piece.push_str(token);
+        piece.push(' ');
+        let n = piece.chars().count();
+        self.input.insert_str(idx, &piece);
+        self.input_cursor += n;
+        self.cursor_on = true;
     }
 
     /// Attach a ready local image file and insert `[图片.img]` into the input.
@@ -1272,7 +1415,16 @@ impl App {
             if start > 0 && self.input.as_bytes().get(start - 1) == Some(&b' ') {
                 start -= 1;
             }
+            let removed = self.input[start..end].chars().count();
+            let caret_byte = self.input_byte_at_cursor();
             self.input.replace_range(start..end, "");
+            if caret_byte >= end {
+                self.input_cursor = self.input_cursor.saturating_sub(removed);
+            } else if caret_byte > start {
+                // Caret was inside the chip — snap to the cut point.
+                self.input_cursor = self.input[..start].chars().count();
+            }
+            self.clamp_input_cursor();
         }
     }
 
@@ -1395,17 +1547,56 @@ impl App {
         self.set_notice(format!("pasted  {token}  {summary}"));
     }
 
-    /// Pop one character, or an entire paste chip (`[图片.….img]` / `[文本.….txt]`).
+    /// Backspace: delete one character (or an entire paste chip) before the caret.
     pub fn pop_input(&mut self) {
-        if self.input.is_empty() {
+        if self.input_cursor == 0 || self.input.is_empty() {
             return;
         }
-        if let Some(n) = one_core::image::paste_chip_backspace_len(&self.input) {
-            let new_len = self.input.len().saturating_sub(n);
-            self.input.truncate(new_len);
+        let byte_end = self.input_byte_at_cursor();
+        let before = &self.input[..byte_end];
+        if let Some(n) = one_core::image::paste_chip_backspace_len(before) {
+            let start = byte_end.saturating_sub(n);
+            // How many chars were removed so the caret can step back correctly.
+            let removed_chars = self.input[start..byte_end].chars().count();
+            self.input.replace_range(start..byte_end, "");
+            self.input_cursor = self.input_cursor.saturating_sub(removed_chars);
         } else {
-            self.input.pop();
+            // Remove the single char immediately before the caret.
+            self.input_cursor -= 1;
+            let idx = self.input_byte_at_cursor();
+            if idx < self.input.len() {
+                self.input.remove(idx);
+            }
         }
+        self.clamp_input_cursor();
+        self.sync_pending_chips();
+        self.cursor_on = true;
+        self.clear_notice();
+    }
+
+    /// Delete: remove one character (or paste chip) at/after the caret.
+    pub fn delete_input_forward(&mut self) {
+        if self.input_cursor >= self.input.chars().count() {
+            return;
+        }
+        let idx = self.input_byte_at_cursor();
+        let rest = &self.input[idx..];
+        // Atomic chip delete when caret sits at the start of `[图片…]` / `[文本…]`.
+        let chip_len = one_core::image::parse_image_token_at(rest)
+            .map(|(_, len)| len)
+            .or_else(|| one_core::image::parse_text_token_at(rest).map(|(_, len)| len));
+        if let Some(len) = chip_len {
+            let mut end = idx + len;
+            // Peel optional trailing space that insert_chip_token adds.
+            if self.input[end..].starts_with(' ') {
+                end += 1;
+            }
+            self.input.replace_range(idx..end, "");
+        } else if let Some(ch) = rest.chars().next() {
+            self.input.remove(idx);
+            let _ = ch;
+        }
+        self.clamp_input_cursor();
         self.sync_pending_chips();
         self.cursor_on = true;
         self.clear_notice();
@@ -1633,6 +1824,7 @@ impl App {
                 self.input.push(' ');
             }
         }
+        self.input_cursor_end();
         self.leave_history_browse();
         self.cursor_on = true;
     }
@@ -1716,6 +1908,7 @@ impl App {
         if let Some(row) = rows.get(self.slash_selected) {
             if let Some(text) = slash::completion_for_row(row) {
                 self.input = text;
+                self.input_cursor_end();
                 self.slash_selected = 0;
                 self.cursor_on = true;
                 self.clamp_slash_selection();
@@ -2538,14 +2731,7 @@ impl App {
             return;
         }
 
-        for ch in normalized.chars() {
-            match ch {
-                '\n' => self.input.push('\n'),
-                c if !c.is_control() => self.input.push(c),
-                _ => {}
-            }
-        }
-        self.cursor_on = true;
+        self.insert_input_str(&normalized);
         self.clear_notice();
     }
 
@@ -2610,6 +2796,23 @@ impl App {
                 self.history_next();
                 RunOutcome::Noop
             }
+            // Ctrl+A / Ctrl+E → caret home / end (readline).
+            KeyCode::Char('a')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.input_cursor_home();
+                self.cursor_on = true;
+                RunOutcome::Noop
+            }
+            KeyCode::Char('e')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.input_cursor_end();
+                self.cursor_on = true;
+                RunOutcome::Noop
+            }
             // Ctrl+L → model select (docked above input)
             KeyCode::Char('l') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.open_model_select();
@@ -2637,8 +2840,7 @@ impl App {
             // Ctrl+J → insert newline (multi-line compose)
             KeyCode::Char('j') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.leave_history_browse();
-                self.input.push('\n');
-                self.cursor_on = true;
+                self.insert_input_char('\n');
                 self.clear_notice();
                 RunOutcome::Noop
             }
@@ -2656,8 +2858,7 @@ impl App {
             // Shift+Enter → newline (when terminal reports SHIFT)
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.leave_history_browse();
-                self.input.push('\n');
-                self.cursor_on = true;
+                self.insert_input_char('\n');
                 self.clear_notice();
                 RunOutcome::Noop
             }
@@ -2713,9 +2914,15 @@ impl App {
                 }
                 RunOutcome::Noop
             }
-            KeyCode::Backspace | KeyCode::Delete => {
+            KeyCode::Backspace => {
                 self.leave_history_browse();
                 self.pop_input();
+                self.clamp_slash_selection();
+                RunOutcome::Noop
+            }
+            KeyCode::Delete => {
+                self.leave_history_browse();
+                self.delete_input_forward();
                 self.clamp_slash_selection();
                 RunOutcome::Noop
             }
@@ -2724,6 +2931,7 @@ impl App {
                 if self.slash_menu_visible() {
                     // Dismiss slash: clear incomplete command.
                     self.input.clear();
+                    self.input_cursor = 0;
                     self.slash_selected = 0;
                     self.clear_notice();
                     return RunOutcome::Noop;
@@ -2737,10 +2945,9 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.leave_history_browse();
-                self.input.push('/');
+                self.insert_input_char('/');
                 self.slash_selected = 0;
                 self.clamp_slash_selection();
-                self.cursor_on = true;
                 self.clear_notice();
                 RunOutcome::Noop
             }
@@ -2765,6 +2972,7 @@ impl App {
                 if let Some(prompt) = WELCOME_TRY_PROMPTS.get(idx) {
                     self.leave_history_browse();
                     self.input = (*prompt).to_string();
+                    self.input_cursor_end();
                     self.cursor_on = true;
                     self.clear_notice();
                     return self.submit_prompt();
@@ -2776,12 +2984,20 @@ impl App {
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
                 self.leave_history_browse();
-                self.input.push(ch);
-                self.cursor_on = true;
+                self.insert_input_char(ch);
                 self.clear_notice();
                 if self.input.starts_with('/') {
                     self.clamp_slash_selection();
                 }
+                RunOutcome::Noop
+            }
+            // ←→ move caret inside the prompt (Home/End still scroll transcript).
+            KeyCode::Left => {
+                self.move_input_cursor(-1);
+                RunOutcome::Noop
+            }
+            KeyCode::Right => {
+                self.move_input_cursor(1);
                 RunOutcome::Noop
             }
             // Transcript scroll (mouse wheel / Page keys).
@@ -3199,7 +3415,8 @@ impl App {
             FloatKind::SettingsModelDetail => self.confirm_settings_model_detail(&entry.item.id),
             FloatKind::SettingsModelAdd => self.confirm_settings_model_add(&entry.item.id),
             FloatKind::Skills => self.confirm_skills_toggle(&entry.item.id),
-            FloatKind::Mcp => self.confirm_mcp_toggle(&entry.item.id),
+            FloatKind::Mcp => self.confirm_mcp_action(&entry.item.id),
+            FloatKind::McpImport => self.confirm_mcp_import(&entry.item.id),
             FloatKind::Help | FloatKind::Commands | FloatKind::Custom => {
                 self.dispatch_command_item(&entry.item.id, &entry.item.hint)
             }
@@ -3215,12 +3432,40 @@ impl App {
         })
     }
 
-    fn confirm_mcp_toggle(&mut self, id: &str) -> RunOutcome {
+    fn confirm_mcp_action(&mut self, id: &str) -> RunOutcome {
+        match id {
+            "_empty" | "" => RunOutcome::Noop,
+            "_import" => {
+                self.close_float();
+                RunOutcome::OpenMcpImportPanel
+            }
+            "_import_all" => {
+                self.close_float();
+                RunOutcome::ConfigOp(ConfigOp::McpImport {
+                    names: Vec::new(),
+                    force: false,
+                })
+            }
+            _ => RunOutcome::ConfigOp(ConfigOp::McpToggle {
+                name: id.to_string(),
+            }),
+        }
+    }
+
+    fn confirm_mcp_import(&mut self, id: &str) -> RunOutcome {
         if id == "_empty" || id.is_empty() {
             return RunOutcome::Noop;
         }
-        RunOutcome::ConfigOp(ConfigOp::McpToggle {
-            name: id.to_string(),
+        // Import one server; force if already owned so user can re-sync.
+        let force = self
+            .mcp_import_rows
+            .iter()
+            .find(|(n, _, _, _)| n == id)
+            .map(|(_, _, _, owned)| *owned)
+            .unwrap_or(false);
+        RunOutcome::ConfigOp(ConfigOp::McpImport {
+            names: vec![id.to_string()],
+            force,
         })
     }
 
@@ -3672,6 +3917,7 @@ impl App {
                 };
                 if cmd.ends_with(' ') {
                     self.input = cmd;
+                    self.input_cursor_end();
                     RunOutcome::Noop
                 } else {
                     RunOutcome::Prompt(cmd)
@@ -3737,16 +3983,20 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
                 let _ = self.submit_followup();
             }
-            KeyCode::Backspace | KeyCode::Delete => {
+            KeyCode::Backspace => {
                 self.pop_input();
+            }
+            KeyCode::Delete => {
+                self.delete_input_forward();
             }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
-                self.input.push(ch);
-                self.cursor_on = true;
+                self.insert_input_char(ch);
             }
+            KeyCode::Left => self.move_input_cursor(-1),
+            KeyCode::Right => self.move_input_cursor(1),
             KeyCode::PageUp => self.scroll_up(self.page_lines()),
             KeyCode::PageDown => self.scroll_down(self.page_lines()),
             KeyCode::Home => self.scroll_to_top(),
@@ -3770,6 +4020,7 @@ impl App {
         if matches.len() == 1 {
             let completed = &matches[0];
             self.input = format!("{prefix}{completed}");
+            self.input_cursor_end();
             self.cursor_on = true;
             self.clear_notice();
             return;
@@ -3778,6 +4029,7 @@ impl App {
         let common = longest_common_prefix(&matches);
         if common.len() > partial.len() {
             self.input = format!("{prefix}{common}");
+            self.input_cursor_end();
             self.cursor_on = true;
         }
         let preview: Vec<_> = matches.iter().take(8).cloned().collect();
@@ -4577,6 +4829,7 @@ mod tests {
         // With draft text, `?` is a normal character.
         app.close_float();
         app.input = "what".into();
+        app.input_cursor = app.input.chars().count();
         app.handle_key(key(KeyCode::Char('?'), KeyModifiers::NONE));
         assert!(!app.float_open());
         assert_eq!(app.input, "what?");
@@ -4600,6 +4853,45 @@ mod tests {
         let search = app.float.as_ref().map(|f| f.search.clone()).unwrap();
         assert_eq!(search, "https://api.example.com/v1");
         assert!(app.float.as_ref().is_some_and(|f| f.edit_mode));
+    }
+
+    #[test]
+    fn main_input_left_right_moves_cursor_and_inserts_mid() {
+        let mut app = App::new("test");
+        for ch in "hello".chars() {
+            app.handle_key(key(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        assert_eq!(app.input, "hello");
+        assert_eq!(app.input_cursor, 5);
+
+        // ←←← → caret before "llo"
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor, 2);
+
+        app.handle_key(key(KeyCode::Char('X'), KeyModifiers::NONE));
+        assert_eq!(app.input, "heXllo");
+        assert_eq!(app.input_cursor, 3);
+
+        // Backspace deletes before caret.
+        app.handle_key(key(KeyCode::Backspace, KeyModifiers::NONE));
+        assert_eq!(app.input, "hello");
+        assert_eq!(app.input_cursor, 2);
+
+        // Delete removes after caret.
+        app.handle_key(key(KeyCode::Delete, KeyModifiers::NONE));
+        assert_eq!(app.input, "helo");
+        assert_eq!(app.input_cursor, 2);
+
+        // Right to end, then right stays at end.
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor, app.input.chars().count());
+        app.handle_key(key(KeyCode::Right, KeyModifiers::NONE));
+        assert_eq!(app.input_cursor, app.input.chars().count());
     }
 
     #[test]
@@ -4868,6 +5160,7 @@ mod tests {
     fn ctrl_j_inserts_newline() {
         let mut app = App::new("test");
         app.input = "a".into();
+        app.input_cursor = 1;
         app.handle_key(key(KeyCode::Char('j'), KeyModifiers::CONTROL));
         assert_eq!(app.input, "a\n");
     }
@@ -4899,6 +5192,88 @@ mod tests {
         assert!(app.take_force_quit());
         // request_force_quit also trips abort so in-flight work stops.
         assert!(app.take_abort());
+    }
+
+    #[test]
+    fn ask_user_enter_keeps_result_against_prompt_reopen() {
+        use crate::select::{SelectOption, SelectPrompt, SelectResult};
+
+        let mut app = App::new("test");
+        app.begin_busy();
+        let mut prompt = SelectPrompt::single(
+            "颜色选择",
+            "你想选择哪种颜色?",
+            vec![
+                SelectOption::new("红色", "红色", ""),
+                SelectOption::new("绿色", "绿色", ""),
+                SelectOption::new("蓝色", "蓝色", ""),
+            ],
+        );
+        prompt.allow_other = true;
+        app.set_select_prompt(SelectKind::AskUser { id: 1 }, prompt);
+        assert!(app.select_prompt().is_some());
+
+        // Confirm first option (Enter).
+        app.handle_busy_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.select_prompt().is_none(), "dock should close after confirm");
+
+        // Simulate the old buggy drain order: re-surface pending HITL before
+        // taking the answer. Must not wipe select_result.
+        let mut reopen = SelectPrompt::single(
+            "颜色选择",
+            "你想选择哪种颜色?",
+            vec![
+                SelectOption::new("红色", "红色", ""),
+                SelectOption::new("绿色", "绿色", ""),
+                SelectOption::new("蓝色", "蓝色", ""),
+            ],
+        );
+        reopen.allow_other = true;
+        app.set_select_prompt(SelectKind::AskUser { id: 1 }, reopen);
+
+        let (kind, result) = app.take_select_result().expect("result must survive reopen");
+        assert!(matches!(kind, SelectKind::AskUser { id: 1 }));
+        assert_eq!(
+            result,
+            SelectResult::Confirmed {
+                ids: vec!["红色".into()],
+                other: None,
+            }
+        );
+    }
+
+    #[test]
+    fn ask_user_tab_enters_other_typing() {
+        use crate::select::{SelectOption, SelectPrompt, SelectPhase, SelectResult};
+
+        let mut app = App::new("test");
+        app.begin_busy();
+        let mut prompt = SelectPrompt::single(
+            "颜色选择",
+            "你想选择哪种颜色?",
+            vec![
+                SelectOption::new("红色", "红色", ""),
+                SelectOption::new("绿色", "绿色", ""),
+            ],
+        );
+        prompt.allow_other = true;
+        app.set_select_prompt(SelectKind::AskUser { id: 7 }, prompt);
+
+        app.handle_busy_key(key(KeyCode::Tab, KeyModifiers::NONE));
+        let p = app.select_prompt().expect("still open for typing");
+        assert!(matches!(p.phase, SelectPhase::Typing { .. }));
+        assert!(p.is_other_row(p.selected));
+
+        app.handle_busy_key(key(KeyCode::Char('紫'), KeyModifiers::NONE));
+        app.handle_busy_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        let (_, result) = app.take_select_result().unwrap();
+        assert_eq!(
+            result,
+            SelectResult::Confirmed {
+                ids: vec![],
+                other: Some("紫".into()),
+            }
+        );
     }
 
     #[test]

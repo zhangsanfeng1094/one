@@ -24,8 +24,9 @@ use rmcp::{RoleClient, ServiceExt};
 use tracing::{info, warn};
 
 use crate::config::{
-    load_effective, set_server_disabled_persistent, ConfigSourceKind, LoadedMcpConfig, McpConfig,
-    McpServerConfig, DEFAULT_MAX_OUTPUT_BYTES,
+    import_servers_to_user, load_effective, scan_import_candidates, set_server_disabled_persistent,
+    ConfigSourceKind, ImportCandidate, ImportReport, LoadedMcpConfig, McpConfig, McpServerConfig,
+    DEFAULT_MAX_OUTPUT_BYTES,
 };
 use crate::error::{McpError, Result};
 use crate::tool::tools_from_list;
@@ -100,7 +101,8 @@ impl McpProgressHandle {
         if self.process_disabled {
             return None;
         }
-        let total = self.shared.config.mcp_servers.len();
+        let config = self.shared.config.read();
+        let total = config.mcp_servers.len();
         if total == 0 {
             return None;
         }
@@ -118,9 +120,7 @@ impl McpProgressHandle {
             .iter()
             .filter(|(n, _)| !disabled.contains(n))
             .count();
-        let enabled_total = self
-            .shared
-            .config
+        let enabled_total = config
             .mcp_servers
             .iter()
             .filter(|(n, c)| !disabled.contains(*n) && c.enabled != Some(false))
@@ -167,8 +167,8 @@ struct LiveServer {
 }
 
 struct SharedState {
-    config: McpConfig,
-    server_sources: std::collections::BTreeMap<String, ConfigSourceKind>,
+    config: RwLock<McpConfig>,
+    server_sources: RwLock<std::collections::BTreeMap<String, ConfigSourceKind>>,
     tools: RwLock<Vec<Arc<dyn Tool>>>,
     failures: RwLock<Vec<(String, String)>>,
     live: RwLock<Vec<LiveServer>>,
@@ -194,8 +194,8 @@ impl McpManager {
     pub fn empty() -> Self {
         Self {
             shared: Arc::new(SharedState {
-                config: McpConfig::empty(),
-                server_sources: Default::default(),
+                config: RwLock::new(McpConfig::empty()),
+                server_sources: RwLock::new(Default::default()),
                 tools: RwLock::new(Vec::new()),
                 failures: RwLock::new(Vec::new()),
                 live: RwLock::new(Vec::new()),
@@ -221,8 +221,8 @@ impl McpManager {
         }
     }
 
-    pub fn config(&self) -> &McpConfig {
-        &self.shared.config
+    pub fn config(&self) -> McpConfig {
+        self.shared.config.read().clone()
     }
 
     pub fn generation(&self) -> u64 {
@@ -238,7 +238,7 @@ impl McpManager {
         {
             return McpLoadStatus::Loading;
         }
-        if self.shared.config.mcp_servers.is_empty() {
+        if self.shared.config.read().mcp_servers.is_empty() {
             return McpLoadStatus::Idle;
         }
         McpLoadStatus::Ready
@@ -271,7 +271,7 @@ impl McpManager {
     }
 
     pub fn server_source(&self, name: &str) -> Option<ConfigSourceKind> {
-        self.shared.server_sources.get(name).copied()
+        self.shared.server_sources.read().get(name).copied()
     }
 
     /// Blocking full connect (tests / `one mcp doctor`). Prefer [`Self::spawn`].
@@ -294,8 +294,8 @@ impl McpManager {
         let disabled_set: HashSet<String> = loaded.config.disabled_servers.iter().cloned().collect();
         let n_enabled = loaded.config.enabled_servers().count();
         let shared = Arc::new(SharedState {
-            config: loaded.config.clone(),
-            server_sources: loaded.server_sources.clone(),
+            config: RwLock::new(loaded.config.clone()),
+            server_sources: RwLock::new(loaded.server_sources.clone()),
             tools: RwLock::new(Vec::new()),
             failures: RwLock::new(Vec::new()),
             live: RwLock::new(Vec::new()),
@@ -350,8 +350,9 @@ impl McpManager {
         let failures = self.shared.failures.read();
         let loading = self.is_loading();
 
+        let config = self.shared.config.read();
         let mut rows = Vec::new();
-        for (name, cfg) in &self.shared.config.mcp_servers {
+        for (name, cfg) in &config.mcp_servers {
             let is_disabled = disabled.contains(name) || cfg.enabled == Some(false);
             let source = self
                 .server_source(name)
@@ -441,7 +442,7 @@ impl McpManager {
         if self.disabled {
             return Err(McpError::other("MCP is disabled for this process (--no-mcp)"));
         }
-        if !self.shared.config.mcp_servers.contains_key(name) {
+        if !self.shared.config.read().mcp_servers.contains_key(name) {
             return Err(McpError::other(format!("unknown MCP server `{name}`")));
         }
 
@@ -456,9 +457,6 @@ impl McpManager {
             }
         }
 
-        // Update in-memory config enabled flag
-        // (config is behind Arc without mut — store only in disabled_names for runtime)
-
         if enabled {
             let already_live = self.shared.live.read().iter().any(|s| s.name == name);
             if already_live {
@@ -469,17 +467,12 @@ impl McpManager {
                 let cfg = self
                     .shared
                     .config
+                    .read()
                     .mcp_servers
                     .get(name)
                     .cloned()
                     .ok_or_else(|| McpError::other("server vanished"))?;
-                let shared = Arc::clone(&self.shared);
-                let name = name.to_string();
-                self.shared.pending.fetch_add(1, Ordering::SeqCst);
-                self.shared.loading.store(true, Ordering::SeqCst);
-                tokio::spawn(async move {
-                    connect_one_into(shared, name, cfg).await;
-                });
+                self.spawn_connect(name.to_string(), cfg);
             }
         } else {
             // Keep connection for fast re-enable, but drop tools from the agent set.
@@ -488,6 +481,69 @@ impl McpManager {
 
         info!(server = %name, enabled, "MCP server toggle");
         Ok(())
+    }
+
+    fn spawn_connect(&self, name: String, cfg: McpServerConfig) {
+        let shared = Arc::clone(&self.shared);
+        self.shared.pending.fetch_add(1, Ordering::SeqCst);
+        self.shared.loading.store(true, Ordering::SeqCst);
+        tokio::spawn(async move {
+            connect_one_into(shared, name, cfg).await;
+        });
+    }
+
+    /// Scan foreign agents for import candidates (does not write).
+    pub fn list_import_candidates(&self, cwd: &Path) -> Result<Vec<ImportCandidate>> {
+        scan_import_candidates(cwd)
+    }
+
+    /// Import foreign MCP servers into One user config and connect them.
+    ///
+    /// Returns the disk import report (imported / replaced / skipped).
+    pub async fn import_from_agents(
+        &self,
+        cwd: &Path,
+        names: &[String],
+        source_filter: Option<ConfigSourceKind>,
+        overwrite: bool,
+    ) -> Result<ImportReport> {
+        if self.disabled {
+            return Err(McpError::other("MCP is disabled for this process (--no-mcp)"));
+        }
+
+        let report = import_servers_to_user(cwd, names, source_filter, overwrite)?;
+        let to_connect: Vec<String> = report
+            .imported
+            .iter()
+            .chain(report.replaced.iter())
+            .cloned()
+            .collect();
+        if to_connect.is_empty() {
+            return Ok(report);
+        }
+
+        // Reload user+project disk view for the new entries only.
+        let loaded = load_effective(cwd)?;
+        for name in &to_connect {
+            if let Some(cfg) = loaded.config.mcp_servers.get(name).cloned() {
+                {
+                    let mut config = self.shared.config.write();
+                    config.mcp_servers.insert(name.clone(), cfg.clone());
+                }
+                self.shared
+                    .server_sources
+                    .write()
+                    .insert(name.clone(), ConfigSourceKind::OneUser);
+                // Ensure enabled
+                self.shared.disabled_names.write().remove(name);
+                // Drop stale live/fail so we reconnect
+                self.shared.live.write().retain(|s| &s.name != name);
+                self.shared.failures.write().retain(|(n, _)| n != name);
+                self.spawn_connect(name.clone(), cfg);
+            }
+        }
+        rebuild_tools_from_live(&self.shared);
+        Ok(report)
     }
 
     pub fn is_server_enabled(&self, name: &str) -> bool {
@@ -535,12 +591,11 @@ impl McpManager {
             live.iter().map(|s| s.name.clone()).collect();
         drop(live);
 
+        let config = self.shared.config.read();
         for (name, msg) in self.shared.failures.read().iter() {
             out.push(ServerHealth {
                 name: name.clone(),
-                transport: self
-                    .shared
-                    .config
+                transport: config
                     .mcp_servers
                     .get(name)
                     .map(|c| {
@@ -561,7 +616,7 @@ impl McpManager {
 
         // Still-pending configured servers
         if self.is_loading() {
-            for (name, cfg) in self.shared.config.enabled_servers() {
+            for (name, cfg) in config.enabled_servers() {
                 if live_names.contains(name) {
                     continue;
                 }
@@ -630,6 +685,7 @@ fn rebuild_tools_from_live(shared: &SharedState) {
 async fn connect_all_background(shared: Arc<SharedState>) {
     let jobs: Vec<(String, McpServerConfig)> = shared
         .config
+        .read()
         .enabled_servers()
         .map(|(n, c)| (n.clone(), c.clone()))
         .collect();
@@ -665,10 +721,13 @@ async fn connect_one_into(shared: Arc<SharedState>, name: String, cfg: McpServer
         return;
     }
 
-    let max_out = if shared.config.max_output_bytes == 0 {
-        DEFAULT_MAX_OUTPUT_BYTES
-    } else {
-        shared.config.max_output_bytes
+    let max_out = {
+        let config = shared.config.read();
+        if config.max_output_bytes == 0 {
+            DEFAULT_MAX_OUTPUT_BYTES
+        } else {
+            config.max_output_bytes
+        }
     };
 
     let result = connect_server(&name, &cfg, max_out).await;

@@ -1,5 +1,7 @@
 # 路线图
 
+> 架构总览与「做了什么 / 是否干净」见 **[architecture.md](./architecture.md)**（活文档，改实现时同步）。
+
 ## 已完成 ✅
 
 ### Phase 1 — 最小 Agent
@@ -37,6 +39,7 @@
 ### Phase 5 — 扩展 & 资源
 - [x] `one-resources`：AGENTS.md / skills / prompts
 - [x] `one-ext`：Rust Extension trait + builtin status
+- [x] Extension 完整面：Registry / ExtensionData / PreTool rewrite-deny / AgentHooks / plugins / hooks.json
 - [x] 基础 compaction
 - [x] 扩展状态 `custom` entry 持久化
 - [x] 扩展热重载（`/reload`）
@@ -114,7 +117,7 @@
 ## 非目标
 
 - 不内置子 Agent orchestrator（与 Pi 一致；可另开需求）
-- ~~不内置 MCP~~ → **已改：MCP 为平台基础能力**（见 [mcp.md](./mcp.md)，实现未开始）
+- ~~不内置 MCP~~ → **已改：MCP 为平台基础能力**（见 [mcp.md](./mcp.md)；stdio/HTTP 已落地，OAuth 待做）
 
 ## Plan Mode（已内置 MVP）
 

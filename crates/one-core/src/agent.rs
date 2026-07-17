@@ -6,6 +6,7 @@ use futures::StreamExt;
 
 use crate::error::{OneError, Result};
 use crate::events::{AgentEvent, EventListener};
+use crate::hooks::AgentHooks;
 use crate::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
 };
@@ -228,8 +229,10 @@ pub struct Agent {
     /// Injected as user messages with a clear prefix — not tool_results (providers require pairing).
     notification_queue: Arc<Mutex<Vec<String>>>,
     abort_flag: Arc<AtomicBool>,
-    /// Optional pre-tool permission gate (allow/deny/ask → resolve).
+    /// Optional pre-tool permission gate (allow/deny/ask/rewrite).
     tool_gate: Option<Arc<dyn ToolGate>>,
+    /// Optional async lifecycle hooks (extensions bridge).
+    hooks: Option<Arc<dyn AgentHooks>>,
 }
 
 impl Agent {
@@ -247,6 +250,7 @@ impl Agent {
             notification_queue: Arc::new(Mutex::new(Vec::new())),
             abort_flag: Arc::new(AtomicBool::new(false)),
             tool_gate: None,
+            hooks: None,
         }
     }
 
@@ -257,6 +261,15 @@ impl Agent {
 
     pub fn tool_gate(&self) -> Option<&Arc<dyn ToolGate>> {
         self.tool_gate.as_ref()
+    }
+
+    /// Install async lifecycle hooks (session / turn boundaries).
+    pub fn set_hooks(&mut self, hooks: Option<Arc<dyn AgentHooks>>) {
+        self.hooks = hooks;
+    }
+
+    pub fn hooks(&self) -> Option<&Arc<dyn AgentHooks>> {
+        self.hooks.as_ref()
     }
 
     /// Replace the notification queue (wire shared background-task registry).
@@ -372,19 +385,25 @@ impl Agent {
     pub async fn run(&mut self, provider: &dyn LlmProvider) -> Result<String> {
         self.clear_abort();
         self.emit(AgentEvent::AgentStart);
+        if let Some(hooks) = &self.hooks {
+            hooks.on_agent_start().await;
+        }
         self.is_busy = true;
         let start_len = self.messages.len();
         let mut final_text;
 
         for turn in 0..self.config.max_turns {
             if self.is_aborted() {
-                return self.finish_aborted(start_len);
+                return self.finish_aborted(start_len).await;
             }
 
             self.drain_steering();
             // Claude-style: background task completions appear as conversation notices.
             self.drain_notifications();
             self.emit(AgentEvent::TurnStart { turn });
+            if let Some(hooks) = &self.hooks {
+                hooks.on_turn_start(turn).await;
+            }
 
             let request = CompletionRequest {
                 system_prompt: self.config.system_prompt.clone(),
@@ -438,7 +457,7 @@ impl Agent {
                     timestamp: crate::message::now_ms(),
                 });
                 self.messages.push(assistant);
-                return self.finish_aborted(start_len);
+                return self.finish_aborted(start_len).await;
             }
 
             let assistant = AgentMessage::Assistant(AssistantMessage {
@@ -460,6 +479,9 @@ impl Agent {
                     assistant,
                     tool_results,
                 });
+                if let Some(hooks) = &self.hooks {
+                    hooks.on_turn_end(turn).await;
+                }
                 if self.drain_followup() {
                     continue;
                 }
@@ -467,6 +489,9 @@ impl Agent {
                 self.emit(AgentEvent::AgentEnd {
                     new_messages: self.messages[start_len..].to_vec(),
                 });
+                if let Some(hooks) = &self.hooks {
+                    hooks.on_agent_end().await;
+                }
                 return Ok(final_text);
             }
 
@@ -477,7 +502,10 @@ impl Agent {
                         assistant: assistant.clone(),
                         tool_results,
                     });
-                    return self.finish_aborted(start_len);
+                    if let Some(hooks) = &self.hooks {
+                        hooks.on_turn_end(turn).await;
+                    }
+                    return self.finish_aborted(start_len).await;
                 }
 
                 self.emit(AgentEvent::ToolExecutionStart {
@@ -513,7 +541,10 @@ impl Agent {
                         assistant,
                         tool_results,
                     });
-                    return self.finish_aborted(start_len);
+                    if let Some(hooks) = &self.hooks {
+                        hooks.on_turn_end(turn).await;
+                    }
+                    return self.finish_aborted(start_len).await;
                 }
 
                 self.emit(AgentEvent::ToolExecutionEnd {
@@ -542,19 +573,28 @@ impl Agent {
                 assistant,
                 tool_results,
             });
+            if let Some(hooks) = &self.hooks {
+                hooks.on_turn_end(turn).await;
+            }
         }
 
         self.is_busy = false;
+        if let Some(hooks) = &self.hooks {
+            hooks.on_agent_end().await;
+        }
         Err(OneError::MaxTurns {
             max: self.config.max_turns,
         })
     }
 
-    fn finish_aborted(&mut self, start_len: usize) -> Result<String> {
+    async fn finish_aborted(&mut self, start_len: usize) -> Result<String> {
         self.is_busy = false;
         self.emit(AgentEvent::AgentEnd {
             new_messages: self.messages[start_len..].to_vec(),
         });
+        if let Some(hooks) = &self.hooks {
+            hooks.on_agent_end().await;
+        }
         Err(OneError::Aborted)
     }
 
@@ -593,9 +633,14 @@ impl Agent {
     }
 
     async fn execute_tool(&self, call: &ToolCall) -> Result<ToolOutput> {
+        // Gate may rewrite arguments (extension PreToolUse).
+        let mut effective = call.clone();
         if let Some(gate) = &self.tool_gate {
-            match gate.check(call).await {
+            match gate.check(&effective).await {
                 ToolGateDecision::Allow => {}
+                ToolGateDecision::Rewrite { arguments } => {
+                    effective.arguments = arguments;
+                }
                 ToolGateDecision::Deny { message } => {
                     return Err(OneError::Tool {
                         tool: call.name.clone(),
@@ -608,13 +653,26 @@ impl Agent {
         let tool = self
             .tools
             .iter()
-            .find(|tool| tool.definition().name == call.name)
+            .find(|tool| tool.definition().name == effective.name)
             .ok_or_else(|| OneError::Tool {
-                tool: call.name.clone(),
+                tool: effective.name.clone(),
                 message: "tool not registered".to_string(),
             })?;
 
-        tool.execute(call).await
+        let result = tool.execute(&effective).await;
+        if let Some(gate) = &self.tool_gate {
+            match &result {
+                Ok(output) => {
+                    let is_error = tool_output_indicates_error(&effective.name, output);
+                    gate.after_tool(&effective, output, is_error).await;
+                }
+                Err(err) => {
+                    let output = ToolOutput::text(err.to_string());
+                    gate.after_tool(&effective, &output, true).await;
+                }
+            }
+        }
+        result
     }
 
     fn emit(&mut self, event: AgentEvent) {

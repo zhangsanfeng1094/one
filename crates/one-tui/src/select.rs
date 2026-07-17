@@ -172,24 +172,27 @@ impl SelectPrompt {
         }
         match self.phase {
             SelectPhase::Typing { .. } => "Type text  Enter:submit  Esc:back".into(),
-            SelectPhase::List => match self.mode {
-                SelectMode::Single => {
-                    let n = self.option_count().max(1);
-                    format!(
-                        "{}/{}:select  Enter:confirm  Esc:cancel",
-                        self.selected + 1,
-                        n
-                    )
+            SelectPhase::List => {
+                let tab = if self.allow_other { "  Tab:other" } else { "" };
+                match self.mode {
+                    SelectMode::Single => {
+                        let n = self.option_count().max(1);
+                        format!(
+                            "{}/{}:select{tab}  Enter:confirm  Esc:cancel",
+                            self.selected + 1,
+                            n
+                        )
+                    }
+                    SelectMode::Multi => {
+                        let n = self.option_count().max(1);
+                        format!(
+                            "{}/{}  Space:toggle{tab}  Enter:confirm  Esc:cancel",
+                            self.selected + 1,
+                            n
+                        )
+                    }
                 }
-                SelectMode::Multi => {
-                    let n = self.option_count().max(1);
-                    format!(
-                        "{}/{}  Space:toggle  Enter:confirm  Esc:cancel",
-                        self.selected + 1,
-                        n
-                    )
-                }
-            },
+            }
         }
     }
 
@@ -215,6 +218,26 @@ impl SelectPrompt {
         if index < self.option_count() {
             self.selected = index;
         }
+    }
+
+    /// Jump focus to the free-text "Other" row (when enabled).
+    pub fn focus_other(&mut self) -> bool {
+        if !self.allow_other {
+            return false;
+        }
+        self.selected = self.options.len();
+        true
+    }
+
+    /// Jump to Other and open the free-text typing phase (Tab shortcut).
+    pub fn jump_to_other_typing(&mut self) -> bool {
+        if !self.focus_other() {
+            return false;
+        }
+        self.phase = SelectPhase::Typing {
+            buffer: String::new(),
+        };
+        true
     }
 
     pub fn toggle_checked(&mut self) {
@@ -454,6 +477,11 @@ impl SelectPrompt {
                 }
                 Some(SelectResult::Cancelled)
             }
+            // Tab → free-text Other (ask_user / any allow_other list).
+            KeyCode::Tab => {
+                let _ = self.jump_to_other_typing();
+                None
+            }
             KeyCode::Enter => self.confirm_list(),
             _ => None,
         }
@@ -601,6 +629,37 @@ mod tests {
             p.handle_key(key(KeyCode::Esc)),
             Some(SelectResult::Cancelled)
         );
+    }
+
+    #[test]
+    fn tab_jumps_to_other_typing() {
+        let mut p = sample_single();
+        p.allow_other = true;
+        assert!(!p.is_typing());
+        let r = p.handle_key(key(KeyCode::Tab));
+        assert!(r.is_none());
+        assert!(p.is_other_row(p.selected));
+        assert!(p.is_typing());
+        p.handle_key(key(KeyCode::Char('h')));
+        p.handle_key(key(KeyCode::Char('i')));
+        let r = p.handle_key(key(KeyCode::Enter)).unwrap();
+        assert_eq!(
+            r,
+            SelectResult::Confirmed {
+                ids: vec![],
+                other: Some("hi".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn tab_noop_without_other() {
+        let mut p = sample_single();
+        assert!(!p.allow_other);
+        let r = p.handle_key(key(KeyCode::Tab));
+        assert!(r.is_none());
+        assert_eq!(p.selected, 0);
+        assert!(!p.is_typing());
     }
 
     #[test]

@@ -522,9 +522,12 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
                 label,
                 detail,
                 hint,
+                style,
             } => {
                 let active = !editing && *entry_index == menu.selected;
-                lines.push(float_item_line(label, detail, hint, col_w, active, editing));
+                lines.push(float_item_line(
+                    label, detail, hint, col_w, active, editing, *style,
+                ));
             }
         }
     }
@@ -581,7 +584,8 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         | FloatKind::SettingsModelDetail => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Back ",
         FloatKind::SettingsModelAdd => " ↑/↓ Fields  ·  Enter Edit/Save  ·  Esc Back ",
         FloatKind::Skills => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Close ",
-        FloatKind::Mcp => " ↑/↓  ·  Enter on/off  ·  Esc ",
+        FloatKind::Mcp => " ↑/↓  ·  Enter  ·  Import  ·  Esc ",
+        FloatKind::McpImport => " ↑/↓  ·  Enter import  ·  Esc back ",
         FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
     };
     base.into()
@@ -643,8 +647,22 @@ fn float_item_line(
     col_w: usize,
     active: bool,
     editing: bool,
+    item_style: crate::float::FloatItemStyle,
 ) -> Line<'static> {
-    let marker = if active { "› " } else { "  " };
+    use crate::float::FloatItemStyle;
+    let is_action = matches!(item_style, FloatItemStyle::Action);
+    // Action rows get a diamond marker so they read as CTAs, not data rows.
+    let marker = if active {
+        if is_action {
+            "◆ "
+        } else {
+            "› "
+        }
+    } else if is_action {
+        "◇ "
+    } else {
+        "  "
+    };
     let action = format_float_action(hint);
     let action_w = action.width();
 
@@ -669,23 +687,40 @@ fn float_item_line(
         pad_or_truncate(detail, value_w)
     };
 
-    let (key_style, value_style, action_style) = if editing {
+    let (key_style, value_style, action_style, fill_style) = if editing {
         (
             Theme::float_dim(),
             Theme::float_dim_desc(),
             Theme::float_dim_desc(),
+            Theme::float_dim(),
+        )
+    } else if is_action && active {
+        (
+            Theme::float_cta_selected(),
+            Theme::float_cta_selected_desc(),
+            Theme::float_cta_chip_selected(),
+            Theme::float_cta_selected(),
+        )
+    } else if is_action {
+        (
+            Theme::float_cta(),
+            Theme::float_cta_desc(),
+            Theme::float_cta_chip(),
+            Theme::slash_panel(),
         )
     } else if active {
         (
             Theme::slash_selected(),
             Theme::slash_selected(),
             Theme::float_action_selected(),
+            Theme::slash_selected(),
         )
     } else {
         (
             Theme::slash_item(),
             Theme::slash_desc(),
             Theme::float_action(),
+            Theme::slash_panel(),
         )
     };
 
@@ -709,13 +744,6 @@ fn float_item_line(
     // Pad to full width so selected / panel bg covers the entire row cell.
     let used: usize = spans.iter().map(|s| s.content.width()).sum();
     if used < col_w {
-        let fill_style = if active && !editing {
-            Theme::slash_selected()
-        } else if editing {
-            Theme::float_dim()
-        } else {
-            Theme::slash_panel()
-        };
         spans.push(Span::styled(" ".repeat(col_w - used), fill_style));
     }
 
@@ -1712,7 +1740,7 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw("")
     };
 
-    // Multi-line input: one Line per input row; caret on last line.
+    // Multi-line input: one Line per input row; caret at `input_cursor`.
     // Image attachments appear as `[图片.img]` tokens inside the text (deletable).
     let mut content: Vec<Line> = vec![Line::from("")]; // top padding
     if app.input.is_empty() {
@@ -1722,19 +1750,52 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::styled(placeholder, Theme::input_placeholder()),
         ]));
     } else {
+        // Place caret using char offset (matches App::input_cursor).
+        let mut remaining = app.input_cursor.min(app.input.chars().count());
         let lines: Vec<&str> = app.input.split('\n').collect();
         let last = lines.len().saturating_sub(1);
+        let mut caret_line = last;
+        let mut caret_col = lines[last].chars().count();
         for (i, line) in lines.iter().enumerate() {
-            if i == last {
+            let line_len = line.chars().count();
+            if remaining <= line_len {
+                caret_line = i;
+                caret_col = remaining;
+                break;
+            }
+            remaining -= line_len;
+            if i < last {
+                // Consume the `\n` between lines.
+                if remaining == 0 {
+                    // Caret sits at end of this line (before newline).
+                    caret_line = i;
+                    caret_col = line_len;
+                    break;
+                }
+                remaining -= 1;
+            }
+        }
+        for (i, line) in lines.iter().enumerate() {
+            if i == caret_line {
+                let col = caret_col.min(line.chars().count());
+                let byte = line
+                    .chars()
+                    .take(col)
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>()
+                    .min(line.len());
+                let before = &line[..byte];
+                let after = &line[byte..];
                 content.push(Line::from(vec![
                     Span::raw(INDENT),
-                    Span::styled(*line, Theme::input_text()),
+                    Span::styled(before.to_string(), Theme::input_text()),
                     caret.clone(),
+                    Span::styled(after.to_string(), Theme::input_text()),
                 ]));
             } else {
                 content.push(Line::from(vec![
                     Span::raw(INDENT),
-                    Span::styled(*line, Theme::input_text()),
+                    Span::styled((*line).to_string(), Theme::input_text()),
                 ]));
             }
         }

@@ -131,9 +131,9 @@ impl HitlChannel {
         prompt.allow_other = true;
         prompt.other_label = "Other (type free text)".into();
         prompt.footer_hint = if q.multi_select {
-            "↑↓:move  Space:toggle  Enter:confirm  Esc:cancel".into()
+            "↑↓:move  Space:toggle  Tab:other  Enter:confirm  Esc:cancel".into()
         } else {
-            "↑↓/1-n:select  Enter:confirm  Esc:cancel".into()
+            "↑↓/1-n:select  Tab:other  Enter:confirm  Esc:cancel".into()
         };
 
         match self.prompt_select(prompt).await? {

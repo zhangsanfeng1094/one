@@ -60,6 +60,43 @@ impl Theme {
             .add_modifier(Modifier::DIM)
     }
 
+    /// Primary CTA row (Import / Fetch models) — blue label, stands out from data.
+    pub fn float_cta() -> Style {
+        Style::default()
+            .bg(Self::PANEL)
+            .fg(Self::SECONDARY)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn float_cta_desc() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::INFO)
+    }
+
+    pub fn float_cta_chip() -> Style {
+        Style::default()
+            .bg(Self::ELEMENT)
+            .fg(Self::SECONDARY)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn float_cta_selected() -> Style {
+        Style::default()
+            .bg(Self::ELEMENT)
+            .fg(Self::SECONDARY)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn float_cta_selected_desc() -> Style {
+        Style::default().bg(Self::ELEMENT).fg(Self::INFO)
+    }
+
+    pub fn float_cta_chip_selected() -> Style {
+        Style::default()
+            .bg(Self::SECONDARY)
+            .fg(Self::BG)
+            .add_modifier(Modifier::BOLD)
+    }
+
     /// Active filter field (user is typing a query).
     pub fn float_filter_active() -> Style {
         Style::default()

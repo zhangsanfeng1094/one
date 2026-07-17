@@ -1,0 +1,284 @@
+//! Cold-start assembly of [`super::AppRuntime`].
+
+use std::sync::{Arc, Mutex};
+
+use one_core::agent::{Agent, AgentConfig, ThinkingLevel};
+use one_core::tool::Tool;
+use one_ext::{discover_all, ExtensionContext};
+use one_mcp::McpManager;
+use one_resources::ResourceLoader;
+use one_session::{agent_dir, SessionManager};
+use one_tools::{
+    coding_tools_with_options, plan_mode_system_overlay, plan_mode_tools_with_policy,
+    read_only_tools_with_ask, AskUserHandler, BackgroundTaskRegistry, OsSandbox, PermissionRules,
+    PlanExitState, ToolBuildOptions,
+};
+
+use super::helpers::{load_extension_state, new_plan_path};
+use super::policy::build_path_policy;
+use super::{AgentMode, AppRuntime};
+use crate::approval::PermissionGate;
+use crate::cli::{Cli, RunMode};
+use crate::hitl::{HitlChannel, InteractiveAskUser};
+
+impl AppRuntime {
+    pub async fn build(cli: &Cli) -> Result<Self, Box<dyn std::error::Error>> {
+        let cwd = cli.cwd.canonicalize().unwrap_or_else(|_| cli.cwd.clone());
+        let agent_dir = agent_dir();
+
+        let mut resources = ResourceLoader::discover(&cwd, &agent_dir).await?;
+
+        // Codex-inspired: extensions.json + plugins + external hooks.
+        let discovery = discover_all(&cwd, &agent_dir).await?;
+        if !discovery.skill_dirs.is_empty() {
+            match one_resources::discover_skills(&discovery.skill_dirs).await {
+                Ok(extra) => resources.merge_skills(extra),
+                Err(e) => tracing::warn!(error = %e, "plugin skill discovery failed"),
+            }
+        }
+        if let Err(e) = resources.merge_prompt_dirs(&discovery.prompt_dirs).await {
+            tracing::warn!(error = %e, "plugin prompt discovery failed");
+        }
+        for overlay in &discovery.system_overlays {
+            resources.push_system_append(overlay.clone());
+        }
+
+        let extensions = Arc::new(discovery.runtime);
+        {
+            let data = extensions.data().clone();
+            let ctx = ExtensionContext {
+                cwd: &cwd,
+                session_file: None,
+                data: &data,
+            };
+            extensions.load_all(&ctx).await?;
+        }
+        if let Some(overlay) = extensions.system_prompt_overlay() {
+            resources.push_system_append(overlay);
+        }
+
+        let user_settings = crate::settings::load();
+        // Codex-style skills enable/disable (settings.skills_config).
+        resources.apply_skills_config(&user_settings.skills_config_entries());
+        let auto_approve = cli.auto_approve || user_settings.auto_approve.unwrap_or(false);
+
+        // agentskills.io: allowlist skill dirs so progressive disclosure `read` works
+        // (Codex-compatible: ~/.agents/skills + client skill homes + package dirs).
+        let path_policy = build_path_policy(&cwd, cli, &user_settings, &resources);
+        // Optional settings kill-switch for OS bash sandbox.
+        if user_settings.bash_sandbox == Some(false) {
+            std::env::set_var("ONE_BASH_SANDBOX", "0");
+        }
+
+        let bg_registry = Arc::new(BackgroundTaskRegistry::new());
+        // Apply OS sandbox to background tasks even before BashTool construction.
+        bg_registry.set_os_sandbox(OsSandbox::from_policy(&path_policy));
+
+        let interactive = matches!(cli.mode, RunMode::Interactive) && cli.print.is_none();
+        let perm_rules = user_settings
+            .permissions
+            .clone()
+            .unwrap_or_else(PermissionRules::default);
+        let permission_gate =
+            PermissionGate::with_auto_approve(perm_rules, auto_approve, interactive);
+
+        let hitl = HitlChannel::new(interactive);
+        let ask_user_handler: Arc<dyn AskUserHandler> =
+            Arc::new(InteractiveAskUser::new(hitl.clone()));
+
+        let start_plan = cli.plan && !cli.read_only;
+        let plan_path = if start_plan {
+            Some(new_plan_path())
+        } else {
+            None
+        };
+        let plan_exit = Arc::new(Mutex::new(PlanExitState::new(
+            plan_path
+                .clone()
+                .unwrap_or_else(|| agent_dir.join("plans").join("_none.md")),
+        )));
+
+        let mut tools: Vec<Arc<dyn Tool>> = if cli.read_only {
+            // No bash / background tools in read-only mode.
+            read_only_tools_with_ask(path_policy.clone(), Some(ask_user_handler.clone()))
+        } else if start_plan {
+            plan_mode_tools_with_policy(
+                path_policy.clone(),
+                plan_path.clone().expect("plan path"),
+                plan_exit.clone(),
+                Some(ask_user_handler.clone()),
+            )
+        } else {
+            coding_tools_with_options(ToolBuildOptions {
+                policy: path_policy.clone(),
+                auto_approve,
+                registry: bg_registry.clone(),
+                ask_user: Some(ask_user_handler.clone()),
+            })
+        };
+        // Extension tools only in Act mode (may include write-capable tools).
+        if !start_plan {
+            tools.extend(extensions.tools());
+        }
+        // Note: plugin MCP servers are declared in plugin.json for future merge;
+        // platform MCP remains `McpManager` (see docs/mcp.md).
+
+        // MCP: Grok-style — load config sync, connect servers in background.
+        // Do not block TUI / first paint on cold `npx` downloads.
+        // Plan mode still starts the pool (so /act gets tools) but does not register them yet.
+        let disable_mcp = cli.no_mcp
+            || std::env::var_os("ONE_DISABLE_MCP").is_some_and(|v| v != "0" && v != "false");
+        let mcp = if disable_mcp {
+            McpManager::empty()
+        } else {
+            match McpManager::spawn(&cwd) {
+                Ok(m) => {
+                    if m.is_loading() {
+                        tracing::info!("MCP background connect started");
+                    }
+                    m
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "MCP config load failed; continuing without MCP");
+                    McpManager::empty()
+                }
+            }
+        };
+        // Snapshot whatever is already ready (usually empty right after spawn).
+        if !start_plan {
+            tools.extend(mcp.tools());
+        }
+        let mcp_tools_generation = mcp.generation();
+
+        let base_system_prompt =
+            resources.build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
+        let system_prompt = if start_plan {
+            let p = plan_path.as_ref().expect("plan path");
+            format!("{base_system_prompt}{}", plan_mode_system_overlay(p))
+        } else {
+            base_system_prompt.clone()
+        };
+        let mut agent = Agent::new(
+            AgentConfig {
+                system_prompt,
+                max_turns: 32,
+                thinking_level: ThinkingLevel::Off,
+            },
+            tools,
+        );
+        // Extension PreToolUse → PermissionGate → after_tool (Codex-style pipeline).
+        agent.set_tool_gate(Some(extensions.tool_gate(permission_gate.clone())));
+        agent.set_hooks(Some(extensions.agent_hooks()));
+        // Claude-style: completed background bash → conversation notice (not TUI status bar).
+        if !cli.read_only {
+            agent.set_notification_queue(bg_registry.notification_queue());
+        }
+
+        // Interactive `-r` opens a picker in TUI — don't load a session yet.
+        let pick_session = cli.resume
+            && matches!(cli.mode, crate::cli::RunMode::Interactive)
+            && cli.print.is_none()
+            && cli.session.is_none();
+
+        let mut session = if cli.no_session {
+            None
+        } else if let Some(path) = &cli.session {
+            Some(SessionManager::open(path).await?)
+        } else if pick_session {
+            // Empty shell until user picks via /resume float.
+            None
+        } else if cli.r#continue || (cli.resume && !pick_session) {
+            // `-c` always most-recent; non-interactive `-r` same.
+            match SessionManager::continue_recent(&cwd).await {
+                Ok(session) => Some(session),
+                Err(_) => {
+                    if matches!(cli.mode, crate::cli::RunMode::Interactive) {
+                        Some(SessionManager::create(&cwd).await?)
+                    } else {
+                        None
+                    }
+                }
+            }
+        } else if matches!(cli.mode, crate::cli::RunMode::Interactive) && cli.print.is_none() {
+            Some(SessionManager::create(&cwd).await?)
+        } else {
+            None
+        };
+
+        // Default thinking from settings before session override.
+        if let Some(level) = user_settings
+            .thinking
+            .as_deref()
+            .and_then(ThinkingLevel::parse)
+        {
+            agent.config.thinking_level = level;
+        }
+
+        if let Some(session) = &session {
+            session.load_messages_into(&mut agent.messages);
+            // Restore thinking level from session if present.
+            if let Some(level) = session.build_session_context().thinking_level {
+                if let Some(tl) = ThinkingLevel::parse(&level) {
+                    agent.config.thinking_level = tl;
+                }
+            }
+            load_extension_state(extensions.as_ref(), session);
+        }
+        if let (Some(session), Some(name)) = (&mut session, &cli.name) {
+            session.append_session_info(name).await?;
+        }
+
+        let steering_queue = agent.steering_queue_handle();
+        let followup_queue = agent.followup_queue_handle();
+        let abort_flag = agent.abort_handle();
+
+        let mut runtime = Self {
+            agent: Arc::new(tokio::sync::Mutex::new(agent)),
+            abort_flag,
+            steering_queue,
+            followup_queue,
+            session,
+            extensions,
+            resources,
+            auto_approve,
+            cwd,
+            read_only: cli.read_only,
+            path_policy,
+            open_session_picker: pick_session,
+            mode: if start_plan {
+                AgentMode::Plan
+            } else {
+                AgentMode::Act
+            },
+            plan_path,
+            plan_exit,
+            bg_registry,
+            base_system_prompt,
+            permission_gate,
+            hitl,
+            ask_user_handler,
+            context_window: 0,
+            mcp,
+            mcp_tools_generation,
+        };
+
+        // Restore plan path + mode from session custom entry if present.
+        if !cli.read_only {
+            if let Some(path) = runtime.restore_plan_path_from_session() {
+                runtime.plan_path = Some(path);
+            }
+            if !start_plan {
+                if let Some(restored) = runtime.restore_mode_from_session() {
+                    if restored == AgentMode::Plan {
+                        let _ = runtime.enter_plan_mode().await;
+                    }
+                }
+            }
+        }
+        if start_plan {
+            let _ = runtime.persist_mode().await;
+        }
+
+        Ok(runtime)
+    }
+}

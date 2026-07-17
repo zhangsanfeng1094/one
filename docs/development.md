@@ -53,7 +53,7 @@ cargo build -p one-cli --features http-providers
 
 ## 添加扩展
 
-参考 `crates/one-ext/examples/status_extension.rs`：
+参考 `crates/one-ext/examples/status_extension.rs` 与 [extensions.md](./extensions.md)：
 
 ```rust
 struct MyExtension;
@@ -61,11 +61,25 @@ struct MyExtension;
 #[async_trait]
 impl Extension for MyExtension {
     fn name(&self) -> &str { "my-ext" }
-    fn tools(&self) -> Vec<Arc<dyn Tool>> { vec![...] }
+    fn tools(&self) -> Vec<Arc<dyn Tool>> { vec![/* ... */] }
+    fn contribute_context(&self) -> Vec<PromptFragment> { vec![] }
+    async fn before_tool(&self, call: &ToolCall) -> one_ext::Result<PreToolDecision> {
+        Ok(PreToolDecision::Allow)
+    }
 }
 ```
 
-在 `AppRuntime::build` 中注册到 `ExtensionRuntime`。
+发现路径：`~/.one/agent/extensions.json`、`~/.one/agent/plugins/*/…`、或代码里 `ExtensionRegistryBuilder::install`。  
+`AppRuntime` 通过 `discover_all` 加载，并绑定 `tool_gate` + `AgentHooks`。
+
+## 架构文档维护
+
+改分层、新 crate、或显著能力（MCP / Ext / Package）落地时，更新：
+
+1. **[architecture.md](./architecture.md)** §2 状态矩阵、§3 依赖图、§7 模块地图、§9 简洁性评估  
+2. 必要时 roadmap 勾选与专题文档（extensions / mcp / package-suites）
+
+`one-cli` 编排逻辑在 `src/runtime/`（按 build / plan / tools / prompt / session / reload 分文件），不要重新合成单文件巨石。
 
 ## 测试
 
@@ -76,6 +90,7 @@ cargo test
 # 单个 crate
 cargo test -p one-session
 cargo test -p one-core
+cargo test -p one-ext
 ```
 
 ## 调试

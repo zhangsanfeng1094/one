@@ -5,7 +5,8 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use one_mcp::{
-    load_user_or_empty, probe_server, save_user_config, user_mcp_path, McpServerConfig,
+    import_servers_to_user, load_user_or_empty, probe_server, save_user_config,
+    scan_import_candidates, user_mcp_path, ConfigSourceKind, McpServerConfig,
 };
 
 #[derive(Debug, Clone, Parser)]
@@ -58,6 +59,22 @@ pub enum McpAction {
         #[arg(long)]
         json: bool,
     },
+    /// Import MCP servers from Claude / Codex / Cursor into ~/.one/agent/mcp.json
+    Import {
+        /// Server names (empty = all not already owned)
+        names: Vec<String>,
+        /// Only this source: codex | claude | cursor | mcp.json
+        #[arg(long)]
+        source: Option<String>,
+        /// Replace existing One entries with the same name
+        #[arg(long)]
+        force: bool,
+        /// List candidates without writing
+        #[arg(long)]
+        list: bool,
+        #[arg(long, default_value = ".")]
+        cwd: PathBuf,
+    },
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -79,7 +96,90 @@ pub async fn run_mcp(cli: McpCli) -> Result<(), Box<dyn std::error::Error>> {
         } => cmd_add(name, transport, url, env, headers, command).await,
         McpAction::Remove { name } => cmd_remove(name).await,
         McpAction::Doctor { name, cwd, json } => cmd_doctor(name, &cwd, json).await,
+        McpAction::Import {
+            names,
+            source,
+            force,
+            list,
+            cwd,
+        } => cmd_import(&cwd, names, source, force, list).await,
     }
+}
+
+async fn cmd_import(
+    cwd: &std::path::Path,
+    names: Vec<String>,
+    source: Option<String>,
+    force: bool,
+    list_only: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let filter = match source.as_deref() {
+        None => None,
+        Some(s) => Some(
+            ConfigSourceKind::parse(s)
+                .filter(|k| k.is_foreign())
+                .ok_or_else(|| {
+                    format!("unknown source `{s}` (use: codex, claude, cursor, mcp.json)")
+                })?,
+        ),
+    };
+
+    if list_only {
+        let candidates = scan_import_candidates(cwd)?;
+        let candidates: Vec<_> = candidates
+            .into_iter()
+            .filter(|c| filter.map(|f| f == c.source).unwrap_or(true))
+            .collect();
+        if candidates.is_empty() {
+            println!("No foreign MCP servers found (Claude / Codex / Cursor / .mcp.json).");
+            return Ok(());
+        }
+        println!(
+            "{:<20} {:<10} {:<8} {}",
+            "NAME", "SOURCE", "OWNED", "PATH"
+        );
+        for c in candidates {
+            let owned = if c.already_owned { "yes" } else { "no" };
+            println!(
+                "{:<20} {:<10} {:<8} {}",
+                c.name,
+                c.source.as_str(),
+                owned,
+                c.path.display()
+            );
+        }
+        println!("\nImport: one mcp import [name…] [--source codex] [--force]");
+        return Ok(());
+    }
+
+    let report = import_servers_to_user(cwd, &names, filter, force)?;
+    if report.imported.is_empty() && report.replaced.is_empty() {
+        println!(
+            "Nothing imported ({} already owned/skipped).",
+            report.skipped_existing.len()
+        );
+        if !report.skipped_existing.is_empty() {
+            println!(
+                "  skipped: {}",
+                report.skipped_existing.join(", ")
+            );
+            println!("  use --force to replace existing One entries");
+        }
+        println!("  list candidates: one mcp import --list");
+        return Ok(());
+    }
+    if !report.imported.is_empty() {
+        println!("imported: {}", report.imported.join(", "));
+    }
+    if !report.replaced.is_empty() {
+        println!("replaced: {}", report.replaced.join(", "));
+    }
+    if !report.skipped_existing.is_empty() {
+        println!("skipped:  {}", report.skipped_existing.join(", "));
+    }
+    println!("→ {}", user_mcp_path().display());
+    println!("Restart or open TUI and let MCP reconnect (or /mcp after next session).");
+    Ok(())
 }
 
 async fn cmd_list(cwd: &std::path::Path, as_json: bool) -> Result<(), Box<dyn std::error::Error>> {
@@ -113,17 +213,15 @@ async fn cmd_list(cwd: &std::path::Path, as_json: bool) -> Result<(), Box<dyn st
         return Ok(());
     }
     if cfg.mcp_servers.is_empty() {
-        println!("No MCP servers configured (after multi-source merge).");
-        println!("  one user:     {}", user_mcp_path().display());
+        println!("No MCP servers in One config (user + project only).");
+        println!("  one user:  {}", user_mcp_path().display());
         println!(
-            "  one project:  {}",
+            "  project:   {}",
             one_mcp::project_mcp_path(cwd).display()
         );
+        println!("  import:    one mcp import --list   # Claude / Codex / Cursor");
         println!(
-            "  also scans: Codex ~/.codex/config.toml, Claude, Cursor, project .mcp.json"
-        );
-        println!(
-            "Add one: one mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /path"
+            "  add:       one mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /path"
         );
         return Ok(());
     }

@@ -16,15 +16,11 @@ use crate::runtime::{AgentMode, AppRuntime};
 use one_session::export_html;
 
 /// Poll permission gate + ask_user HITL and feed TUI answers back.
+///
+/// **Order matters**: deliver answers *before* re-surfacing pending prompts.
+/// `set_approval_prompt` / `set_select_prompt` clear stored answers; if we
+/// re-open the dock first, Enter looks like a no-op (result wiped, UI stays).
 fn drain_hitl(app: &mut App, gate: &PermissionGate, hitl: &HitlChannel) {
-    if let Some(req) = gate.poll_request() {
-        app.set_approval_prompt(ApprovalPrompt {
-            id: req.id,
-            tool: req.tool,
-            summary: req.summary,
-            reason: req.reason,
-        });
-    }
     if let Some(answer) = app.take_approval_answer() {
         let choice = match answer {
             ApprovalAnswer::Always => ApprovalChoice::Always,
@@ -34,13 +30,23 @@ fn drain_hitl(app: &mut App, gate: &PermissionGate, hitl: &HitlChannel) {
         };
         let _ = gate.respond(choice);
     }
-
-    if let Some(req) = hitl.poll_request() {
-        app.set_select_prompt(SelectKind::AskUser { id: req.id }, req.prompt);
-    }
     if let Some((kind, result)) = app.take_select_result() {
         if matches!(kind, SelectKind::AskUser { .. }) {
             let _ = hitl.respond(result);
+        }
+    }
+
+    // Only open a dock when the UI is not already showing one.
+    if app.select_kind().is_none() {
+        if let Some(req) = gate.poll_request() {
+            app.set_approval_prompt(ApprovalPrompt {
+                id: req.id,
+                tool: req.tool,
+                summary: req.summary,
+                reason: req.reason,
+            });
+        } else if let Some(req) = hitl.poll_request() {
+            app.set_select_prompt(SelectKind::AskUser { id: req.id }, req.prompt);
         }
     }
 }
@@ -150,6 +156,26 @@ fn refresh_mcp_rows(app: &mut App, runtime: &AppRuntime) {
         .collect();
     app.set_mcp_rows(rows, runtime.mcp.settings_summary());
     refresh_mcp_chip(app, runtime);
+}
+
+fn refresh_mcp_import_rows(app: &mut App, runtime: &AppRuntime) {
+    let rows: Vec<(String, String, String, bool)> = match runtime.mcp.list_import_candidates(&runtime.cwd)
+    {
+        Ok(cands) => cands
+            .into_iter()
+            .map(|c| {
+                let transport = if c.server.is_http() { "http" } else { "stdio" };
+                let detail = format!("{} · {transport}", c.source.as_str());
+                let label = c.name.clone();
+                (c.name, label, detail, c.already_owned)
+            })
+            .collect(),
+        Err(e) => {
+            app.set_notice(format!("mcp scan: {e}"));
+            Vec::new()
+        }
+    };
+    app.set_mcp_import_rows(rows);
 }
 
 /// Update the status-bar / prompt-meta chip (`MCP 4/5…`) from live manager state.
@@ -359,6 +385,37 @@ async fn apply_config_op(
                     app.reopen_mcp_float();
                 }
                 Err(err) => app.set_notice(format!("mcp: {err}")),
+            }
+        }
+        ConfigOp::McpImport { names, force } => {
+            match runtime
+                .import_mcp_from_agents(&names, None, force)
+                .await
+            {
+                Ok(report) => {
+                    refresh_mcp_rows(app, runtime);
+                    let mut parts = Vec::new();
+                    if !report.imported.is_empty() {
+                        parts.push(format!("imported {}", report.imported.join(", ")));
+                    }
+                    if !report.replaced.is_empty() {
+                        parts.push(format!("replaced {}", report.replaced.join(", ")));
+                    }
+                    if !report.skipped_existing.is_empty() && parts.is_empty() {
+                        parts.push(format!(
+                            "skipped {} (already in One · Enter again to force)",
+                            report.skipped_existing.len()
+                        ));
+                    }
+                    if parts.is_empty() {
+                        app.set_notice("mcp import: nothing to do");
+                    } else {
+                        app.set_notice(format!("mcp {}", parts.join(" · ")));
+                    }
+                    // Stay on MCP manager after import.
+                    app.open_mcp_float();
+                }
+                Err(err) => app.set_notice(format!("mcp import: {err}")),
             }
         }
     }
@@ -595,6 +652,13 @@ pub async fn run_interactive(
                     .draw(&mut app)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
+            RunOutcome::OpenMcpImportPanel => {
+                refresh_mcp_import_rows(&mut app, runtime);
+                app.open_mcp_import_float();
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
             RunOutcome::ConfigOp(op) => {
                 // Paint "fetching…" before the network await so Ctrl+F feels responsive.
                 if let ConfigOp::ProviderFetchModels { ref id } = op {
@@ -714,10 +778,12 @@ async fn run_turn_streaming(
     }
     let text = resolved.text;
     runtime.maybe_compact(provider.as_ref(), false).await?;
-    runtime
+    let _ = runtime
         .extensions
-        .emit(&one_ext::ExtensionEvent::AgentStart)
-        .await?;
+        .emit(&one_ext::ExtensionEvent::UserPromptSubmit {
+            text: text.clone(),
+        })
+        .await;
 
     let before = agent.lock().await.messages.len();
     let steering = runtime.steering_queue();
@@ -842,10 +908,6 @@ async fn run_turn_streaming(
                 }
             }
             runtime.persist_extension_state().await?;
-            runtime
-                .extensions
-                .emit(&one_ext::ExtensionEvent::AgentEnd)
-                .await?;
 
             if app.stream_buffer.is_empty() && !reply.is_empty() {
                 app.push_assistant(reply);
@@ -868,10 +930,6 @@ async fn run_turn_streaming(
                 }
             }
             runtime.persist_extension_state().await?;
-            runtime
-                .extensions
-                .emit(&one_ext::ExtensionEvent::AgentEnd)
-                .await?;
             let _ = runtime.take_plan_exit_request();
         }
         Err(err) => {
@@ -1264,9 +1322,30 @@ async fn handle_slash(
                     }
                     Ok(SlashAction::Consumed)
                 }
+                "import" => {
+                    // `/mcp import` → panel; `/mcp import all` → import all
+                    let rest = parts.get(2).copied().unwrap_or("");
+                    if rest == "all" {
+                        match runtime.import_mcp_from_agents(&[], None, false).await {
+                            Ok(report) => {
+                                refresh_mcp_rows(app, runtime);
+                                app.set_notice(format!(
+                                    "mcp imported {} · skipped {}",
+                                    report.imported.len(),
+                                    report.skipped_existing.len()
+                                ));
+                            }
+                            Err(err) => app.set_notice(format!("mcp import: {err}")),
+                        }
+                    } else {
+                        refresh_mcp_import_rows(app, runtime);
+                        app.open_mcp_import_float();
+                    }
+                    Ok(SlashAction::Consumed)
+                }
                 other => {
                     app.set_notice(format!(
-                        "unknown /mcp {other} · try: /mcp | enable|disable <name> | list"
+                        "unknown /mcp {other} · try: /mcp | import | enable|disable <name> | list"
                     ));
                     Ok(SlashAction::Consumed)
                 }
