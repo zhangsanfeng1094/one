@@ -10,21 +10,26 @@
 //! - [`subscribe`] — agent event fans-out
 
 mod build;
+pub mod explore_tools;
+pub mod harness;
 mod helpers;
 mod mode;
 mod plan;
 mod policy;
+pub mod presets;
 mod prompt;
+pub mod provider_limit;
 mod reload;
 mod session;
 mod subscribe;
+pub mod task_tool;
 mod tools;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use one_core::agent::Agent;
+use one_core::agent::{Agent, LlmProvider};
 use one_ext::ExtensionRuntime;
 use one_mcp::McpManager;
 use one_resources::ResourceLoader;
@@ -33,8 +38,10 @@ use one_tools::{AskUserHandler, BackgroundTaskRegistry, PathPolicy, PlanExitStat
 
 use crate::approval::PermissionGate;
 use crate::hitl::HitlChannel;
+use crate::langfuse::LangfuseTraceSink;
 
 pub use mode::AgentMode;
+pub use task_tool::TaskToolHost;
 
 pub struct AppRuntime {
     pub agent: Arc<tokio::sync::Mutex<Agent>>,
@@ -74,11 +81,38 @@ pub struct AppRuntime {
     pub mcp: McpManager,
     /// Last applied MCP tool generation (re-sync when background load advances).
     mcp_tools_generation: u64,
+    /// Langfuse sink (if `--trace`); held so we can flush before process exit.
+    langfuse: Option<Arc<LangfuseTraceSink>>,
+    /// Host for the `task` meta-tool (None when spawn disabled).
+    pub task_host: Option<Arc<TaskToolHost>>,
 }
 
 impl AppRuntime {
+    /// Bind the active LLM so `task` can call `harness::run` with the same provider.
+    pub async fn bind_task_provider(&self, provider: Arc<dyn LlmProvider>) {
+        if let Some(host) = &self.task_host {
+            host.bind_provider(provider).await;
+        }
+    }
+
+    /// Refresh session id on the task host (after session open / resume).
+    pub async fn sync_task_session(&self) {
+        if let Some(host) = &self.task_host {
+            let id = self.session.as_ref().map(|s| s.header().id.clone());
+            host.set_session_id(id).await;
+        }
+    }
+
     pub fn mode(&self) -> AgentMode {
         self.mode
+    }
+
+    /// Whether the `task` tool is registered for this runtime.
+    pub fn task_enabled(&self) -> bool {
+        self.task_host
+            .as_ref()
+            .map(|h| h.can_spawn())
+            .unwrap_or(false)
     }
 
     pub fn plan_path(&self) -> Option<&std::path::Path> {
@@ -96,6 +130,13 @@ impl AppRuntime {
     /// Update the model context window used for auto-compact thresholds.
     pub fn set_context_window(&mut self, window: usize) {
         self.context_window = window;
+    }
+
+    /// Flush Langfuse batches and stop the upload worker (idempotent).
+    pub fn flush_trace(&self) {
+        if let Some(sink) = &self.langfuse {
+            sink.shutdown();
+        }
     }
 
     /// Optional notice for TUI when MCP is still loading / just became ready.

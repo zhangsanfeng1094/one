@@ -58,7 +58,8 @@
 
 ### 文档
 - [x] README
-- [x] architecture / cli / session-format / development / roadmap / extensions
+- [x] architecture / cli / session-format / development / roadmap / extensions / mcp / harness-eval / gap-vs-pi
+- [x] 2026-07-19：文档与实现同步（OAuth xAI、默认 http-providers、slash/tools 全表、gap-vs-pi 重写）
 
 ---
 
@@ -86,12 +87,44 @@
 - [x] OpenCode 订阅登录 — **Zen / Go**（`one login opencode` · `one login opencode-go` · API key + models seed）
 - [x] OAuth：**xAI Grok** SuperGrok（`one login xai` · browser PKCE / device code · cli-chat-proxy）
 - [ ] OAuth：Anthropic Claude Pro/Max、GitHub Copilot
-- [ ] TS 扩展兼容层（QuickJS / WASM 评估）
 - [ ] self-update 命令
 - [x] 性能 / 能力基准套件 — `--trace` + `one bench` smoke（见 [harness-eval.md](./harness-eval.md)）；full 任务与跨 agent normalize 待扩展
 - [ ] TUI 差分渲染优化 / 贴图 / `@` 模糊搜索增强
 - [ ] 与官方 Pi session 全量兼容性回归测试
 - [ ] 更准的 per-model pricing 表
+
+### 程序化执行 · Subagent · Workflow（对齐 Claude，见设计）
+
+> 设计：[claude-workflow-model.md](./claude-workflow-model.md) · [subagents.md](./subagents.md) · 实现计划：[plans/2026-07-19-programmatic-subagents.md](./plans/2026-07-19-programmatic-subagents.md)  
+> 顺序：**P0 契约 → P1 worker → P2 宿主 spawn → P3 外置脚本/YAML**；**不**内嵌 QuickJS 作地基。
+
+#### P0 / P1a — CLI harness（先做；完整 JSON + preset）
+- [x] `AgentSpec` / `RunRequest` / `RunResult` / `TaskExitStatus`（protocol）
+- [x] 内置 **preset `explore`** harness JSON + `presets::load`
+- [x] `harness::run` + ProviderPermit + explore 白名单
+- [x] CLI：`one agent run explore` / `one run --preset|--spec` + `--output-format json`
+- [x] `one agent dump explore`（导出完整 JSON）
+- [x] 测试：preset / dump roundtrip / explore 白名单
+
+#### P1b — 封装 task 工具（CLI 稳定后）
+- [x] `TaskTool`（仅 one-cli）→ 同一 `harness::run`
+- [x] 支持 `agent` preset 名 + 可选 `agent_spec` 完整 JSON
+- [x] status trailer；无子 TUI stream；并发 permit
+- [x] mock e2e 主→task
+
+#### P2 — 扩展
+- [ ] RPC `spawn` / `run`
+- [ ] `agents/*.md` 磁盘 preset
+- [ ] 示例脚本 workflow
+
+#### P3 — Workflow（默认外置）
+- [ ] 文档 + 示例（外置脚本编排）
+- [ ] （可选）`one workflow run` YAML steps
+- [ ] ~~内嵌 QuickJS/V8 workflow runtime~~ → **非目标**（见 claude-workflow-model §5.1）
+
+#### P4 — 后置
+- [ ] Agent Teams 式 peer 协作（仅在有明确需求时）
+- [ ] background subagent + 完成通知
 
 ### MCP（平台基础能力，设计见 [mcp.md](./mcp.md)）
 
@@ -103,7 +136,7 @@
 - [x] M3：Streamable HTTP、超时、大输出截断
 - [ ] M4：OAuth / 凭证（按需）
 - [x] Plan mode 不注册 MCP tools（/act 后恢复）
-- [ ] M5：`/reload` 热更新 MCP 连接
+- [x] M5：`/reload` 热更新 MCP 连接（重读磁盘 + 合并 plugin mcpServers；已连 server 保持）
 
 ### Package / Suite（设计已写，未排期实现）
 
@@ -119,8 +152,11 @@
 
 ## 非目标
 
-- 不内置子 Agent orchestrator（与 Pi 一致；可另开需求）
+- ~~不内置子 Agent orchestrator~~ → **已改：分阶段做 Subagent + 程序化 spawn**（见上节；非 Teams 全家桶）
 - ~~不内置 MCP~~ → **已改：MCP 为平台基础能力**（见 [mcp.md](./mcp.md)；stdio/HTTP 已落地，OAuth 待做）
+- **不**内嵌 QuickJS/V8 作为 workflow 地基（P3 默认外置脚本；§5.1）
+- 不内置 sub-agent **peer 互聊 Teams**（除非另开需求）
+- 不把 TS 扩展兼容当短期目标
 
 ## Plan Mode（已内置 MVP）
 

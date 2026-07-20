@@ -131,8 +131,18 @@ one --no-mcp
 
 ---
 
+## 已实现（相关）
+
+- stdio + streamable HTTP  
+- 用户 / 项目 `mcp.json` + plugin `mcpServers` 合并  
+- `one mcp list|add|remove|doctor|import`  
+- TUI `/mcp` 与 Settings 入口  
+- Plan mode 不注册 MCP tools  
+- `/reload`：重读磁盘配置 + 合并 plugin；**已连接 server 保持**（不强制全量重连）  
+- `--no-mcp` 本 session 禁用  
+
 ## 尚未做
 
-- OAuth 浏览器流  
-- `/reload` 热重连全部 MCP  
-- 导入时预览完整 argv / secrets 遮罩 UI  
+- MCP 侧 OAuth / 浏览器凭证流  
+- `/reload` 强制断开并重连全部 server  
+- 导入时预览完整 argv / secrets 遮罩 UI

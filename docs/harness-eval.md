@@ -1,29 +1,53 @@
 # Harness 能力对比与埋点评测
 
 > 目标：收集 agent **完整执行链路**，用固定任务打分，再和对照 agent 对比，驱动 harness 改进。  
-> 原则：**非破坏** — Core 只增加可选 `TraceSink`；默认路径零开销；不改分层与依赖纪律。
+> 原则：**非破坏** — Core 只增加可选 `TraceSink`；默认路径零开销；观测后端 **仅 Langfuse**。
 
 ## 快速使用
 
-### 1. 写轨迹（任意一次运行）
+### 1. 配置 Langfuse
+
+在 [Langfuse](https://langfuse.com) 项目设置里创建 API keys，然后：
 
 ```bash
-# 默认写入 ~/.one/agent/traces/trace_<ms>.jsonl
+export LANGFUSE_PUBLIC_KEY=pk-lf-...
+export LANGFUSE_SECRET_KEY=sk-lf-...
+# 可选（默认 EU cloud）
+# export LANGFUSE_BASE_URL=https://cloud.langfuse.com   # EU
+# export LANGFUSE_BASE_URL=https://us.cloud.langfuse.com # US
+# export LANGFUSE_BASE_URL=http://localhost:3000         # self-host
+# export LANGFUSE_TRACING_ENVIRONMENT=dev
+# export LANGFUSE_RELEASE=0.1.0
+```
+
+`ONE_LANGFUSE=0` 可强制关闭（即使 keys 已设置）。
+
+### 2. 打开轨迹
+
+```bash
+# 任意一次运行 → OTLP → Langfuse
 one --trace -p "list files in current directory" -y --provider mock
 
-# 指定路径
-one --trace ./run.jsonl -p "…" -y
+# 含 LLM/tool I/O 预览（更大 payload）
+one --trace --trace-full -p "…" -y
 
-# 环境变量
+# 环境变量等价
 ONE_TRACE=1 one -p "…" -y
+
+# 别名
+one --langfuse -p "…" -y
 ```
 
-### 2. 看汇总
+可选身份：
 
 ```bash
-one trace-stats ./run.jsonl
-one trace-stats ./run.jsonl --json
+export LANGFUSE_USER_ID=alice          # 或 ONE_USER_ID；默认回退 $USER
+export LANGFUSE_TRACING_ENVIRONMENT=dev
+export LANGFUSE_RELEASE=0.1.0
 ```
+
+传输：**OpenTelemetry OTLP/HTTP** → `{BASE}/api/public/otel/v1/traces`（官方非 SDK 语言推荐路径）。  
+控制台可见：agent → turn(chain) → generation / tool；同一 One session 的多次 run 共享 `sessionId`；bench 会写 harness scores。
 
 ### 3. 跑 smoke 任务包（mock，可进 CI）
 
@@ -33,20 +57,17 @@ one bench --task mock-list-files
 one bench --suite all --out ./benches/out/manual
 ```
 
-输出目录含：
+- **有** `LANGFUSE_*` keys：每个 task 的事件与 harness score 写入 Langfuse  
+- **无** keys：仅内存打分（不联网），适合离线 CI  
 
-- `traces/<task>.jsonl` — 完整 span
-- `summary.json` / `summary.md` — 通过率表
-
-`suite=full` 的任务（如 `edit-marker`）需要真实模型才能过；当前 bench runner 默认仍走 **MockProvider**（确定性 smoke）。对 full 任务请用：
+`suite=full` 的任务（如 `edit-marker`）需要真实模型才能过；当前 bench runner 默认仍走 **MockProvider**。对 full 任务请用：
 
 ```bash
-one --trace ./edit.jsonl --provider <real> -y -p "$(cat benches/tasks/edit-marker/prompt.md)" \
+one --trace --provider <real> -y -p "$(cat benches/tasks/edit-marker/prompt.md)" \
   --cwd /tmp/edit-ws
-# 再人工或脚本按 rubric.json 判分
 ```
 
-## 架构（加法）
+## 架构
 
 ```text
 Agent::run
@@ -58,32 +79,56 @@ Agent::run
   └─ gate                        (allow | rewrite | deny)
          │
          ▼
-  JsonlTraceSink  ──►  *.jsonl
-         │
+  LangfuseTraceSink (OTEL)
+         ├─ OTLP/HTTP  →  /api/public/otel/v1/traces
+         └─ Scores API →  /api/public/scores
          ▼
-  TraceStats / one trace-stats / one bench scorer
+  Langfuse UI（唯一观测面）
 ```
 
 | 层 | 职责 |
 |----|------|
-| `one-core::trace` | `TraceEvent` schema、`TraceSink`、`MemoryTrace`、`JsonlTraceSink`、`TraceStats` |
+| `one-core::trace` | `TraceEvent` schema、`TraceSink`、`MemoryTrace`、`TraceStats` |
 | `Agent` | 可选 `set_trace` / `set_trace_meta`；loop 内埋点 |
-| `one-cli` | `--trace`、`trace-stats`、`bench` |
+| `one-cli::langfuse` | `LangfuseTraceSink` → OTEL OTLP + Scores API |
+| `one-cli` | `--trace` / `--langfuse`、`one bench` |
 | `benches/tasks/*` | 任务包：fixture + prompt + rubric |
 
 **不**改：`AgentEvent` 语义、session 格式、crate 依赖方向、默认运行行为。
 
-## Trace 事件类型
+## 与 Langfuse 官方对齐
 
-| type | 含义 |
-|------|------|
-| `run_start` / `run_end` | 一次 prompt 循环边界；status = ok / aborted / max_turns / error |
-| `turn_start` | 一轮 LLM |
-| `llm_request` / `llm_response` | 请求规模 + 时延 + usage + stop_reason |
-| `tool_start` / `tool_end` | 工具名、args 预览、时长、错误 |
-| `gate` | 权限/扩展门控 |
-| `compaction` | （预留）压缩前后 token |
-| `score` | bench 写入的自动判分 |
+| 官方项 | One 现状 |
+|--------|----------|
+| Env：`LANGFUSE_PUBLIC_KEY` / `SECRET_KEY` / `BASE_URL` | ✅（`LANGFUSE_HOST` 别名） |
+| Auth：Basic `pk:sk` | ✅ |
+| **OTLP `/api/public/otel/v1/traces`** | ✅ **当前路径** |
+| `x-langfuse-ingestion-version: 4` | ✅ |
+| `langfuse.observation.type` agent/chain/generation/tool | ✅ |
+| `gen_ai.*` model + usage | ✅ |
+| `langfuse.observation.usage_details` | ✅ |
+| 短生命周期 `force_flush` / shutdown | ✅ |
+| Scores API（BOOLEAN 0/1 + NUMERIC） | ✅ flush OTLP → POST scores → join workers |
+| Trace 属性传播到所有 span | ✅ session/user/tags/metadata/release/env |
+| `langfuse.trace.tags` 为 string[] | ✅ OTEL string array |
+| `sessionId` | ✅ One session header id / bench 每次独立 id |
+| `userId` | ✅ `LANGFUSE_USER_ID` / `ONE_USER_ID` / `USER` |
+| Generation I/O 文本 | ✅ 默认仅长度；`--trace-full` 上报预览（至 16k 字符） |
+| Experiments dataset 属性 | ⚠️ 未接；bench 用 tags + harness scores |
+
+## Trace 事件 → OTEL / Langfuse
+
+| `TraceEvent` | OTEL span | Langfuse 映射 |
+|--------------|-----------|---------------|
+| `run_start` | root span | observation **agent** |
+| `run_end` | end root | status / output / tokens |
+| `turn_start` | child | observation **chain** |
+| `llm_request` | child | observation **generation**（开始） |
+| `llm_response` | end generation | model + `gen_ai.usage.*` |
+| `tool_start` / `tool_end` | child | observation **tool** |
+| `gate` | span event | event on tool/turn |
+| `compaction` | child span | span |
+| `score` | — | `POST /api/public/scores` |
 
 ## 主评测项目：`broken-kit` v0.2
 
@@ -113,6 +158,8 @@ Agent::run
 
 脚本结构见 `benches/README.md`：`run.sh` 只做分发，`lib/` 公共，`cmd/{offline,one,codex,compare}.sh` 各管一块。
 
+有 `LANGFUSE_*` 时，`./benches/run.sh full` 会自动加 `--trace`。
+
 ### 对照 agent 协议（Codex / 其它）
 
 | 项 | 约定 |
@@ -120,24 +167,9 @@ Agent::run
 | Fixture | 每次独立拷贝 stock 树，互不污染 |
 | Prompt | 同一 `benches/tasks/<id>/prompt.md` |
 | 打分 | 只认 `cargo test` exit 0（不认 agent 自述） |
-| One | 白盒 TraceEvent（turns/tools/tokens/latency） |
+| One | 白盒 TraceEvent → Langfuse |
 | Codex | `codex exec --json` 事件流 + session JSONL + wall_ms |
 | 公平性 | 都在临时 workspace、可写 sandbox、无 SOLUTIONS.md |
-
-### Codex 结构化输出（已接到 `run.sh codex`）
-
-官方支持（见 [Non-interactive mode](https://developers.openai.com/codex/non-interactive-mode)）：
-
-```bash
-codex exec --json -C "$WS" --sandbox workspace-write -o last.txt "…"
-# stdout → JSONL: thread.started / turn.* / item.* (command_execution, file_change, …)
-# turn.completed.usage → input/output/cached tokens
-# 另有 ~/.codex/sessions/**/rollout-*.jsonl 全量 session
-```
-
-`./benches/run.sh codex` 会保存 `codex-events.jsonl` + `codex-stats.txt`，便于和 One 的 `run.jsonl` / `trace-stats.txt` 对照。
-
-接入其它 agent：仿 `cmd_codex`，包「cwd + prompt + 结构化 log + cargo test」。
 
 ### Harness 行为约束（评测隔离）
 
@@ -165,8 +197,7 @@ Shell 真模型路径（`./benches/run.sh full|codex|compare`）与 `one bench` 
 
 - workspace：`project` → `fixture` 字段 → `tasks/<id>/fixture/`
 - 打分：`rubric` 的 `command` 检查 → 否则 `test_filter`（可多 pattern，每个单独 `cargo test`）→ 否则全量 test
-- `test_filter` 支持 `"ledger::"`、`"money:: promo::"`（空格拆成多次）或 `["money::","promo::"]`
-- 产物：`result.txt`（仅 `pass`/`fail`）、`score.log` / `score.json`
+- 产物：`result.txt`（仅 `pass`/`fail`）、`score.log` / `score.json`；One 链路指标看 Langfuse
 
 ### Rubric checks
 
@@ -183,25 +214,20 @@ Shell 真模型路径（`./benches/run.sh full|codex|compare`）与 `one bench` 
 
 ## 指标（对比维度）
 
-从 `TraceStats` / summary 表直接读：
+从 Langfuse UI / Scores：
 
-- **pass rate**（主）
-- turns / tool_calls / tool_error_rate
-- wall_ms / llm latency / ttft_p50
+- **pass rate**（主，`harness_pass` score）
+- turns / tool_calls / tool errors（span 元数据）
+- wall_ms / llm latency / ttft
 - tokens (in/out/cache)
 - gate denies
 
 同任务对比不同 harness 时：固定 fixture、尽量同模型、非交互 auto-approve、N 次取中位。
 
-## 对照 agent（后续）
-
-1. One：原生 `--trace`  
-2. 其他：导出 session/日志 → normalize 到同一 `TraceEvent` 子集（脚本即可，不必进 core）  
-3. 输出并排 summary，按失败模式改 prompt / tool 描述 / compaction
-
 ## 相关代码
 
 - `crates/one-core/src/trace.rs`
 - `crates/one-core/src/agent.rs`（`set_trace`）
-- `crates/one-cli/src/bench_cmd.rs` / `trace_cmd.rs`
+- `crates/one-cli/src/langfuse.rs`
+- `crates/one-cli/src/bench_cmd.rs`
 - `crates/one-cli/src/runtime/build.rs`（`--trace` 装配）

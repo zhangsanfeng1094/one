@@ -22,29 +22,50 @@ one --list-models            # 列出可用模型
 one --list-providers         # 列出内置 + models.json 自定义 provider
 
 # 执行轨迹 / harness 评测（见 docs/harness-eval.md）
-one --trace ./run.jsonl -p "…" -y   # 写 JSONL 链路（turns/tools/latency/tokens）
-one --trace -p "…"                  # 默认 ~/.one/agent/traces/…
-one trace-stats ./run.jsonl         # 汇总轨迹
-one bench --suite smoke             # mock 可重复任务包
+# 需 LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY
+one --trace -p "…" -y               # 导出链路到 Langfuse
+one --langfuse -p "…" -y            # 同上（别名）
+one bench --suite smoke             # mock 可重复任务包（有 keys 则同步到 Langfuse）
 one bench --task mock-list-files
 
-# 订阅登录
-one login                    # 交互选择：Codex / xAI Grok / OpenCode …
-one login openai-codex       # ChatGPT Plus/Pro OAuth
+# Agent harness（preset + 完整 JSON；与 subagent 同构，见 docs/protocol.md）
+one agent run explore -p "map auth" --provider mock -y
+one agent dump explore                    # 导出完整 harness JSON
+one agent inspect explore
+one run --preset explore -p "…" -y
+one run --spec ./my-agent.json -p "…" -y  # 完整 AgentSpec
+one -p "hello" --provider mock -y --output-format json   # 主会话 RunResult envelope
+
+# 主会话内的 task 工具（P1b）：模型可调用 task → 同一 harness::run
+# 参数：prompt（必填）, agent|mode=explore, description?, agent_spec?
+# tool_result 形如：[task · explore · status=success]\n<summary>
+# 物理 LLM 并发：ONE_LLM_CONCURRENCY（默认 4）；逻辑 task 槽：spawn_policy.max_concurrent（默认 4）
+
+# 订阅 / OAuth 登录（catalog：Codex · xAI · OpenCode Zen/Go）
+one login                    # 交互选择
+one login openai-codex       # ChatGPT Plus/Pro OAuth（别名 codex / chatgpt）
+one login openai-codex --browser
+one login openai-codex --device-code
 one login xai                # SuperGrok / X Premium+ OAuth（别名 grok）
-one login xai --browser      # 仅浏览器 PKCE（localhost:56121）
+one login xai --browser      # 浏览器 PKCE
 one login xai --device-code  # 无头 device code
-one login opencode           # OpenCode Zen（控制台 API key）
+one login opencode           # OpenCode Zen（控制台 API key；别名 zen）
 one login opencode-go        # OpenCode Go 订阅（可 import CLI auth.json）
 one logout opencode-go
 one logout --all
 one --provider openai-codex -p "hello"
+one --provider xai -p "hello"
 one --provider opencode-go --model deepseek-v4-flash -p "hello"
+
+# 其它常用 flags
+one --no-mcp                 # 本 session 不连 MCP
+one --no-skills              # 不注入 skills catalog（评测隔离）
+one --max-turns 16           # 单 prompt 最大 tool 循环
 ```
 
-凭证存 `~/.one/agent/auth.json`（`0600`）。Codex OAuth 过期自动 refresh。OpenCode 与 `OPENCODE_API_KEY` 共用。
+凭证存 `~/.one/agent/auth.json`（`0600`）。Codex / xAI OAuth 过期自动 refresh。OpenCode 与 `OPENCODE_API_KEY` 共用。
 
-交互模式：`/login`（弹出选择）· `/login opencode-go` · `/logout` · `/model opencode-go:deepseek-v4-flash`
+交互模式：`/login`（弹出选择）· `/login xai` · `/login opencode-go` · `/logout` · `/model opencode-go:deepseek-v4-flash` · `/mcp`
 
 ## 权限与路径沙箱
 
@@ -172,19 +193,27 @@ one --full-access
 ## Provider 与模型配置
 
 ```bash
-one --provider mock          # 默认，本地测试
+one --provider mock          # 默认（无 settings 时），本地测试
 one --provider ollama        # 本地 Ollama
 one --provider anthropic     # ANTHROPIC_API_KEY
 one --provider openai        # OPENAI_API_KEY
+one --provider openai-codex  # ChatGPT OAuth（one login）
 one --provider openrouter    # OPENROUTER_API_KEY
 one --provider deepseek      # DEEPSEEK_API_KEY（OpenAI-compat）
 one --provider gemini        # GEMINI_API_KEY 或 GOOGLE_API_KEY
+one --provider xai           # xAI OAuth 或 XAI_API_KEY
+one --provider opencode      # OpenCode Zen
+one --provider opencode-go   # OpenCode Go
 
 one --model gpt-4o           # 模型 id（-m）
 one --base-url https://api.openai.com/v1
 one --api-key sk-...
 one --openai-api openai-responses   # 或 openai-completions / anthropic-messages / gemini-generate-content
+one --list-providers
+one --list-models
 ```
+
+> `http-providers` 已是 `one-cli` 默认 feature；直接 `cargo run -p one-cli` / 安装后的 `one` 即可打真实 API。
 
 ### 配置优先级（高 → 低）
 
@@ -196,17 +225,21 @@ one --openai-api openai-responses   # 或 openai-completions / anthropic-message
 | api / providerType | `--openai-api` | `api` 或 `providerType`（固定枚举） | `ONE_OPENAI_API` | openai→responses，anthropic→messages，gemini→generate-content，其它→completions |
 | apiKey | `--api-key` | `apiKey`（支持 `$ENV`） | `OPENAI_API_KEY` 等 | — |
 
-默认 model：
+默认 model（可被 settings / models.json / `-m` 覆盖）：
 
 | provider | default model |
 |----------|----------------|
 | mock | `mock-v1` |
 | openai | `gpt-4o` |
+| openai-codex | `gpt-5.4`（login 后 seed） |
 | anthropic | `claude-sonnet-4-20250514` |
 | ollama | `llama3.2` |
 | openrouter | `anthropic/claude-sonnet-4` |
 | deepseek | `deepseek-chat` |
 | gemini | `gemini-2.5-flash` |
+| xai | `grok-4.5`（login 后 seed） |
+| opencode | `kimi-k2.6` |
+| opencode-go | `deepseek-v4-flash` |
 
 ### 统一设置 `~/.one/agent/settings.json`
 
@@ -539,11 +572,25 @@ Settings
 |------|------|
 | `OPENAI_API_KEY` | OpenAI key |
 | `OPENAI_BASE_URL` / `OPENAI_API_BASE` | OpenAI base URL |
-| `ONE_OPENAI_API` | `openai-responses` / `openai-completions` |
+| `ONE_OPENAI_API` | wire：`openai-responses` / `openai-completions` / … |
 | `ANTHROPIC_API_KEY` | Anthropic key |
 | `OPENROUTER_API_KEY` | OpenRouter key |
 | `OPENROUTER_BASE_URL` | OpenRouter base（可选） |
-| `OLLAMA_HOST` | 如 `http://127.0.0.1:11434` |
+| `OPENROUTER_MODEL` | OpenRouter 默认模型 |
+| `OLLAMA_HOST` / `OLLAMA_MODEL` | Ollama |
+| `DEEPSEEK_API_KEY` / `DEEPSEEK_BASE_URL` | DeepSeek |
+| `GEMINI_API_KEY` / `GOOGLE_API_KEY` | Gemini |
+| `XAI_API_KEY` | xAI API key（OAuth 外的备用） |
+| `OPENCODE_API_KEY` | OpenCode Zen/Go 共用 |
+| `BRAVE_API_KEY` | `web_search` 优先用 Brave，否则 DDG HTML |
+| `ONE_AUTO_APPROVE` | 等同 `-y` |
+| `ONE_BASH_SANDBOX` | `0` 关闭 bwrap |
+| `ONE_DISABLE_SKILLS` | 等同 `--no-skills` |
+| `ONE_TRACE` | 等同 `--trace` |
+| `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | Langfuse |
+| `LANGFUSE_BASE_URL` | 默认 EU cloud |
+| `GITHUB_TOKEN` | `--share` Gist |
+| `ONE_DEBUG_CACHE` / `ONE_DEBUG_CACHE_DIR` | prompt cache 调试 |
 
 ## 运行模式
 
@@ -589,18 +636,35 @@ Slash 命令：
 | `/tree` / `/tree <id>` | 列出或切换分支 |
 | `/rewind` / `/rewind <id>` | 回退到某条用户提示并重新编辑（同 `Esc Esc`） |
 | `/model [provider[:model]]` | 切换模型；裸 `/model` 打开**输入框上方** select（同 **Ctrl+L**） |
+| `/login [provider]` | 订阅/OAuth 登录；裸命令打开选择器（Codex / xAI / OpenCode） |
+| `/logout [provider\|all]` | 清除凭证；裸命令打开已存凭证列表 |
 | `/settings [key value]` | 裸命令打开**居中 Settings**（同 **Ctrl+G**）；带参则写 settings.json |
 | `/thinking [off\|low\|medium\|high]` | 设置或循环 thinking |
 | `/plan` | 进入 Plan 模式（只读探索 + 写 plan 文件） |
 | `/act` / `/build` | 批准计划并切到 Build 模式开始实现 |
 | `/compact [instructions]` | 手动压缩上下文（LLM 摘要优先） |
-| `/settings [key value]` | 查看或写入统一设置 |
 | `/skills [enable\|disable <name>]` | 管理 skills：裸命令打开开关面板；`enable`/`disable` 按名称切换 |
 | `/skill:name [args]` | **可选**强制加载 skill（默认由模型 `read` 按需加载） |
+| `/mcp [import\|enable\|disable <name>]` | MCP 面板 / 导入 / 开关 |
 | `/export [path]` | 导出 HTML |
-| `/reload` | 热重载扩展 / skills / prompts |
+| `/reload` | 热重载扩展 / skills / prompts / MCP 配置 |
 | `/clear` | 清空屏幕历史 |
 | `/quit` | 退出 |
+
+### 内置工具一览
+
+| 工具 | 模式 | 说明 |
+|------|------|------|
+| `read` / `write` / `edit` | Act（write/edit 仅 Act） | 文件读写与补丁 |
+| `bash` | Act |  shell；支持后台 task_id |
+| `bash_output` | Act | 轮询/等待后台 bash 输出 |
+| `bash_kill` | Act | 终止后台 bash 任务 |
+| `grep` / `find` / `ls` | Act / Plan / read-only | 搜索与列举 |
+| `task` | Act / Plan / read-only | 子 agent（默认 explore）→ 同一 `harness::run`；见 [protocol.md](./protocol.md) |
+| `ask_user` | 均有（仅 Interactive） | 结构化澄清问题 |
+| `web_search` / `web_fetch` | Act / Plan / read-only | 联网（需 `network` feature，CLI 默认开） |
+| `plan` 相关 + `exit_plan_mode` | Plan | 写 plan 文件并退出 Plan |
+| MCP `server__tool` | Act | 来自已连接 MCP 服务器 |
 
 ### Skills（Agent Skills 标准）
 
@@ -690,8 +754,28 @@ one --mode json -p "hello"
 
 ### RPC
 
+JSONL over stdin/stdout（每行一个请求/响应）：
+
 ```bash
 one --mode rpc --no-session
+```
+
+| method | params | 说明 |
+|--------|--------|------|
+| `ping` | — | 健康检查 |
+| `prompt` | `{ "text": "…" }` | 跑一轮 agent（阻塞到结束） |
+| `abort` | — | 中止当前 run |
+| `steer` | `{ "text": "…" }` | 运行中注入（插队） |
+| `follow_up` | `{ "text": "…" }` | 本轮结束后追加 |
+| `session` | — | path + summary |
+| `status` | — | provider/model/thinking/usage/mcp |
+| `thinking` | `{ "level"?: "off\|low\|medium\|high" }` | 读/写 thinking level |
+| `compact` | — | 强制上下文压缩 |
+
+示例：
+
+```bash
+echo '{"id":"1","method":"prompt","params":{"text":"list files"}}' | one --mode rpc -y --provider mock
 ```
 
 ## 联网搜索

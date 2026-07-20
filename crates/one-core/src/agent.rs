@@ -20,18 +20,23 @@ use crate::trace::{
 
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are an AI coding assistant. Use the provided tools to read and change files, run shell commands, and search or fetch the web when you need current information.
 
-Tool choice (prefer specialized tools over bash):
-- Explore: `ls`, `find`, `grep`, `read` — not `bash` with find/rg/cat/head/sed/awk pipelines.
+Tool choice (prefer specialized tools over bash — Claude Code style):
+- Explore: `ls`, `find` (glob), `grep`, `read` — not `bash` with find/rg/cat/head/sed/awk pipelines.
 - Edit: `edit` / `write` — not shell redirection or sed/awk rewrites.
-- Run: `bash` only for real process work (build, test, git, package managers, long-running commands).
+- Run: `bash` only for real process work (build, test, git, package managers, long-running commands). Always pass a short `description` for bash commands.
 - Never use bash echo (or similar) to talk to the user; reply in normal assistant text.
 - Do not assume host extras exist (`rg`, `tree`, `eza`, `fd`, …). The `grep` tool uses ripgrep when available; if a tool fails with missing binary, fall back to another tool or plain `grep`/`find` via bash only when needed.
-- Parallelize independent tool calls when it speeds exploration.
+- You may request multiple independent tool calls in one turn; read-only tools (read/grep/find/ls/…) may run concurrently, while write/edit/bash and similar run serially.
+- For large exploration across many files, use the `task` tool (agent=explore) so findings return as a summary without bloating this conversation. Do not use task for a trivial single-file read.
+- Path args accept `path` or Claude-style `file_path`.
 
 File changes:
-- Prefer `edit` for localized fixes (change only the relevant snippet; `old_string` must uniquely match once).
+- Prefer `edit` for localized fixes. By default `old_string` must uniquely match once; set `replace_all=true` to replace every occurrence (e.g. renames).
 - Use `write` only for new files or intentional full-file rewrites — do not rewrite an entire file when a small edit would do.
 - Read a file before editing it when you need its current contents.
+
+Search:
+- Prefer `grep` with `glob` / `type` / `output_mode` / `head_limit` / context (`-A`/`-B`/`-C`) over shell ripgrep.
 
 Bash / sandbox:
 - Default bash runs under an OS sandbox (workspace-write): workspace is writable; home and system paths are mostly read-only. Prefer the dedicated file tools so path policy and truncation stay consistent.
@@ -273,6 +278,12 @@ pub struct TraceRunMeta {
     pub task_id: Option<String>,
     pub agent_version: Option<String>,
     pub config: Option<serde_json::Value>,
+    /// Langfuse / OTEL session id (multi-turn conversation grouping).
+    pub session_id: Option<String>,
+    /// Optional end-user id (`langfuse.user.id`).
+    pub user_id: Option<String>,
+    /// When true, include larger I/O previews on LLM / tool / run events.
+    pub trace_full: bool,
 }
 
 impl Agent {
@@ -330,9 +341,26 @@ impl Agent {
         self.trace_meta = meta;
     }
 
+    pub fn trace_meta(&self) -> &TraceRunMeta {
+        &self.trace_meta
+    }
+
+    /// Update session id for the next run (e.g. after `/new` or `/resume`).
+    pub fn set_trace_session_id(&mut self, session_id: Option<String>) {
+        self.trace_meta.session_id = session_id;
+    }
+
     fn record_trace(&self, event: TraceEvent) {
         if let Some(sink) = &self.trace {
             sink.record(event);
+        }
+    }
+
+    fn preview_limit(&self) -> usize {
+        if self.trace_meta.trace_full {
+            crate::trace::PREVIEW_FULL_CHARS
+        } else {
+            crate::trace::PREVIEW_DEFAULT_CHARS
         }
     }
 
@@ -461,6 +489,9 @@ impl Agent {
             model: Some(provider.model().to_string()),
             task_id: meta.task_id.clone(),
             config: meta.config.clone(),
+            session_id: meta.session_id.clone(),
+            user_id: meta.user_id.clone(),
+            trace_full: meta.trace_full,
         });
 
         self.emit(AgentEvent::AgentStart);
@@ -506,6 +537,15 @@ impl Agent {
                 thinking_level: self.config.thinking_level,
             };
 
+            let input_preview = if self.trace_meta.trace_full {
+                crate::trace::llm_input_preview(
+                    &request.system_prompt,
+                    &request.messages,
+                    self.preview_limit(),
+                )
+            } else {
+                None
+            };
             self.record_trace(TraceEvent::LlmRequest {
                 ts_ms: now_ms(),
                 run_id: run_id.clone(),
@@ -513,6 +553,7 @@ impl Agent {
                 message_count: request.messages.len(),
                 tools_n: request.tools.len(),
                 system_prompt_len: request.system_prompt.len(),
+                input_preview,
             });
 
             let llm_start = Instant::now();
@@ -557,6 +598,7 @@ impl Agent {
             let response = match response {
                 Ok(r) => r,
                 Err(err) => {
+                    let err = map_provider_error(err);
                     self.record_trace(TraceEvent::RunEnd {
                         ts_ms: now_ms(),
                         run_id: run_id.clone(),
@@ -565,6 +607,7 @@ impl Agent {
                         wall_ms: wall_start.elapsed().as_millis() as u64,
                         usage: self.token_usage,
                         final_text_len: None,
+                        final_text_preview: None,
                         error: Some(err.to_string()),
                     });
                     self.is_busy = false;
@@ -578,8 +621,14 @@ impl Agent {
             let latency_ms = llm_start.elapsed().as_millis() as u64;
             let ttft = ttft_ms.lock().expect("ttft").clone();
             let tool_calls = extract_tool_calls(&response.content);
-            let text_len = extract_text(&response.content).len();
+            let text = extract_text(&response.content);
+            let text_len = text.len();
             let thinking_len = extract_thinking_len(&response.content);
+            let output_preview = if self.trace_meta.trace_full {
+                crate::trace::text_preview(&text, self.preview_limit())
+            } else {
+                None
+            };
 
             self.record_trace(TraceEvent::LlmResponse {
                 ts_ms: now_ms(),
@@ -594,6 +643,7 @@ impl Agent {
                 usage: response.usage,
                 provider: response.provider.clone(),
                 model: response.model.clone(),
+                output_preview,
             });
 
             if !response.usage.is_zero() {
@@ -651,6 +701,11 @@ impl Agent {
                 if let Some(hooks) = &self.hooks {
                     hooks.on_agent_end().await;
                 }
+                let final_text_preview = if self.trace_meta.trace_full {
+                    crate::trace::text_preview(&final_text, self.preview_limit())
+                } else {
+                    crate::trace::text_preview(&final_text, crate::trace::PREVIEW_DEFAULT_CHARS)
+                };
                 self.record_trace(TraceEvent::RunEnd {
                     ts_ms: now_ms(),
                     run_id: run_id.clone(),
@@ -659,13 +714,20 @@ impl Agent {
                     wall_ms: wall_start.elapsed().as_millis() as u64,
                     usage: self.token_usage,
                     final_text_len: Some(final_text.len()),
+                    final_text_preview,
                     error: None,
                 });
                 return Ok(final_text);
             }
 
-            for call in tool_calls {
-                if self.is_aborted() {
+            // Gate sequentially (HITL Ask is single-slot), then run allowed tools
+            // concurrently. Steer/abort mid-batch → synthetic error toolResults so
+            // tool_call / tool_result pairs stay valid for the provider.
+            match self
+                .run_tool_batch(&tool_calls, turn, &run_id, &mut tool_results)
+                .await
+            {
+                ToolBatchOutcome::Aborted => {
                     self.emit(AgentEvent::TurnEnd {
                         turn,
                         assistant: assistant.clone(),
@@ -678,93 +740,7 @@ impl Agent {
                         .finish_aborted(start_len, &run_id, wall_start, turns_done)
                         .await;
                 }
-
-                let (args_bytes, args_preview) = args_preview(&call.arguments, 240);
-                self.record_trace(TraceEvent::ToolStart {
-                    ts_ms: now_ms(),
-                    run_id: run_id.clone(),
-                    turn,
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    args_bytes,
-                    args_preview,
-                });
-
-                self.emit(AgentEvent::ToolExecutionStart {
-                    tool_call: call.clone(),
-                });
-
-                let tool_start = Instant::now();
-                let (output, is_error, gate_decision) =
-                    match self.execute_tool(&call, &run_id, turn).await {
-                        Ok((output, gate)) => {
-                            let failed = tool_output_indicates_error(&call.name, &output);
-                            (output, failed, gate)
-                        }
-                        Err(err) => (ToolOutput::text(err.to_string()), true, None),
-                    };
-                let duration_ms = tool_start.elapsed().as_millis() as u64;
-                let output_bytes = output.as_text().len();
-
-                self.record_trace(TraceEvent::ToolEnd {
-                    ts_ms: now_ms(),
-                    run_id: run_id.clone(),
-                    turn,
-                    call_id: call.id.clone(),
-                    name: call.name.clone(),
-                    duration_ms,
-                    is_error,
-                    output_bytes,
-                    gate: gate_decision,
-                });
-
-                if self.is_aborted() {
-                    self.emit(AgentEvent::ToolExecutionEnd {
-                        tool_call: call.clone(),
-                        output: output.clone(),
-                        is_error,
-                    });
-                    let result = AgentMessage::ToolResult(ToolResultMessage {
-                        tool_call_id: call.id.clone(),
-                        tool_name: call.name.clone(),
-                        content: output.content.clone(),
-                        is_error,
-                        timestamp: crate::message::now_ms(),
-                    });
-                    self.messages.push(result.clone());
-                    tool_results.push(result);
-                    self.emit(AgentEvent::TurnEnd {
-                        turn,
-                        assistant,
-                        tool_results,
-                    });
-                    if let Some(hooks) = &self.hooks {
-                        hooks.on_turn_end(turn).await;
-                    }
-                    return self
-                        .finish_aborted(start_len, &run_id, wall_start, turns_done)
-                        .await;
-                }
-
-                self.emit(AgentEvent::ToolExecutionEnd {
-                    tool_call: call.clone(),
-                    output: output.clone(),
-                    is_error,
-                });
-
-                let result = AgentMessage::ToolResult(ToolResultMessage {
-                    tool_call_id: call.id.clone(),
-                    tool_name: call.name.clone(),
-                    content: output.content.clone(),
-                    is_error,
-                    timestamp: crate::message::now_ms(),
-                });
-                self.messages.push(result.clone());
-                tool_results.push(result);
-
-                if !self.steering_queue.lock().expect("steering queue lock").is_empty() {
-                    break;
-                }
+                ToolBatchOutcome::Continue => {}
             }
 
             self.emit(AgentEvent::TurnEnd {
@@ -789,6 +765,7 @@ impl Agent {
             wall_ms: wall_start.elapsed().as_millis() as u64,
             usage: self.token_usage,
             final_text_len: None,
+            final_text_preview: None,
             error: Some(format!("max turns ({})", self.config.max_turns)),
         });
         self.emit(AgentEvent::AgentEnd {
@@ -821,6 +798,7 @@ impl Agent {
             wall_ms: wall_start.elapsed().as_millis() as u64,
             usage: self.token_usage,
             final_text_len: None,
+            final_text_preview: None,
             error: Some("aborted".into()),
         });
         Err(OneError::Aborted)
@@ -860,14 +838,302 @@ impl Agent {
         true
     }
 
-    /// Execute a tool after gate check. Returns `(output, gate_decision)`.
-    async fn execute_tool(
-        &self,
-        call: &ToolCall,
-        run_id: &str,
+    /// Gate + execute a batch of tool calls from one assistant turn.
+    async fn run_tool_batch(
+        &mut self,
+        tool_calls: &[ToolCall],
         turn: usize,
-    ) -> Result<(ToolOutput, Option<TraceGateDecision>)> {
-        // Gate may rewrite arguments (extension PreToolUse).
+        run_id: &str,
+        tool_results: &mut Vec<AgentMessage>,
+    ) -> ToolBatchOutcome {
+        let mut slots: Vec<ToolSlot> = Vec::with_capacity(tool_calls.len());
+
+        for (i, call) in tool_calls.iter().enumerate() {
+            if self.is_aborted() {
+                self.execute_slots(&mut slots, turn, run_id, tool_results).await;
+                for call in &tool_calls[i..] {
+                    self.emit_synthetic_skip(
+                        call,
+                        turn,
+                        run_id,
+                        "aborted before tool execution",
+                        tool_results,
+                    );
+                }
+                return ToolBatchOutcome::Aborted;
+            }
+            if i > 0 && self.has_steering() {
+                // Finish already-gated tools, skip the rest with paired error results.
+                self.execute_slots(&mut slots, turn, run_id, tool_results).await;
+                for call in &tool_calls[i..] {
+                    self.emit_synthetic_skip(
+                        call,
+                        turn,
+                        run_id,
+                        "skipped: user steering message queued",
+                        tool_results,
+                    );
+                }
+                return ToolBatchOutcome::Continue;
+            }
+
+            let (args_bytes, preview) = args_preview(&call.arguments, self.preview_limit());
+            self.record_trace(TraceEvent::ToolStart {
+                ts_ms: now_ms(),
+                run_id: run_id.to_string(),
+                turn,
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                args_bytes,
+                args_preview: preview,
+            });
+            self.emit(AgentEvent::ToolExecutionStart {
+                tool_call: call.clone(),
+            });
+
+            match self.gate_tool(call, run_id, turn).await {
+                GateOutcome::Allow {
+                    effective,
+                    gate,
+                    tool,
+                } => {
+                    slots.push(ToolSlot::Pending {
+                        original: call.clone(),
+                        effective,
+                        gate,
+                        tool,
+                    });
+                }
+                GateOutcome::Deny { message, gate } => {
+                    slots.push(ToolSlot::Done {
+                        original: call.clone(),
+                        output: ToolOutput::text(message),
+                        is_error: true,
+                        gate,
+                        duration_ms: 0,
+                    });
+                }
+            }
+        }
+
+        self.execute_slots(&mut slots, turn, run_id, tool_results).await;
+        ToolBatchOutcome::Continue
+    }
+
+    /// Execute pending slots, then emit ToolEnd / ToolResult in original order.
+    ///
+    /// **Parallelism policy:** consecutive read-only tools (`read`/`grep`/`find`/…)
+    /// run via `join_all`. Side-effecting tools (`write`/`edit`/`bash`/MCP/…) run
+    /// one at a time so they cannot race on the same files or shell state.
+    async fn execute_slots(
+        &mut self,
+        slots: &mut Vec<ToolSlot>,
+        turn: usize,
+        run_id: &str,
+        tool_results: &mut Vec<AgentMessage>,
+    ) {
+        let n = slots.len();
+        let mut i = 0;
+        while i < n {
+            // Already finished (e.g. gate deny).
+            if matches!(&slots[i], ToolSlot::Done { .. }) {
+                i += 1;
+                continue;
+            }
+
+            let side_effect = match &slots[i] {
+                ToolSlot::Pending { original, .. } => !is_parallel_safe_tool(&original.name),
+                ToolSlot::Done { .. } => false,
+            };
+
+            if side_effect {
+                self.run_pending_at(slots, i).await;
+                i += 1;
+                continue;
+            }
+
+            // Gather consecutive parallel-safe pending indices until a side-effecting pending.
+            let mut batch: Vec<usize> = Vec::new();
+            let mut k = i;
+            while k < n {
+                match &slots[k] {
+                    ToolSlot::Pending { original, .. } if is_parallel_safe_tool(&original.name) => {
+                        batch.push(k);
+                        k += 1;
+                    }
+                    ToolSlot::Pending { .. } => break, // write/bash/MCP — stop before it
+                    ToolSlot::Done { .. } => {
+                        k += 1; // skip denials; keep collecting later reads
+                    }
+                }
+            }
+
+            if batch.is_empty() {
+                // Should not happen (i was Pending parallel-safe).
+                i += 1;
+                continue;
+            }
+
+            self.run_pending_batch(slots, &batch).await;
+            i = k;
+        }
+
+        for slot in std::mem::take(slots) {
+            match slot {
+                ToolSlot::Done {
+                    original,
+                    output,
+                    is_error,
+                    gate,
+                    duration_ms,
+                } => {
+                    self.finish_tool_result(
+                        &original,
+                        turn,
+                        run_id,
+                        output,
+                        is_error,
+                        gate,
+                        duration_ms,
+                        tool_results,
+                    );
+                }
+                ToolSlot::Pending { original, .. } => {
+                    self.finish_tool_result(
+                        &original,
+                        turn,
+                        run_id,
+                        ToolOutput::text("internal error: tool not executed"),
+                        true,
+                        None,
+                        0,
+                        tool_results,
+                    );
+                }
+            }
+        }
+    }
+
+    async fn run_pending_at(&mut self, slots: &mut [ToolSlot], index: usize) {
+        let (original, effective, gate, tool) = match &slots[index] {
+            ToolSlot::Pending {
+                original,
+                effective,
+                gate,
+                tool,
+            } => (
+                original.clone(),
+                effective.clone(),
+                gate.clone(),
+                Arc::clone(tool),
+            ),
+            ToolSlot::Done { .. } => return,
+        };
+        let start = Instant::now();
+        let res = tool.execute(&effective).await;
+        let duration_ms = start.elapsed().as_millis() as u64;
+        let (output, is_error) = match res {
+            Ok(output) => {
+                let failed = tool_output_indicates_error(&original.name, &output);
+                if let Some(g) = &self.tool_gate {
+                    g.after_tool(&effective, &output, failed).await;
+                }
+                (output, failed)
+            }
+            Err(err) => {
+                let output = ToolOutput::text(err.to_string());
+                if let Some(g) = &self.tool_gate {
+                    g.after_tool(&effective, &output, true).await;
+                }
+                (output, true)
+            }
+        };
+        slots[index] = ToolSlot::Done {
+            original,
+            output,
+            is_error,
+            gate,
+            duration_ms,
+        };
+    }
+
+    async fn run_pending_batch(&mut self, slots: &mut [ToolSlot], indices: &[usize]) {
+        if indices.is_empty() {
+            return;
+        }
+        if indices.len() == 1 {
+            self.run_pending_at(slots, indices[0]).await;
+            return;
+        }
+
+        let mut jobs: Vec<(usize, ToolCall, ToolCall, Option<TraceGateDecision>, Arc<dyn Tool>)> =
+            Vec::with_capacity(indices.len());
+        for &i in indices {
+            if let ToolSlot::Pending {
+                original,
+                effective,
+                gate,
+                tool,
+            } = &slots[i]
+            {
+                jobs.push((
+                    i,
+                    original.clone(),
+                    effective.clone(),
+                    gate.clone(),
+                    Arc::clone(tool),
+                ));
+            }
+        }
+
+        let start = Instant::now();
+        let futs: Vec<_> = jobs
+            .iter()
+            .map(|(_, _, effective, _, tool)| {
+                let tool = Arc::clone(tool);
+                let effective = effective.clone();
+                async move { tool.execute(&effective).await }
+            })
+            .collect();
+        let results = futures::future::join_all(futs).await;
+        let elapsed = start.elapsed().as_millis() as u64;
+
+        for ((i, original, effective, gate, _tool), res) in jobs.into_iter().zip(results) {
+            let (output, is_error) = match res {
+                Ok(output) => {
+                    let failed = tool_output_indicates_error(&original.name, &output);
+                    if let Some(g) = &self.tool_gate {
+                        g.after_tool(&effective, &output, failed).await;
+                    }
+                    (output, failed)
+                }
+                Err(err) => {
+                    let output = ToolOutput::text(err.to_string());
+                    if let Some(g) = &self.tool_gate {
+                        g.after_tool(&effective, &output, true).await;
+                    }
+                    (output, true)
+                }
+            };
+            slots[i] = ToolSlot::Done {
+                original,
+                output,
+                is_error,
+                gate,
+                duration_ms: elapsed,
+            };
+        }
+    }
+
+    fn has_steering(&self) -> bool {
+        !self
+            .steering_queue
+            .lock()
+            .expect("steering queue lock")
+            .is_empty()
+    }
+
+    async fn gate_tool(&self, call: &ToolCall, run_id: &str, turn: usize) -> GateOutcome {
         let mut effective = call.clone();
         let mut gate_decision = None;
         if let Some(gate) = &self.tool_gate {
@@ -907,37 +1173,109 @@ impl Agent {
                         decision: TraceGateDecision::Deny,
                         message: Some(message.clone()),
                     });
-                    return Err(OneError::Tool {
-                        tool: call.name.clone(),
+                    return GateOutcome::Deny {
                         message,
-                    });
+                        gate: Some(TraceGateDecision::Deny),
+                    };
                 }
             }
         }
 
-        let tool = self
+        match self
             .tools
             .iter()
             .find(|tool| tool.definition().name == effective.name)
-            .ok_or_else(|| OneError::Tool {
-                tool: effective.name.clone(),
-                message: "tool not registered".to_string(),
-            })?;
-
-        let result = tool.execute(&effective).await;
-        if let Some(gate) = &self.tool_gate {
-            match &result {
-                Ok(output) => {
-                    let is_error = tool_output_indicates_error(&effective.name, output);
-                    gate.after_tool(&effective, output, is_error).await;
-                }
-                Err(err) => {
-                    let output = ToolOutput::text(err.to_string());
-                    gate.after_tool(&effective, &output, true).await;
-                }
-            }
+        {
+            Some(tool) => GateOutcome::Allow {
+                effective,
+                gate: gate_decision,
+                tool: Arc::clone(tool),
+            },
+            None => GateOutcome::Deny {
+                message: format!("tool not registered: {}", effective.name),
+                gate: None,
+            },
         }
-        result.map(|o| (o, gate_decision))
+    }
+
+    /// Emit ToolStart + error ToolResult for a call that never ran (steer/abort).
+    fn emit_synthetic_skip(
+        &mut self,
+        call: &ToolCall,
+        turn: usize,
+        run_id: &str,
+        reason: &str,
+        tool_results: &mut Vec<AgentMessage>,
+    ) {
+        let (args_bytes, preview) = args_preview(&call.arguments, self.preview_limit());
+        self.record_trace(TraceEvent::ToolStart {
+            ts_ms: now_ms(),
+            run_id: run_id.to_string(),
+            turn,
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            args_bytes,
+            args_preview: preview,
+        });
+        self.emit(AgentEvent::ToolExecutionStart {
+            tool_call: call.clone(),
+        });
+        self.finish_tool_result(
+            call,
+            turn,
+            run_id,
+            ToolOutput::text(reason),
+            true,
+            None,
+            0,
+            tool_results,
+        );
+    }
+
+    fn finish_tool_result(
+        &mut self,
+        call: &ToolCall,
+        turn: usize,
+        run_id: &str,
+        output: ToolOutput,
+        is_error: bool,
+        gate_decision: Option<TraceGateDecision>,
+        duration_ms: u64,
+        tool_results: &mut Vec<AgentMessage>,
+    ) {
+        let output_text = output.as_text();
+        let output_bytes = output_text.len();
+        let output_preview = if self.trace_meta.trace_full {
+            crate::trace::text_preview(&output_text, self.preview_limit())
+        } else {
+            None
+        };
+        self.record_trace(TraceEvent::ToolEnd {
+            ts_ms: now_ms(),
+            run_id: run_id.to_string(),
+            turn,
+            call_id: call.id.clone(),
+            name: call.name.clone(),
+            duration_ms,
+            is_error,
+            output_bytes,
+            gate: gate_decision,
+            output_preview,
+        });
+        self.emit(AgentEvent::ToolExecutionEnd {
+            tool_call: call.clone(),
+            output: output.clone(),
+            is_error,
+        });
+        let result = AgentMessage::ToolResult(ToolResultMessage {
+            tool_call_id: call.id.clone(),
+            tool_name: call.name.clone(),
+            content: output.content.clone(),
+            is_error,
+            timestamp: crate::message::now_ms(),
+        });
+        self.messages.push(result.clone());
+        tool_results.push(result);
     }
 
     fn emit(&mut self, event: AgentEvent) {
@@ -947,12 +1285,80 @@ impl Agent {
     }
 }
 
-/// Detect soft failures that still return `Ok(ToolOutput)` (e.g. bash exit ≠ 0).
+/// Slot for concurrent tool execution (gate already applied).
+enum ToolSlot {
+    Pending {
+        original: ToolCall,
+        effective: ToolCall,
+        gate: Option<TraceGateDecision>,
+        tool: Arc<dyn Tool>,
+    },
+    Done {
+        original: ToolCall,
+        output: ToolOutput,
+        is_error: bool,
+        gate: Option<TraceGateDecision>,
+        duration_ms: u64,
+    },
+}
+
+enum ToolBatchOutcome {
+    Continue,
+    Aborted,
+}
+
+enum GateOutcome {
+    Allow {
+        effective: ToolCall,
+        gate: Option<TraceGateDecision>,
+        tool: Arc<dyn Tool>,
+    },
+    Deny {
+        message: String,
+        gate: Option<TraceGateDecision>,
+    },
+}
+
+
+/// Tools that only observe state and are safe to run concurrently with each other.
+///
+/// Everything else (writes, shell, MCP, ask_user, plan tools, unknown names) runs serially.
+pub fn is_parallel_safe_tool(name: &str) -> bool {
+    matches!(
+        name,
+        // `task` is explore-only (read-only research) in MVP → concurrent-safe.
+        // When general/write subagents land, keep them serial via a different
+        // name or gate classification on mode.
+        "read" | "grep" | "find" | "ls" | "bash_output" | "web_search" | "web_fetch" | "task"
+    )
+}
+
+/// Detect soft failures that still return `Ok(ToolOutput)` (e.g. bash exit ≠ 0, MCP is_error).
 fn tool_output_indicates_error(tool_name: &str, output: &ToolOutput) -> bool {
+    // Generic details flags (MCP, tools that report ok/is_error).
+    if let Some(details) = &output.details {
+        if details.get("is_error").and_then(|v| v.as_bool()) == Some(true) {
+            return true;
+        }
+        if details.get("ok").and_then(|v| v.as_bool()) == Some(false) {
+            // Background bash start / still-running snapshots are handled below.
+            let background = details
+                .get("background")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let running = details
+                .get("running")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if !background && !running {
+                return true;
+            }
+        }
+    }
+
     match tool_name {
         "bash" | "shell" | "bash_output" => {
             if let Some(details) = &output.details {
-                // Background start is never an error.
                 if details
                     .get("background")
                     .and_then(|v| v.as_bool())
@@ -960,7 +1366,6 @@ fn tool_output_indicates_error(tool_name: &str, output: &ToolOutput) -> bool {
                 {
                     return false;
                 }
-                // Still running snapshot is not an error.
                 if details
                     .get("running")
                     .and_then(|v| v.as_bool())
@@ -981,7 +1386,6 @@ fn tool_output_indicates_error(tool_name: &str, output: &ToolOutput) -> bool {
                     None => {}
                 }
             }
-            // Fallback: leading `exit N` line in text.
             let text = output.as_text();
             if let Some(rest) = text.strip_prefix("exit ") {
                 let code = rest
@@ -998,6 +1402,16 @@ fn tool_output_indicates_error(tool_name: &str, output: &ToolOutput) -> bool {
             false
         }
         _ => false,
+    }
+}
+
+/// Lift string-matched context overflows into the dedicated error variant.
+fn map_provider_error(err: OneError) -> OneError {
+    match err {
+        OneError::Provider(msg) if crate::compaction::is_context_overflow_error(&msg) => {
+            OneError::ContextOverflow(msg)
+        }
+        other => other,
     }
 }
 
@@ -1059,6 +1473,22 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_safe_tools_are_read_only() {
+        assert!(is_parallel_safe_tool("read"));
+        assert!(is_parallel_safe_tool("grep"));
+        assert!(is_parallel_safe_tool("find"));
+        assert!(is_parallel_safe_tool("ls"));
+        assert!(is_parallel_safe_tool("web_search"));
+        assert!(is_parallel_safe_tool("task")); // explore MVP concurrent
+        assert!(!is_parallel_safe_tool("write"));
+        assert!(!is_parallel_safe_tool("edit"));
+        assert!(!is_parallel_safe_tool("bash"));
+        assert!(!is_parallel_safe_tool("ask_user"));
+        assert!(!is_parallel_safe_tool("mcp_something"));
+        assert!(!is_parallel_safe_tool("exit_plan_mode"));
+    }
 
     #[test]
     fn token_usage_total_does_not_double_count_cache() {

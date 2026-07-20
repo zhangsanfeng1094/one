@@ -35,7 +35,7 @@ One 提供 **Rust-native** 扩展运行时，架构对齐 [Codex extension-api /
 | `plugin.json` | `.one-plugin/plugin.json` |
 | Hooks 脚本 | `~/.one/agent/hooks.json` |
 
-**MCP** 仍是平台基础能力（`one-mcp`），不经扩展插件路径实现协议；plugin 仅可**声明** MCP 配置片段（装配合并后续迭代）。
+**MCP** 仍是平台基础能力（`one-mcp`），不经扩展插件路径实现协议；plugin 可在 `plugin.json` 的 `mcpServers` 中**声明**片段，由 `AppRuntime` build/reload 合并进 `McpManager`（同名时 One 用户/项目配置优先）。
 
 ---
 
@@ -103,7 +103,7 @@ impl Extension for MyExtension {
 
 | 事件 | 时机 |
 |------|------|
-| `SessionStart` / `SessionEnd` | 每次 agent run 开始/结束（`AgentHooks`） |
+| `SessionStart` / `SessionEnd` | conversation 级：load/unload、`/new` / `/resume`（非每个 turn） |
 | `TurnStart` / `TurnEnd` | 每个 LLM turn |
 | `ToolStart` / `ToolEnd` | 工具前后（`ToolEnd` 由 runtime 在 after 路径发出） |
 | `UserPromptSubmit` | CLI 收到用户输入、进入 model 前 |
@@ -307,7 +307,7 @@ one-ext = { path = "...", features = ["dylib"] }
 ## 未来方向
 
 1. 稳定 dylib / WASM ABI（真正 out-of-tree 扩展）  
-2. plugin MCP 片段合并进 `McpManager`  
+2. ~~plugin MCP 片段合并进 `McpManager`~~ ✅ build/reload 已合并  
 3. TUI 挂接 `ExtensionCommand`  
 4. Package / Suite 通过 `extensions.load` 引用（见 [package-suites.md](./package-suites.md)）  
 5. Compaction 真正发出 `PreCompact` / `PostCompact`

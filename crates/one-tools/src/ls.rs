@@ -6,6 +6,7 @@ use one_core::tool::{tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
 use crate::path_policy::{AccessKind, PathPolicy};
+use crate::tool_args::path_arg;
 
 pub struct LsTool {
     policy: PathPolicy,
@@ -30,18 +31,21 @@ impl Tool for LsTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" }
+                    "path": {
+                        "type": "string",
+                        "description": "Directory path (Claude Code alias: `file_path`)"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Alias for `path` (Claude Code compatibility)"
+                    }
                 }
             }),
         }
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = call
-            .arguments
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or(".");
+        let path = path_arg(&call.arguments).unwrap_or(".");
         let resolved = self
             .policy
             .resolve(path, AccessKind::Read)

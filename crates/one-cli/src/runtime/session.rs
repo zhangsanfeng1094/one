@@ -8,14 +8,26 @@ use super::{AgentMode, AppRuntime};
 
 impl AppRuntime {
     pub async fn new_session(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Conversation switch only when replacing an existing session.
+        // Cold start already emitted SessionStart from extension load_all.
+        let switching = self.session.is_some();
+        if switching {
+            self.extensions.notify_session_end().await;
+        }
         // New conversation only — MCP connection pool is process-scoped (Grok-style).
         self.session = Some(SessionManager::create(&self.cwd).await?);
         {
             let mut agent = self.agent.lock().await;
             agent.messages.clear();
+            if let Some(s) = &self.session {
+                agent.set_trace_session_id(Some(s.header().id.clone()));
+            }
         }
         // Ensure any MCP servers that finished loading attach to this clean slate.
         self.sync_mcp_tools().await?;
+        if switching {
+            self.extensions.notify_session_start().await;
+        }
         Ok(())
     }
 
@@ -23,6 +35,10 @@ impl AppRuntime {
         &mut self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        let switching = self.session.is_some();
+        if switching {
+            self.extensions.notify_session_end().await;
+        }
         let session = SessionManager::open(path).await?;
         {
             let mut agent = self.agent.lock().await;
@@ -33,9 +49,13 @@ impl AppRuntime {
                     agent.config.thinking_level = tl;
                 }
             }
+            agent.set_trace_session_id(Some(session.header().id.clone()));
         }
         load_extension_state(self.extensions.as_ref(), &session);
         self.session = Some(session);
+        if switching {
+            self.extensions.notify_session_start().await;
+        }
 
         // Restore plan path / mode from session custom entries.
         if !self.read_only {

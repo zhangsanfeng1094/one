@@ -55,11 +55,14 @@ One 实现 JSONL session **v3 子集**，文件为 JSONL（每行一个 JSON 对
 
 ## Context 构建
 
-`build_context_entries(leaf_id)` 从 leaf 走到 root，遇到 `compaction` 时：
+`build_context_entries(leaf_id)` 从 leaf 走到 root，取路径上**最新**的 `compaction`：
 
-1. 包含 compaction entry
-2. 从 `firstKeptEntryId` 到 compaction 的 entries
-3. compaction 之后的 entries
+1. 包含该 compaction entry **一次**（作为摘要消息）
+2. 从 `firstKeptEntryId` 起、到该 compaction **之前**的 entries（近期窗口）
+3. 该 compaction **之后**的 entries（压缩后又产生的消息）
+
+`firstKeptEntryId` 必须是「保留窗口里最旧一条」的 entry id（不是当前 leaf）。  
+写入时用 `SessionManager::first_kept_entry_id_for_tail(kept.len())`。
 
 `build_session_context(leaf_id)` 将 entries 转为 `AgentMessage` 列表供 LLM 使用。
 

@@ -12,7 +12,7 @@ pub(super) fn is_overflow_err(err: &OneError) -> bool {
     match err {
         OneError::ContextOverflow(_) => true,
         OneError::Provider(msg) => is_context_overflow_error(msg),
-        _ => false,
+        other => is_context_overflow_error(&other.to_string()),
     }
 }
 

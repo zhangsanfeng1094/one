@@ -6,6 +6,7 @@ use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, T
 use serde_json::json;
 
 use crate::path_policy::{AccessKind, PathPolicy};
+use crate::tool_args::path_arg;
 
 pub struct FindTool {
     policy: PathPolicy,
@@ -26,12 +27,21 @@ impl Tool for FindTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "find".to_string(),
-            description: "Find files by glob pattern.".to_string(),
+            description: "Find files by glob pattern (Claude Code Glob-compatible). Prefer this \
+                 over bash `find`."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "pattern": { "type": "string", "description": "Glob like **/*.rs" },
-                    "path": { "type": "string" }
+                    "path": {
+                        "type": "string",
+                        "description": "Directory to search under (default: workspace root)"
+                    },
+                    "file_path": {
+                        "type": "string",
+                        "description": "Alias for `path` (Claude Code compatibility)"
+                    }
                 },
                 "required": ["pattern"]
             }),
@@ -44,11 +54,7 @@ impl Tool for FindTool {
             .get("pattern")
             .and_then(|value| value.as_str())
             .ok_or_else(|| invalid_args("find", "missing `pattern`"))?;
-        let path = call
-            .arguments
-            .get("path")
-            .and_then(|value| value.as_str())
-            .unwrap_or(".");
+        let path = path_arg(&call.arguments).unwrap_or(".");
 
         let root = self
             .policy

@@ -43,16 +43,15 @@ cmd_trace() {
   local prompt="${*:-list files in current directory}"
   local out
   out="$(make_out trace)"
-  local trace="$out/run.jsonl"
-  run_one --trace "$trace" -p "$prompt" --provider mock -y --no-session --no-mcp --no-skills
+  if [[ -z "${LANGFUSE_PUBLIC_KEY:-}" || -z "${LANGFUSE_SECRET_KEY:-}" ]]; then
+    die "cmd trace requires LANGFUSE_PUBLIC_KEY + LANGFUSE_SECRET_KEY (export then re-run)"
+  fi
+  run_one --trace -p "$prompt" --provider mock -y --no-session --no-mcp --no-skills
   echo ""
-  run_one trace-stats "$trace" | tee "$out/trace-stats.txt"
-  echo ""; echo "trace: $trace"
+  echo "trace: langfuse (${LANGFUSE_BASE_URL:-${LANGFUSE_HOST:-https://cloud.langfuse.com}})"
+  echo "out:   $out"
 }
 
 cmd_stats() {
-  local file="${1:-}"
-  [[ -n "$file" ]] || die "usage: run.sh stats <trace.jsonl>"
-  [[ -f "$file" ]] || die "not found: $file"
-  run_one trace-stats "$file"
+  die "stats removed — traces live in Langfuse UI (set LANGFUSE_* and use --trace)"
 }

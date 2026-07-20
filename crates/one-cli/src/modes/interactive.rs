@@ -104,6 +104,8 @@ async fn apply_switch_model(
             let ctx = providers.context_window();
             app.set_context_window(ctx);
             runtime.set_context_window(ctx);
+            // Keep nested task harness on the same provider after model switch.
+            runtime.bind_task_provider(providers.as_arc()).await;
             app.set_notice(format!(
                 "model → {} / {}",
                 providers.provider_id,
@@ -788,6 +790,22 @@ async fn run_turn_streaming(
     app.begin_busy();
     runtime.clear_abort();
 
+    // Attach MCP tools that finished loading since the last turn (same as print path).
+    if runtime.mcp.is_loading() && runtime.mcp.tool_count() == 0 {
+        app.set_notice("waiting for MCP…");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+        while runtime.mcp.is_loading()
+            && runtime.mcp.tool_count() == 0
+            && tokio::time::Instant::now() < deadline
+        {
+            refresh_mcp_chip(app, runtime);
+            let _ = terminal.draw(app);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+    }
+    runtime.sync_mcp_tools().await?;
+    refresh_mcp_chip(app, runtime);
+
     let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
     runtime.subscribe_collector(events.clone()).await;
 
@@ -805,7 +823,7 @@ async fn run_turn_streaming(
         })
         .await;
 
-    let before = agent.lock().await.messages.len();
+    let mut before = agent.lock().await.messages.len();
     let steering = runtime.steering_queue();
     let followup = runtime.followup_queue();
 
@@ -865,6 +883,16 @@ async fn run_turn_streaming(
             app.set_notice("context overflow · compacting…");
             let _ = terminal.draw(app);
             runtime.maybe_compact(provider.as_ref(), true).await?;
+            // Buffer shrank: avoid `[before..]` panic; keep the in-flight user turn
+            // for session append without re-writing already-persisted kept history.
+            before = {
+                let guard = agent.lock().await;
+                guard
+                    .messages
+                    .iter()
+                    .rposition(|m| matches!(m, AgentMessage::User(_)))
+                    .unwrap_or(guard.messages.len())
+            };
             let events2: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
             runtime.subscribe_collector(events2.clone()).await;
             let agent2 = agent.clone();
@@ -919,16 +947,17 @@ async fn run_turn_streaming(
 
     app.end_busy();
 
+    // Always persist new messages — including error / aborted partial turns —
+    // so tool results and the user prompt are not lost on crash or resume.
+    if let Err(e) = runtime.append_session_delta(before).await {
+        tracing::warn!(error = %e, "failed to append session messages after turn");
+    }
+    if let Err(e) = runtime.persist_extension_state().await {
+        tracing::warn!(error = %e, "failed to persist extension state after turn");
+    }
+
     match prompt_result {
         Ok(reply) => {
-            if let Some(session) = &mut runtime.session {
-                let messages = agent.lock().await.messages[before..].to_vec();
-                for message in messages {
-                    session.append_message(message).await?;
-                }
-            }
-            runtime.persist_extension_state().await?;
-
             if app.stream_buffer.is_empty() && !reply.is_empty() {
                 app.push_assistant(reply);
             } else {
@@ -943,19 +972,12 @@ async fn run_turn_streaming(
         Err(OneError::Aborted) => {
             app.finish_stream_with_interrupted(true);
             app.set_notice("interrupted");
-            if let Some(session) = &mut runtime.session {
-                let messages = agent.lock().await.messages[before..].to_vec();
-                for message in messages {
-                    session.append_message(message).await?;
-                }
-            }
-            runtime.persist_extension_state().await?;
             let _ = runtime.take_plan_exit_request();
         }
         Err(err) => {
             // Mid-transcript alert (UI only). Short notice remains for status strip.
             app.push_error_alert(format!("{err}"));
-            app.set_notice(format!("error · see transcript"));
+            app.set_notice("error · see transcript".to_string());
             let _ = runtime.take_plan_exit_request();
         }
     }

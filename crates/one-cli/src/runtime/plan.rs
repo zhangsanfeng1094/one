@@ -1,10 +1,13 @@
 //! Plan / Act mode transitions and session persistence of mode.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use one_core::tool::Tool;
 use one_tools::{plan_mode_system_overlay, plan_mode_tools_with_policy};
 
 use super::helpers::new_plan_path;
+use super::task_tool::TaskTool;
 use super::{AgentMode, AppRuntime};
 
 impl AppRuntime {
@@ -38,12 +41,18 @@ impl AppRuntime {
             state.clear();
         }
 
-        let tools = plan_mode_tools_with_policy(
+        let mut tools: Vec<Arc<dyn Tool>> = plan_mode_tools_with_policy(
             self.path_policy.clone(),
             path.clone(),
             self.plan_exit.clone(),
             Some(self.ask_user_handler.clone()),
         );
+        // Explore-only task allowed in plan mode (research while planning).
+        if let Some(host) = &self.task_host {
+            if host.can_spawn() {
+                tools.push(Arc::new(TaskTool::new(host.clone())));
+            }
+        }
         // Keep extension tools out of plan mode (may be write-capable).
 
         {

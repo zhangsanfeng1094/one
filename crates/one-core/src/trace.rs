@@ -14,7 +14,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::agent::TokenUsage;
-use crate::message::now_ms;
+use crate::message::{now_ms, AgentMessage, UserContent};
+
+/// Default preview size for tool args / short run output (chars).
+pub const PREVIEW_DEFAULT_CHARS: usize = 240;
+/// Larger preview when `--trace-full` is set (chars).
+pub const PREVIEW_FULL_CHARS: usize = 16_384;
 
 /// Where traces go. Implementations must be cheap and non-panicking.
 pub trait TraceSink: Send + Sync {
@@ -154,6 +159,12 @@ pub enum TraceEvent {
         task_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         config: Option<Value>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        trace_full: bool,
     },
     RunEnd {
         ts_ms: u64,
@@ -165,6 +176,8 @@ pub enum TraceEvent {
         usage: TokenUsage,
         #[serde(skip_serializing_if = "Option::is_none")]
         final_text_len: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        final_text_preview: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
@@ -184,6 +197,8 @@ pub enum TraceEvent {
         message_count: usize,
         tools_n: usize,
         system_prompt_len: usize,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_preview: Option<String>,
     },
     LlmResponse {
         ts_ms: u64,
@@ -200,6 +215,8 @@ pub enum TraceEvent {
         usage: TokenUsage,
         provider: String,
         model: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_preview: Option<String>,
     },
     ToolStart {
         ts_ms: u64,
@@ -222,6 +239,8 @@ pub enum TraceEvent {
         output_bytes: usize,
         #[serde(skip_serializing_if = "Option::is_none")]
         gate: Option<TraceGateDecision>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_preview: Option<String>,
     },
     Gate {
         ts_ms: u64,
@@ -288,16 +307,96 @@ impl TraceEvent {
 pub fn args_preview(args: &Value, max_chars: usize) -> (usize, Option<String>) {
     let raw = serde_json::to_string(args).unwrap_or_else(|_| "{}".into());
     let bytes = raw.len();
-    if max_chars == 0 {
-        return (bytes, None);
+    (bytes, text_preview(&raw, max_chars))
+}
+
+/// Bound a string for trace / Langfuse observation input-output fields.
+pub fn text_preview(s: &str, max_chars: usize) -> Option<String> {
+    if max_chars == 0 || s.is_empty() {
+        return None;
     }
-    let preview = if raw.chars().count() <= max_chars {
-        raw
+    if s.chars().count() <= max_chars {
+        Some(s.to_string())
     } else {
-        let truncated: String = raw.chars().take(max_chars).collect();
-        format!("{truncated}…")
-    };
-    (bytes, Some(preview))
+        let truncated: String = s.chars().take(max_chars).collect();
+        Some(format!("{truncated}…"))
+    }
+}
+
+/// Compact LLM input snapshot for `--trace-full` (system + recent messages).
+pub fn llm_input_preview(
+    system_prompt: &str,
+    messages: &[AgentMessage],
+    max_chars: usize,
+) -> Option<String> {
+    if max_chars == 0 {
+        return None;
+    }
+    // Prefer the last few turns so the preview stays relevant under budget.
+    let recent: Vec<Value> = messages
+        .iter()
+        .rev()
+        .take(8)
+        .map(|m| match m {
+            AgentMessage::User(u) => {
+                let text = match &u.content {
+                    UserContent::Text(text) => text.clone(),
+                    UserContent::Blocks(blocks) => blocks
+                        .iter()
+                        .filter_map(|b| match b {
+                            crate::message::TextOrImage::Text { text } => Some(text.as_str()),
+                            crate::message::TextOrImage::Image { .. } => Some("[image]"),
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n"),
+                };
+                serde_json::json!({"role": "user", "text": text})
+            }
+            AgentMessage::Assistant(a) => {
+                let text = a
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::message::ContentBlock::Text { text } => Some(text.as_str()),
+                        crate::message::ContentBlock::ToolCall { name, .. } => {
+                            Some(name.as_str())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                serde_json::json!({"role": "assistant", "text": text})
+            }
+            AgentMessage::ToolResult(t) => {
+                let text = t
+                    .content
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::message::TextOrImage::Text { text } => Some(text.as_str()),
+                        crate::message::TextOrImage::Image { .. } => Some("[image]"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                serde_json::json!({
+                    "role": "tool",
+                    "name": t.tool_name,
+                    "is_error": t.is_error,
+                    "text": text,
+                })
+            }
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    let payload = serde_json::json!({
+        "system_len": system_prompt.len(),
+        "system": text_preview(system_prompt, max_chars.min(2000)),
+        "messages": recent,
+        "message_count": messages.len(),
+    });
+    let raw = serde_json::to_string(&payload).ok()?;
+    text_preview(&raw, max_chars)
 }
 
 /// Load JSONL trace events from a file (skips blank / non-object lines).
@@ -529,6 +628,9 @@ mod tests {
             model: None,
             task_id: None,
             config: None,
+            session_id: None,
+            user_id: None,
+            trace_full: false,
         });
         assert_eq!(t.len(), 1);
     }
@@ -565,6 +667,9 @@ mod tests {
                 model: Some("m".into()),
                 task_id: None,
                 config: None,
+                session_id: Some("sess-1".into()),
+                user_id: None,
+                trace_full: false,
             },
             TraceEvent::LlmResponse {
                 ts_ms: 10,
@@ -583,6 +688,7 @@ mod tests {
                 },
                 provider: "mock".into(),
                 model: "m".into(),
+                output_preview: None,
             },
             TraceEvent::ToolStart {
                 ts_ms: 11,
@@ -603,6 +709,7 @@ mod tests {
                 is_error: false,
                 output_bytes: 20,
                 gate: Some(TraceGateDecision::Allow),
+                output_preview: None,
             },
             TraceEvent::RunEnd {
                 ts_ms: 30,
@@ -616,6 +723,7 @@ mod tests {
                     ..Default::default()
                 },
                 final_text_len: Some(12),
+                final_text_preview: Some("hello".into()),
                 error: None,
             },
         ];

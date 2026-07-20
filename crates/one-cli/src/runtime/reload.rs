@@ -67,6 +67,17 @@ impl AppRuntime {
             agent.set_hooks(Some(self.extensions.agent_hooks()));
         }
 
+        // MCP: re-read disk config + merge plugin servers; keep live pool.
+        if !self.mcp.is_disabled() {
+            if let Err(e) = self.mcp.reload_from_disk(&self.cwd) {
+                tracing::warn!(error = %e, "MCP reload from disk failed");
+            }
+            if !discovery.plugin_mcp_servers.is_empty() {
+                self.mcp
+                    .merge_plugin_server_json(&discovery.plugin_mcp_servers);
+            }
+        }
+
         self.base_system_prompt = self
             .resources
             .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);

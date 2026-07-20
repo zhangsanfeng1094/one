@@ -12,13 +12,14 @@ use one_ai::MockProvider;
 use one_core::agent::{Agent, AgentConfig, LlmProvider};
 use one_core::message::now_ms;
 use one_core::trace::{
-    load_trace_file, new_run_id, JsonlTraceSink, ScoreCheckResult, TraceEvent, TraceStats,
+    new_run_id, MemoryTrace, ScoreCheckResult, SharedTrace, TraceEvent, TraceStats,
 };
 use one_core::TraceRunMeta;
 use one_tools::default_tools;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::BenchCli;
+use crate::langfuse::{LangfuseConfig, LangfuseTraceSink};
 
 /// Rubric for automatic scoring.
 #[derive(Debug, Clone, Deserialize)]
@@ -153,7 +154,8 @@ struct TaskResult {
     tool_calls: usize,
     wall_ms: u64,
     tokens: u64,
-    trace: PathBuf,
+    /// Where traces went: `langfuse:<host>` or `memory` (offline, no credentials).
+    trace: String,
     checks: Vec<ScoreCheckResult>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<String>,
@@ -163,8 +165,6 @@ pub async fn run_bench(cli: BenchCli) -> Result<(), Box<dyn std::error::Error>> 
     let tasks_dir = resolve_tasks_dir(cli.tasks_dir.as_deref())?;
     let out_dir = resolve_out_dir(cli.out.as_deref())?;
     std::fs::create_dir_all(&out_dir)?;
-    let traces_dir = out_dir.join("traces");
-    std::fs::create_dir_all(&traces_dir)?;
 
     let suite_filter = cli.suite.to_ascii_lowercase();
     let mut tasks = discover_tasks(&tasks_dir)?;
@@ -185,6 +185,13 @@ pub async fn run_bench(cli: BenchCli) -> Result<(), Box<dyn std::error::Error>> 
         .into());
     }
 
+    let langfuse = LangfuseConfig::from_env();
+    if let Some(cfg) = &langfuse {
+        println!("bench: langfuse → {}", cfg.project_url_hint());
+    } else {
+        println!("bench: offline trace (set LANGFUSE_* keys to export)");
+    }
+
     println!(
         "bench: {} task(s) from {} → {}",
         tasks.len(),
@@ -195,7 +202,7 @@ pub async fn run_bench(cli: BenchCli) -> Result<(), Box<dyn std::error::Error>> 
     let mut results = Vec::new();
     for (meta, task_dir) in &tasks {
         print!("  • {} … ", meta.id);
-        let r = run_one_task(meta, task_dir, &traces_dir, cli.max_turns, cli.keep).await;
+        let r = run_one_task(meta, task_dir, cli.max_turns, cli.keep, langfuse.as_ref()).await;
         match &r {
             Ok(tr) if tr.pass => println!("PASS (turns={} tools={})", tr.turns, tr.tool_calls),
             Ok(tr) => println!("FAIL score={:.2}", tr.score),
@@ -212,7 +219,7 @@ pub async fn run_bench(cli: BenchCli) -> Result<(), Box<dyn std::error::Error>> 
                 tool_calls: 0,
                 wall_ms: 0,
                 tokens: 0,
-                trace: PathBuf::new(),
+                trace: "none".into(),
                 checks: vec![],
                 error: Some(e.to_string()),
             }),
@@ -267,9 +274,9 @@ pub async fn run_bench(cli: BenchCli) -> Result<(), Box<dyn std::error::Error>> 
 async fn run_one_task(
     meta: &TaskMeta,
     task_dir: &Path,
-    traces_dir: &Path,
     max_turns: usize,
     keep: bool,
+    langfuse: Option<&LangfuseConfig>,
 ) -> Result<TaskResult, Box<dyn std::error::Error>> {
     let work = make_workspace(task_dir, meta)?;
     let prompt = load_prompt(task_dir, meta)?;
@@ -288,8 +295,29 @@ async fn run_one_task(
         }
     }
 
-    let trace_path = traces_dir.join(format!("{}.jsonl", meta.id));
-    let sink = JsonlTraceSink::create(&trace_path)?;
+    // Single sink: Langfuse when credentials exist; otherwise in-memory for scoring only.
+    let mut langfuse_handle: Option<Arc<LangfuseTraceSink>> = None;
+    let (sink, events_fn, trace_label): (SharedTrace, Box<dyn Fn() -> Vec<TraceEvent>>, String) =
+        if let Some(cfg) = langfuse {
+            let lf = LangfuseTraceSink::start(cfg.clone());
+            let label = format!("langfuse:{}", cfg.project_url_hint());
+            let lf_events = lf.clone();
+            langfuse_handle = Some(lf.clone());
+            (
+                lf,
+                Box::new(move || lf_events.events()),
+                label,
+            )
+        } else {
+            let mem = Arc::new(MemoryTrace::new());
+            let mem_events = mem.clone();
+            (
+                mem,
+                Box::new(move || mem_events.events()),
+                "memory".into(),
+            )
+        };
+
     let tools = default_tools(work.clone());
     let mut agent = Agent::new(
         AgentConfig {
@@ -299,7 +327,9 @@ async fn run_one_task(
         },
         tools,
     );
-    agent.set_trace(Some(Arc::new(sink)));
+    agent.set_trace(Some(sink.clone()));
+    // Stable session id per task run so multi-turn harness traces group in Langfuse.
+    let bench_session_id = format!("bench:{}:{}", meta.id, uuid::Uuid::new_v4().simple());
     agent.set_trace_meta(TraceRunMeta {
         task_id: Some(meta.id.clone()),
         agent_version: Some(env!("CARGO_PKG_VERSION").into()),
@@ -309,12 +339,17 @@ async fn run_one_task(
             "cwd": work.display().to_string(),
             "project": meta.project,
             "test_filter": meta.test_filter,
+            "backend": if langfuse.is_some() { "langfuse" } else { "memory" },
+            "harness": "one-bench",
         })),
+        session_id: Some(bench_session_id),
+        user_id: crate::langfuse::user_id_from_env(),
+        trace_full: false,
     });
 
     // Smoke suite uses mock for determinism. Full suite also defaults to mock so
     // `one bench` stays offline; for real-model eval use:
-    //   one --trace … --provider <p> -y --cwd <fixture-copy> -p "$(cat prompt.md)"
+    //   one --trace --provider <p> -y --cwd <fixture-copy> -p "$(cat prompt.md)"
     let provider: Box<dyn LlmProvider> = Box::new(MockProvider::new());
     let run_result = agent.prompt(provider.as_ref(), &prompt).await;
     let final_text = match run_result {
@@ -325,29 +360,25 @@ async fn run_one_task(
         }
     };
 
-    let events = load_trace_file(&trace_path).unwrap_or_default();
+    let events = events_fn();
     let stats = TraceStats::from_events(&events);
     let (pass, score, checks) = score_task(&rubric, &work, &stats, &events, &final_text);
 
-    // Append Score event.
-    if let Ok(mut f) = std::fs::OpenOptions::new().append(true).open(&trace_path) {
-        use std::io::Write;
-        let run_id = stats
-            .run_id
-            .clone()
-            .unwrap_or_else(new_run_id);
-        let score_ev = TraceEvent::Score {
-            ts_ms: now_ms(),
-            run_id,
-            task_id: Some(meta.id.clone()),
-            pass,
-            score,
-            checks: checks.clone(),
-            notes: None,
-        };
-        if let Ok(line) = serde_json::to_string(&score_ev) {
-            let _ = writeln!(f, "{line}");
-        }
+    // Score event → same sink (Langfuse scores, or memory-only offline).
+    let run_id = stats.run_id.clone().unwrap_or_else(new_run_id);
+    sink.record(TraceEvent::Score {
+        ts_ms: now_ms(),
+        run_id,
+        task_id: Some(meta.id.clone()),
+        pass,
+        score,
+        checks: checks.clone(),
+        notes: None,
+    });
+
+    // Drain Langfuse worker before moving on / process exit.
+    if let Some(lf) = langfuse_handle {
+        lf.shutdown();
     }
 
     if !keep {
@@ -363,7 +394,7 @@ async fn run_one_task(
         tool_calls: stats.tool_calls,
         wall_ms: stats.wall_ms,
         tokens: stats.usage.total(),
-        trace: trace_path,
+        trace: trace_label,
         checks,
         error: None,
     })

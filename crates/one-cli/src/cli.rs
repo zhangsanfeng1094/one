@@ -93,11 +93,11 @@ pub struct Cli {
     pub no_session: bool,
 
     /// Provider to use (defaults to last selection, or mock).
-    #[arg(long, value_enum)]
+    #[arg(long, value_enum, global = true)]
     pub provider: Option<ProviderKind>,
 
     /// Model id (overrides provider default / models.json).
-    #[arg(long, short = 'm')]
+    #[arg(long, short = 'm', global = true)]
     pub model: Option<String>,
 
     /// Wire protocol: `openai-responses` | `openai-completions` | `anthropic-messages` | `gemini-generate-content`.
@@ -107,25 +107,25 @@ pub struct Cli {
 
     /// API base URL override (e.g. `https://api.openai.com/v1`, `http://127.0.0.1:11434/v1`).
     /// Also set via `models.json` `baseUrl` or env `OPENAI_BASE_URL` / `OLLAMA_HOST`.
-    #[arg(long = "base-url")]
+    #[arg(long = "base-url", global = true)]
     pub base_url: Option<String>,
 
     /// API key override (otherwise env / models.json `apiKey`).
-    #[arg(long = "api-key")]
+    #[arg(long = "api-key", global = true)]
     pub api_key: Option<String>,
 
     /// Working directory for tools (workspace root).
-    #[arg(long, default_value = ".")]
+    #[arg(long, default_value = ".", global = true)]
     pub cwd: PathBuf,
 
     /// Extra directories the agent may read/write (repeatable).
     /// Paths outside cwd + these roots are denied unless `--full-access`.
-    #[arg(long = "add-dir", value_name = "DIR")]
+    #[arg(long = "add-dir", value_name = "DIR", global = true)]
     pub add_dir: Vec<PathBuf>,
 
     /// Disable workspace path boundary (file tools may touch any path).
     /// Prefer containers/VMs; also set via settings `sandbox=full-access`.
-    #[arg(long = "full-access")]
+    #[arg(long = "full-access", global = true)]
     pub full_access: bool,
 
     /// Session display name.
@@ -154,7 +154,7 @@ pub struct Cli {
 
     /// Auto-approve risky bash commands (or set ONE_AUTO_APPROVE=1).
     /// Does not disable the workspace path boundary — use `--full-access` for that.
-    #[arg(short = 'y', long = "yes")]
+    #[arg(short = 'y', long = "yes", global = true)]
     pub auto_approve: bool,
 
     /// Upload session export to GitHub Gist (requires GITHUB_TOKEN).
@@ -170,17 +170,28 @@ pub struct Cli {
     #[arg(long = "no-skills")]
     pub no_skills: bool,
 
-    /// Write agent execution trace as JSONL (turns / LLM latency / tools / usage).
-    /// Use `-` for a default path under `~/.one/agent/traces/`.
-    /// For harness eval and comparison — see `docs/harness-eval.md`.
-    #[arg(long = "trace", value_name = "PATH", num_args = 0..=1, default_missing_value = "-")]
-    pub trace: Option<PathBuf>,
+    /// Export execution trace to Langfuse (turns / LLM / tools / usage / scores).
+    ///
+    /// Requires `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY`.
+    /// Optional: `LANGFUSE_BASE_URL` (default `https://cloud.langfuse.com`).
+    /// Also enabled by `ONE_TRACE=1`. See `docs/harness-eval.md`.
+    #[arg(long = "trace", alias = "langfuse")]
+    pub trace: bool,
 
-    /// Include full tool argument JSON in the trace (default: truncated preview only).
+    /// Include larger LLM / tool I/O previews in the Langfuse trace
+    /// (default: short tool-arg preview + lengths only).
     #[arg(long = "trace-full")]
     pub trace_full: bool,
 
-    /// Optional subcommands (`one mcp …` / `one trace-stats` / `one bench`).
+    /// Max agent turns per user prompt (tool-call loops). Default 32.
+    #[arg(long = "max-turns", default_value_t = 32)]
+    pub max_turns: usize,
+
+    /// Machine-readable result: `text` | `json` (RunResult envelope). See docs/protocol.md.
+    #[arg(long = "output-format", value_name = "FMT")]
+    pub output_format: Option<String>,
+
+    /// Optional subcommands (`one mcp …` / `one bench` / `one agent` / `one run`).
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -189,25 +200,22 @@ pub struct Cli {
 pub enum Commands {
     /// Manage MCP servers (list / add / remove / doctor)
     Mcp(McpCli),
-    /// Subscription / OAuth login (Codex, OpenCode Zen/Go, …)
+    /// Subscription / OAuth login (Codex, xAI Grok, OpenCode Zen/Go, …)
     Login(LoginCli),
     /// Clear stored OAuth / API credentials
     Logout(LogoutCli),
-    /// Summarize a JSONL execution trace (`--trace` output)
-    #[command(name = "trace-stats")]
-    TraceStats(TraceStatsCli),
     /// Run harness capability tasks and score them
     Bench(BenchCli),
+    /// Run / dump / inspect agent presets (CLI harness; same as subagent)
+    Agent(AgentCli),
+    /// Run harness with --preset or --spec (full AgentSpec JSON)
+    Run(crate::agent_cmd::RunCli),
 }
 
 #[derive(Debug, Clone, clap::Args)]
-pub struct TraceStatsCli {
-    /// Path to a JSONL trace file written by `--trace`.
-    pub path: PathBuf,
-
-    /// Emit machine-readable JSON instead of a text report.
-    #[arg(long)]
-    pub json: bool,
+pub struct AgentCli {
+    #[command(subcommand)]
+    pub command: crate::agent_cmd::AgentCommands,
 }
 
 #[derive(Debug, Clone, clap::Args)]
@@ -239,17 +247,17 @@ pub struct BenchCli {
 
 #[derive(Debug, Clone, clap::Args)]
 pub struct LoginCli {
-    /// Provider id: `openai-codex` | `opencode` | `opencode-go`
-    /// (aliases: codex, chatgpt, zen, go).
+    /// Provider id: `openai-codex` | `xai` | `opencode` | `opencode-go`
+    /// (aliases: codex, chatgpt, grok, zen, go).
     /// Omit to pick interactively from the catalog.
     #[arg(value_name = "PROVIDER")]
     pub provider: Option<String>,
 
-    /// Codex only: device-code flow (headless / remote).
+    /// Codex / xAI: device-code flow (headless / remote).
     #[arg(long = "device-code")]
     pub device_code: bool,
 
-    /// Codex only: force browser PKCE flow (skip method prompt).
+    /// Codex / xAI: force browser PKCE flow (skip method prompt).
     #[arg(long = "browser")]
     pub browser: bool,
 }

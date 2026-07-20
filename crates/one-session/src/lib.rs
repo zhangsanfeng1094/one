@@ -9,7 +9,10 @@ pub mod prompt_history;
 #[cfg(feature = "network")]
 pub mod share;
 
-pub use context::{SessionContext, build_context_entries, build_session_context};
+pub use context::{
+    SessionContext, build_context_entries, build_session_context, context_message_entries,
+    first_kept_entry_id,
+};
 pub use entries::*;
 pub use error::{Result, SessionError};
 pub use export::export_html;

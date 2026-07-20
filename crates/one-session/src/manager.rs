@@ -5,7 +5,9 @@ use one_core::message::AgentMessage;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
-use crate::context::{build_context_entries, build_session_context, SessionContext};
+use crate::context::{
+    build_context_entries, build_session_context, first_kept_entry_id, SessionContext,
+};
 use crate::entries::{new_entry_base, new_session_header, SessionEntry, SessionHeader};
 use crate::error::{Result, SessionError};
 use crate::paths::session_dir_for_cwd;
@@ -422,6 +424,16 @@ impl SessionManager {
     /// Message count on the active branch (for `/session` UX).
     pub fn message_count(&self) -> usize {
         self.build_session_context().messages.len()
+    }
+
+    /// Entry id for the oldest of the last `kept_count` context messages.
+    ///
+    /// Used when appending a compaction so resume keeps the full recent window.
+    pub fn first_kept_entry_id_for_tail(&self, kept_count: usize) -> String {
+        let leaf = self.leaf_id.as_deref().unwrap_or("");
+        first_kept_entry_id(&self.entries, leaf, kept_count)
+            .or_else(|| self.leaf_id.clone())
+            .unwrap_or_else(|| "root".into())
     }
 
     pub fn entry_count(&self) -> usize {

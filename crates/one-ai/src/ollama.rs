@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use futures::StreamExt;
-use one_core::agent::{CompletionRequest, CompletionResponse, LlmProvider};
+use one_core::agent::{CompletionRequest, CompletionResponse, LlmProvider, TokenUsage};
 use one_core::error::{OneError, Result};
 use one_core::message::{ContentBlock, StopReason};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -75,6 +75,7 @@ impl LlmProvider for OllamaProvider {
         let mut stream = response.bytes_stream();
         let mut full_text = String::new();
         let mut thinking_text = String::new();
+        let mut usage = TokenUsage::default();
         let mut aborted = false;
 
         while let Some(chunk) = stream.next().await {
@@ -91,19 +92,23 @@ impl LlmProvider for OllamaProvider {
                     Ok(event) => event,
                     Err(_) => continue,
                 };
-                if let Some(msg) = event.message {
-                    if let Some(thinking) = msg.thinking {
+                if let Some(msg) = event.message.as_ref() {
+                    if let Some(thinking) = msg.thinking.as_ref() {
                         if !thinking.is_empty() {
-                            thinking_text.push_str(&thinking);
-                            on_event(StreamEvent::ThinkingDelta(thinking));
+                            thinking_text.push_str(thinking);
+                            on_event(StreamEvent::ThinkingDelta(thinking.clone()));
                         }
                     }
-                    if let Some(content) = msg.content {
+                    if let Some(content) = msg.content.as_ref() {
                         if !content.is_empty() {
-                            full_text.push_str(&content);
-                            on_event(StreamEvent::TextDelta(content));
+                            full_text.push_str(content);
+                            on_event(StreamEvent::TextDelta(content.clone()));
                         }
                     }
+                }
+                // Final chunk (`done: true`) carries prompt_eval_count / eval_count.
+                if event.done == Some(true) || event.prompt_eval_count.is_some() {
+                    apply_ollama_usage(&mut usage, &event);
                 }
             }
         }
@@ -125,8 +130,17 @@ impl LlmProvider for OllamaProvider {
             } else {
                 StopReason::Stop
             },
-            usage: one_core::agent::TokenUsage::default(),
+            usage,
         })
+    }
+}
+
+fn apply_ollama_usage(usage: &mut TokenUsage, event: &OllamaStreamEvent) {
+    if let Some(n) = event.prompt_eval_count {
+        usage.input_tokens = n as u64;
+    }
+    if let Some(n) = event.eval_count {
+        usage.output_tokens = n as u64;
     }
 }
 
@@ -193,6 +207,15 @@ fn map_message(message: &one_core::AgentMessage) -> Option<Value> {
 #[derive(Debug, Deserialize)]
 struct OllamaStreamEvent {
     message: Option<OllamaMessage>,
+    /// Present on the final NDJSON line of a stream.
+    #[serde(default)]
+    done: Option<bool>,
+    /// Input tokens (prompt evaluation count).
+    #[serde(default)]
+    prompt_eval_count: Option<u64>,
+    /// Output tokens generated.
+    #[serde(default)]
+    eval_count: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -201,4 +224,19 @@ struct OllamaMessage {
     /// Native think channel (DeepSeek-R1 / QwQ / etc. via Ollama).
     #[serde(default)]
     thinking: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_from_done_chunk() {
+        let raw = r#"{"model":"llama3.2","created_at":"…","message":{"role":"assistant","content":"hi"},"done":true,"prompt_eval_count":42,"eval_count":7}"#;
+        let event: OllamaStreamEvent = serde_json::from_str(raw).unwrap();
+        let mut usage = TokenUsage::default();
+        apply_ollama_usage(&mut usage, &event);
+        assert_eq!(usage.input_tokens, 42);
+        assert_eq!(usage.output_tokens, 7);
+    }
 }

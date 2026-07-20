@@ -32,6 +32,8 @@ pub const DEFAULT_STARTUP_TIMEOUT_SEC: u64 = 30;
 pub enum ConfigSourceKind {
     OneUser,
     OneProject,
+    /// Contributed by a local plugin.json `mcpServers` block.
+    Plugin,
     Codex,
     Claude,
     Cursor,
@@ -43,6 +45,7 @@ impl ConfigSourceKind {
         match self {
             Self::OneUser => "one-user",
             Self::OneProject => "one-project",
+            Self::Plugin => "plugin",
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Cursor => "cursor",

@@ -75,16 +75,31 @@ impl ExtensionRuntime {
         for extension in self.registry.extensions() {
             extension.on_load(ctx).await?;
         }
+        // True session lifecycle (once at process/extension load).
+        let _ = self.emit(&ExtensionEvent::SessionStart).await;
         hooks::run_session_hooks(&self.hooks.session_start, "SessionStart", &self.cwd).await;
         Ok(())
     }
 
     pub async fn unload_all(&self, ctx: &ExtensionContext<'_>) -> crate::Result<()> {
+        let _ = self.emit(&ExtensionEvent::SessionEnd).await;
         hooks::run_session_hooks(&self.hooks.session_end, "SessionEnd", &self.cwd).await;
         for extension in self.registry.extensions() {
             extension.on_unload(ctx).await?;
         }
         Ok(())
+    }
+
+    /// Fire session-start for conversation switches (`/new`, `/resume`) without reloading extensions.
+    pub async fn notify_session_start(&self) {
+        let _ = self.emit(&ExtensionEvent::SessionStart).await;
+        hooks::run_session_hooks(&self.hooks.session_start, "SessionStart", &self.cwd).await;
+    }
+
+    /// Fire session-end before replacing the active conversation.
+    pub async fn notify_session_end(&self) {
+        let _ = self.emit(&ExtensionEvent::SessionEnd).await;
+        hooks::run_session_hooks(&self.hooks.session_end, "SessionEnd", &self.cwd).await;
     }
 
     pub fn make_context<'a>(
@@ -256,13 +271,11 @@ struct RuntimeAgentHooks {
 
 #[async_trait]
 impl AgentHooks for RuntimeAgentHooks {
-    async fn on_agent_start(&self) {
-        let _ = self.runtime.emit(&ExtensionEvent::SessionStart).await;
-    }
+    // Agent start/end are *prompt* boundaries, not conversation sessions.
+    // SessionStart/End are fired from load/unload and AppRuntime session open/new.
+    async fn on_agent_start(&self) {}
 
-    async fn on_agent_end(&self) {
-        let _ = self.runtime.emit(&ExtensionEvent::SessionEnd).await;
-    }
+    async fn on_agent_end(&self) {}
 
     async fn on_turn_start(&self, turn: usize) {
         let _ = self

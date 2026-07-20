@@ -437,6 +437,98 @@ impl McpManager {
         parts.join(" · ")
     }
 
+    /// Merge extra servers (e.g. plugin.json `mcpServers`) that are not already configured.
+    ///
+    /// Existing One user/project names win. New names are connected in the background.
+    pub fn merge_extra_servers(
+        &self,
+        servers: impl IntoIterator<Item = (String, McpServerConfig)>,
+        source: ConfigSourceKind,
+    ) {
+        if self.disabled {
+            return;
+        }
+        let mut to_connect = Vec::new();
+        {
+            let mut config = self.shared.config.write();
+            let mut sources = self.shared.server_sources.write();
+            for (name, cfg) in servers {
+                if config.mcp_servers.contains_key(&name) {
+                    continue;
+                }
+                let enabled = cfg.enabled.unwrap_or(true);
+                config.mcp_servers.insert(name.clone(), cfg.clone());
+                sources.insert(name.clone(), source);
+                if enabled {
+                    to_connect.push((name, cfg));
+                }
+            }
+        }
+        if to_connect.is_empty() {
+            return;
+        }
+        // `spawn_connect` bumps pending/loading per server.
+        for (name, cfg) in to_connect {
+            self.spawn_connect(name, cfg);
+        }
+    }
+
+    /// Parse raw JSON server objects (plugin manifest shape) and merge unknowns.
+    pub fn merge_plugin_server_json(
+        &self,
+        servers: &std::collections::BTreeMap<String, serde_json::Value>,
+    ) {
+        let mut parsed = Vec::new();
+        for (name, val) in servers {
+            match serde_json::from_value::<McpServerConfig>(val.clone()) {
+                Ok(cfg) => parsed.push((name.clone(), cfg)),
+                Err(e) => {
+                    warn!(server = %name, error = %e, "plugin MCP server JSON invalid; skip");
+                }
+            }
+        }
+        self.merge_extra_servers(parsed, ConfigSourceKind::Plugin);
+    }
+
+    /// Re-read One MCP config from disk and connect any new servers (for `/reload`).
+    ///
+    /// Existing live connections for still-configured servers are kept.
+    /// Servers removed from disk stay connected until process exit (tools dropped if disabled).
+    pub fn reload_from_disk(&self, cwd: &Path) -> Result<()> {
+        if self.disabled {
+            return Ok(());
+        }
+        let loaded = load_effective(cwd)?;
+        let mut to_connect = Vec::new();
+        {
+            let mut config = self.shared.config.write();
+            let mut sources = self.shared.server_sources.write();
+            // Update disabled set from user config.
+            {
+                let mut disabled = self.shared.disabled_names.write();
+                *disabled = loaded.config.disabled_servers.iter().cloned().collect();
+            }
+            for (name, cfg) in &loaded.config.mcp_servers {
+                let is_new = !config.mcp_servers.contains_key(name);
+                config.mcp_servers.insert(name.clone(), cfg.clone());
+                if let Some(src) = loaded.server_sources.get(name) {
+                    sources.insert(name.clone(), *src);
+                }
+                let disabled = self.shared.disabled_names.read().contains(name)
+                    || cfg.enabled == Some(false);
+                let already_live = self.shared.live.read().iter().any(|s| &s.name == name);
+                if is_new && !disabled && !already_live {
+                    to_connect.push((name.clone(), cfg.clone()));
+                }
+            }
+        }
+        for (name, cfg) in to_connect {
+            self.spawn_connect(name, cfg);
+        }
+        rebuild_tools_from_live(&self.shared);
+        Ok(())
+    }
+
     /// Toggle one server on/off (persists + reconnects or drops tools).
     pub async fn set_server_enabled(&self, name: &str, enabled: bool) -> Result<()> {
         if self.disabled {

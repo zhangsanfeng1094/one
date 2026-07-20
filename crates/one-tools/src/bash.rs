@@ -97,7 +97,9 @@ unless --yes / ONE_AUTO_APPROVE=1."
         ToolDefinition {
             name: "bash".to_string(),
             description: format!(
-                "Execute a shell command in the project working directory.{boundary} \
+                "Execute a shell command in the project working directory (Claude Code Bash-compatible).{boundary} \
+Prefer dedicated tools (read/edit/grep/find/ls) over shell for file work. \
+Always set `description` to a short human-readable summary of what the command does. \
 For long-running work (tests, builds, dev servers) set run_in_background=true: \
 returns a task_id immediately so you can continue other tools. \
 When the task finishes, a [Background task completed] notice is injected into the conversation. \
@@ -110,9 +112,17 @@ is spilled to disk with a ~4KB head preview + path for read/grep)."
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Shell command to run" },
+                    "description": {
+                        "type": "string",
+                        "description": "Short clear description of what this command does (Claude Code; shown in UI / logs)"
+                    },
                     "timeout_secs": {
                         "type": "integer",
                         "description": "Max seconds before the command is killed (foreground default 120; background optional hard limit)"
+                    },
+                    "timeout": {
+                        "type": "integer",
+                        "description": "Alias for timeout_secs (seconds). If value is >= 1000, treated as milliseconds like Claude Code."
                     },
                     "run_in_background": {
                         "type": "boolean",
@@ -133,16 +143,21 @@ is spilled to disk with a ~4KB head preview + path for read/grep)."
 
         self.check_command(command)?;
 
+        let description = call
+            .arguments
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
         let run_in_background = call
             .arguments
             .get("run_in_background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
-        let timeout_secs = call
-            .arguments
-            .get("timeout_secs")
-            .and_then(|value| value.as_u64());
+        let timeout_secs = resolve_timeout_secs(&call.arguments);
 
         if run_in_background {
             let id = self
@@ -158,15 +173,19 @@ is spilled to disk with a ~4KB head preview + path for read/grep)."
                  Use bash_output with this task_id to poll or wait; bash_kill to stop.\n\
                  A [Background task completed] notice will appear when it finishes."
             );
-            return Ok(ToolOutput::text_with_details(
-                text,
-                json!({
-                    "background": true,
-                    "task_id": id,
-                    "command": command,
-                    "ok": true,
-                }),
-            ));
+            let mut details = json!({
+                "background": true,
+                "task_id": id,
+                "command": command,
+                "ok": true,
+            });
+            if let Some(d) = &description {
+                details
+                    .as_object_mut()
+                    .unwrap()
+                    .insert("description".into(), json!(d));
+            }
+            return Ok(ToolOutput::text_with_details(text, details));
         }
 
         // —— Foreground (blocking) ——
@@ -266,19 +285,40 @@ is spilled to disk with a ~4KB head preview + path for read/grep)."
             output.push_str(&presented.text);
         }
 
-        Ok(ToolOutput::text_with_details(
-            output,
-            json!({
-                "exitCode": exit_code,
-                "command": command,
-                "ok": status.success(),
-                "background": false,
-                "sandboxed": sandboxed,
-                "sandboxMode": self.sandbox_mode.as_str(),
-                "truncated": truncated,
-                "fullOutputPath": spill_path,
-            }),
-        ))
+        let mut details = json!({
+            "exitCode": exit_code,
+            "command": command,
+            "ok": status.success(),
+            "background": false,
+            "sandboxed": sandboxed,
+            "sandboxMode": self.sandbox_mode.as_str(),
+            "truncated": truncated,
+            "fullOutputPath": spill_path,
+        });
+        if let Some(d) = description {
+            details
+                .as_object_mut()
+                .unwrap()
+                .insert("description".into(), json!(d));
+        }
+        Ok(ToolOutput::text_with_details(output, details))
+    }
+}
+
+/// `timeout_secs` preferred; `timeout` accepted (Claude). Values ≥ 1000 on `timeout` are ms.
+fn resolve_timeout_secs(args: &serde_json::Value) -> Option<u64> {
+    if let Some(s) = args.get("timeout_secs").and_then(|v| v.as_u64()) {
+        return Some(s);
+    }
+    let t = args.get("timeout").and_then(|v| {
+        v.as_u64()
+            .or_else(|| v.as_i64().map(|n| n.max(0) as u64))
+    })?;
+    // Claude Code historically uses milliseconds for `timeout`.
+    if t >= 1000 {
+        Some((t / 1000).max(1))
+    } else {
+        Some(t)
     }
 }
 

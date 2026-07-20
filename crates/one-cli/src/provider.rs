@@ -139,8 +139,10 @@ impl ProviderSet {
             share: false,
             no_mcp: false,
             no_skills: false,
-            trace: None,
+            trace: false,
             trace_full: false,
+            max_turns: 32,
+            output_format: None,
             command: None,
         };
 

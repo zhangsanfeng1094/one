@@ -16,6 +16,10 @@ use one_tools::{
 
 use super::helpers::{load_extension_state, new_plan_path};
 use super::policy::build_path_policy;
+use super::task_tool::{
+    harness_opts_from_policy, main_parent_agent_spec, TaskTool, TaskToolHost,
+    TASK_TOOL_PROMPT_HINT,
+};
 use super::{AgentMode, AppRuntime};
 use crate::approval::PermissionGate;
 use crate::cli::{Cli, RunMode};
@@ -107,8 +111,22 @@ impl AppRuntime {
                 .unwrap_or_else(|| agent_dir.join("plans").join("_none.md")),
         )));
 
+        // Task meta-tool host (same harness as `one agent run`). Enabled for
+        // main agents that can spawn (not pure --read-only research shells).
+        let task_host = {
+            let add_dirs = cli.add_dir.clone();
+            let opts = harness_opts_from_policy(
+                cwd.clone(),
+                cli.full_access,
+                add_dirs,
+                auto_approve,
+            );
+            Some(TaskToolHost::new(opts, main_parent_agent_spec()))
+        };
+
         let mut tools: Vec<Arc<dyn Tool>> = if cli.read_only {
             // No bash / background tools in read-only mode.
+            // Still allow explore task so -RO parents can delegate research.
             read_only_tools_with_ask(path_policy.clone(), Some(ask_user_handler.clone()))
         } else if start_plan {
             plan_mode_tools_with_policy(
@@ -125,16 +143,20 @@ impl AppRuntime {
                 ask_user: Some(ask_user_handler.clone()),
             })
         };
+        // Register `task` whenever the host can spawn (explore-only MVP).
+        if let Some(host) = &task_host {
+            if host.can_spawn() {
+                tools.push(Arc::new(TaskTool::new(host.clone())));
+            }
+        }
         // Extension tools only in Act mode (may include write-capable tools).
         if !start_plan {
             tools.extend(extensions.tools());
         }
-        // Note: plugin MCP servers are declared in plugin.json for future merge;
-        // platform MCP remains `McpManager` (see docs/mcp.md).
-
         // MCP: Grok-style — load config sync, connect servers in background.
         // Do not block TUI / first paint on cold `npx` downloads.
         // Plan mode still starts the pool (so /act gets tools) but does not register them yet.
+        // Plugin `mcpServers` merge in after spawn (One user/project names win).
         let disable_mcp = cli.no_mcp
             || std::env::var_os("ONE_DISABLE_MCP").is_some_and(|v| v != "0" && v != "false");
         let mcp = if disable_mcp {
@@ -142,6 +164,9 @@ impl AppRuntime {
         } else {
             match McpManager::spawn(&cwd) {
                 Ok(m) => {
+                    if !discovery.plugin_mcp_servers.is_empty() {
+                        m.merge_plugin_server_json(&discovery.plugin_mcp_servers);
+                    }
                     if m.is_loading() {
                         tracing::info!("MCP background connect started");
                     }
@@ -159,18 +184,26 @@ impl AppRuntime {
         }
         let mcp_tools_generation = mcp.generation();
 
-        let base_system_prompt =
+        let mut base_system_prompt =
             resources.build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
+        // Hint for when to use task (also in DEFAULT_SYSTEM_PROMPT; keep overlay if resources strip it).
+        if let Some(host) = &task_host {
+            if host.can_spawn() && !base_system_prompt.contains("`task` tool") {
+                base_system_prompt.push_str("\n");
+                base_system_prompt.push_str(TASK_TOOL_PROMPT_HINT);
+            }
+        }
         let system_prompt = if start_plan {
             let p = plan_path.as_ref().expect("plan path");
             format!("{base_system_prompt}{}", plan_mode_system_overlay(p))
         } else {
             base_system_prompt.clone()
         };
+        let max_turns = cli.max_turns.max(1);
         let mut agent = Agent::new(
             AgentConfig {
                 system_prompt,
-                max_turns: 32,
+                max_turns,
                 thinking_level: ThinkingLevel::Off,
             },
             tools,
@@ -178,28 +211,43 @@ impl AppRuntime {
         // Extension PreToolUse → PermissionGate → after_tool (Codex-style pipeline).
         agent.set_tool_gate(Some(extensions.tool_gate(permission_gate.clone())));
         agent.set_hooks(Some(extensions.agent_hooks()));
-        // Optional harness trace (additive; default off).
-        if let Some(trace_path) = resolve_trace_path(cli) {
-            match one_core::JsonlTraceSink::create(&trace_path) {
-                Ok(sink) => {
-                    tracing::info!(path = %trace_path.display(), "writing agent trace");
-                    agent.set_trace(Some(std::sync::Arc::new(sink)));
+        // Optional Langfuse trace (additive; default off).
+        // session_id is filled in after the session is opened (see below).
+        let mut langfuse_sink = None;
+        if trace_enabled(cli) {
+            match crate::langfuse::LangfuseConfig::from_env() {
+                Some(cfg) => {
+                    let host = cfg.project_url_hint();
+                    tracing::info!(%host, "langfuse tracing enabled");
+                    let sink = crate::langfuse::LangfuseTraceSink::start(cfg);
+                    agent.set_trace(Some(sink.clone()));
                     agent.set_trace_meta(one_core::TraceRunMeta {
                         agent_version: Some(env!("CARGO_PKG_VERSION").into()),
                         config: Some(serde_json::json!({
-                            "max_turns": 32,
+                            "max_turns": max_turns,
                             "read_only": cli.read_only,
                             "plan": cli.plan,
                             "auto_approve": auto_approve,
                             "cwd": cwd.display().to_string(),
                             "trace_full": cli.trace_full,
+                            "backend": "langfuse",
                         })),
                         task_id: None,
+                        session_id: None,
+                        user_id: crate::langfuse::user_id_from_env(),
+                        trace_full: cli.trace_full,
                     });
-                    eprintln!("trace: {}", trace_path.display());
+                    eprintln!("trace: langfuse otel ({host}/api/public/otel/v1/traces)");
+                    if cli.trace_full {
+                        eprintln!("trace: full I/O previews enabled (--trace-full)");
+                    }
+                    langfuse_sink = Some(sink);
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, path = %trace_path.display(), "failed to open --trace file");
+                None => {
+                    eprintln!(
+                        "trace: requested but Langfuse keys missing — set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY"
+                    );
+                    tracing::warn!("--trace/--langfuse ignored: Langfuse credentials not configured");
                 }
             }
         }
@@ -257,6 +305,8 @@ impl AppRuntime {
                 }
             }
             load_extension_state(extensions.as_ref(), session);
+            // Group multi-turn runs under one Langfuse session.
+            agent.set_trace_session_id(Some(session.header().id.clone()));
         }
         if let (Some(session), Some(name)) = (&mut session, &cli.name) {
             session.append_session_info(name).await?;
@@ -294,7 +344,12 @@ impl AppRuntime {
             context_window: 0,
             mcp,
             mcp_tools_generation,
+            langfuse: langfuse_sink,
+            task_host,
         };
+
+        // Seed session id for task parent metadata.
+        runtime.sync_task_session().await;
 
         // Restore plan path + mode from session custom entry if present.
         if !cli.read_only {
@@ -317,35 +372,13 @@ impl AppRuntime {
     }
 }
 
-/// Resolve `--trace` / `ONE_TRACE` into a concrete file path.
-///
-/// - CLI `--trace` / `--trace PATH` wins
-/// - Else `ONE_TRACE=1` or `ONE_TRACE=path`
-/// - `-` or bare flag → `~/.one/agent/traces/<timestamp>.jsonl`
-fn resolve_trace_path(cli: &Cli) -> Option<std::path::PathBuf> {
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    let from_cli = cli.trace.clone();
-    let from_env = std::env::var_os("ONE_TRACE").and_then(|v| {
-        let s = v.to_string_lossy();
-        if s.is_empty() || s == "0" || s.eq_ignore_ascii_case("false") {
-            None
-        } else if s == "1" || s.eq_ignore_ascii_case("true") {
-            Some(PathBuf::from("-"))
-        } else {
-            Some(PathBuf::from(s.as_ref()))
-        }
-    });
-    let raw = from_cli.or(from_env)?;
-    if raw.as_os_str() == "-" || raw.as_os_str().is_empty() {
-        let dir = agent_dir().join("traces");
-        let ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis())
-            .unwrap_or(0);
-        Some(dir.join(format!("trace_{ms}.jsonl")))
-    } else {
-        Some(raw)
+/// Whether Langfuse tracing was requested (`--trace` / `ONE_TRACE=1`).
+fn trace_enabled(cli: &Cli) -> bool {
+    if cli.trace {
+        return true;
     }
+    std::env::var_os("ONE_TRACE").is_some_and(|v| {
+        let s = v.to_string_lossy();
+        s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+    })
 }

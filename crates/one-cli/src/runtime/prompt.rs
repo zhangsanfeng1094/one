@@ -44,48 +44,75 @@ impl AppRuntime {
             })
             .await;
 
-        let before = {
+        let mut before = {
             let agent = self.agent.lock().await;
             agent.messages.len()
         };
 
-        let output = match {
-            let mut agent = self.agent.lock().await;
-            agent.prompt(provider, &text).await
-        } {
-            Ok(out) => out,
-            Err(err) if is_overflow_err(&err) => {
-                // Force compact then retry once.
-                drop(err);
-                self.maybe_compact(provider, true).await?;
+        let result: Result<String, Box<dyn std::error::Error>> = async {
+            match {
                 let mut agent = self.agent.lock().await;
-                // Drop the user message that was pushed before failure if present twice risk:
-                // agent.prompt already pushed user text — on error messages may include it.
-                // Retry by calling run() if last message is the user text, else re-prompt.
-                if agent
-                    .messages
-                    .last()
-                    .map(|m| matches!(m, AgentMessage::User(_)))
-                    .unwrap_or(false)
-                {
-                    agent.run(provider).await?
-                } else {
-                    agent.prompt(provider, &text).await?
+                agent.prompt(provider, &text).await
+            } {
+                Ok(out) => Ok(out),
+                Err(err) if is_overflow_err(&err) => {
+                    drop(err);
+                    self.maybe_compact(provider, true).await?;
+                    // Buffer shrank. Re-base so we (1) don't panic on `[before..]` and
+                    // (2) still persist the in-flight user turn (never written yet) without
+                    // re-appending already-on-disk kept history.
+                    before = {
+                        let agent = self.agent.lock().await;
+                        agent
+                            .messages
+                            .iter()
+                            .rposition(|m| matches!(m, AgentMessage::User(_)))
+                            .unwrap_or(agent.messages.len())
+                    };
+                    let mut agent = self.agent.lock().await;
+                    if agent
+                        .messages
+                        .last()
+                        .map(|m| matches!(m, AgentMessage::User(_)))
+                        .unwrap_or(false)
+                    {
+                        Ok(agent.run(provider).await?)
+                    } else {
+                        Ok(agent.prompt(provider, &text).await?)
+                    }
                 }
-            }
-            Err(err) => return Err(err.into()),
-        };
-
-        if let Some(session) = &mut self.session {
-            let messages = self.agent.lock().await.messages[before..].to_vec();
-            for message in messages {
-                session.append_message(message).await?;
+                Err(err) => Err(err.into()),
             }
         }
+        .await;
 
-        self.persist_extension_state().await?;
-        // SessionStart/SessionEnd also fire from AgentHooks inside the loop.
-        Ok(output)
+        // Always persist new messages (including failed / partial turns).
+        if let Err(e) = self.append_session_delta(before).await {
+            tracing::warn!(error = %e, "failed to append session messages after prompt");
+        }
+        if let Err(e) = self.persist_extension_state().await {
+            tracing::warn!(error = %e, "failed to persist extension state after prompt");
+        }
+
+        result
+    }
+
+    /// Append agent messages from `before..` onto the session (best-effort bounds).
+    pub async fn append_session_delta(
+        &mut self,
+        before: usize,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(session) = &mut self.session else {
+            return Ok(());
+        };
+        let agent = self.agent.lock().await;
+        let start = before.min(agent.messages.len());
+        let messages = agent.messages[start..].to_vec();
+        drop(agent);
+        for message in messages {
+            session.append_message(message).await?;
+        }
+        Ok(())
     }
 
     /// Compact when over threshold, or when `force` (e.g. context overflow recovery).
@@ -126,10 +153,11 @@ impl AppRuntime {
             return Ok(());
         }
 
+        // first_kept = oldest kept context message entry (not the current leaf).
         let first_kept = self
             .session
             .as_ref()
-            .and_then(|s| s.get_leaf_id().map(|s| s.to_string()))
+            .map(|s| s.first_kept_entry_id_for_tail(kept.len()))
             .unwrap_or_else(|| "root".into());
 
         if let Some(session) = &mut self.session {

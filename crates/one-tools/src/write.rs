@@ -6,6 +6,7 @@ use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, T
 use serde_json::json;
 
 use crate::path_policy::{AccessKind, PathPolicy};
+use crate::tool_args::{path_arg, path_properties};
 
 pub struct WriteTool {
     policy: PathPolicy,
@@ -32,30 +33,37 @@ impl Tool for WriteTool {
                 self.policy.cwd().display()
             )
         };
+        let mut properties = path_properties(
+            "File path to create or overwrite (Claude Code alias: `file_path`)",
+        );
+        if let Some(obj) = properties.as_object_mut() {
+            obj.insert(
+                "content".into(),
+                json!({
+                    "type": "string",
+                    "description": "Full new file contents"
+                }),
+            );
+        }
         ToolDefinition {
             name: "write".to_string(),
             description: format!(
-                "Create a new file or intentionally overwrite an entire file with `content`. \
-                 Prefer `edit` for small/localized changes — do not rewrite a whole file when \
-                 a unique string replace would suffice. Allowed: {scope}."
+                "Create a new file or intentionally overwrite an entire file with `content` \
+                 (Claude Code Write-compatible). Prefer `edit` for small/localized changes — \
+                 do not rewrite a whole file when a unique string replace would suffice. \
+                 Allowed: {scope}."
             ),
             parameters: json!({
                 "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path to create or overwrite" },
-                    "content": { "type": "string", "description": "Full new file contents" }
-                },
-                "required": ["path", "content"]
+                "properties": properties,
+                "required": ["content"]
             }),
         }
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = call
-            .arguments
-            .get("path")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| invalid_args("write", "missing `path`"))?;
+        let path = path_arg(&call.arguments)
+            .ok_or_else(|| invalid_args("write", "missing `path` or `file_path`"))?;
         let content = call
             .arguments
             .get("content")

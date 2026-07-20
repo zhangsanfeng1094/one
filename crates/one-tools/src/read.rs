@@ -7,6 +7,7 @@ use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, T
 use serde_json::json;
 
 use crate::path_policy::{AccessKind, PathPolicy};
+use crate::tool_args::{path_arg, path_properties};
 
 pub struct ReadTool {
     policy: PathPolicy,
@@ -33,32 +34,42 @@ impl Tool for ReadTool {
                 self.policy.cwd().display()
             )
         };
+        let mut properties = path_properties("File path (Claude Code alias: `file_path`)");
+        if let Some(obj) = properties.as_object_mut() {
+            obj.insert(
+                "offset".into(),
+                json!({
+                    "type": "integer",
+                    "description": "1-based line offset (text only)"
+                }),
+            );
+            obj.insert(
+                "limit".into(),
+                json!({
+                    "type": "integer",
+                    "description": "Maximum lines to read (text only; still subject to 50KB cap)"
+                }),
+            );
+        }
         ToolDefinition {
             name: "read".to_string(),
             description: format!(
-                "Read a file from the filesystem. Text files return numbered lines; \
+                "Read a file from the filesystem (Claude Code Read-compatible). Text files return numbered lines; \
                  image files (png/jpeg/gif/webp/bmp) return image content for vision models. \
                  Text output is capped (~2000 lines / 50KB from the requested window; use offset/limit for slices). \
                  Allowed: {scope}."
             ),
             parameters: json!({
                 "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "File path" },
-                    "offset": { "type": "integer", "description": "1-based line offset (text only)" },
-                    "limit": { "type": "integer", "description": "Maximum lines to read (text only; still subject to 50KB cap)" }
-                },
-                "required": ["path"]
+                "properties": properties,
+                "required": []
             }),
         }
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = call
-            .arguments
-            .get("path")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| invalid_args("read", "missing `path`"))?;
+        let path = path_arg(&call.arguments)
+            .ok_or_else(|| invalid_args("read", "missing `path` or `file_path`"))?;
 
         let resolved = self
             .policy

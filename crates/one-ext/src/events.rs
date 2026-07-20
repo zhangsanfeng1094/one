@@ -6,13 +6,13 @@ use serde_json::Value;
 /// Lifecycle / tool events fired by [`crate::runtime::ExtensionRuntime`].
 #[derive(Debug, Clone)]
 pub enum ExtensionEvent {
-    /// Session / prompt batch starts (`AgentStart`).
+    /// Conversation session starts (once per open / `/new` / cold load — **not** each prompt).
     SessionStart,
-    /// Session / prompt batch ends (`AgentEnd`).
+    /// Conversation session ends (`/new` replacing current, `/reload` unload, process teardown).
     SessionEnd,
-    /// One LLM turn begins.
+    /// One LLM→tools loop iteration begins (inside a user prompt).
     TurnStart { turn: usize },
-    /// One LLM turn ends.
+    /// One LLM→tools loop iteration ends.
     TurnEnd { turn: usize },
     /// Tool about to run (observe; intercept uses [`crate::intercept::PreToolDecision`]).
     ToolStart { tool_call: ToolCall },

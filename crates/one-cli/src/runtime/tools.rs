@@ -7,6 +7,7 @@ use one_tools::{
     coding_tools_with_options, read_only_tools_with_ask, ToolBuildOptions,
 };
 
+use super::task_tool::{TaskTool, TASK_TOOL_PROMPT_HINT};
 use super::{AgentMode, AppRuntime};
 
 impl AppRuntime {
@@ -14,9 +15,14 @@ impl AppRuntime {
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error>> {
         // Refresh base prompt from resources in case of /reload.
-        self.base_system_prompt = self
+        let mut base = self
             .resources
             .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
+        if self.task_enabled() && !base.contains("`task` tool") {
+            base.push('\n');
+            base.push_str(TASK_TOOL_PROMPT_HINT);
+        }
+        self.base_system_prompt = base;
 
         self.rebuild_act_tools().await?;
         let mut agent = self.agent.lock().await;
@@ -42,6 +48,11 @@ impl AppRuntime {
                 ask_user: Some(self.ask_user_handler.clone()),
             })
         };
+        if let Some(host) = &self.task_host {
+            if host.can_spawn() {
+                tools.push(Arc::new(TaskTool::new(host.clone())));
+            }
+        }
         tools.extend(self.extensions.tools());
         // MCP tools only outside Plan mode (external side effects).
         if self.mode != AgentMode::Plan {
