@@ -59,6 +59,7 @@ impl AppRuntime {
                 auto_approve: self.auto_approve,
                 registry: self.bg_registry.clone(),
                 ask_user: Some(self.ask_user_handler.clone()),
+                tool_gate: Some(self.permission_gate.clone()),
             })
         };
         self.push_task_tools(&mut tools);

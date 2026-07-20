@@ -283,6 +283,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn require_escalated_fail_closed() {
+        let gate = PermissionGate::with_auto_approve(PermissionRules::default(), false, false);
+        let decision = gate
+            .check(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({
+                    "command": "kill 1",
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "cleanup host process"
+                }),
+            })
+            .await;
+        match decision {
+            ToolGateDecision::Deny { message } => {
+                assert!(
+                    message.contains("sandbox escalation"),
+                    "expected escalate deny reason, got {message}"
+                );
+            }
+            other => panic!("expected Deny in fail-closed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn require_escalated_interactive_once() {
+        let gate = PermissionGate::with_auto_approve(PermissionRules::default(), false, true);
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({
+                    "command": "kill 1",
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "cleanup"
+                }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if let Some(req) = gate.poll_request() {
+                assert!(req.reason.starts_with("sandbox escalation:"), "{}", req.reason);
+                assert!(req.summary.contains("outside sandbox"), "{}", req.summary);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.respond(ApprovalChoice::Once));
+        assert_eq!(handle.await.unwrap(), ToolGateDecision::Allow);
+    }
+
+    #[tokio::test]
     async fn always_enables_session_auto() {
         let gate = PermissionGate::with_auto_approve(PermissionRules::default(), false, true);
         let g = gate.clone();

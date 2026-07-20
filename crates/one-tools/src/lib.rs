@@ -12,6 +12,7 @@ pub mod permissions;
 pub mod plan;
 pub mod read;
 pub mod sandbox;
+pub mod sandbox_permissions;
 pub mod tasks;
 pub mod tool_args;
 pub mod truncate;
@@ -39,6 +40,10 @@ pub use permissions::{
     call_fingerprint, call_summary, evaluate as evaluate_permissions, PermissionRules,
     PermissionRule, PermissionVerdict, RuleAction,
 };
+pub use sandbox_permissions::{
+    justification_of, looks_like_sandbox_denial, requires_escalation, sandbox_permissions_of,
+    SandboxPermissions,
+};
 pub use plan::{
     plan_mode_system_overlay, plan_mode_tools, plan_mode_tools_with_policy, ExitPlanModeTool,
     PlanEditTool, PlanExitState, PlanWriteTool,
@@ -65,6 +70,8 @@ pub struct ToolBuildOptions {
     pub registry: Arc<BackgroundTaskRegistry>,
     /// Human-in-the-loop bridge for `ask_user` (fail-closed when None).
     pub ask_user: Option<Arc<dyn AskUserHandler>>,
+    /// Permission gate for bash escalate-on-failure (Codex-aligned).
+    pub tool_gate: Option<Arc<dyn one_core::tool_gate::ToolGate>>,
 }
 
 impl ToolBuildOptions {
@@ -74,6 +81,7 @@ impl ToolBuildOptions {
             auto_approve: true,
             registry: Arc::new(BackgroundTaskRegistry::new()),
             ask_user: None,
+            tool_gate: None,
         }
     }
 
@@ -94,6 +102,11 @@ impl ToolBuildOptions {
 
     pub fn with_ask_user(mut self, handler: Arc<dyn AskUserHandler>) -> Self {
         self.ask_user = Some(handler);
+        self
+    }
+
+    pub fn with_tool_gate(mut self, gate: Arc<dyn one_core::tool_gate::ToolGate>) -> Self {
+        self.tool_gate = Some(gate);
         self
     }
 }
@@ -125,6 +138,7 @@ pub fn coding_tools_with_registry(
         auto_approve,
         registry,
         ask_user: None,
+        tool_gate: None,
     })
 }
 
@@ -140,10 +154,11 @@ pub fn coding_tools_with_options(opts: ToolBuildOptions) -> Vec<Arc<dyn Tool>> {
         Arc::new(ReadTool::with_policy(policy.clone())),
         Arc::new(WriteTool::with_policy(policy.clone())),
         Arc::new(EditTool::with_policy(policy.clone())),
-        Arc::new(BashTool::with_policy(
+        Arc::new(BashTool::with_policy_and_gate(
             policy.clone(),
             opts.auto_approve,
             opts.registry.clone(),
+            opts.tool_gate.clone(),
         )),
         Arc::new(BashOutputTool::new(opts.registry.clone())),
         Arc::new(BashKillTool::new(opts.registry)),

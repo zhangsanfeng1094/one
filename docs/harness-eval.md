@@ -7,7 +7,24 @@
 
 ### 1. 配置 Langfuse
 
-在 [Langfuse](https://langfuse.com) 项目设置里创建 API keys，然后：
+在 [Langfuse](https://langfuse.com) 项目设置里创建 API keys，然后任选其一：
+
+**推荐：项目根目录 `.env`（gitignored，CLI 启动时自动加载）**
+
+```bash
+cp .env.example .env
+# 编辑 .env 填入 keys；可选 ONE_TRACE=1 免每次写 --trace
+# 可选：LANGFUSE_TRACING_ENVIRONMENT=dev  （debug 构建未设置时会默认 dev）
+```
+
+| 场景 | 怎么加载 |
+|------|----------|
+| 在仓库里 `cargo run` / `./target/debug/one` | 读仓库 `.env`；**debug** 还会从二进制向上找 workspace `.env` |
+| `cd 别的项目` 再跑 debug `one` | 同上：靠 exe 旁路径找到仓库 `.env` |
+| 安装到 `PATH` 的 release / 任意 cwd | 放 **`~/.one/agent/.env`**（或 `~/.one/.env`） |
+| 已 `export` 的变量 | 优先级最高，不会被任何 `.env` 覆盖 |
+
+也可放在 `~/.one/agent/.env` 作全局兜底（dev/prod 都适用）。
 
 ```bash
 export LANGFUSE_PUBLIC_KEY=pk-lf-...
@@ -113,7 +130,7 @@ Agent::run
 | `langfuse.trace.tags` 为 string[] | ✅ OTEL string array |
 | `sessionId` | ✅ One session header id / bench 每次独立 id |
 | `userId` | ✅ `LANGFUSE_USER_ID` / `ONE_USER_ID` / `USER` |
-| Generation I/O 文本 | ✅ 默认仅长度；`--trace-full` 上报预览（至 16k 字符） |
+| Generation I/O 文本 | ✅ 默认短预览（240 字：input=末条 user，output=回复文本）；`--trace-full` 至 16k |
 | Experiments dataset 属性 | ⚠️ 未接；bench 用 tags + harness scores |
 
 ## Trace 事件 → OTEL / Langfuse

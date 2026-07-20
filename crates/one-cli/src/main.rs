@@ -51,8 +51,69 @@ fn init_tracing(interactive_tui: bool) {
         .init();
 }
 
+/// Load `.env` files without overriding variables already present in the process.
+///
+/// Priority (highest → lowest):
+/// 1. process env (shell `export`)
+/// 2. cwd / parent `.env` (project you are working in)
+/// 3. **debug only**: walk up from the binary path (workspace `.env` next to
+///    `target/debug/one` — so `cd ~/other-app && path/to/one` still loads keys)
+/// 4. `~/.one/agent/.env` then `~/.one/.env` (global; use this for release/`PATH` installs)
+///
+/// Debug builds also default `LANGFUSE_TRACING_ENVIRONMENT=dev` when neither that
+/// nor `ONE_ENV` is set, so local traces show under the Langfuse **dev** environment.
+fn load_env_files() {
+    // Project you are editing (cwd and parents — first file wins via dotenvy).
+    let _ = dotenvy::dotenv();
+
+    // Dev: binary-adjacent workspace `.env` (fills only still-unset keys).
+    #[cfg(debug_assertions)]
+    load_env_from_exe_ancestors();
+
+    // Global One config fallbacks for still-unset keys only.
+    let agent = one_session::agent_dir();
+    let _ = dotenvy::from_path(agent.join(".env"));
+    if let Some(one_home) = agent.parent() {
+        let _ = dotenvy::from_path(one_home.join(".env"));
+    }
+
+    #[cfg(debug_assertions)]
+    {
+        if std::env::var_os("LANGFUSE_TRACING_ENVIRONMENT").is_none()
+            && std::env::var_os("ONE_ENV").is_none()
+        {
+            // Local debug → Langfuse environment filter "dev".
+            // Override in `.env` with LANGFUSE_TRACING_ENVIRONMENT=… if needed.
+            std::env::set_var("LANGFUSE_TRACING_ENVIRONMENT", "dev");
+        }
+    }
+}
+
+/// Walk parents of `current_exe()` and load any `.env` found (no override).
+///
+/// Typical path: `…/one/target/debug/one` → finds `…/one/.env`.
+#[cfg(debug_assertions)]
+fn load_env_from_exe_ancestors() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    let Some(mut dir) = exe.parent().map(|p| p.to_path_buf()) else {
+        return;
+    };
+    for _ in 0..16 {
+        let candidate = dir.join(".env");
+        if candidate.is_file() {
+            let _ = dotenvy::from_path(&candidate);
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
+    load_env_files();
     let mut cli = Cli::parse();
 
     // Interactive TUI owns the terminal — never print tracing to stderr

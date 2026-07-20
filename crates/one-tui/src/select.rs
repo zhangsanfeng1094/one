@@ -117,38 +117,121 @@ impl SelectPrompt {
     }
 
     /// Permission dialog matching Codex-style list (4 options).
+    ///
+    /// When `reason` starts with `sandbox escalation:` (from PermissionGate),
+    /// labels switch to Codex-style outside-sandbox approval copy, the body is
+    /// restructured (why first, short command), and focus defaults to **once**
+    /// instead of always-approve.
     pub fn permission(tool: &str, summary: &str, reason: &str) -> Self {
-        let body = if reason.is_empty() {
+        let escalate = reason.starts_with("sandbox escalation:");
+        let body = if escalate {
+            format_escalate_body(tool, summary, reason)
+        } else if reason.is_empty() {
             format!("{tool}\n{summary}")
         } else {
             format!("{tool}\n{summary}\n{reason}")
         };
-        let options = vec![
-            SelectOption::new(
-                "always",
-                "Yes, and don't ask again for anything (always-approve mode)",
-                "Auto-approve all tool asks for the rest of this process",
-            ),
-            SelectOption::new("once", "Yes, proceed", "Allow this single tool call"),
-            SelectOption::new(
-                "session",
-                "Yes, and don't ask again for this",
-                "Allow matching calls for the rest of this process",
-            ),
-            SelectOption::new(
-                "deny",
-                "No, reject (type to add feedback)",
-                "Block this call; optional message is sent to the model",
-            ),
-        ];
-        let mut p = Self::single("Permission required", body, options);
+        let options = if escalate {
+            // Safer default first (Codex "Yes, proceed" is the primary action).
+            // always-approve is available but not pre-focused.
+            vec![
+                SelectOption::new(
+                    "once",
+                    "Yes, run outside sandbox (this command only)",
+                    "Disable bubblewrap for this single command",
+                ),
+                SelectOption::new(
+                    "session",
+                    "Yes, and don't ask again for this command",
+                    "Remember escalate for this command until one exits",
+                ),
+                SelectOption::new(
+                    "always",
+                    "Yes, and don't ask again for anything",
+                    "Auto-approve all tool asks (including escalations) for the rest of this process",
+                ),
+                SelectOption::new(
+                    "deny",
+                    "No, keep sandboxed",
+                    "Do not escalate; optional message is sent to the model",
+                ),
+            ]
+        } else {
+            vec![
+                SelectOption::new(
+                    "always",
+                    "Yes, and don't ask again for anything (always-approve mode)",
+                    "Auto-approve all tool asks for the rest of this process",
+                ),
+                SelectOption::new("once", "Yes, proceed", "Allow this single tool call"),
+                SelectOption::new(
+                    "session",
+                    "Yes, and don't ask again for this",
+                    "Allow matching calls for the rest of this process",
+                ),
+                SelectOption::new(
+                    "deny",
+                    "No, reject (type to add feedback)",
+                    "Block this call; optional message is sent to the model",
+                ),
+            ]
+        };
+        let title = if escalate {
+            "Run outside sandbox?"
+        } else {
+            "Permission required"
+        };
+        let mut p = Self::single(title, body, options);
+        // Escalate: focus "once" (index 0 after reorder). High-risk: keep always at 0.
+        p.selected = 0;
         p.type_on_ids.insert("deny".into());
         p.ctrl_o_id = Some("always".into());
-        p.footer_hint = "↑↓/1-4:select  Enter:confirm  Ctrl+o:always-approve  Esc:cancel".into();
+        p.footer_hint = if escalate {
+            "↑↓/1-4:select  Enter:confirm  Ctrl+o:always-approve  Esc:deny".into()
+        } else {
+            "↑↓/1-4:select  Enter:confirm  Ctrl+o:always-approve  Esc:cancel".into()
+        };
         p.other_label = "Feedback for the model (Enter empty to skip)".into();
         p
     }
+}
 
+/// Build a compact escalate body: why first, then a short command preview.
+fn format_escalate_body(tool: &str, summary: &str, reason: &str) -> String {
+    let why = reason
+        .strip_prefix("sandbox escalation:")
+        .unwrap_or(reason)
+        .trim();
+    // summary is often `[outside sandbox] <cmd>` or a description — peel prefix.
+    let cmd = summary
+        .strip_prefix("[outside sandbox]")
+        .unwrap_or(summary)
+        .trim();
+    let cmd_preview = truncate_cmd_preview(cmd, 100);
+    format!(
+        "{tool} · leave bubblewrap for this command\n\
+         Why: {why}\n\
+         $ {cmd_preview}"
+    )
+}
+
+fn truncate_cmd_preview(cmd: &str, max: usize) -> String {
+    let one_line: String = cmd
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if one_line.chars().count() <= max {
+        return one_line;
+    }
+    let mut out: String = one_line.chars().take(max.saturating_sub(1)).collect();
+    out.push('…');
+    out
+}
+
+impl SelectPrompt {
     pub fn option_count(&self) -> usize {
         let extra = if self.allow_other { 1 } else { 0 };
         self.options.len() + extra
@@ -570,7 +653,7 @@ mod tests {
 
     #[test]
     fn permission_always_via_ctrl_o() {
-        let mut p = SelectPrompt::permission("bash", "sudo id", "high-risk");
+        let mut p = SelectPrompt::permission("bash", "sudo id", "high-risk bash pattern `sudo`");
         let r = p.handle_key(key_ctrl(KeyCode::Char('o')));
         assert_eq!(
             r,
@@ -579,6 +662,39 @@ mod tests {
                 other: None,
             })
         );
+    }
+
+    #[test]
+    fn sandbox_escalation_uses_outside_sandbox_labels() {
+        let p = SelectPrompt::permission(
+            "bash",
+            "[outside sandbox] kill 1 && ps aux | grep auggie | head -20 | something very long",
+            "sandbox escalation: cleanup host process",
+        );
+        assert_eq!(p.title, "Run outside sandbox?");
+        // Safer default: "once" is first and focused.
+        assert_eq!(p.options[0].id, "once");
+        assert_eq!(p.selected, 0);
+        assert_eq!(p.focused_option_id(), Some("once"));
+        assert!(p.body.contains("Why: cleanup host process"), "{}", p.body);
+        assert!(p.body.contains("$ "), "{}", p.body);
+        // Long command is truncated for the dock.
+        assert!(
+            p.body.lines().any(|l| l.starts_with("$ ") && l.contains('…'))
+                || p.body.lines().any(|l| l.starts_with("$ ") && l.len() <= 110),
+            "expected short command preview, body:\n{}",
+            p.body
+        );
+        assert!(p
+            .options
+            .iter()
+            .any(|o| o.label.contains("run outside sandbox")));
+    }
+
+    #[test]
+    fn truncate_cmd_preview_collapses_whitespace() {
+        let s = truncate_cmd_preview("ps  aux\n|  grep x", 80);
+        assert_eq!(s, "ps aux | grep x");
     }
 
     #[test]

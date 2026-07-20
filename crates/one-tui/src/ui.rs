@@ -169,19 +169,21 @@ fn draw_select_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     for (i, line) in prompt.body.lines().enumerate() {
         let text = truncate_mid(line, max_w);
-        if i == 0 {
-            lines.push(Line::from(Span::styled(
-                text,
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            )));
+        let style = if i == 0 {
+            // Tool / headline
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else if line.starts_with("Why:") {
+            // Escalation justification — make it readable, not dark-gray.
+            Style::default().fg(Color::Yellow)
+        } else if line.starts_with("$ ") {
+            // Command preview
+            Style::default().fg(Color::White)
         } else {
-            lines.push(Line::from(Span::styled(
-                text,
-                Style::default().fg(Color::DarkGray),
-            )));
-        }
+            Style::default().fg(Color::DarkGray)
+        };
+        lines.push(Line::from(Span::styled(text, style)));
     }
     if !prompt.body.is_empty() {
         lines.push(Line::from(""));

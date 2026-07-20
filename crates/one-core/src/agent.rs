@@ -559,6 +559,7 @@ impl Agent {
                 thinking_level: self.config.thinking_level,
             };
 
+            // Default: last user turn (short). --trace-full: system + recent messages.
             let input_preview = if self.trace_meta.trace_full {
                 crate::trace::llm_input_preview(
                     &request.system_prompt,
@@ -566,7 +567,7 @@ impl Agent {
                     self.preview_limit(),
                 )
             } else {
-                None
+                crate::trace::last_user_preview(&request.messages, self.preview_limit())
             };
             self.record_trace(TraceEvent::LlmRequest {
                 ts_ms: now_ms(),
@@ -646,11 +647,14 @@ impl Agent {
             let text = extract_text(&response.content);
             let text_len = text.len();
             let thinking_len = extract_thinking_len(&response.content);
-            let output_preview = if self.trace_meta.trace_full {
-                crate::trace::text_preview(&text, self.preview_limit())
-            } else {
-                None
-            };
+            // Always attach generation text (or tool-call summary) so Langfuse
+            // observation.output is readable without --trace-full.
+            // --trace-full only raises the preview budget (16k vs 240 chars).
+            let output_preview = crate::trace::llm_output_preview(
+                &text,
+                &tool_calls,
+                self.preview_limit(),
+            );
 
             self.record_trace(TraceEvent::LlmResponse {
                 ts_ms: now_ms(),
@@ -1316,11 +1320,8 @@ impl Agent {
     ) {
         let output_text = output.as_text();
         let output_bytes = output_text.len();
-        let output_preview = if self.trace_meta.trace_full {
-            crate::trace::text_preview(&output_text, self.preview_limit())
-        } else {
-            None
-        };
+        // Same as generation: short preview by default; --trace-full expands budget.
+        let output_preview = crate::trace::text_preview(&output_text, self.preview_limit());
         self.record_trace(TraceEvent::ToolEnd {
             ts_ms: now_ms(),
             run_id: run_id.to_string(),

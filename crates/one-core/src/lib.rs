@@ -28,7 +28,8 @@ pub use message::{AgentMessage, AssistantMessage, StopReason, ToolResultMessage,
 pub use tool::{Tool, ToolCall, ToolDefinition, ToolOutput};
 pub use tool_gate::{AllowAllGate, ToolGate, ToolGateDecision};
 pub use trace::{
-    args_preview, llm_input_preview, load_trace_file, new_run_id, text_preview, JsonlTraceSink,
-    MemoryTrace, NullTrace, ScoreCheckResult, SharedTrace, TraceEvent, TraceGateDecision,
-    TraceRunStatus, TraceSink, TraceStats, PREVIEW_DEFAULT_CHARS, PREVIEW_FULL_CHARS,
+    args_preview, last_user_preview, llm_input_preview, llm_output_preview, load_trace_file,
+    new_run_id, text_preview, JsonlTraceSink, MemoryTrace, NullTrace, ScoreCheckResult,
+    SharedTrace, TraceEvent, TraceGateDecision, TraceRunStatus, TraceSink, TraceStats,
+    PREVIEW_DEFAULT_CHARS, PREVIEW_FULL_CHARS,
 };

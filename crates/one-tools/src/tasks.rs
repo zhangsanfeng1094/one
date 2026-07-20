@@ -154,12 +154,24 @@ impl BackgroundTaskRegistry {
         cwd: PathBuf,
         timeout_secs: Option<u64>,
     ) -> Result<String, String> {
+        let sandbox = self.os_sandbox.lock().expect("os_sandbox lock").clone();
+        self.spawn_with_sandbox(command, cwd, timeout_secs, sandbox)
+            .await
+    }
+
+    /// Spawn with an explicit OS sandbox (e.g. escalated / disabled bwrap).
+    pub async fn spawn_with_sandbox(
+        self: &Arc<Self>,
+        command: String,
+        cwd: PathBuf,
+        timeout_secs: Option<u64>,
+        sandbox: OsSandbox,
+    ) -> Result<String, String> {
         let id = Self::next_id();
         let done = Arc::new(Notify::new());
         let stdout_buf = Arc::new(Mutex::new(String::new()));
         let stderr_buf = Arc::new(Mutex::new(String::new()));
 
-        let sandbox = self.os_sandbox.lock().expect("os_sandbox lock").clone();
         let (prog, args) = sandbox.command_line(&command);
         let mut cmd = Command::new(&prog);
         cmd.args(&args)

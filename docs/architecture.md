@@ -83,6 +83,7 @@ flowchart TB
 | OAuth / 订阅登录 | ✅ | `one-ai/auth` + `one-cli/auth_cmd` | Codex · xAI · OpenCode Zen/Go；Claude/Copilot 待 |
 | 工作区 PathPolicy | ✅ | `one-tools/path_policy` | 默认 workspace-write |
 | OS sandbox (bwrap) | ✅ | `one-tools/os_sandbox` | bash 可选 |
+| 沙箱提权（Codex 对齐） | ✅ | `sandbox_permissions` + `PermissionGate` | `require_escalated` / escalate_on_failure |
 | 权限门控 allow/deny/ask | ✅ | `one-cli/approval` + `ToolGate` | 规则 + 交互 |
 | Session JSONL 树 | ✅ | `one-session` | v3 子集 + 迁移 |
 | Session UX（continue/resume/new/tree） | ✅ | runtime + TUI | export/share 有 |

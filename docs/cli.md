@@ -190,6 +190,35 @@ one --full-access
 - 网络：保留（cargo/npm/curl）
 - `--full-access` 或 `bash_sandbox: false` / `ONE_BASH_SANDBOX=0`：关闭
 
+### 沙箱提权（Codex 对齐）
+
+模型可在 `bash` 调用里按命令申请逃逸 OS 沙箱（**不等于**关掉 PathPolicy）：
+
+| 字段 | 值 | 含义 |
+|------|-----|------|
+| `sandbox_permissions` | `use_default`（默认） | 沿用会话 bwrap |
+| `sandbox_permissions` | `require_escalated` | 请求**本次**在沙箱外执行 |
+| `justification` | 字符串 | 展示在审批 UI 里的原因（`require_escalated` 时建议填写） |
+
+交互会话下会弹出 **Run outside sandbox?**（默认焦点在「仅本次」）：
+
+1. **Yes, run outside sandbox (this command only)** ← 默认选中  
+2. Yes, and don't ask again for this command  
+3. Yes, and don't ask again for anything  
+4. No, keep sandboxed  
+
+正文优先展示 **Why:**（justification）+ 截断后的 `$ command`，不再把整行超长命令塞进对话框。
+
+另外：沙箱内命令若以 **signal 退出** 或输出含 `Permission denied` / `Operation not permitted` 等，one 会尝试 **escalate_on_failure**——再弹一次提权审批，通过后用同一命令在沙箱外重跑。
+
+| 模式 | `require_escalated` / 失败提权 |
+|------|--------------------------------|
+| Interactive | 弹窗询问 |
+| `-y` / always-approve | 直接允许（危险，等同 yolo） |
+| print / RPC（非 interactive） | **拒绝**（fail-closed），除非 `-y` |
+
+整会话关闭沙箱仍用：`one --full-access` 或 `/settings sandbox full-access`。
+
 
 ## Provider 与模型配置
 

@@ -93,11 +93,13 @@ docs/            架构活文档与专题设计
 观测后端为 **Langfuse（OpenTelemetry OTLP）**（需项目 API keys）：
 
 ```bash
+# 推荐：cp .env.example .env 填 keys（可选 ONE_TRACE=1）；CLI 启动自动加载
+# 或 export：
 export LANGFUSE_PUBLIC_KEY=pk-lf-...
 export LANGFUSE_SECRET_KEY=sk-lf-...
 export LANGFUSE_BASE_URL=https://us.cloud.langfuse.com   # 按区域
 
-# 记录 agent 链路 → OTLP → Langfuse UI
+# 记录 agent 链路 → OTLP → Langfuse UI（.env 里 ONE_TRACE=1 时可省略 --trace）
 one --trace -p "list files" --provider mock -y
 # 含更大 LLM/tool I/O 预览
 one --trace --trace-full -p "list files" --provider mock -y

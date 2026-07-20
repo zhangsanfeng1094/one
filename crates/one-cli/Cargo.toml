@@ -30,6 +30,7 @@ async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
+dotenvy = "0.15"
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", default-features = false, features = [
     "trace",

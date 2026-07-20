@@ -186,6 +186,10 @@ fn wildcard_match_inner(pat: &[u8], text: &[u8]) -> bool {
 }
 
 /// Fingerprint for session-level "always allow".
+///
+/// Escalated bash calls use a separate key (`bash::escalate::{cmd}`) so that
+/// approving a high-risk command under the sandbox does not auto-approve
+/// unsandboxed re-runs (Codex session escalate is scoped to the escalate path).
 pub fn call_fingerprint(call: &ToolCall) -> String {
     let subject = match call.name.as_str() {
         "bash" | "shell" => call
@@ -202,19 +206,46 @@ pub fn call_fingerprint(call: &ToolCall) -> String {
             .to_string(),
         _ => call.arguments.to_string(),
     };
-    // For bash, allow by command *prefix* for "always" is too broad; use exact command.
-    format!("{}::{}", call.name.to_ascii_lowercase(), subject)
+    let name = call.name.to_ascii_lowercase();
+    if matches!(name.as_str(), "bash" | "shell")
+        && crate::sandbox_permissions::requires_escalation(call)
+    {
+        format!("{name}::escalate::{subject}")
+    } else {
+        // For bash, allow by command *prefix* for "always" is too broad; use exact command.
+        format!("{name}::{subject}")
+    }
 }
 
 /// Human-readable summary for approval UI.
+///
+/// Prefer a short `description` when the model provided one; otherwise the
+/// command (callers / TUI may further truncate for display).
 pub fn call_summary(call: &ToolCall) -> String {
     match call.name.as_str() {
-        "bash" | "shell" => call
-            .arguments
-            .get("command")
-            .and_then(|v| v.as_str())
-            .unwrap_or("(empty command)")
-            .to_string(),
+        "bash" | "shell" => {
+            let desc = call
+                .arguments
+                .get("description")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            let cmd = call
+                .arguments
+                .get("command")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(empty command)");
+            // Prefer human description for the dock; keep command for escalate
+            // body via the same field (format_escalate_body peels prefixes).
+            let core = desc.unwrap_or(cmd);
+            if crate::sandbox_permissions::requires_escalation(call) {
+                // Prefer command for escalate preview (user should see what runs).
+                // Still prefix so the UI can detect escalate-shaped summaries.
+                format!("[outside sandbox] {cmd}")
+            } else {
+                core.to_string()
+            }
+        }
         "write" | "edit" | "read" | "ls" | "grep" | "find" => {
             let path = call
                 .arguments
@@ -296,6 +327,20 @@ fn default_verdict(call: &ToolCall, auto_approve: bool) -> PermissionVerdict {
                     reason: format!("blocked command pattern: {pat}"),
                 };
             }
+
+            // Codex-aligned: model-requested sandbox escape always needs Ask
+            // (unless auto_approve / --yes). Distinct reason prefix drives TUI copy.
+            if crate::sandbox_permissions::requires_escalation(call) {
+                if auto_approve {
+                    return PermissionVerdict::Allow;
+                }
+                let just = crate::sandbox_permissions::justification_of(call)
+                    .unwrap_or_else(|| "model requested unsandboxed execution".into());
+                return PermissionVerdict::Ask {
+                    reason: format!("sandbox escalation: {just}"),
+                };
+            }
+
             if !auto_approve {
                 if let Some(pat) = crate::sandbox::requires_confirmation(command) {
                     return PermissionVerdict::Ask {
@@ -374,5 +419,43 @@ mod tests {
         let rules = vec![PermissionRule::parse(RuleAction::Ask, "Write(**/.env*)").unwrap()];
         let v = evaluate(&write("app/.env"), &rules, false);
         assert!(matches!(v, PermissionVerdict::Ask { .. }), "{v:?}");
+    }
+
+    #[test]
+    fn require_escalated_asks_even_for_safe_commands() {
+        let call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: json!({
+                "command": "echo hi",
+                "sandbox_permissions": "require_escalated",
+                "justification": "need host access"
+            }),
+        };
+        let v = evaluate(&call, &[], false);
+        match v {
+            PermissionVerdict::Ask { reason } => {
+                assert!(reason.starts_with("sandbox escalation:"), "{reason}");
+                assert!(reason.contains("need host access"), "{reason}");
+            }
+            other => panic!("expected Ask, got {other:?}"),
+        }
+        // auto_approve skips the prompt (like -y / always-approve).
+        assert_eq!(evaluate(&call, &[], true), PermissionVerdict::Allow);
+    }
+
+    #[test]
+    fn escalate_fingerprint_differs() {
+        let normal = bash("kill 1");
+        let escalated = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: json!({
+                "command": "kill 1",
+                "sandbox_permissions": "require_escalated"
+            }),
+        };
+        assert_ne!(call_fingerprint(&normal), call_fingerprint(&escalated));
+        assert!(call_fingerprint(&escalated).contains("escalate"));
     }
 }

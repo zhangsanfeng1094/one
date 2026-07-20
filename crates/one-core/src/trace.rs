@@ -323,6 +323,46 @@ pub fn text_preview(s: &str, max_chars: usize) -> Option<String> {
     }
 }
 
+/// Generation observation output for Langfuse: assistant text, or a tool-call summary.
+pub fn llm_output_preview(
+    text: &str,
+    tool_calls: &[crate::tool::ToolCall],
+    max_chars: usize,
+) -> Option<String> {
+    if !text.is_empty() {
+        return text_preview(text, max_chars);
+    }
+    if tool_calls.is_empty() {
+        return None;
+    }
+    let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
+    text_preview(&format!("tool_calls: [{}]", names.join(", ")), max_chars)
+}
+
+/// Short default generation input: last user message text only.
+pub fn last_user_preview(messages: &[AgentMessage], max_chars: usize) -> Option<String> {
+    if max_chars == 0 {
+        return None;
+    }
+    for m in messages.iter().rev() {
+        if let AgentMessage::User(u) = m {
+            let text = match &u.content {
+                UserContent::Text(text) => text.clone(),
+                UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .filter_map(|b| match b {
+                        crate::message::TextOrImage::Text { text } => Some(text.as_str()),
+                        crate::message::TextOrImage::Image { .. } => Some("[image]"),
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            };
+            return text_preview(&text, max_chars);
+        }
+    }
+    None
+}
+
 /// Compact LLM input snapshot for `--trace-full` (system + recent messages).
 pub fn llm_input_preview(
     system_prompt: &str,
@@ -740,5 +780,38 @@ mod tests {
         let (n, p) = args_preview(&json!({"x": "hello world"}), 8);
         assert!(n > 8);
         assert!(p.unwrap().ends_with('…'));
+    }
+
+    #[test]
+    fn llm_output_preview_prefers_text() {
+        let p = llm_output_preview("你好！有什么我可以帮你的吗？", &[], 240).unwrap();
+        assert!(p.contains("你好"));
+    }
+
+    #[test]
+    fn llm_output_preview_tool_calls_when_no_text() {
+        let calls = vec![crate::tool::ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: json!({}),
+        }];
+        let p = llm_output_preview("", &calls, 240).unwrap();
+        assert_eq!(p, "tool_calls: [bash]");
+    }
+
+    #[test]
+    fn last_user_preview_takes_latest() {
+        use crate::message::{AgentMessage, UserMessage, UserContent};
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text("first".into()),
+                timestamp: 0,
+            }),
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text("second".into()),
+                timestamp: 1,
+            }),
+        ];
+        assert_eq!(last_user_preview(&messages, 240).as_deref(), Some("second"));
     }
 }

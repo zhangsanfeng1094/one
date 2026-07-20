@@ -158,6 +158,8 @@ impl AppRuntime {
                 auto_approve,
                 registry: bg_registry.clone(),
                 ask_user: Some(ask_user_handler.clone()),
+                // Same gate the agent uses pre-tool — enables escalate_on_failure.
+                tool_gate: Some(permission_gate.clone()),
             })
         };
         // Register `task` + job poll/kill when feature + spawn policy allow.
