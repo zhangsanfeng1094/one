@@ -76,6 +76,8 @@ pub enum FloatKind {
     SettingsModelAdd,
     /// Skills manager — list + enable/disable (Codex-style).
     Skills,
+    /// Runtime feature flags (subagent, …).
+    Features,
     /// MCP servers — status + enable/disable.
     Mcp,
     /// Import MCP servers from Claude / Codex / Cursor.
@@ -423,6 +425,12 @@ impl FloatMenu {
                             "/skills",
                         ),
                         item(
+                            "features",
+                            "Features",
+                            "subagent (task) · context packages",
+                            "toggle",
+                        ),
+                        item(
                             "mcp",
                             "MCP",
                             mcp_summary,
@@ -622,6 +630,65 @@ impl FloatMenu {
         Self {
             kind: FloatKind::Skills,
             title: "Skills".into(),
+            search: String::new(),
+            sections,
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Features manager: rows are `(id, label, detail, enabled, affects_context)`.
+    pub fn features_manager(rows: &[(String, String, String, bool, bool)]) -> Self {
+        let mut on_items = Vec::new();
+        let mut off_items = Vec::new();
+        for (id, label, detail, on, affects) in rows {
+            let hint = if *affects { "ctx · /new" } else { "live" };
+            let item = FloatItem {
+                id: id.clone(),
+                label: label.clone(),
+                detail: detail.clone(),
+                hint: if *on {
+                    format!("on · {hint}")
+                } else {
+                    format!("off · {hint}")
+                },
+                style: FloatItemStyle::Normal,
+            };
+            if *on {
+                on_items.push(item);
+            } else {
+                off_items.push(item);
+            }
+        }
+        let mut sections = Vec::new();
+        if !on_items.is_empty() {
+            sections.push(FloatSection {
+                title: format!("Enabled ({})", on_items.len()),
+                items: on_items,
+            });
+        }
+        if !off_items.is_empty() {
+            sections.push(FloatSection {
+                title: format!("Disabled ({})", off_items.len()),
+                items: off_items,
+            });
+        }
+        if sections.is_empty() {
+            sections.push(FloatSection {
+                title: "Features".into(),
+                items: vec![item(
+                    "_empty",
+                    "(no features)",
+                    "registry empty",
+                    "",
+                )],
+            });
+        }
+        Self {
+            kind: FloatKind::Features,
+            title: "Features".into(),
             search: String::new(),
             sections,
             selected: 0,

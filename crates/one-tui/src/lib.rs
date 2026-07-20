@@ -9,7 +9,7 @@
 //! - **Structured** [`Message`] roles with soft, role-specific paint (not label soup)
 //! - **Streaming** via [`TerminalSession::run_busy`] (token paint + blink caret)
 //! - **Scroll + copy**: mouse wheel scrolls chat (capture on). Drag selects
-//!   lines in-app and copies via **OSC 52** (lazygit/Claude Code pattern).
+//!   text (character-level) in-app and copies via **OSC 52** (lazygit/Claude Code pattern).
 //!   `Ctrl+Shift+C` / `y` also copy; `Ctrl+Shift+M` toggles mouse;
 //!   `ONE_MOUSE=0` starts with mouse off.
 //! - **Tools**: collapsed multi-tool groups, edit/write diffs, click or Ctrl+O to expand
@@ -31,7 +31,7 @@ pub mod ui;
 
 pub use app::{
     expand_at_files, App, ApprovalAnswer, ApprovalPrompt, ConfigOp, InteractiveApp, PendingImage,
-    PendingText, RunOutcome, SelectKind, Toast,
+    PendingText, RunOutcome, SelectKind, SelectPos, Toast,
 };
 pub use error::Result;
 pub use float::{FloatItem, FloatKind, FloatMenu, FloatSection};

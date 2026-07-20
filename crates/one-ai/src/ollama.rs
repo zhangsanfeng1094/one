@@ -58,13 +58,11 @@ impl LlmProvider for OllamaProvider {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let body = build_body(&request, &self.model, true);
 
-        let response = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| OneError::Provider(e.to_string()))?;
+        let response = crate::sse::send_with_abort(
+            self.client.post(&url).json(&body),
+            abort,
+        )
+        .await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -78,11 +76,22 @@ impl LlmProvider for OllamaProvider {
         let mut usage = TokenUsage::default();
         let mut aborted = false;
 
-        while let Some(chunk) = stream.next().await {
+        loop {
             if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
                 aborted = true;
                 break;
             }
+            let next = tokio::select! {
+                biased;
+                chunk = stream.next() => chunk,
+                _ = one_core::streaming::wait_until_aborted(abort) => {
+                    aborted = true;
+                    break;
+                }
+            };
+            let Some(chunk) = next else {
+                break;
+            };
             let chunk = chunk.map_err(|e| OneError::Provider(e.to_string()))?;
             for line in chunk.split(|b| *b == b'\n') {
                 if line.is_empty() {

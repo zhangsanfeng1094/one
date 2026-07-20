@@ -4,6 +4,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use unicode_width::UnicodeWidthChar;
 
 use crate::float::{FloatKind, FloatMenu};
 use crate::message::{
@@ -13,12 +14,48 @@ use crate::message::{
 use crate::slash::{self, ModelChoice, PopupKind, PopupRow};
 use crate::tool_view;
 
+/// Map a display column (terminal cells from content left edge) to a caret
+/// index into `s` (0..=char_count). Half-open selection uses this caret.
+fn display_col_to_caret(s: &str, display_col: usize) -> usize {
+    let mut w = 0usize;
+    for (i, ch) in s.chars().enumerate() {
+        if w >= display_col {
+            return i;
+        }
+        w = w.saturating_add(ch.width().unwrap_or(0).max(1));
+    }
+    s.chars().count()
+}
+
 /// Empty-session sample prompts — keys `1`–`3` run these when input is empty.
 pub const WELCOME_TRY_PROMPTS: &[&str] = &[
     "list files in this directory",
     "explain how the agent loop works",
     "fix the failing tests",
 ];
+
+/// One caret in the chat transcript (character-level selection).
+///
+/// `col` is a **caret** into `chat_line_text[line]` (0..=char_len): selection is
+/// the half-open range between ordered anchor and end.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectPos {
+    pub line: usize,
+    pub col: usize,
+}
+
+impl SelectPos {
+    pub fn new(line: usize, col: usize) -> Self {
+        Self { line, col }
+    }
+
+    /// Document order: earlier line, then earlier caret.
+    fn cmp_doc(self, other: Self) -> std::cmp::Ordering {
+        self.line
+            .cmp(&other.line)
+            .then_with(|| self.col.cmp(&other.col))
+    }
+}
 
 /// Image attachment bound to a prompt placeholder token (`[图片.img]` / `[图片.N.img]`).
 ///
@@ -157,6 +194,10 @@ pub enum ConfigOp {
         names: Vec<String>,
         /// Replace existing One entries with the same name.
         force: bool,
+    },
+    /// Toggle a settings feature flag (e.g. `subagent`).
+    FeatureToggle {
+        id: String,
     },
 }
 
@@ -351,10 +392,12 @@ pub struct App {
     pub chat_top_pad: usize,
     /// Terminal mouse capture is armed (wheel → chat).
     pub mouse_capture: bool,
-    /// In-app transcript selection (absolute display-line indices, inclusive).
+    /// Left column of chat text content (terminal x). Mouse col − this → display col.
+    pub chat_content_x: u16,
+    /// In-app transcript selection (character carets on absolute display lines).
     /// App-owned select + OSC 52 copy — does not need native terminal drag-select.
-    pub select_anchor: Option<usize>,
-    pub select_end: Option<usize>,
+    pub select_anchor: Option<SelectPos>,
+    pub select_end: Option<SelectPos>,
     /// True after mouse moved while button down (distinguishes click vs drag).
     pub select_dragging: bool,
     /// Plain text for each display line (parallel to `chat_line_owners`), for copy.
@@ -380,6 +423,8 @@ pub struct App {
     pub settings_model_rows: Vec<(String, String)>,
     /// Skills manager rows: `(path, label, detail, enabled)`.
     pub skills_rows: Vec<(String, String, String, bool)>,
+    /// Features manager rows: `(id, label, detail, enabled, affects_context)`.
+    pub features_rows: Vec<(String, String, String, bool, bool)>,
     /// MCP manager rows: `(name, label, detail, enabled)`.
     pub mcp_rows: Vec<(String, String, String, bool)>,
     /// MCP import candidates: `(name, label, detail, already_owned)`.
@@ -508,6 +553,7 @@ impl App {
             chat_view_start: 0,
             chat_top_pad: 0,
             mouse_capture: true,
+            chat_content_x: 0,
             select_anchor: None,
             select_end: None,
             select_dragging: false,
@@ -523,6 +569,7 @@ impl App {
             settings_provider_field_rows: Vec::new(),
             settings_model_rows: Vec::new(),
             skills_rows: Vec::new(),
+            features_rows: Vec::new(),
             mcp_rows: Vec::new(),
             mcp_import_rows: Vec::new(),
             mcp_summary: "none".into(),
@@ -787,6 +834,11 @@ impl App {
         self.skills_rows = rows;
     }
 
+    /// Populate features manager rows (id, label, detail, enabled, affects_context).
+    pub fn set_features_rows(&mut self, rows: Vec<(String, String, String, bool, bool)>) {
+        self.features_rows = rows;
+    }
+
     /// Populate MCP manager rows + settings summary.
     pub fn set_mcp_rows(
         &mut self,
@@ -824,6 +876,25 @@ impl App {
     pub fn reopen_skills_float(&mut self) {
         let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
         self.float = Some(FloatMenu::skills_manager(&self.skills_rows));
+        if let Some(f) = self.float.as_mut() {
+            let max = f.filtered_entries().len().saturating_sub(1);
+            f.selected = prev_selected.min(max);
+        }
+        self.clear_notice();
+    }
+
+    /// Open features enable/disable panel (Settings → Features).
+    pub fn open_features_float(&mut self) {
+        self.close_float();
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::features_manager(&self.features_rows));
+        self.clear_notice();
+    }
+
+    /// Re-open features panel after a toggle.
+    pub fn reopen_features_float(&mut self) {
+        let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
+        self.float = Some(FloatMenu::features_manager(&self.features_rows));
         if let Some(f) = self.float.as_mut() {
             let max = f.filtered_entries().len().saturating_sub(1);
             f.selected = prev_selected.min(max);
@@ -1062,6 +1133,10 @@ impl App {
             }
             FloatKind::Skills => {
                 // Same as Thinking: Esc returns to Settings root.
+                self.open_settings_float();
+                true
+            }
+            FloatKind::Features => {
                 self.open_settings_float();
                 true
             }
@@ -2213,6 +2288,25 @@ impl App {
         }
     }
 
+    /// Map a terminal mouse column to a caret on the given display line.
+    ///
+    /// `terminal_col` is the absolute screen column from the mouse event.
+    pub fn view_col_to_caret(&self, line: usize, terminal_col: u16) -> usize {
+        let display_col = terminal_col.saturating_sub(self.chat_content_x) as usize;
+        let text = self
+            .chat_line_text
+            .get(line)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+        display_col_to_caret(text, display_col)
+    }
+
+    fn pos_at(&self, row_in_view: usize, terminal_col: u16) -> Option<SelectPos> {
+        let line = self.view_row_to_line(row_in_view)?;
+        let col = self.view_col_to_caret(line, terminal_col);
+        Some(SelectPos::new(line, col))
+    }
+
     /// Click at row offset within the chat viewport (0 = top visible line).
     pub fn click_chat_row(&mut self, row_in_view: usize) {
         let Some(line) = self.view_row_to_line(row_in_view) else {
@@ -2230,29 +2324,29 @@ impl App {
         }
     }
 
-    /// Begin in-app selection at a viewport row (mouse down).
-    pub fn select_begin(&mut self, row_in_view: usize) {
-        let Some(line) = self.view_row_to_line(row_in_view) else {
+    /// Begin in-app selection at a viewport cell (mouse down).
+    pub fn select_begin(&mut self, row_in_view: usize, terminal_col: u16) {
+        let Some(pos) = self.pos_at(row_in_view, terminal_col) else {
             self.clear_selection();
             return;
         };
-        self.select_anchor = Some(line);
-        self.select_end = Some(line);
+        self.select_anchor = Some(pos);
+        self.select_end = Some(pos);
         self.select_dragging = false;
     }
 
     /// Extend selection.
     ///
     /// `from_drag`: true for Drag/Moved while held (always a select gesture).
-    /// false for mouse-up release row (only multi-line counts as select).
-    pub fn select_update(&mut self, row_in_view: usize, from_drag: bool) {
-        let Some(line) = self.view_row_to_line(row_in_view) else {
+    /// false for mouse-up release (only a real range counts as select).
+    pub fn select_update(&mut self, row_in_view: usize, terminal_col: u16, from_drag: bool) {
+        let Some(pos) = self.pos_at(row_in_view, terminal_col) else {
             return;
         };
         if self.select_anchor.is_none() {
-            self.select_anchor = Some(line);
+            self.select_anchor = Some(pos);
         }
-        self.select_end = Some(line);
+        self.select_end = Some(pos);
         if from_drag {
             // Any pointer motion while held → select → auto-copy on release.
             self.select_dragging = true;
@@ -2267,17 +2361,48 @@ impl App {
         }
     }
 
-    /// Inclusive absolute line range of the current selection, if any.
-    pub fn selection_range(&self) -> Option<(usize, usize)> {
+    /// Ordered half-open selection endpoints, if any.
+    ///
+    /// Returns `None` when there is no anchor, or when anchor == end (empty).
+    pub fn selection_span(&self) -> Option<(SelectPos, SelectPos)> {
         let a = self.select_anchor?;
         let b = self.select_end.unwrap_or(a);
-        if self.chat_total_lines == 0 {
-            return Some((a.min(b), a.max(b)));
+        if a == b {
+            return None;
         }
-        let max = self.chat_total_lines.saturating_sub(1);
-        let lo = a.min(b).min(max);
-        let hi = a.max(b).min(max);
+        let (mut lo, mut hi) = if a.cmp_doc(b) == std::cmp::Ordering::Less {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        // Clamp lines into the known transcript when metrics are available.
+        if self.chat_total_lines > 0 {
+            let max_line = self.chat_total_lines.saturating_sub(1);
+            lo.line = lo.line.min(max_line);
+            hi.line = hi.line.min(max_line);
+        }
+        if !self.chat_line_text.is_empty() {
+            let clamp_col = |p: SelectPos| {
+                let len = self
+                    .chat_line_text
+                    .get(p.line)
+                    .map(|s| s.chars().count())
+                    .unwrap_or(0);
+                SelectPos::new(p.line, p.col.min(len))
+            };
+            lo = clamp_col(lo);
+            hi = clamp_col(hi);
+        }
+        if lo == hi {
+            return None;
+        }
         Some((lo, hi))
+    }
+
+    /// Inclusive absolute line range covering the selection (for coarse checks).
+    pub fn selection_range(&self) -> Option<(usize, usize)> {
+        let (lo, hi) = self.selection_span()?;
+        Some((lo.line, hi.line))
     }
 
     pub fn clear_selection(&mut self) {
@@ -2288,23 +2413,51 @@ impl App {
 
     /// True when selection spans more than one display line.
     pub fn selection_is_multi_line(&self) -> bool {
-        self.selection_range().is_some_and(|(lo, hi)| hi > lo)
+        self.selection_span()
+            .is_some_and(|(lo, hi)| hi.line > lo.line)
     }
 
-    /// Plain text for the selected lines (joined with `\n`).
+    /// True when there is a non-empty character selection.
+    pub fn has_selection(&self) -> bool {
+        self.selection_span().is_some()
+    }
+
+    /// Plain text for the selected region (joined with `\n` across lines).
     pub fn selection_text(&self) -> Option<String> {
-        let (lo, hi) = self.selection_range()?;
+        let (lo, hi) = self.selection_span()?;
         if self.chat_line_text.is_empty() {
             return None;
         }
-        let hi = hi.min(self.chat_line_text.len().saturating_sub(1));
-        let lo = lo.min(hi);
-        let mut parts = Vec::new();
-        for line in &self.chat_line_text[lo..=hi] {
-            parts.push(line.as_str());
-        }
-        let text = parts.join("\n");
-        if text.trim().is_empty() {
+        let last = self.chat_line_text.len().saturating_sub(1);
+        let lo_line = lo.line.min(last);
+        let hi_line = hi.line.min(last);
+
+        let slice_chars = |s: &str, start: usize, end: usize| -> String {
+            let n = s.chars().count();
+            let start = start.min(n);
+            let end = end.min(n).max(start);
+            s.chars().skip(start).take(end - start).collect()
+        };
+
+        let text = if lo_line == hi_line {
+            let s = self.chat_line_text[lo_line].as_str();
+            slice_chars(s, lo.col, hi.col)
+        } else {
+            let mut parts = Vec::new();
+            // First line: from lo.col to end.
+            let first = self.chat_line_text[lo_line].as_str();
+            parts.push(slice_chars(first, lo.col, first.chars().count()));
+            // Middle lines: full.
+            for line in &self.chat_line_text[lo_line + 1..hi_line] {
+                parts.push(line.clone());
+            }
+            // Last line: from start to hi.col.
+            let last_s = self.chat_line_text[hi_line].as_str();
+            parts.push(slice_chars(last_s, 0, hi.col));
+            parts.join("\n")
+        };
+
+        if text.is_empty() {
             None
         } else {
             Some(text)
@@ -2342,18 +2495,19 @@ impl App {
         false
     }
 
-    /// Finish pointer gesture: drag or multi-line → **auto-copy**;
-    /// plain click (no movement) → tool expand.
-    pub fn select_finish(&mut self, row_in_view: usize) {
-        // Apply release row without forcing drag (click stays click).
-        self.select_update(row_in_view, false);
-        // Selecting text always copies on release.
-        if self.select_dragging || self.selection_is_multi_line() {
+    /// Finish pointer gesture: drag with a real range → **auto-copy**;
+    /// plain click (no movement / empty range) → tool expand.
+    pub fn select_finish(&mut self, row_in_view: usize, terminal_col: u16) {
+        // Apply release cell without forcing drag (click stays click).
+        self.select_update(row_in_view, terminal_col, false);
+        // Selecting text always copies on release when there is a non-empty range
+        // (or any drag gesture that produced a range).
+        if self.select_dragging && self.has_selection() {
             let _ = self.request_copy_selection();
             self.select_dragging = false;
             return;
         }
-        // Pure click: clear + expand tools.
+        // Pure click or empty drag: clear + expand tools.
         self.clear_selection();
         self.click_chat_row(row_in_view);
     }
@@ -3480,6 +3634,7 @@ impl App {
             FloatKind::SettingsModelDetail => self.confirm_settings_model_detail(&entry.item.id),
             FloatKind::SettingsModelAdd => self.confirm_settings_model_add(&entry.item.id),
             FloatKind::Skills => self.confirm_skills_toggle(&entry.item.id),
+            FloatKind::Features => self.confirm_features_toggle(&entry.item.id),
             FloatKind::Mcp => self.confirm_mcp_action(&entry.item.id),
             FloatKind::McpImport => self.confirm_mcp_import(&entry.item.id),
             FloatKind::Help | FloatKind::Commands | FloatKind::Custom => {
@@ -3494,6 +3649,15 @@ impl App {
         }
         RunOutcome::ConfigOp(ConfigOp::SkillToggle {
             path: id.to_string(),
+        })
+    }
+
+    fn confirm_features_toggle(&mut self, id: &str) -> RunOutcome {
+        if id == "_empty" || id.is_empty() {
+            return RunOutcome::Noop;
+        }
+        RunOutcome::ConfigOp(ConfigOp::FeatureToggle {
+            id: id.to_string(),
         })
     }
 
@@ -3556,6 +3720,10 @@ impl App {
             }
             "skills" => {
                 self.open_skills_float();
+                RunOutcome::Noop
+            }
+            "features" => {
+                self.open_features_float();
                 RunOutcome::Noop
             }
             "mcp" => {
@@ -4867,8 +5035,9 @@ mod tests {
             "line-3".into(),
             "line-4".into(),
         ];
-        app.select_anchor = Some(1);
-        app.select_end = Some(3);
+        // Full lines 1..=3: caret at start of line 1 → end of line 3.
+        app.select_anchor = Some(SelectPos::new(1, 0));
+        app.select_end = Some(SelectPos::new(3, "line-3".chars().count()));
         assert!(app.selection_is_multi_line());
         assert_eq!(app.selection_range(), Some((1, 3)));
         let text = app.selection_text().unwrap();
@@ -4878,6 +5047,57 @@ mod tests {
             app.clipboard_pending.as_deref(),
             Some("line-1\nline-2\nline-3")
         );
+    }
+
+    #[test]
+    fn partial_line_selection_text() {
+        let mut app = App::new("t");
+        app.chat_total_lines = 1;
+        app.chat_line_text = vec!["hello world".into()];
+        app.select_anchor = Some(SelectPos::new(0, 0));
+        app.select_end = Some(SelectPos::new(0, 5));
+        assert!(!app.selection_is_multi_line());
+        assert_eq!(app.selection_text().as_deref(), Some("hello"));
+
+        app.select_anchor = Some(SelectPos::new(0, 6));
+        app.select_end = Some(SelectPos::new(0, 11));
+        assert_eq!(app.selection_text().as_deref(), Some("world"));
+    }
+
+    #[test]
+    fn partial_multi_line_selection_text() {
+        let mut app = App::new("t");
+        app.chat_total_lines = 3;
+        app.chat_line_text = vec!["abcdef".into(), "123456".into(), "uvwxyz".into()];
+        // From 'c' on line 0 through 'x' on line 2 (exclusive end caret after 'x' = col 2).
+        app.select_anchor = Some(SelectPos::new(0, 2));
+        app.select_end = Some(SelectPos::new(2, 2));
+        assert_eq!(app.selection_text().as_deref(), Some("cdef\n123456\nuv"));
+    }
+
+    #[test]
+    fn empty_selection_is_none() {
+        let mut app = App::new("t");
+        app.chat_total_lines = 1;
+        app.chat_line_text = vec!["hello".into()];
+        app.select_anchor = Some(SelectPos::new(0, 2));
+        app.select_end = Some(SelectPos::new(0, 2));
+        assert!(!app.has_selection());
+        assert!(app.selection_text().is_none());
+    }
+
+    #[test]
+    fn display_col_to_caret_ascii_and_wide() {
+        assert_eq!(display_col_to_caret("hello", 0), 0);
+        assert_eq!(display_col_to_caret("hello", 3), 3);
+        assert_eq!(display_col_to_caret("hello", 5), 5);
+        assert_eq!(display_col_to_caret("hello", 99), 5);
+        // CJK: each char width 2. Caret advances once the pointer leaves the
+        // start cell of a glyph (half-open range includes that glyph).
+        assert_eq!(display_col_to_caret("你好", 0), 0);
+        assert_eq!(display_col_to_caret("你好", 1), 1);
+        assert_eq!(display_col_to_caret("你好", 2), 1);
+        assert_eq!(display_col_to_caret("你好", 4), 2);
     }
 
     #[test]

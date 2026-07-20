@@ -116,9 +116,14 @@ impl Default for BackgroundTaskRegistry {
 
 impl BackgroundTaskRegistry {
     pub fn new() -> Self {
+        Self::with_notification_queue(Arc::new(Mutex::new(Vec::new())))
+    }
+
+    /// Share a notification queue with other producers (e.g. agent jobs in one-cli).
+    pub fn with_notification_queue(notifications: Arc<Mutex<Vec<String>>>) -> Self {
         Self {
             tasks: Mutex::new(HashMap::new()),
-            notifications: Arc::new(Mutex::new(Vec::new())),
+            notifications,
             os_sandbox: Mutex::new(OsSandbox::disabled(std::env::temp_dir())),
         }
     }

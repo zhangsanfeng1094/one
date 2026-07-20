@@ -60,6 +60,7 @@ one --provider opencode-go --model deepseek-v4-flash -p "hello"
 # 其它常用 flags
 one --no-mcp                 # 本 session 不连 MCP
 one --no-skills              # 不注入 skills catalog（评测隔离）
+one --no-subagent            # 关闭 subagent 能力包（task/job 工具 + 提示词）
 one --max-turns 16           # 单 prompt 最大 tool 循环
 ```
 
@@ -253,17 +254,28 @@ one --list-models
   "auto_approve": false,
   "context_window": 128000,
   "sandbox": "workspace-write",
-  "additional_directories": []
+  "additional_directories": [],
+  "features": {
+    "subagent": true
+  }
 }
 ```
+
+**Features**（能力包）：关闭后对应工具 + system prompt section 一并过滤。V1 仅 `subagent`（`task` / `job_*` + 提示词策略），默认 **on**。  
+改上下文的 feature 在已有消息时只写入 settings 并 **pending**，需 **`/new`**（或冷启动）后才应用到当前 agent。
 
 交互内：
 
 ```text
-/settings                  # 查看
+/settings                  # 查看（居中面板）
 /settings thinking high    # 写入并立即生效（thinking）
 /settings auto_approve true
+/settings features         # Features 面板
+/settings feature subagent off
+/settings feature.subagent on
 ```
+
+也可：Ctrl+G → **Features** → Enter 切换。CLI：`--no-subagent` / `ONE_DISABLE_SUBAGENT=1` 强制本进程关闭。
 
 ### Wire protocol（请求/响应编解码）
 
@@ -638,7 +650,7 @@ Slash 命令：
 | `/model [provider[:model]]` | 切换模型；裸 `/model` 打开**输入框上方** select（同 **Ctrl+L**） |
 | `/login [provider]` | 订阅/OAuth 登录；裸命令打开选择器（Codex / xAI / OpenCode） |
 | `/logout [provider\|all]` | 清除凭证；裸命令打开已存凭证列表 |
-| `/settings [key value]` | 裸命令打开**居中 Settings**（同 **Ctrl+G**）；带参则写 settings.json |
+| `/settings [key value]` | 裸命令打开**居中 Settings**（同 **Ctrl+G**）；`features` / `feature <id> on\|off` 管理能力包 |
 | `/thinking [off\|low\|medium\|high]` | 设置或循环 thinking |
 | `/plan` | 进入 Plan 模式（只读探索 + 写 plan 文件） |
 | `/act` / `/build` | 批准计划并切到 Build 模式开始实现 |

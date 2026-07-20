@@ -377,13 +377,35 @@ pub enum TaskExitStatus {
 
 ### 4.4 与 background bash 的关系
 
-| | background bash | sub-agent |
-|--|-----------------|-----------|
-| 单位 | shell 进程 | LLM loop |
-| 完成通知 | notification_queue | **同步** tool_result（MVP） |
-| 轮询 | bash_output | 无（MVP 阻塞父 tool 直到结束） |
+| | background bash | sub-agent（MVP） | sub-agent（计划） |
+|--|-----------------|------------------|-------------------|
+| 单位 | shell 进程 | LLM loop | 同左 |
+| 完成通知 | `BackgroundTaskRegistry` notification_queue | **同步** tool_result | 同队列；**AgentJobRegistry** → `[job completed]` |
+| 轮询 | `bash_output` / `bash_kill` | 无（阻塞到结束） | `job_output` / `job_kill` ✅ |
+| 阻塞等待 | — | — | **`wait_tasks`**（mode=all/any；完成流）✅ |
+| 立即返回 | `run_in_background=true` → id | 否 | `background=true` → `status=started` + `job_id` ✅ |
 
-**v1.3 可选**：`task(background=true)` → 注册到扩展版 TaskRegistry，完成后 notification；MVP **不做**。
+**实现计划**：[plans/2026-07-20-worktree-background.md](./plans/2026-07-20-worktree-background.md)。**BG0 已落地**（2026-07-20）。
+
+要点（绑定）：
+
+1. Agent job **不**塞进 `one-tools`；与 bash **共享** `Arc<Mutex<Vec<String>>>` notification queue。  
+2. 通知只在 **父 turn 边界** `drain_notifications` 注入 User 消息。  
+3. 终态 status 与同步 `task` 同形；`started` 仅表示已接受。  
+4. 仍 **禁止** 子 token 流刷主 TUI。  
+5. 默认 **同步**；`background=true` 显式开启。
+
+### 4.4.1 Worktree 隔离（计划）
+
+| `isolation` | 含义 | 默认 |
+|-------------|------|------|
+| `none` | 继承父 cwd / PathPolicy | explore；同步 general |
+| `worktree` | `git worktree add`；子 PathPolicy root = 新路径 | **bg general 建议默认** |
+
+- **不**自动 merge 回主树；envelope 带回 `path` / `branch`。  
+- base = 当前 **HEAD**（非远程 default branch）。  
+- 非 git 仓库 → 显式错误，不 silent 降级。  
+- 详见 plan WT0–WT1 / CMB。
 
 ### 4.5 截断与预算
 
@@ -461,7 +483,37 @@ parent run
 
 ### Phase 4 — 高级（按需）
 
-- `background=true` + 完成通知  
+- [x] `background=true` + 完成通知（**BG0**）  
+- [x] BG1：粗进度 turns/max、父 abort→kill_all、`ONE_JOB_MAX_WALL_MS` wall-time  
+
+### 4.4.2 后台 task 典型场景
+
+| 场景 | 为何用 background |
+|------|-------------------|
+| 主 agent 边写代码边摸清大模块 | 派 explore 查 auth/billing，自己继续改入口 |
+| 并行只读调研（一轮多个 bg task） | 多路摘要稍后以 `[job completed]` 回来，主 context 不塞满中间 grep |
+| 长测试/构建日志分析（未来 general） | 不阻塞对话；先 started 再通知 |
+| CI/脚本 | 仍更推荐外置 `one agent run`；bg 主要服务**交互主会话** |
+
+**不适合**：需要立刻用结果才能下一步的决策（用默认同步 `task`）；单文件 `read`（别用 task）。
+
+### 4.4.3 `wait_tasks`（前台无事时阻塞等待）
+
+当前台已 `task(background=true)` 派完所有子任务、自己无其他 tool 可做时：
+
+```text
+wait_tasks()                    # 默认 mode=all，等全部 running
+wait_tasks(mode="any")          # 等下一个完成就返回（可循环收）
+wait_tasks(job_ids=["job_a","job_b"], wait_ms=120000)
+```
+
+- **阻塞** tool 直到条件满足或 `wait_ms` 超时  
+- 返回 **completion stream**（按完成顺序带摘要）  
+- 会 **吸收** 对应的 `[job completed]` 通知，避免下一 turn drain 重复  
+- 模型在 **单次 tool_result** 里看到全部过程摘要（「每完成一个」体现在 stream 段落里）
+
+
+- [ ] `isolation=worktree`（**WT0/WT1**；可写并行刚需）  
 - 有限深度 2 + 子可 explore-only 再派  
 - `model` 覆盖  
 - inherit skills / MCP 开关  

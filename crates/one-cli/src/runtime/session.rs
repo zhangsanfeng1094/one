@@ -23,6 +23,8 @@ impl AppRuntime {
                 agent.set_trace_session_id(Some(s.header().id.clone()));
             }
         }
+        // Apply pending feature flags (context-affecting) now that history is clear.
+        self.apply_features_from_settings().await?;
         // Ensure any MCP servers that finished loading attach to this clean slate.
         self.sync_mcp_tools().await?;
         if switching {

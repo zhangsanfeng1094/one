@@ -2,6 +2,9 @@
 //!
 //! Lives in **one-cli only** (not one-tools). Parent agents register this tool
 //! when `spawn_policy` allows children; explore children never get it.
+//!
+//! Sync path returns tool_result. `background=true` returns `status=started` and
+//! pushes `[job completed]` onto the shared notification queue when done.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -16,6 +19,7 @@ use serde_json::{json, Value};
 use tokio::sync::{RwLock, Semaphore};
 
 use super::harness::{self, HarnessOptions};
+use super::jobs::AgentJobRegistry;
 use super::presets;
 use crate::protocol::{
     error_code, AgentSpec, ProtocolError, RunParent, RunRequest, RunResult, SessionMode,
@@ -35,12 +39,18 @@ pub struct TaskToolHost {
     parent_run_id: RwLock<String>,
     parent_session_id: RwLock<Option<String>>,
     parent_depth: AtomicU32,
-    /// Logical concurrent `task` slots (default 4).
+    /// Logical concurrent `task` slots (default 4); shared with background jobs.
     task_slots: Arc<Semaphore>,
+    /// Background agent jobs (completion → notification queue).
+    jobs: Arc<AgentJobRegistry>,
 }
 
 impl TaskToolHost {
-    pub fn new(opts: HarnessOptions, parent_agent: AgentSpec) -> Arc<Self> {
+    pub fn new(
+        opts: HarnessOptions,
+        parent_agent: AgentSpec,
+        jobs: Arc<AgentJobRegistry>,
+    ) -> Arc<Self> {
         let max_c = parent_agent.spawn_policy.max_concurrent.max(1) as usize;
         Arc::new(Self {
             provider: RwLock::new(None),
@@ -50,7 +60,12 @@ impl TaskToolHost {
             parent_session_id: RwLock::new(None),
             parent_depth: AtomicU32::new(0),
             task_slots: Arc::new(Semaphore::new(max_c)),
+            jobs,
         })
+    }
+
+    pub fn jobs(&self) -> Arc<AgentJobRegistry> {
+        self.jobs.clone()
     }
 
     pub async fn bind_provider(&self, provider: Arc<dyn LlmProvider>) {
@@ -168,6 +183,9 @@ Run a sub-agent via the same harness as `one agent run` (Agent ≡ Subagent). \
 Default agent=explore: read-only multi-file research; returns a concise summary \
 so this conversation stays small. Do not use for a single trivial file read. \
 MVP supports agent=explore (or equivalent agent_spec). \
+Set background=true for long research that should not block this turn: returns \
+status=started + job_id immediately; when done a [job completed] notice is \
+injected before the next LLM turn (or poll with job_output). \
 The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR:."
                 .into(),
             parameters: json!({
@@ -193,6 +211,10 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                     "agent_spec": {
                         "type": "object",
                         "description": "Optional full AgentSpec JSON override (must still pass spawn_policy)"
+                    },
+                    "background": {
+                        "type": "boolean",
+                        "description": "If true, return immediately with job_id; result arrives as [job completed] notification"
                     }
                 }
             }),
@@ -216,9 +238,14 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             .map(|s| s.to_string());
 
         let agent_name = resolve_agent_name(&call.arguments);
+        let background = call
+            .arguments
+            .get("background")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         // Logical concurrency (independent of physical LLM permit).
-        let _slot = self
+        let slot = self
             .host
             .task_slots
             .clone()
@@ -248,6 +275,7 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
         ) {
             Ok(r) => r,
             Err(e) => {
+                drop(slot);
                 return Ok(format_task_output(
                     &agent_name,
                     description.as_deref(),
@@ -258,6 +286,7 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
 
         // MVP: only explore / read_only children.
         if !is_supported_child(&req.agent) {
+            drop(slot);
             return Ok(format_task_output(
                 &agent_name,
                 description.as_deref(),
@@ -275,7 +304,42 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             ));
         }
 
+        if background {
+            let provider = self.host.provider.read().await.clone();
+            let Some(provider) = provider else {
+                drop(slot);
+                return Ok(format_task_output(
+                    &agent_name,
+                    description.as_deref(),
+                    &RunResult::failure(
+                        ProtocolError::new(
+                            error_code::INTERNAL,
+                            "task tool has no LLM provider bound (call bind_provider)",
+                        ),
+                        0,
+                    )
+                    .with_status(TaskExitStatus::RuntimeError),
+                ));
+            };
+            let opts = self.host.opts.read().await.clone();
+            let job_id = self.host.jobs.spawn(
+                req,
+                provider,
+                opts,
+                agent_name.clone(),
+                description.clone(),
+                Some(slot),
+            );
+            return Ok(format_task_started(
+                &agent_name,
+                description.as_deref(),
+                &job_id,
+            ));
+        }
+
+        // Sync: hold slot until harness returns.
         let result = self.harness.run(req).await;
+        drop(slot);
         Ok(format_task_output(
             &agent_name,
             description.as_deref(),
@@ -384,6 +448,32 @@ fn build_child_request(
     Ok(req)
 }
 
+/// Immediate ack for background spawn.
+pub fn format_task_started(
+    agent_name: &str,
+    description: Option<&str>,
+    job_id: &str,
+) -> ToolOutput {
+    let desc_part = description
+        .map(|d| format!(" · {d}"))
+        .unwrap_or_default();
+    let text = format!(
+        "[task · {agent_name}{desc_part} · status=started · id={job_id}]\n\
+         Background job started. Continue other work.\n\
+         Result arrives as a [job completed] notice before the next LLM turn, \
+         or poll with job_output(job_id=\"{job_id}\")."
+    );
+    let details = json!({
+        "ok": true,
+        "status": "started",
+        "job_id": job_id,
+        "background": true,
+        "agent": agent_name,
+        "description": description,
+    });
+    ToolOutput::text_with_details(text, details)
+}
+
 /// Format tool_result: summary + status trailer + structured details.
 pub fn format_task_output(
     agent_name: &str,
@@ -450,7 +540,7 @@ pub fn format_task_output(
 
 /// One-liner for main agent system prompt.
 pub const TASK_TOOL_PROMPT_HINT: &str = "\
-- For large exploration across many files, use the `task` tool (agent=explore) so findings return as a summary without bloating this conversation. Do not use task for a trivial single-file read.";
+- For large exploration across many files, use the `task` tool (agent=explore) so findings return as a summary without bloating this conversation. Do not use task for a trivial single-file read. For long research that should not block this turn, use task(background=true); when you have spawned all background tasks and have nothing else to do, call wait_tasks (mode=all) to block until they finish and receive each completion in order — or wait_tasks(mode=any) for the next one. job_output polls without waiting.";
 
 /// Build default parent AgentSpec for the interactive / -p main agent.
 pub fn main_parent_agent_spec() -> AgentSpec {
@@ -501,9 +591,11 @@ mod tests {
     }
 
     fn test_host() -> Arc<TaskToolHost> {
+        let jobs = AgentJobRegistry::new(Arc::new(std::sync::Mutex::new(Vec::new())));
         TaskToolHost::new(
             HarnessOptions::from_cwd(std::env::temp_dir()),
             AgentSpec::builtin_main(),
+            jobs,
         )
     }
 
@@ -605,10 +697,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn task_tool_background_started() {
+        let host = test_host();
+        host.bind_provider(Arc::new(one_ai::MockProvider::new()))
+            .await;
+        let tool = TaskTool::new(host.clone());
+        let out = tool
+            .execute(&ToolCall {
+                id: "bg1".into(),
+                name: "task".into(),
+                arguments: json!({
+                    "prompt": "research auth entrypoints",
+                    "description": "auth",
+                    "agent": "explore",
+                    "background": true
+                }),
+            })
+            .await
+            .expect("bg task");
+        let text = out.as_text();
+        assert!(text.contains("status=started"), "{text}");
+        let details = out.details.expect("details");
+        assert_eq!(details["status"], "started");
+        assert!(details["job_id"].as_str().unwrap().starts_with("job_"));
+        assert_eq!(details["background"], true);
+
+        // Wait for completion notification.
+        let job_id = details["job_id"].as_str().unwrap().to_string();
+        for _ in 0..100 {
+            if let Some(s) = host.jobs().get(&job_id) {
+                if s.state.is_terminal() {
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let notes = host.jobs().notification_queue().lock().unwrap().clone();
+        assert!(
+            notes.iter().any(|n| n.contains("[job completed]") && n.contains(&job_id)),
+            "notes={notes:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn task_tool_spawn_not_allowed() {
         let mut parent = AgentSpec::builtin_main();
         parent.spawn_policy = crate::protocol::SpawnPolicy::none();
-        let host = TaskToolHost::new(HarnessOptions::from_cwd(std::env::temp_dir()), parent);
+        let jobs = AgentJobRegistry::new(Arc::new(std::sync::Mutex::new(Vec::new())));
+        let host = TaskToolHost::new(
+            HarnessOptions::from_cwd(std::env::temp_dir()),
+            parent,
+            jobs,
+        );
         let tool = TaskTool::with_harness(
             host,
             Arc::new(FakeHarness {
@@ -633,6 +773,34 @@ mod tests {
         let rr = RunResult::success("hello", 10);
         let out = format_task_output("explore", Some("scan"), &rr);
         assert!(out.as_text().starts_with("[task · explore · scan · status=success]"));
+    }
+
+    #[tokio::test]
+    async fn parent_abort_kills_background_jobs() {
+        let host = test_host();
+        host.bind_provider(Arc::new(one_ai::MockProvider::new()))
+            .await;
+        let tool = TaskTool::new(host.clone());
+        let out = tool
+            .execute(&ToolCall {
+                id: "bg_abort".into(),
+                name: "task".into(),
+                arguments: json!({
+                    "prompt": "research something long",
+                    "background": true,
+                    "agent": "explore"
+                }),
+            })
+            .await
+            .unwrap();
+        let job_id = out.details.unwrap()["job_id"].as_str().unwrap().to_string();
+        host.jobs().kill_all();
+        let snap = host.jobs().get(&job_id).expect("job");
+        assert!(
+            snap.state.is_terminal(),
+            "expected terminal after kill_all, got {:?}",
+            snap.state
+        );
     }
 
     /// Real harness path: TaskTool → harness::run → MockProvider (no nested parent LLM).

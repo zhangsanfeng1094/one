@@ -1,6 +1,8 @@
-//! Single entry: `run(RunRequest) → RunResult` (CLI + future TaskTool).
+//! Single entry: `run(RunRequest) → RunResult` (CLI + TaskTool / background jobs).
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::Arc;
 use std::time::Instant;
 
 use one_core::agent::{Agent, AgentConfig, LlmProvider, ThinkingLevel};
@@ -36,11 +38,30 @@ impl HarnessOptions {
     }
 }
 
+/// Optional controls for nested / background runs.
+#[derive(Debug, Clone, Default)]
+pub struct RunControl {
+    /// Shared abort flag (job_kill / parent Esc).
+    pub abort: Option<Arc<AtomicBool>>,
+    /// 1-based turn progress for job_output while running.
+    pub turn_progress: Option<Arc<AtomicU64>>,
+}
+
 /// Run one agent (root or sub) according to [`RunRequest`].
 pub async fn run(
     req: RunRequest,
     provider: &dyn LlmProvider,
     opts: &HarnessOptions,
+) -> RunResult {
+    run_with_control(req, provider, opts, RunControl::default()).await
+}
+
+/// Like [`run`], with abort / progress hooks for background jobs.
+pub async fn run_with_control(
+    req: RunRequest,
+    provider: &dyn LlmProvider,
+    opts: &HarnessOptions,
+    control: RunControl,
 ) -> RunResult {
     let t0 = Instant::now();
     let depth = req.parent.as_ref().map(|p| p.depth).unwrap_or(0);
@@ -73,6 +94,12 @@ pub async fn run(
     };
 
     let mut agent = Agent::new(config, tools);
+    if let Some(flag) = control.abort {
+        agent.set_abort_flag(flag);
+    }
+    if let Some(progress) = control.turn_progress {
+        agent.set_turn_progress(Some(progress));
+    }
 
     // Fail-closed permissions for non-interactive harness (subagent / agent run).
     let gate = PermissionGate::new(

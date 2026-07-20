@@ -83,6 +83,7 @@ docs/            架构活文档与专题设计
 - [Harness JSON 协议（Agent≡Subagent）](docs/protocol.md)
 - [子 Agent 设计](docs/subagents.md)
 - [实现计划 W0–W2](docs/plans/2026-07-19-programmatic-subagents.md)
+- [Worktree + Background 计划](docs/plans/2026-07-20-worktree-background.md)
 - [开发指南](docs/development.md)
 - [路线图](docs/roadmap.md)
 - [与 Pi 差距](docs/gap-vs-pi.md)

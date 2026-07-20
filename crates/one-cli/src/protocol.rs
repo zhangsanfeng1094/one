@@ -76,6 +76,8 @@ pub enum TaskExitStatus {
     RuntimeError,
     /// Sub-agent ended with ERROR: … or lacks info (not a question to the user).
     IncompleteInfo,
+    /// Background job accepted (not a terminal research status).
+    Started,
 }
 
 impl TaskExitStatus {
@@ -86,11 +88,22 @@ impl TaskExitStatus {
             Self::Aborted => "aborted",
             Self::RuntimeError => "runtime_error",
             Self::IncompleteInfo => "incomplete_info",
+            Self::Started => "started",
         }
     }
 
+    /// Terminal success only (not `started`).
     pub fn is_ok(self) -> bool {
         matches!(self, Self::Success)
+    }
+
+    /// Job was accepted or finished successfully.
+    pub fn is_accepted(self) -> bool {
+        matches!(self, Self::Success | Self::Started)
+    }
+
+    pub fn is_terminal(self) -> bool {
+        !matches!(self, Self::Started)
     }
 }
 

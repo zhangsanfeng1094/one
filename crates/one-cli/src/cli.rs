@@ -170,6 +170,11 @@ pub struct Cli {
     #[arg(long = "no-skills")]
     pub no_skills: bool,
 
+    /// Disable the subagent feature for this process (`task` / job tools + prompt section).
+    /// Also set via env `ONE_DISABLE_SUBAGENT=1`. Overrides settings.features.subagent.
+    #[arg(long = "no-subagent")]
+    pub no_subagent: bool,
+
     /// Export execution trace to Langfuse (turns / LLM / tools / usage / scores).
     ///
     /// Requires `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY`.

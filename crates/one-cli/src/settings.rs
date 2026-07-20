@@ -2,6 +2,7 @@
 //!
 //! Migrates from legacy `preferences.json` (provider + model only).
 
+use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
@@ -46,9 +47,27 @@ pub struct Settings {
     /// Skills enable/disable list (like Codex `[[skills.config]]`).
     /// Omitted paths default to enabled.
     pub skills_config: Option<Vec<SkillConfigEntry>>,
+    /// Runtime feature flags (id → enabled). Omitted ids use registry defaults.
+    /// See `runtime/features.rs` (e.g. `subagent` → task tools + prompt section).
+    pub features: Option<HashMap<String, bool>>,
 }
 
 impl Settings {
+    /// Effective feature value (registry default when omitted).
+    pub fn feature_enabled(&self, id: &str, default: bool) -> bool {
+        self.features
+            .as_ref()
+            .and_then(|m| m.get(id))
+            .copied()
+            .unwrap_or(default)
+    }
+
+    /// Persist a feature flag (creates the map if needed).
+    pub fn set_feature(&mut self, id: &str, enabled: bool) {
+        let map = self.features.get_or_insert_with(HashMap::new);
+        map.insert(id.to_string(), enabled);
+    }
+
     pub fn skills_config_entries(&self) -> Vec<one_resources::SkillConfigEntry> {
         self.skills_config
             .as_ref()
@@ -185,6 +204,31 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             let v = value.trim().to_ascii_lowercase();
             settings.bash_sandbox = Some(matches!(v.as_str(), "1" | "true" | "yes" | "on"));
         }
+        // Feature flags: /settings feature.subagent off  or  /settings features.subagent on
+        key if key.starts_with("feature.") || key.starts_with("features.") => {
+            let id = key
+                .split_once('.')
+                .map(|(_, rest)| rest.trim())
+                .unwrap_or("")
+                .to_string();
+            if id.is_empty() {
+                return Err("feature id required (e.g. feature.subagent)".into());
+            }
+            // Validate against known registry when available (avoid circular import:
+            // accept any non-empty id here; runtime validates known set).
+            let current = settings.feature_enabled(&id, true);
+            let on = match value.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "yes" | "on" | "enable" | "enabled" => true,
+                "0" | "false" | "no" | "off" | "disable" | "disabled" => false,
+                "toggle" => !current,
+                other => {
+                    return Err(format!(
+                        "feature value must be on|off|toggle (got `{other}`)"
+                    ));
+                }
+            };
+            settings.set_feature(&id, on);
+        }
         // Append a single rule: /settings allow Bash(cargo *)
         action @ ("allow" | "deny" | "ask") => {
             let rule = value.trim();
@@ -210,7 +254,7 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
         other => {
             return Err(format!(
                 "unknown setting `{other}` · known: provider model thinking auto_approve \
-                 context_window sandbox add_dir bash_sandbox allow deny ask"
+                 context_window sandbox add_dir bash_sandbox feature.<id> allow deny ask"
             ));
         }
     }
@@ -290,6 +334,25 @@ pub fn rows(settings: &Settings) -> Vec<(String, String)> {
                 })
                 .unwrap_or_else(|| "(none)".into()),
         ),
+        (
+            "features".into(),
+            settings
+                .features
+                .as_ref()
+                .map(|m| {
+                    let mut parts: Vec<String> = m
+                        .iter()
+                        .map(|(k, v)| format!("{k}={}", if *v { "on" } else { "off" }))
+                        .collect();
+                    parts.sort();
+                    if parts.is_empty() {
+                        "(defaults)".into()
+                    } else {
+                        parts.join(" ")
+                    }
+                })
+                .unwrap_or_else(|| "(defaults)".into()),
+        ),
         ("path".into(), path_display()),
     ]
 }
@@ -326,10 +389,20 @@ mod tests {
                 path: "/tmp/s/SKILL.md".into(),
                 enabled: false,
             }]),
+            features: Some(HashMap::from([("subagent".into(), false)])),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn set_key_feature() {
+        let mut s = Settings::default();
+        set_key(&mut s, "feature.subagent", "off").unwrap();
+        assert_eq!(s.feature_enabled("subagent", true), false);
+        set_key(&mut s, "features.subagent", "toggle").unwrap();
+        assert_eq!(s.feature_enabled("subagent", true), true);
     }
 
     #[test]

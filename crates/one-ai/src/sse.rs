@@ -1,14 +1,19 @@
-//! SSE reader with **correct streaming UTF-8** decoding.
+//! SSE reader with **correct streaming UTF-8** decoding and **fast abort**.
 //!
 //! TCP/HTTP chunks may split a multi-byte character (e.g. Chinese) across
 //! boundaries. Using `String::from_utf8_lossy` on each chunk permanently
 //! replaces incomplete sequences with U+FFFD (`�`) — that was the TUI 乱码.
 //! We keep a pending byte buffer until a complete UTF-8 sequence is available.
+//!
+//! Abort is raced against every network wait (HTTP send + each SSE chunk).
+//! Checking the flag only *after* `stream.next().await` made Esc feel stuck
+//! whenever the model paused between tokens or TTFT was slow.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use futures::StreamExt;
 use one_core::error::{OneError, Result};
+use one_core::streaming::wait_until_aborted;
 use reqwest::Response;
 
 pub fn parse_sse_data_lines(buffer: &str) -> Vec<&str> {
@@ -57,7 +62,28 @@ pub fn push_utf8_chunk(pending: &mut Vec<u8>, out: &mut String, chunk: &[u8]) {
     }
 }
 
+/// HTTP `send()` that returns within ~[`one_core::streaming::ABORT_POLL_INTERVAL`]
+/// of Esc / abort, instead of waiting for headers / first body byte.
+pub async fn send_with_abort(
+    request: reqwest::RequestBuilder,
+    abort: Option<&AtomicBool>,
+) -> Result<Response> {
+    if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+        return Err(OneError::Aborted);
+    }
+    tokio::select! {
+        biased;
+        result = request.send() => {
+            result.map_err(|e| OneError::Provider(e.to_string()))
+        }
+        _ = wait_until_aborted(abort) => Err(OneError::Aborted),
+    }
+}
+
 /// Read an SSE HTTP response, invoking `on_data` for each `data:` payload line.
+///
+/// Returns [`OneError::Aborted`] promptly when the abort flag is set, even if
+/// the upstream is idle between tokens (drops the stream to cancel the socket).
 pub async fn read_sse_response(
     response: Response,
     on_data: &mut (dyn FnMut(&str) + Send),
@@ -67,14 +93,29 @@ pub async fn read_sse_response(
     let mut pending_utf8: Vec<u8> = Vec::new();
     let mut buffer = String::new();
 
-    while let Some(chunk) = stream.next().await {
+    loop {
         if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
             return Err(OneError::Aborted);
         }
+
+        let next = tokio::select! {
+            biased;
+            chunk = stream.next() => chunk,
+            _ = wait_until_aborted(abort) => {
+                return Err(OneError::Aborted);
+            }
+        };
+
+        let Some(chunk) = next else {
+            break;
+        };
         let chunk = chunk.map_err(|e| OneError::Provider(e.to_string()))?;
         push_utf8_chunk(&mut pending_utf8, &mut buffer, &chunk);
 
         while let Some(pos) = buffer.find("\n\n") {
+            if abort.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+                return Err(OneError::Aborted);
+            }
             let block = buffer[..pos].to_string();
             buffer = buffer[pos + 2..].to_string();
             for line in block.lines() {
@@ -115,6 +156,8 @@ pub async fn read_sse_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     #[test]
     fn chinese_split_across_chunks_not_corrupted() {
@@ -156,5 +199,20 @@ mod tests {
         push_utf8_chunk(&mut pending, &mut out, b"hello ");
         push_utf8_chunk(&mut pending, &mut out, b"world");
         assert_eq!(out, "hello world");
+    }
+
+    #[tokio::test]
+    async fn wait_until_aborted_returns_quickly() {
+        let flag = Arc::new(AtomicBool::new(false));
+        let flag2 = flag.clone();
+        let waiter = tokio::spawn(async move {
+            wait_until_aborted(Some(flag2.as_ref())).await;
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        flag.store(true, Ordering::Relaxed);
+        tokio::time::timeout(Duration::from_millis(200), waiter)
+            .await
+            .expect("abort wait should finish within poll interval")
+            .expect("join");
     }
 }

@@ -125,11 +125,7 @@ mod inner {
             if self.compat.send_session_affinity_headers {
                 req = req.header("x-session-affinity", &self.session_id);
             }
-            let response = req
-                .json(&body)
-                .send()
-                .await
-                .map_err(|err| OneError::Provider(err.to_string()))?;
+            let response = crate::sse::send_with_abort(req.json(&body), abort).await?;
 
             if !response.status().is_success() {
                 let status = response.status();

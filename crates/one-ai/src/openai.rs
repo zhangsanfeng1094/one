@@ -444,12 +444,12 @@ mod inner {
                 "{}/chat/completions",
                 self.base_url.trim_end_matches('/')
             );
-            let response = self
-                .apply_request_headers(self.client.post(&url))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|err| OneError::Provider(err.to_string()))?;
+            let response = crate::sse::send_with_abort(
+                self.apply_request_headers(self.client.post(&url))
+                    .json(&body),
+                abort,
+            )
+            .await?;
 
             if !response.status().is_success() {
                 let status = response.status();
@@ -592,12 +592,12 @@ mod inner {
         ) -> Result<CompletionResponse> {
             let body = build_responses_body(&request, &self.model, stream);
             let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-            let response = self
-                .apply_request_headers(self.client.post(&url))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|err| OneError::Provider(err.to_string()))?;
+            let response = crate::sse::send_with_abort(
+                self.apply_request_headers(self.client.post(&url))
+                    .json(&body),
+                abort,
+            )
+            .await?;
 
             if !response.status().is_success() {
                 let status = response.status();

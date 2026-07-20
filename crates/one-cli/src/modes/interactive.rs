@@ -138,6 +138,23 @@ fn refresh_skills_rows(app: &mut App, runtime: &AppRuntime) {
     app.set_skills_rows(rows);
 }
 
+fn refresh_features_rows(app: &mut App, runtime: &AppRuntime) {
+    // Show desired settings state (includes pending toggles not yet applied).
+    let s = crate::settings::load();
+    let desired = crate::runtime::FeatureState::from_settings(&s);
+    let mut rows = desired.rows();
+    if runtime.features_pending() {
+        for row in &mut rows {
+            // detail already has description; append pending hint when applied differs.
+            let applied_on = runtime.applied_features().is_enabled(&row.0);
+            if applied_on != row.3 {
+                row.2 = format!("{} · pending /new", row.2);
+            }
+        }
+    }
+    app.set_features_rows(rows);
+}
+
 fn refresh_mcp_rows(app: &mut App, runtime: &AppRuntime) {
     // Keep the panel high-level: name + coarse status only (no source/URL/errors).
     let rows: Vec<(String, String, String, bool)> = runtime
@@ -324,6 +341,44 @@ async fn apply_config_op(
             Err(err) => app.set_notice(format!("model: {err}")),
         },
         ConfigOp::SettingSet { key, value } => {
+            // Feature flags go through runtime so pending-/new policy applies.
+            if key.starts_with("feature.") || key.starts_with("features.") {
+                let id = key
+                    .split_once('.')
+                    .map(|(_, rest)| rest.trim())
+                    .unwrap_or("")
+                    .to_string();
+                let current = runtime.applied_features().is_enabled(&id);
+                let enabled = match value.as_str() {
+                    "toggle" => !current,
+                    other => match crate::runtime::features::parse_bool_token(other, current) {
+                        Ok(b) => b,
+                        Err(err) => {
+                            app.set_notice(format!("settings: {err}"));
+                            return;
+                        }
+                    },
+                };
+                match runtime.set_feature_enabled(&id, enabled).await {
+                    Ok((on, applied)) => {
+                        refresh_features_rows(app, runtime);
+                        if applied {
+                            app.set_notice(format!(
+                                "feature `{id}` → {}",
+                                if on { "on" } else { "off" }
+                            ));
+                        } else {
+                            app.set_notice(format!(
+                                "feature `{id}` → {} · takes effect on /new",
+                                if on { "on" } else { "off" }
+                            ));
+                        }
+                        app.open_features_float();
+                    }
+                    Err(err) => app.set_notice(format!("feature: {err}")),
+                }
+                return;
+            }
             let mut s = crate::settings::load();
             let apply_value = match (key.as_str(), value.as_str()) {
                 ("auto_approve", "toggle") => {
@@ -347,6 +402,30 @@ async fn apply_config_op(
                     app.open_settings_float();
                 }
                 Err(err) => app.set_notice(format!("settings: {err}")),
+            }
+        }
+        ConfigOp::FeatureToggle { id } => {
+            // Toggle from settings desired state so pending double-toggles reverse cleanly.
+            let s = crate::settings::load();
+            let current = crate::runtime::FeatureState::from_settings(&s).is_enabled(&id);
+            let new_enabled = !current;
+            match runtime.set_feature_enabled(&id, new_enabled).await {
+                Ok((on, applied)) => {
+                    refresh_features_rows(app, runtime);
+                    if applied {
+                        app.set_notice(format!(
+                            "feature `{id}` → {}",
+                            if on { "on" } else { "off" }
+                        ));
+                    } else {
+                        app.set_notice(format!(
+                            "feature `{id}` → {} · takes effect on /new",
+                            if on { "on" } else { "off" }
+                        ));
+                    }
+                    app.reopen_features_float();
+                }
+                Err(err) => app.set_notice(format!("feature: {err}")),
             }
         }
         ConfigOp::SkillToggle { path } => {
@@ -463,6 +542,7 @@ pub async fn run_interactive(
 
     // Skills: model sees catalog only; force-load via /skill:name is optional.
     refresh_skills_rows(&mut app, runtime);
+    refresh_features_rows(&mut app, runtime);
     refresh_mcp_rows(&mut app, runtime);
     let visible = runtime.resources.model_visible_skills();
     let total = runtime.resources.all_skills().len();
@@ -1113,11 +1193,16 @@ async fn handle_slash(
             app.messages.clear();
             app.chat_scroll = 0;
             app.set_agent_label(runtime.mode().label());
+            refresh_features_rows(app, runtime);
             // MCP pool is kept; tools may still be loading in background.
-            let notice = match runtime.mcp_status_line() {
+            let mut notice = match runtime.mcp_status_line() {
                 Some(mcp) => format!("new session · {mcp}"),
                 None => "new session".into(),
             };
+            notice.push_str(&format!(
+                " · features {}",
+                runtime.applied_features().fingerprint()
+            ));
             app.set_notice(notice);
             refresh_usage(app, runtime).await;
             Ok(SlashAction::Consumed)
@@ -1533,9 +1618,84 @@ async fn handle_slash(
             Ok(SlashAction::Consumed)
         }
         Some("/settings") => {
+            // /settings features — list effective + pending
+            if parts.get(1).is_some_and(|p| {
+                p.eq_ignore_ascii_case("features") || p.eq_ignore_ascii_case("feature")
+            }) && parts.len() == 2
+            {
+                refresh_features_rows(app, runtime);
+                app.open_features_float();
+                if let Some(n) = runtime.features_pending_notice() {
+                    app.set_notice(n);
+                }
+                return Ok(SlashAction::Consumed);
+            }
+            // /settings feature <id> <on|off|toggle>
+            if parts.get(1).is_some_and(|p| p.eq_ignore_ascii_case("feature"))
+                && parts.len() >= 4
+            {
+                let id = parts[2];
+                let value = parts[3..].join(" ");
+                let s = crate::settings::load();
+                let current = crate::runtime::FeatureState::from_settings(&s).is_enabled(id);
+                match crate::runtime::features::parse_bool_token(&value, current) {
+                    Ok(enabled) => match runtime.set_feature_enabled(id, enabled).await {
+                        Ok((on, applied)) => {
+                            refresh_features_rows(app, runtime);
+                            if applied {
+                                app.set_notice(format!(
+                                    "feature `{id}` → {}",
+                                    if on { "on" } else { "off" }
+                                ));
+                            } else {
+                                app.set_notice(format!(
+                                    "feature `{id}` → {} · takes effect on /new",
+                                    if on { "on" } else { "off" }
+                                ));
+                            }
+                        }
+                        Err(err) => app.set_notice(format!("feature: {err}")),
+                    },
+                    Err(err) => app.set_notice(format!("settings: {err}")),
+                }
+                return Ok(SlashAction::Consumed);
+            }
             if parts.len() >= 3 {
                 let key = parts[1];
                 let value = parts[2..].join(" ");
+                // feature.<id> / features.<id> → runtime policy
+                if key.to_ascii_lowercase().starts_with("feature.")
+                    || key.to_ascii_lowercase().starts_with("features.")
+                {
+                    let id = key
+                        .split_once('.')
+                        .map(|(_, rest)| rest.trim())
+                        .unwrap_or("");
+                    let s = crate::settings::load();
+                    let current =
+                        crate::runtime::FeatureState::from_settings(&s).is_enabled(id);
+                    match crate::runtime::features::parse_bool_token(&value, current) {
+                        Ok(enabled) => match runtime.set_feature_enabled(id, enabled).await {
+                            Ok((on, applied)) => {
+                                refresh_features_rows(app, runtime);
+                                if applied {
+                                    app.set_notice(format!(
+                                        "feature `{id}` → {}",
+                                        if on { "on" } else { "off" }
+                                    ));
+                                } else {
+                                    app.set_notice(format!(
+                                        "feature `{id}` → {} · takes effect on /new",
+                                        if on { "on" } else { "off" }
+                                    ));
+                                }
+                            }
+                            Err(err) => app.set_notice(format!("feature: {err}")),
+                        },
+                        Err(err) => app.set_notice(format!("settings: {err}")),
+                    }
+                    return Ok(SlashAction::Consumed);
+                }
                 let mut s = crate::settings::load();
                 match crate::settings::set_key(&mut s, key, &value) {
                     Ok(()) => {
@@ -1568,6 +1728,7 @@ async fn handle_slash(
                 }
             } else {
                 // Bare /settings → center Settings panel (same as Ctrl+G).
+                refresh_features_rows(app, runtime);
                 app.open_settings_float();
             }
             Ok(SlashAction::Consumed)

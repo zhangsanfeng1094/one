@@ -7,12 +7,12 @@
 //! bubbletea / helix / Claude Code:
 //!
 //! 1. **Keep mouse capture** so the wheel scrolls the TUI, not shell history.
-//! 2. **In-app selection** on drag (highlight lines in the chat).
+//! 2. **In-app selection** on drag (character-level highlight in the chat).
 //! 3. **OSC 52** push to the system clipboard on release (also keybinding).
 //! 4. Optional: Shift still releases capture for hosts that want native select.
 //!
 //! Free drag-select without Shift only works if the *application* implements
-//! selection — which we do.
+//! selection — which we do (caret-based half-open range per display line).
 
 use std::fmt;
 use std::io::{self, Stdout, Write};
@@ -257,6 +257,7 @@ impl TerminalSession {
         let chat_h = app.chat_view_height as u16;
         let in_chat = chat_h > 0 && mouse.row < chat_h;
         let row = mouse.row as usize;
+        let col = mouse.column;
 
         match mouse.kind {
             MouseEventKind::ScrollUp => {
@@ -269,24 +270,24 @@ impl TerminalSession {
             }
             MouseEventKind::Down(MouseButton::Left) if in_chat => {
                 self.left_down = true;
-                app.select_begin(row);
+                app.select_begin(row, col);
             }
-            // Multi-line select: Drag + Moved while held (hosts vary).
+            // Character / multi-line select: Drag + Moved while held (hosts vary).
             MouseEventKind::Drag(MouseButton::Left) if self.left_down => {
                 if in_chat {
-                    app.select_update(row, true);
+                    app.select_update(row, col, true);
                 }
             }
             MouseEventKind::Moved if self.left_down => {
                 if in_chat {
-                    app.select_update(row, true);
+                    app.select_update(row, col, true);
                 }
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.left_down {
                     self.left_down = false;
-                    // select_finish applies release row; drag/multi-line → auto-copy.
-                    app.select_finish(row);
+                    // select_finish applies release cell; non-empty drag → auto-copy.
+                    app.select_finish(row, col);
                     self.flush_clipboard(app);
                 }
             }
@@ -321,7 +322,7 @@ impl TerminalSession {
         if matches!(key.code, KeyCode::Char('y'))
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && !key.modifiers.contains(KeyModifiers::ALT)
-            && app.selection_range().is_some()
+            && app.has_selection()
             && app.input.is_empty()
         {
             app.request_copy_selection();

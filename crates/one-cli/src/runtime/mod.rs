@@ -11,13 +11,17 @@
 
 mod build;
 pub mod explore_tools;
+pub mod features;
 pub mod harness;
 mod helpers;
+pub mod job_tools;
+pub mod jobs;
 mod mode;
 mod plan;
 mod policy;
 pub mod presets;
 mod prompt;
+mod prompt_compose;
 pub mod provider_limit;
 mod reload;
 mod session;
@@ -40,6 +44,7 @@ use crate::approval::PermissionGate;
 use crate::hitl::HitlChannel;
 use crate::langfuse::LangfuseTraceSink;
 
+pub use features::{FeatureState, FEATURE_SUBAGENT};
 pub use mode::AgentMode;
 pub use task_tool::TaskToolHost;
 
@@ -85,6 +90,12 @@ pub struct AppRuntime {
     langfuse: Option<Arc<LangfuseTraceSink>>,
     /// Host for the `task` meta-tool (None when spawn disabled).
     pub task_host: Option<Arc<TaskToolHost>>,
+    /// Feature flags currently driving tools + system prompt.
+    applied_features: FeatureState,
+    /// Settings features that differ from `applied_features` (awaiting `/new`).
+    pending_features: Option<FeatureState>,
+    /// Process kill-switch: never enable subagent this process (`--no-subagent`).
+    no_subagent_process: bool,
 }
 
 impl AppRuntime {
@@ -109,10 +120,137 @@ impl AppRuntime {
 
     /// Whether the `task` tool is registered for this runtime.
     pub fn task_enabled(&self) -> bool {
+        self.applied_features.subagent_enabled()
+            && self
+                .task_host
+                .as_ref()
+                .map(|h| h.can_spawn())
+                .unwrap_or(false)
+    }
+
+    /// Features currently applied to tools + prompt.
+    pub fn applied_features(&self) -> &FeatureState {
+        &self.applied_features
+    }
+
+    /// True when settings features diverge from the live agent context.
+    pub fn features_pending(&self) -> bool {
+        self.pending_features.is_some()
+    }
+
+    /// Short notice for UI when feature changes need `/new`.
+    pub fn features_pending_notice(&self) -> Option<String> {
+        self.pending_features.as_ref().map(|p| {
+            format!(
+                "features pending ({}) · /new to apply",
+                p.fingerprint()
+            )
+        })
+    }
+
+    fn can_spawn_policy(&self) -> bool {
         self.task_host
             .as_ref()
             .map(|h| h.can_spawn())
             .unwrap_or(false)
+    }
+
+    /// Recompose base + mode system prompt from applied features + resources.
+    pub(super) fn recompose_base_prompt(&mut self) {
+        self.base_system_prompt = prompt_compose::compose_base_system_prompt(
+            &self.applied_features,
+            &self.resources,
+            self.can_spawn_policy(),
+        );
+    }
+
+    /// Whether the agent currently has conversation messages (context-bound).
+    pub async fn has_messages(&self) -> bool {
+        !self.agent.lock().await.messages.is_empty()
+    }
+
+    /// Persist feature flag; context-affecting changes apply on `/new` if messages exist.
+    ///
+    /// Returns `(enabled, applied_now)` — `applied_now` is false when pending `/new`.
+    pub async fn set_feature_enabled(
+        &mut self,
+        id: &str,
+        enabled: bool,
+    ) -> Result<(bool, bool), Box<dyn std::error::Error>> {
+        use features::{env_no_subagent, feature_affects_context, feature_def};
+
+        if feature_def(id).is_none() {
+            return Err(format!(
+                "unknown feature `{id}` · known: {}",
+                features::FEATURE_REGISTRY
+                    .iter()
+                    .map(|d| d.id)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+            .into());
+        }
+        if id == FEATURE_SUBAGENT && (self.no_subagent_process || env_no_subagent()) {
+            return Err(
+                "subagent disabled for this process (--no-subagent / ONE_DISABLE_SUBAGENT)".into(),
+            );
+        }
+
+        let mut s = crate::settings::load();
+        s.set_feature(id, enabled);
+        crate::settings::save(&s)?;
+
+        let desired = FeatureState::from_settings(&s)
+            .with_process_overrides(self.no_subagent_process || env_no_subagent());
+
+        if desired.fingerprint() == self.applied_features.fingerprint() {
+            self.pending_features = None;
+            return Ok((enabled, true));
+        }
+
+        let affects = feature_affects_context(id);
+        let has_msgs = self.has_messages().await;
+        if affects && has_msgs {
+            self.pending_features = Some(desired);
+            return Ok((enabled, false));
+        }
+
+        // Apply immediately (no messages, or non-context feature).
+        self.applied_features = desired;
+        self.pending_features = None;
+        self.rebuild_mode_tools_and_prompt().await?;
+        Ok((enabled, true))
+    }
+
+    /// Load features from settings and apply to tools + prompt (cold start / `/new`).
+    pub async fn apply_features_from_settings(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        use features::env_no_subagent;
+        let s = crate::settings::load();
+        self.applied_features = FeatureState::from_settings(&s)
+            .with_process_overrides(self.no_subagent_process || env_no_subagent());
+        self.pending_features = None;
+        self.recompose_base_prompt();
+        self.rebuild_mode_tools_and_prompt().await
+    }
+
+    /// Rebuild tools + prompt for the current Plan/Act mode.
+    pub(super) async fn rebuild_mode_tools_and_prompt(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match self.mode {
+            AgentMode::Plan => {
+                // Re-enter plan tooling without rewriting plan file.
+                if let Some(path) = self.plan_path.clone() {
+                    self.apply_plan_tools_and_prompt(&path).await?;
+                } else {
+                    self.apply_act_tools_and_prompt().await?;
+                }
+            }
+            AgentMode::Act => {
+                self.apply_act_tools_and_prompt().await?;
+            }
+        }
+        Ok(())
     }
 
     pub fn plan_path(&self) -> Option<&std::path::Path> {
@@ -193,5 +331,9 @@ impl AppRuntime {
 
     pub fn abort(&self) {
         self.abort_flag.store(true, Ordering::Relaxed);
+        // Cancel background subagent jobs (signals child abort_flag + notifies).
+        if let Some(host) = &self.task_host {
+            host.jobs().kill_all();
+        }
     }
 }

@@ -14,11 +14,13 @@ use one_tools::{
     PlanExitState, ToolBuildOptions,
 };
 
+use super::features::{env_no_subagent, FeatureState};
 use super::helpers::{load_extension_state, new_plan_path};
+use super::job_tools::{JobKillTool, JobOutputTool, WaitTasksTool};
 use super::policy::build_path_policy;
+use super::prompt_compose::compose_base_system_prompt;
 use super::task_tool::{
     harness_opts_from_policy, main_parent_agent_spec, TaskTool, TaskToolHost,
-    TASK_TOOL_PROMPT_HINT,
 };
 use super::{AgentMode, AppRuntime};
 use crate::approval::PermissionGate;
@@ -73,6 +75,12 @@ impl AppRuntime {
         let user_settings = crate::settings::load();
         // Codex-style skills enable/disable (settings.skills_config).
         resources.apply_skills_config(&user_settings.skills_config_entries());
+        let no_subagent_process = cli.no_subagent || env_no_subagent();
+        let applied_features = FeatureState::from_settings(&user_settings)
+            .with_process_overrides(no_subagent_process);
+        if no_subagent_process {
+            tracing::info!("subagent feature disabled (--no-subagent / ONE_DISABLE_SUBAGENT)");
+        }
         let auto_approve = cli.auto_approve || user_settings.auto_approve.unwrap_or(false);
 
         // agentskills.io: allowlist skill dirs so progressive disclosure `read` works
@@ -83,9 +91,14 @@ impl AppRuntime {
             std::env::set_var("ONE_BASH_SANDBOX", "0");
         }
 
-        let bg_registry = Arc::new(BackgroundTaskRegistry::new());
+        // Shared notification queue: background bash + agent jobs → Agent drain.
+        let shared_notifications = Arc::new(Mutex::new(Vec::<String>::new()));
+        let bg_registry = Arc::new(BackgroundTaskRegistry::with_notification_queue(
+            shared_notifications.clone(),
+        ));
         // Apply OS sandbox to background tasks even before BashTool construction.
         bg_registry.set_os_sandbox(OsSandbox::from_policy(&path_policy));
+        let agent_jobs = super::jobs::AgentJobRegistry::new(shared_notifications.clone());
 
         let interactive = matches!(cli.mode, RunMode::Interactive) && cli.print.is_none();
         let perm_rules = user_settings
@@ -121,7 +134,11 @@ impl AppRuntime {
                 add_dirs,
                 auto_approve,
             );
-            Some(TaskToolHost::new(opts, main_parent_agent_spec()))
+            Some(TaskToolHost::new(
+                opts,
+                main_parent_agent_spec(),
+                agent_jobs.clone(),
+            ))
         };
 
         let mut tools: Vec<Arc<dyn Tool>> = if cli.read_only {
@@ -143,10 +160,14 @@ impl AppRuntime {
                 ask_user: Some(ask_user_handler.clone()),
             })
         };
-        // Register `task` whenever the host can spawn (explore-only MVP).
-        if let Some(host) = &task_host {
-            if host.can_spawn() {
+        // Register `task` + job poll/kill when feature + spawn policy allow.
+        let can_spawn = task_host.as_ref().map(|h| h.can_spawn()).unwrap_or(false);
+        if applied_features.subagent_enabled() && can_spawn {
+            if let Some(host) = &task_host {
                 tools.push(Arc::new(TaskTool::new(host.clone())));
+                tools.push(Arc::new(JobOutputTool::new(host.jobs())));
+                tools.push(Arc::new(WaitTasksTool::new(host.jobs())));
+                tools.push(Arc::new(JobKillTool::new(host.jobs())));
             }
         }
         // Extension tools only in Act mode (may include write-capable tools).
@@ -184,15 +205,8 @@ impl AppRuntime {
         }
         let mcp_tools_generation = mcp.generation();
 
-        let mut base_system_prompt =
-            resources.build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
-        // Hint for when to use task (also in DEFAULT_SYSTEM_PROMPT; keep overlay if resources strip it).
-        if let Some(host) = &task_host {
-            if host.can_spawn() && !base_system_prompt.contains("`task` tool") {
-                base_system_prompt.push_str("\n");
-                base_system_prompt.push_str(TASK_TOOL_PROMPT_HINT);
-            }
-        }
+        let base_system_prompt =
+            compose_base_system_prompt(&applied_features, &resources, can_spawn);
         let system_prompt = if start_plan {
             let p = plan_path.as_ref().expect("plan path");
             format!("{base_system_prompt}{}", plan_mode_system_overlay(p))
@@ -251,9 +265,12 @@ impl AppRuntime {
                 }
             }
         }
-        // Claude-style: completed background bash → conversation notice (not TUI status bar).
-        if !cli.read_only {
-            agent.set_notification_queue(bg_registry.notification_queue());
+        // Claude-style: completed background bash + agent jobs → conversation notice.
+        // Wire when coding tools or subagent task tools are active.
+        let wire_notifications = !cli.read_only
+            || (applied_features.subagent_enabled() && can_spawn);
+        if wire_notifications {
+            agent.set_notification_queue(shared_notifications);
         }
 
         // Interactive `-r` opens a picker in TUI — don't load a session yet.
@@ -346,6 +363,9 @@ impl AppRuntime {
             mcp_tools_generation,
             langfuse: langfuse_sink,
             task_host,
+            applied_features,
+            pending_features: None,
+            no_subagent_process,
         };
 
         // Seed session id for task parent metadata.

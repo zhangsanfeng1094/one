@@ -172,12 +172,11 @@ mod inner {
                 })),
             );
 
-            let response = self
-                .apply_headers(self.client.post(&url))
-                .json(&body)
-                .send()
-                .await
-                .map_err(|err| OneError::Provider(err.to_string()))?;
+            let response = crate::sse::send_with_abort(
+                self.apply_headers(self.client.post(&url)).json(&body),
+                abort,
+            )
+            .await?;
 
             if !response.status().is_success() {
                 let status = response.status();

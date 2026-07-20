@@ -586,6 +586,9 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         | FloatKind::SettingsModelDetail => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Back ",
         FloatKind::SettingsModelAdd => " ↑/↓ Fields  ·  Enter Edit/Save  ·  Esc Back ",
         FloatKind::Skills => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Close ",
+        FloatKind::Features => {
+            " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Back  ·  ctx needs /new "
+        }
         FloatKind::Mcp => " ↑/↓  ·  Enter  ·  Import  ·  Esc ",
         FloatKind::McpImport => " ↑/↓  ·  Enter import  ·  Esc back ",
         FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
@@ -862,17 +865,29 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.chat_view_start = start;
     // New / short chats start at the top of the pane (0,0) — not pinned to the prompt.
     app.chat_top_pad = 0;
-    let sel = app.selection_range();
+    // Content origin for mouse → caret mapping (matches horizontal pad above).
+    app.chat_content_x = area.x;
+    let sel = app.selection_span();
     let window: Vec<Line<'static>> = if start < end {
         all_lines[start..end]
             .iter()
             .enumerate()
             .map(|(i, line)| {
                 let abs = start + i;
-                if sel.is_some_and(|(lo, hi)| abs >= lo && abs <= hi) {
-                    highlight_line(line)
-                } else {
-                    line.clone()
+                match sel {
+                    Some((lo, hi)) if abs >= lo.line && abs <= hi.line => {
+                        let (col_lo, col_hi) = if lo.line == hi.line {
+                            (lo.col, hi.col)
+                        } else if abs == lo.line {
+                            (lo.col, usize::MAX)
+                        } else if abs == hi.line {
+                            (0, hi.col)
+                        } else {
+                            (0, usize::MAX)
+                        };
+                        highlight_line_range(line, col_lo, col_hi)
+                    }
+                    _ => line.clone(),
                 }
             })
             .collect()
@@ -883,8 +898,70 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(window).style(Theme::bg()), area);
 }
 
-/// Paint a line with selection background (keeps glyph content).
-fn highlight_line(line: &Line<'static>) -> Line<'static> {
+/// Paint `[char_lo, char_hi)` of a line with selection background.
+///
+/// `char_hi == usize::MAX` means through the end of the line.
+fn highlight_line_range(line: &Line<'static>, char_lo: usize, char_hi: usize) -> Line<'static> {
+    if char_lo == 0 && char_hi == usize::MAX {
+        return highlight_line_full(line);
+    }
+    let plain: String = line
+        .spans
+        .iter()
+        .map(|s| s.content.as_ref())
+        .collect();
+    let n = plain.chars().count();
+    let lo = char_lo.min(n);
+    let hi = if char_hi == usize::MAX {
+        n
+    } else {
+        char_hi.min(n).max(lo)
+    };
+    if lo >= hi {
+        return line.clone();
+    }
+
+    // Rebuild spans, splitting at caret boundaries so only [lo, hi) is highlighted.
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let mut cursor = 0usize; // char index into the line
+    for span in &line.spans {
+        let content = span.content.as_ref();
+        let span_len = content.chars().count();
+        if span_len == 0 {
+            continue;
+        }
+        let span_start = cursor;
+        let span_end = cursor + span_len;
+        // Before / selected / after, clipped to this span.
+        for (a, b, selected) in [
+            (span_start, span_end.min(lo), false),
+            (span_start.max(lo), span_end.min(hi), true),
+            (span_start.max(hi), span_end, false),
+        ] {
+            if a < b {
+                let skip = a - span_start;
+                let take = b - a;
+                let s: String = content.chars().skip(skip).take(take).collect();
+                let style = if selected {
+                    span.style.patch(Theme::selection())
+                } else {
+                    span.style
+                };
+                out.push(Span::styled(s, style));
+            }
+        }
+        cursor = span_end;
+    }
+
+    if out.is_empty() {
+        Line::from(Span::styled(" ", Theme::selection()))
+    } else {
+        Line::from(out)
+    }
+}
+
+/// Paint a full line with selection background (keeps glyph content).
+fn highlight_line_full(line: &Line<'static>) -> Line<'static> {
     let spans: Vec<Span<'static>> = line
         .spans
         .iter()

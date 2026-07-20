@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -18,6 +18,12 @@ use crate::trace::{
     args_preview, new_run_id, SharedTrace, TraceEvent, TraceGateDecision, TraceRunStatus,
 };
 
+/// Core role + tool policy for the coding agent.
+///
+/// Feature packages (subagent/task, …) are **not** included here — the CLI
+/// prompt composer attaches them when the matching settings feature is enabled.
+/// Keep this string free of optional capability prose so disabled features do
+/// not leak into the model context.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "You are an AI coding assistant. Use the provided tools to read and change files, run shell commands, and search or fetch the web when you need current information.
 
 Tool choice (prefer specialized tools over bash — Claude Code style):
@@ -27,7 +33,6 @@ Tool choice (prefer specialized tools over bash — Claude Code style):
 - Never use bash echo (or similar) to talk to the user; reply in normal assistant text.
 - Do not assume host extras exist (`rg`, `tree`, `eza`, `fd`, …). The `grep` tool uses ripgrep when available; if a tool fails with missing binary, fall back to another tool or plain `grep`/`find` via bash only when needed.
 - You may request multiple independent tool calls in one turn; read-only tools (read/grep/find/ls/…) may run concurrently, while write/edit/bash and similar run serially.
-- For large exploration across many files, use the `task` tool (agent=explore) so findings return as a summary without bloating this conversation. Do not use task for a trivial single-file read.
 - Path args accept `path` or Claude-style `file_path`.
 
 File changes:
@@ -262,6 +267,8 @@ pub struct Agent {
     /// Injected as user messages with a clear prefix — not tool_results (providers require pairing).
     notification_queue: Arc<Mutex<Vec<String>>>,
     abort_flag: Arc<AtomicBool>,
+    /// Optional external turn counter (1-based completed turns) for job progress UIs.
+    turn_progress: Option<Arc<AtomicU64>>,
     /// Optional pre-tool permission gate (allow/deny/ask/rewrite).
     tool_gate: Option<Arc<dyn ToolGate>>,
     /// Optional async lifecycle hooks (extensions bridge).
@@ -300,6 +307,7 @@ impl Agent {
             followup_queue: Arc::new(Mutex::new(Vec::new())),
             notification_queue: Arc::new(Mutex::new(Vec::new())),
             abort_flag: Arc::new(AtomicBool::new(false)),
+            turn_progress: None,
             tool_gate: None,
             hooks: None,
             trace: None,
@@ -380,6 +388,16 @@ impl Agent {
 
     pub fn abort_handle(&self) -> Arc<AtomicBool> {
         self.abort_flag.clone()
+    }
+
+    /// Replace the abort flag (e.g. share with a parent job registry for background cancel).
+    pub fn set_abort_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.abort_flag = flag;
+    }
+
+    /// Report completed turns (1-based) for external progress (background jobs).
+    pub fn set_turn_progress(&mut self, counter: Option<Arc<AtomicU64>>) {
+        self.turn_progress = counter;
     }
 
     pub fn abort(&self) {
@@ -513,6 +531,10 @@ impl Agent {
             self.drain_steering();
             // Claude-style: background task completions appear as conversation notices.
             self.drain_notifications();
+            // Progress: report the turn about to run (1-based) for job UIs.
+            if let Some(p) = &self.turn_progress {
+                p.store((turn as u64) + 1, Ordering::Relaxed);
+            }
             self.emit(AgentEvent::TurnStart { turn });
             if let Some(hooks) = &self.hooks {
                 hooks.on_turn_start(turn).await;
@@ -917,6 +939,9 @@ impl Agent {
         }
 
         self.execute_slots(&mut slots, turn, run_id, tool_results).await;
+        if self.is_aborted() {
+            return ToolBatchOutcome::Aborted;
+        }
         ToolBatchOutcome::Continue
     }
 
@@ -1029,8 +1054,28 @@ impl Agent {
             ),
             ToolSlot::Done { .. } => return,
         };
+        if self.is_aborted() {
+            slots[index] = ToolSlot::Done {
+                original,
+                output: ToolOutput::text("aborted before tool execution"),
+                is_error: true,
+                gate,
+                duration_ms: 0,
+            };
+            return;
+        }
         let start = Instant::now();
-        let res = tool.execute(&effective).await;
+        // Race tool work against Esc so long bash/network tools stop ~50ms after abort
+        // (bash uses kill_on_drop; dropping the future cancels the child).
+        let res = match crate::streaming::race_abort(
+            tool.execute(&effective),
+            Some(&self.abort_flag),
+        )
+        .await
+        {
+            Ok(res) => res,
+            Err(()) => Err(OneError::Aborted),
+        };
         let duration_ms = start.elapsed().as_millis() as u64;
         let (output, is_error) = match res {
             Ok(output) => {
@@ -1039,6 +1084,13 @@ impl Agent {
                     g.after_tool(&effective, &output, failed).await;
                 }
                 (output, failed)
+            }
+            Err(OneError::Aborted) => {
+                let output = ToolOutput::text("aborted");
+                if let Some(g) = &self.tool_gate {
+                    g.after_tool(&effective, &output, true).await;
+                }
+                (output, true)
             }
             Err(err) => {
                 let output = ToolOutput::text(err.to_string());
@@ -1087,12 +1139,24 @@ impl Agent {
         }
 
         let start = Instant::now();
+        let abort = self.abort_flag.clone();
         let futs: Vec<_> = jobs
             .iter()
             .map(|(_, _, effective, _, tool)| {
                 let tool = Arc::clone(tool);
                 let effective = effective.clone();
-                async move { tool.execute(&effective).await }
+                let abort = abort.clone();
+                async move {
+                    match crate::streaming::race_abort(
+                        tool.execute(&effective),
+                        Some(abort.as_ref()),
+                    )
+                    .await
+                    {
+                        Ok(res) => res,
+                        Err(()) => Err(OneError::Aborted),
+                    }
+                }
             })
             .collect();
         let results = futures::future::join_all(futs).await;
@@ -1106,6 +1170,13 @@ impl Agent {
                         g.after_tool(&effective, &output, failed).await;
                     }
                     (output, failed)
+                }
+                Err(OneError::Aborted) => {
+                    let output = ToolOutput::text("aborted");
+                    if let Some(g) = &self.tool_gate {
+                        g.after_tool(&effective, &output, true).await;
+                    }
+                    (output, true)
                 }
                 Err(err) => {
                     let output = ToolOutput::text(err.to_string());
@@ -1568,6 +1639,98 @@ mod tests {
         assert!(matches!(result, Err(OneError::Aborted)));
         assert!(!agent.is_busy);
         assert_eq!(agent.messages.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn abort_cancels_in_flight_tool_quickly() {
+        use crate::tool::{Tool, ToolDefinition};
+        use std::time::Duration;
+
+        struct SlowTool;
+
+        #[async_trait::async_trait]
+        impl Tool for SlowTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "slow".into(),
+                    description: "sleeps".into(),
+                    parameters: serde_json::json!({"type":"object","properties":{}}),
+                }
+            }
+
+            async fn execute(&self, _call: &ToolCall) -> Result<ToolOutput> {
+                tokio::time::sleep(Duration::from_secs(30)).await;
+                Ok(ToolOutput::text("done"))
+            }
+        }
+
+        struct ToolThenStopProvider {
+            calls: AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for ToolThenStopProvider {
+            fn name(&self) -> &str {
+                "abort-tool-test"
+            }
+
+            fn model(&self) -> &str {
+                "test"
+            }
+
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                unreachable!()
+            }
+
+            async fn complete_streaming(
+                &self,
+                _request: CompletionRequest,
+                _on_event: &mut (dyn FnMut(crate::streaming::StreamEvent) + Send),
+                _abort: Option<&AtomicBool>,
+            ) -> Result<CompletionResponse> {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().to_string(),
+                        model: self.model().to_string(),
+                        content: vec![ContentBlock::ToolCall {
+                            id: "c1".into(),
+                            name: "slow".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        provider: self.name().to_string(),
+                        model: self.model().to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "should not reach".into(),
+                        }],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                    })
+                }
+            }
+        }
+
+        let mut agent = Agent::new(AgentConfig::default(), vec![Arc::new(SlowTool)]);
+        let handle = agent.abort_handle();
+        let provider = ToolThenStopProvider {
+            calls: AtomicU64::new(0),
+        };
+
+        let run = tokio::spawn(async move { agent.prompt(&provider, "go").await });
+        // Let the tool start sleeping, then abort.
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        handle.store(true, Ordering::Relaxed);
+
+        let result = tokio::time::timeout(Duration::from_millis(500), run)
+            .await
+            .expect("tool abort should finish within poll interval")
+            .expect("join");
+        assert!(matches!(result, Err(OneError::Aborted)));
     }
 
     #[test]

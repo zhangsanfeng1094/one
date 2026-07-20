@@ -5,7 +5,6 @@ use std::sync::Arc;
 use one_ext::{discover_all, ExtensionContext};
 use one_resources::ResourceLoader;
 use one_session::agent_dir;
-use one_tools::{plan_mode_system_overlay, plan_mode_tools_with_policy};
 
 use super::helpers::new_plan_path;
 use super::{AgentMode, AppRuntime};
@@ -78,10 +77,7 @@ impl AppRuntime {
             }
         }
 
-        self.base_system_prompt = self
-            .resources
-            .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
-        // Rebuild tools + prompt for current mode.
+        // Rebuild tools + prompt for current mode (keeps applied features).
         match self.mode {
             AgentMode::Plan => {
                 let path = self.plan_path.clone().unwrap_or_else(new_plan_path);
@@ -90,16 +86,7 @@ impl AppRuntime {
                     let mut state = self.plan_exit.lock().expect("plan exit lock");
                     state.plan_path = path.clone();
                 }
-                let tools = plan_mode_tools_with_policy(
-                    self.path_policy.clone(),
-                    path.clone(),
-                    self.plan_exit.clone(),
-                    Some(self.ask_user_handler.clone()),
-                );
-                let mut agent = self.agent.lock().await;
-                agent.set_tools(tools);
-                agent.config.system_prompt =
-                    format!("{}{}", self.base_system_prompt, plan_mode_system_overlay(&path));
+                self.apply_plan_tools_and_prompt(&path).await?;
             }
             AgentMode::Act => {
                 self.apply_act_tools_and_prompt().await?;
@@ -113,15 +100,17 @@ impl AppRuntime {
         let user_settings = crate::settings::load();
         self.resources
             .apply_skills_config(&user_settings.skills_config_entries());
-        self.base_system_prompt = self
-            .resources
-            .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
+        self.recompose_base_prompt();
         match self.mode {
             AgentMode::Plan => {
-                let path = self.plan_path.clone().unwrap_or_else(new_plan_path);
-                let mut agent = self.agent.lock().await;
-                agent.config.system_prompt =
-                    format!("{}{}", self.base_system_prompt, plan_mode_system_overlay(&path));
+                if let Some(path) = self.plan_path.clone() {
+                    let mut agent = self.agent.lock().await;
+                    agent.config.system_prompt = format!(
+                        "{}{}",
+                        self.base_system_prompt,
+                        one_tools::plan_mode_system_overlay(&path)
+                    );
+                }
             }
             AgentMode::Act => {
                 let mut agent = self.agent.lock().await;

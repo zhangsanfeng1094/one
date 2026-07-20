@@ -7,29 +7,42 @@ use one_tools::{
     coding_tools_with_options, read_only_tools_with_ask, ToolBuildOptions,
 };
 
-use super::task_tool::{TaskTool, TASK_TOOL_PROMPT_HINT};
+use super::job_tools::{JobKillTool, JobOutputTool, WaitTasksTool};
+use super::task_tool::TaskTool;
 use super::{AgentMode, AppRuntime};
 
 impl AppRuntime {
+    /// Whether task/job tools should be registered under current applied features.
+    pub(super) fn should_register_task_tools(&self) -> bool {
+        self.applied_features.subagent_enabled()
+            && self
+                .task_host
+                .as_ref()
+                .map(|h| h.can_spawn())
+                .unwrap_or(false)
+    }
+
+    /// Append task + job poll/kill tools when the feature + spawn policy allow.
+    pub(super) fn push_task_tools(&self, tools: &mut Vec<Arc<dyn Tool>>) {
+        if !self.should_register_task_tools() {
+            return;
+        }
+        let Some(host) = &self.task_host else {
+            return;
+        };
+        tools.push(Arc::new(TaskTool::new(host.clone())));
+        tools.push(Arc::new(JobOutputTool::new(host.jobs())));
+        tools.push(Arc::new(WaitTasksTool::new(host.jobs())));
+        tools.push(Arc::new(JobKillTool::new(host.jobs())));
+    }
+
     pub(super) async fn apply_act_tools_and_prompt(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Refresh base prompt from resources in case of /reload.
-        let mut base = self
-            .resources
-            .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
-        if self.task_enabled() && !base.contains("`task` tool") {
-            base.push('\n');
-            base.push_str(TASK_TOOL_PROMPT_HINT);
-        }
-        self.base_system_prompt = base;
-
+        self.recompose_base_prompt();
         self.rebuild_act_tools().await?;
         let mut agent = self.agent.lock().await;
         agent.config.system_prompt = self.base_system_prompt.clone();
-        if !self.read_only {
-            agent.set_notification_queue(self.bg_registry.notification_queue());
-        }
         Ok(())
     }
 
@@ -48,11 +61,7 @@ impl AppRuntime {
                 ask_user: Some(self.ask_user_handler.clone()),
             })
         };
-        if let Some(host) = &self.task_host {
-            if host.can_spawn() {
-                tools.push(Arc::new(TaskTool::new(host.clone())));
-            }
-        }
+        self.push_task_tools(&mut tools);
         tools.extend(self.extensions.tools());
         // MCP tools only outside Plan mode (external side effects).
         if self.mode != AgentMode::Plan {
@@ -62,6 +71,18 @@ impl AppRuntime {
 
         let mut agent = self.agent.lock().await;
         agent.set_tools(tools);
+        // Keep shared queue: bash + agent jobs (already set at build; re-apply if missing).
+        if !self.read_only {
+            if let Some(host) = &self.task_host {
+                agent.set_notification_queue(host.jobs().notification_queue());
+            } else {
+                agent.set_notification_queue(self.bg_registry.notification_queue());
+            }
+        } else if self.should_register_task_tools() {
+            if let Some(host) = &self.task_host {
+                agent.set_notification_queue(host.jobs().notification_queue());
+            }
+        }
         Ok(())
     }
 

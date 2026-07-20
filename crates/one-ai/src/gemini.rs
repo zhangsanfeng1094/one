@@ -95,15 +95,15 @@ mod inner {
             abort: Option<&AtomicBool>,
         ) -> Result<CompletionResponse> {
             let body = build_request_body(&request);
-            let response = self
-                .client
-                .post(self.endpoint(true))
-                .header("x-goog-api-key", &self.api_key)
-                .header("Content-Type", "application/json")
-                .json(&body)
-                .send()
-                .await
-                .map_err(|err| OneError::Provider(err.to_string()))?;
+            let response = crate::sse::send_with_abort(
+                self.client
+                    .post(self.endpoint(true))
+                    .header("x-goog-api-key", &self.api_key)
+                    .header("Content-Type", "application/json")
+                    .json(&body),
+                abort,
+            )
+            .await?;
 
             if !response.status().is_success() {
                 let status = response.status();

@@ -1,16 +1,39 @@
 //! Plan / Act mode transitions and session persistence of mode.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use one_core::tool::Tool;
 use one_tools::{plan_mode_system_overlay, plan_mode_tools_with_policy};
 
 use super::helpers::new_plan_path;
-use super::task_tool::TaskTool;
 use super::{AgentMode, AppRuntime};
 
 impl AppRuntime {
+    /// Apply plan-mode tools + system overlay for an existing plan path.
+    pub(super) async fn apply_plan_tools_and_prompt(
+        &mut self,
+        path: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.recompose_base_prompt();
+        let mut tools: Vec<Arc<dyn Tool>> = plan_mode_tools_with_policy(
+            self.path_policy.clone(),
+            path.to_path_buf(),
+            self.plan_exit.clone(),
+            Some(self.ask_user_handler.clone()),
+        );
+        // Explore-only task allowed in plan mode when subagent feature is on.
+        self.push_task_tools(&mut tools);
+
+        {
+            let mut agent = self.agent.lock().await;
+            agent.set_tools(tools);
+            agent.config.system_prompt =
+                format!("{}{}", self.base_system_prompt, plan_mode_system_overlay(path));
+        }
+        Ok(())
+    }
+
     /// Enter plan mode: hard tool gate + system overlay + plan file path.
     pub async fn enter_plan_mode(&mut self) -> Result<PathBuf, Box<dyn std::error::Error>> {
         if self.read_only {
@@ -41,29 +64,9 @@ impl AppRuntime {
             state.clear();
         }
 
-        let mut tools: Vec<Arc<dyn Tool>> = plan_mode_tools_with_policy(
-            self.path_policy.clone(),
-            path.clone(),
-            self.plan_exit.clone(),
-            Some(self.ask_user_handler.clone()),
-        );
-        // Explore-only task allowed in plan mode (research while planning).
-        if let Some(host) = &self.task_host {
-            if host.can_spawn() {
-                tools.push(Arc::new(TaskTool::new(host.clone())));
-            }
-        }
-        // Keep extension tools out of plan mode (may be write-capable).
-
-        {
-            let mut agent = self.agent.lock().await;
-            agent.set_tools(tools);
-            agent.config.system_prompt =
-                format!("{}{}", self.base_system_prompt, plan_mode_system_overlay(&path));
-        }
-
         self.mode = AgentMode::Plan;
         self.plan_path = Some(path.clone());
+        self.apply_plan_tools_and_prompt(&path).await?;
         self.persist_mode().await?;
         Ok(path)
     }

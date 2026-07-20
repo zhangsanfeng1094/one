@@ -293,13 +293,18 @@ Core 只看见 `ToolGate` + `Tool`；**不知道** Permission 规则长什么样
 ### 6.3 System Prompt 拼装
 
 ```text
-DEFAULT_SYSTEM_PROMPT
+DEFAULT_SYSTEM_PROMPT          # core role + tool policy（无 feature 包）
   + AGENTS.md / CLAUDE.md（向上合并）
   + skills catalog XML（name/description/location only）
   + plugin system overlays
   + extension contribute_context()
+  + [feature subagent on] TASK_TOOL_PROMPT_HINT
   + [Plan 模式] plan_mode_system_overlay
 ```
+
+**Settings features**（`settings.json` → `features`）：能力包开关（V1：`subagent`）。  
+关闭后对应工具 + 提示词 section 一并去掉。改上下文的 feature 在已有对话中只 **pending**，`/new` 或冷启动后生效。  
+组装入口：`runtime/prompt_compose.rs` + `runtime/features.rs`（`build` / `tools` / `plan` / `reload` 共用）。
 
 ### 6.4 配置与发现路径（磁盘）
 
@@ -342,11 +347,13 @@ DEFAULT_SYSTEM_PROMPT
 | 模块 | 职责 |
 |------|------|
 | `runtime/mod.rs` | `AppRuntime` 字段 + 轻量控制（abort/steer/session 摘要） |
-| `runtime/build.rs` | 冷启动装配（resources · ext · tools · mcp · session） |
+| `runtime/build.rs` | 冷启动装配（resources · ext · tools · mcp · session · features） |
 | `runtime/plan.rs` | Plan/Act 切换与 mode 持久化 |
 | `runtime/tools.rs` | 工具列表重建 + MCP generation 同步 |
+| `runtime/features.rs` | settings feature 注册表 + pending/applied |
+| `runtime/prompt_compose.rs` | system prompt 统一拼装（feature sections） |
 | `runtime/prompt.rs` | `prompt` + compaction |
-| `runtime/session.rs` | new/open/list session · thinking |
+| `runtime/session.rs` | new/open/list session · thinking · apply features on `/new` |
 | `runtime/reload.rs` | `/reload` 与 skills toggle · MCP 配置重读 |
 | `runtime/subscribe.rs` | print/json/TUI 事件订阅 |
 | `runtime/policy.rs` | PathPolicy 构造 |

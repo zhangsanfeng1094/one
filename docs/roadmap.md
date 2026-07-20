@@ -95,8 +95,9 @@
 
 ### 程序化执行 · Subagent · Workflow（对齐 Claude，见设计）
 
-> 设计：[claude-workflow-model.md](./claude-workflow-model.md) · [subagents.md](./subagents.md) · 实现计划：[plans/2026-07-19-programmatic-subagents.md](./plans/2026-07-19-programmatic-subagents.md)  
-> 顺序：**P0 契约 → P1 worker → P2 宿主 spawn → P3 外置脚本/YAML**；**不**内嵌 QuickJS 作地基。
+> 设计：[claude-workflow-model.md](./claude-workflow-model.md) · [subagents.md](./subagents.md) · 实现计划：[plans/2026-07-19-programmatic-subagents.md](./plans/2026-07-19-programmatic-subagents.md) · [plans/2026-07-20-worktree-background.md](./plans/2026-07-20-worktree-background.md)  
+> 顺序：**P0 契约 → P1 worker → P2 宿主 spawn → P3 外置脚本/YAML**；**不**内嵌 QuickJS 作地基。  
+> Background + worktree：**BG0 优先**（复用 bash 通知管线）→ general 可写 → worktree 隔离。
 
 #### P0 / P1a — CLI harness（先做；完整 JSON + preset）
 - [x] `AgentSpec` / `RunRequest` / `RunResult` / `TaskExitStatus`（protocol）
@@ -122,9 +123,13 @@
 - [ ] （可选）`one workflow run` YAML steps
 - [ ] ~~内嵌 QuickJS/V8 workflow runtime~~ → **非目标**（见 claude-workflow-model §5.1）
 
-#### P4 — 后置
+#### P4 — Background · Worktree · Teams（见 worktree-background plan）
+- [x] **BG0** `task(background=true)` + `AgentJobRegistry` + 共享 notification_queue + `job_output`/`job_kill`
+- [x] **BG1** 粗进度（turns/max）/ 父 abort→`kill_all` / wall-time（`ONE_JOB_MAX_WALL_MS`，默认 300s）
+- [ ] **WT0** `WorktreeManager` + `one agent run --isolation worktree`
+- [ ] **WT1** `task isolation=` + harness PathPolicy 绑 worktree cwd（不自动 merge）
+- [ ] **CMB** general + bg 默认 worktree；并行写警告
 - [ ] Agent Teams 式 peer 协作（仅在有明确需求时）
-- [ ] background subagent + 完成通知
 
 ### MCP（平台基础能力，设计见 [mcp.md](./mcp.md)）
 
