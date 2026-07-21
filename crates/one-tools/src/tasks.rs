@@ -567,7 +567,7 @@ fn format_output_body(stdout: &str, stderr: &str, max_chars: usize) -> String {
         body.push_str(stderr.trim_end());
         body.push('\n');
     }
-    // Claude-style spill when huge; head preview + full path under tool-outputs.
+    // OpenCode unified spill when over tool_output limits.
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let presented = crate::truncate::present_tool_output(
         &body,

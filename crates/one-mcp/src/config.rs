@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 use crate::error::{McpError, Result};
 
 /// Default max tool-result size returned to the model (bytes).
-pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 20_000;
+/// Default MCP maxOutputBytes — aligned with OpenCode / one-tools 50 KiB.
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 50 * 1024;
 
 /// Default per-tool call timeout (seconds).
 pub const DEFAULT_TOOL_TIMEOUT_SEC: u64 = 120;

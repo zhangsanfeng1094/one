@@ -581,6 +581,7 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         FloatKind::SettingsRemoteModels => {
             " ↑/↓ Navigate  ·  Enter Add  ·  Ctrl+F Re-import  ·  Esc Back "
         }
+        FloatKind::SettingsToolOutput => " ↑/↓ Navigate  ·  Enter Edit  ·  Esc Back ",
         FloatKind::SettingsProviders
         | FloatKind::SettingsProviderApi
         | FloatKind::SettingsThinkingFormat
@@ -588,6 +589,7 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         | FloatKind::SettingsModelDetail => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Back ",
         FloatKind::SettingsModelAdd => " ↑/↓ Fields  ·  Enter Edit/Save  ·  Esc Back ",
         FloatKind::Skills => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Close ",
+        FloatKind::Agents => " ↑/↓ Navigate  ·  Enter details/path  ·  Esc Close ",
         FloatKind::Features => {
             " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Back  ·  ctx needs /new "
         }

@@ -37,6 +37,7 @@ impl AppRuntime {
             resources.push_system_append(overlay.clone());
         }
         let user_settings = crate::settings::load();
+        user_settings.apply_tool_output_limits();
         resources.apply_skills_config(&user_settings.skills_config_entries());
         self.resources = resources;
 

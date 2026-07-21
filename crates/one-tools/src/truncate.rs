@@ -1,14 +1,15 @@
-//! Shared truncation for tool outputs.
+//! Shared truncation for tool outputs (OpenCode-aligned).
 //!
-//! **Inline cap (Pi-style):** line limit (2000) and byte limit (50 KiB) —
-//! whichever is hit first. Prefer complete lines.
+//! **Unified strategy** (same pipeline for bash, grep, find, MCP, …):
+//! - Inline cap: [`DEFAULT_MAX_LINES`] (2000) **and** [`DEFAULT_MAX_BYTES`] (50 KiB)
+//! - When over either limit: write the **full** text under
+//!   `~/.one/agent/tool-outputs/`, return a head/tail **preview** that fits the
+//!   limits plus a path hint so the model can `read` / `grep` the rest.
 //!
-//! **Spill (Claude Code-style):** when output exceeds the inline cap, the
-//! full content is written under `~/.one/agent/tool-outputs/` and the model
-//! only receives a short **head preview** plus the absolute path so it can
-//! `read` / `grep` the rest.
+//! Limits are configurable via [`set_tool_output_limits`] (settings / env).
 
 use std::path::{Path, PathBuf};
+use std::sync::{OnceLock, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default max lines in a tool result shown to the model.
@@ -17,11 +18,81 @@ pub const DEFAULT_MAX_LINES: usize = 2000;
 pub const DEFAULT_MAX_BYTES: usize = 50 * 1024;
 /// Max characters per grep match line (Pi: 500).
 pub const GREP_MAX_LINE_LENGTH: usize = 500;
-/// Claude Code default bash output length (chars) before spill; overridable via
-/// `BASH_MAX_OUTPUT_LENGTH` / `ONE_BASH_MAX_OUTPUT_LENGTH`.
-pub const DEFAULT_BASH_MAX_OUTPUT_CHARS: usize = 30_000;
-/// Head preview size when spilling full output to disk.
-pub const DEFAULT_SPILL_PREVIEW_CHARS: usize = 4_000;
+
+/// Resolved truncation limits (OpenCode `tool_output`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ToolOutputLimits {
+    pub max_lines: usize,
+    pub max_bytes: usize,
+}
+
+impl Default for ToolOutputLimits {
+    fn default() -> Self {
+        Self {
+            max_lines: DEFAULT_MAX_LINES,
+            max_bytes: DEFAULT_MAX_BYTES,
+        }
+    }
+}
+
+impl ToolOutputLimits {
+    /// Build from optional overrides (None keeps the current field default).
+    pub fn resolve(max_lines: Option<usize>, max_bytes: Option<usize>) -> Self {
+        let mut lim = Self::default();
+        if let Some(n) = max_lines.filter(|&n| n >= 1) {
+            lim.max_lines = n;
+        }
+        if let Some(n) = max_bytes.filter(|&n| n >= 1) {
+            lim.max_bytes = n;
+        }
+        lim
+    }
+
+    /// Defaults, then settings-style overrides, then env
+    /// (`ONE_TOOL_OUTPUT_MAX_LINES` / `ONE_TOOL_OUTPUT_MAX_BYTES`).
+    pub fn from_env_and_overrides(
+        max_lines: Option<usize>,
+        max_bytes: Option<usize>,
+    ) -> Self {
+        let mut lim = Self::resolve(max_lines, max_bytes);
+        if let Some(n) = env_usize("ONE_TOOL_OUTPUT_MAX_LINES") {
+            lim.max_lines = n;
+        }
+        if let Some(n) = env_usize("ONE_TOOL_OUTPUT_MAX_BYTES") {
+            lim.max_bytes = n;
+        }
+        lim
+    }
+}
+
+fn env_usize(key: &str) -> Option<usize> {
+    std::env::var(key)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .filter(|&n| n >= 1)
+}
+
+fn limits_cell() -> &'static RwLock<ToolOutputLimits> {
+    static CELL: OnceLock<RwLock<ToolOutputLimits>> = OnceLock::new();
+    CELL.get_or_init(|| {
+        RwLock::new(ToolOutputLimits::from_env_and_overrides(None, None))
+    })
+}
+
+/// Install process-wide limits (CLI startup / `/settings` / tests).
+pub fn set_tool_output_limits(limits: ToolOutputLimits) {
+    if let Ok(mut g) = limits_cell().write() {
+        *g = limits;
+    }
+}
+
+/// Current process-wide limits.
+pub fn tool_output_limits() -> ToolOutputLimits {
+    limits_cell()
+        .read()
+        .map(|g| *g)
+        .unwrap_or_default()
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TruncationResult {
@@ -37,7 +108,7 @@ pub struct TruncationResult {
 }
 
 impl TruncationResult {
-    /// Notice line for the model / user when content was cut.
+    /// Notice line for the model / user when content was cut (no spill).
     pub fn notice(&self) -> Option<String> {
         if !self.truncated {
             return None;
@@ -175,7 +246,7 @@ pub fn truncate_head(content: &str, max_lines: usize, max_bytes: usize) -> Trunc
     }
 }
 
-/// Keep the **end** of content (bash stdout/stderr).
+/// Keep the **end** of content (bash logs when tail is preferred).
 pub fn truncate_tail(content: &str, max_lines: usize, max_bytes: usize) -> TruncationResult {
     let total_bytes = byte_len(content);
     let lines = split_lines_for_counting(content);
@@ -271,20 +342,23 @@ pub fn truncate_line(line: &str, max_chars: usize) -> (String, bool) {
     (format!("{kept}... [truncated]"), true)
 }
 
-/// Convenience: head truncate with defaults + notice footer.
+/// Head truncate with process limits + notice (no spill). Prefer
+/// [`present_tool_output`] for model-facing tool results.
 pub fn apply_head_default(content: &str) -> String {
-    truncate_head(content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES).with_notice()
+    let lim = tool_output_limits();
+    truncate_head(content, lim.max_lines, lim.max_bytes).with_notice()
 }
 
-/// Convenience: tail truncate with defaults + notice footer.
+/// Tail truncate with process limits + notice (no spill).
 pub fn apply_tail_default(content: &str) -> String {
-    truncate_tail(content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES).with_notice()
+    let lim = tool_output_limits();
+    truncate_tail(content, lim.max_lines, lim.max_bytes).with_notice()
 }
 
 /// How to pick the inline preview when spilling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewStyle {
-    /// Keep the start (Claude Code bash: head preview).
+    /// Keep the start (default — OpenCode / file listings).
     Head,
     /// Keep the end (useful for build/test logs).
     Tail,
@@ -300,27 +374,106 @@ pub struct PresentedOutput {
     pub total_chars: usize,
 }
 
-/// Max inline chars (Claude-compatible env overrides).
-pub fn max_inline_output_chars() -> usize {
-    std::env::var("ONE_BASH_MAX_OUTPUT_LENGTH")
-        .or_else(|_| std::env::var("BASH_MAX_OUTPUT_LENGTH"))
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .filter(|&n| n >= 1_000 && n <= 150_000)
-        .unwrap_or(DEFAULT_BASH_MAX_OUTPUT_CHARS)
-}
+/// Retention for spilled tool outputs (OpenCode-aligned).
+pub const TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
 
-fn tool_outputs_dir(cwd: &Path) -> PathBuf {
+/// Root directory for all spill files: `~/.one/agent/tool-outputs/`.
+pub fn tool_outputs_root() -> PathBuf {
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
+    home.join(".one").join("agent").join("tool-outputs")
+}
+
+fn tool_outputs_dir(cwd: &Path) -> PathBuf {
     let slug = cwd
         .to_string_lossy()
         .replace(std::path::MAIN_SEPARATOR, "-");
-    home.join(".one")
-        .join("agent")
-        .join("tool-outputs")
-        .join(format!("--{slug}--"))
+    tool_outputs_root().join(format!("--{slug}--"))
+}
+
+/// Result of pruning old spill files.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CleanupReport {
+    pub removed_files: usize,
+    pub removed_bytes: u64,
+    pub removed_dirs: usize,
+    pub errors: usize,
+}
+
+/// Delete spill files under [`tool_outputs_root`] older than `retention_days`
+/// (mtime). Empty project subdirs are removed afterward.
+///
+/// Mirrors OpenCode `Truncate.cleanup` (7-day retention). Safe to call on
+/// every startup; no-ops when the directory is missing.
+pub fn cleanup_tool_outputs(retention_days: u64) -> CleanupReport {
+    let cutoff = SystemTime::now()
+        .checked_sub(std::time::Duration::from_secs(
+            retention_days.saturating_mul(24 * 60 * 60),
+        ))
+        .unwrap_or(UNIX_EPOCH);
+    cleanup_tool_outputs_before(&tool_outputs_root(), cutoff)
+}
+
+/// Like [`cleanup_tool_outputs`] but with an explicit root and cutoff (for tests).
+pub fn cleanup_tool_outputs_before(root: &Path, cutoff: SystemTime) -> CleanupReport {
+    if !root.is_dir() {
+        return CleanupReport::default();
+    }
+    let mut report = CleanupReport::default();
+    cleanup_dir_recursive(root, cutoff, &mut report, /*is_root*/ true);
+    report
+}
+
+fn cleanup_dir_recursive(
+    dir: &Path,
+    cutoff: SystemTime,
+    report: &mut CleanupReport,
+    is_root: bool,
+) {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(_) => {
+            report.errors += 1;
+            return;
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else {
+            report.errors += 1;
+            continue;
+        };
+        if meta.is_dir() {
+            cleanup_dir_recursive(&path, cutoff, report, false);
+            // Drop empty project spill dirs (not the root).
+            if !is_root {
+                if let Ok(mut remaining) = std::fs::read_dir(&path) {
+                    if remaining.next().is_none() {
+                        if std::fs::remove_dir(&path).is_ok() {
+                            report.removed_dirs += 1;
+                        }
+                    }
+                }
+            }
+            continue;
+        }
+        if !meta.is_file() {
+            continue;
+        }
+        let mtime = meta.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+        if mtime >= cutoff {
+            continue;
+        }
+        let len = meta.len();
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                report.removed_files += 1;
+                report.removed_bytes = report.removed_bytes.saturating_add(len);
+            }
+            Err(_) => report.errors += 1,
+        }
+    }
 }
 
 /// Write full content to disk; return absolute path.
@@ -338,56 +491,43 @@ pub fn spill_full_output(content: &str, tool: &str, cwd: &Path) -> std::io::Resu
     Ok(std::fs::canonicalize(&path).unwrap_or(path))
 }
 
-fn preview_chars(content: &str, style: PreviewStyle, max_chars: usize) -> String {
-    let total = content.chars().count();
-    if total <= max_chars {
-        return content.to_string();
-    }
-    match style {
-        PreviewStyle::Head => {
-            let kept: String = content.chars().take(max_chars).collect();
-            kept
-        }
-        PreviewStyle::Tail => {
-            let skip = total.saturating_sub(max_chars);
-            content.chars().skip(skip).collect()
-        }
-    }
-}
-
-/// Present tool output to the model: keep small results inline; for large
-/// results spill full text to disk and return a short preview + path.
+/// Present tool output to the model (OpenCode unified strategy).
 ///
-/// Inline path also applies line/byte caps so a 25k-char, 10k-line dump still
-/// gets thinned. Spill triggers when char count exceeds
-/// [`max_inline_output_chars`] or UTF-8 size exceeds [`DEFAULT_MAX_BYTES`].
+/// - Within `max_lines` **and** `max_bytes` → return text unchanged.
+/// - Otherwise → spill full text to disk; model gets a preview that fits the
+///   limits plus a path hint (`read` / `grep` the spill).
 pub fn present_tool_output(
     content: &str,
     tool: &str,
     cwd: &Path,
     style: PreviewStyle,
 ) -> PresentedOutput {
+    present_tool_output_with(content, tool, cwd, style, None)
+}
+
+/// Like [`present_tool_output`] with optional per-call limit overrides
+/// (e.g. MCP `maxOutputBytes`).
+pub fn present_tool_output_with(
+    content: &str,
+    tool: &str,
+    cwd: &Path,
+    style: PreviewStyle,
+    overrides: Option<ToolOutputLimits>,
+) -> PresentedOutput {
     let content = content.trim_end();
     let total_bytes = content.len();
     let total_chars = content.chars().count();
-    let max_chars = max_inline_output_chars();
+    let lim = overrides.unwrap_or_else(tool_output_limits);
 
-    let needs_spill = total_chars > max_chars || total_bytes > DEFAULT_MAX_BYTES;
+    let trunc = match style {
+        PreviewStyle::Head => truncate_head(content, lim.max_lines, lim.max_bytes),
+        PreviewStyle::Tail => truncate_tail(content, lim.max_lines, lim.max_bytes),
+    };
 
-    if !needs_spill {
-        // Mild Pi-style cap for line floods under the char limit.
-        let capped = match style {
-            PreviewStyle::Head => {
-                truncate_head(content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES).with_notice()
-            }
-            PreviewStyle::Tail => {
-                truncate_tail(content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES).with_notice()
-            }
-        };
-        let truncated = capped != content;
+    if !trunc.truncated {
         return PresentedOutput {
-            text: capped,
-            truncated,
+            text: content.to_string(),
+            truncated: false,
             spill_path: None,
             total_bytes,
             total_chars,
@@ -398,17 +538,10 @@ pub fn present_tool_output(
         Ok(p) => Some(p),
         Err(e) => {
             // Fall back to hard truncate without path.
-            let fallback = match style {
-                PreviewStyle::Head => {
-                    truncate_head(content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES).with_notice()
-                }
-                PreviewStyle::Tail => {
-                    truncate_tail(content, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES).with_notice()
-                }
-            };
             return PresentedOutput {
                 text: format!(
-                    "{fallback}\n\n[spill failed: {e}; full output not saved to disk]"
+                    "{}\n\n[spill failed: {e}; full output not saved to disk]",
+                    trunc.with_notice()
                 ),
                 truncated: true,
                 spill_path: None,
@@ -418,20 +551,32 @@ pub fn present_tool_output(
         }
     };
 
-    let preview = preview_chars(content, style, DEFAULT_SPILL_PREVIEW_CHARS);
     let path_disp = spill_path
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_else(|| "(unknown)".into());
-    let text = format!(
-        "{preview}\n\n\
-         --- output truncated (Claude-style spill) ---\n\
-         full_output: {path_disp}\n\
-         size: {} ({total_chars} chars)\n\
-         preview: first {DEFAULT_SPILL_PREVIEW_CHARS} chars shown above\n\
-         Use the `read` tool (with offset/limit) or `grep` on full_output for the rest.",
-        format_size(total_bytes),
+
+    let hit_bytes = trunc.truncated_by == Some("bytes");
+    let removed = if hit_bytes {
+        total_bytes.saturating_sub(trunc.output_bytes)
+    } else {
+        trunc.total_lines.saturating_sub(trunc.output_lines)
+    };
+    let unit = if hit_bytes { "bytes" } else { "lines" };
+    let preview = trunc.content;
+    let hint = format!(
+        "The tool call succeeded but the output was truncated. Full output saved to: {path_disp}\n\
+         Use Grep to search the full content or Read with offset/limit to view specific sections."
     );
+
+    let text = match style {
+        PreviewStyle::Head => {
+            format!("{preview}\n\n...{removed} {unit} truncated...\n\n{hint}")
+        }
+        PreviewStyle::Tail => {
+            format!("...{removed} {unit} truncated...\n\n{hint}\n\n{preview}")
+        }
+    };
 
     PresentedOutput {
         text,
@@ -442,10 +587,11 @@ pub fn present_tool_output(
     }
 }
 
-/// Head truncate for files with Claude-style PARTIAL view wording.
+/// Head truncate for files with PARTIAL view wording (uses process limits).
 pub fn present_file_read(numbered: &str, file_lines: usize, offset: usize) -> PresentedOutput {
     let total_bytes = numbered.len();
-    let trunc = truncate_head(numbered, DEFAULT_MAX_LINES, DEFAULT_MAX_BYTES);
+    let lim = tool_output_limits();
+    let trunc = truncate_head(numbered, lim.max_lines, lim.max_bytes);
     if !trunc.truncated {
         return PresentedOutput {
             text: trunc.content,
@@ -485,7 +631,10 @@ mod tests {
 
     #[test]
     fn head_by_lines() {
-        let content = (0..50).map(|i| format!("line{i}")).collect::<Vec<_>>().join("\n");
+        let content = (0..50)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let r = truncate_head(&content, 5, 10_000);
         assert!(r.truncated);
         assert_eq!(r.truncated_by, Some("lines"));
@@ -498,7 +647,7 @@ mod tests {
     #[test]
     fn head_by_bytes() {
         let content = "aaaa\nbbbb\ncccc\n";
-        let r = truncate_head(content, 100, 6); // "aaaa\nb" = 6 bytes would need partial; stop before bbbb
+        let r = truncate_head(content, 100, 6);
         assert!(r.truncated);
         assert_eq!(r.truncated_by, Some("bytes"));
         assert_eq!(r.content, "aaaa");
@@ -506,7 +655,10 @@ mod tests {
 
     #[test]
     fn tail_keeps_end() {
-        let content = (0..20).map(|i| format!("L{i}")).collect::<Vec<_>>().join("\n");
+        let content = (0..20)
+            .map(|i| format!("L{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let r = truncate_tail(&content, 3, 10_000);
         assert!(r.truncated);
         assert_eq!(r.output_lines, 3);
@@ -517,7 +669,10 @@ mod tests {
 
     #[test]
     fn notice_appended() {
-        let content = (0..30).map(|i| format!("{i}")).collect::<Vec<_>>().join("\n");
+        let content = (0..30)
+            .map(|i| format!("{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let s = truncate_head(&content, 2, 10_000).with_notice();
         assert!(s.contains("[truncated"));
         assert!(s.starts_with("0\n1"));
@@ -532,7 +687,7 @@ mod tests {
     }
 
     #[test]
-    fn spill_large_bash_output() {
+    fn spill_when_over_line_limit() {
         let dir = std::env::temp_dir().join(format!(
             "one-spill-test-{}-{}",
             std::process::id(),
@@ -542,16 +697,105 @@ mod tests {
                 .unwrap_or(0)
         ));
         let _ = std::fs::create_dir_all(&dir);
-        let big = "line\n".repeat(20_000); // well over 30k chars
+        // Override process limits for isolation.
+        let prev = tool_output_limits();
+        set_tool_output_limits(ToolOutputLimits {
+            max_lines: 10,
+            max_bytes: 1_000_000,
+        });
+        let big = (0..100)
+            .map(|i| format!("line{i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
         let presented = present_tool_output(&big, "bash", &dir, PreviewStyle::Head);
+        set_tool_output_limits(prev);
+
         assert!(presented.truncated);
         assert!(presented.spill_path.is_some());
         let path = presented.spill_path.unwrap();
         assert!(path.exists());
         let on_disk = std::fs::read_to_string(&path).unwrap();
         assert_eq!(on_disk, big.trim_end());
-        assert!(presented.text.contains("full_output:"));
-        assert!(presented.text.contains("PARTIAL") || presented.text.contains("truncated"));
+        assert!(presented.text.contains("Full output saved to:"));
+        assert!(presented.text.contains("lines truncated"));
+        assert!(presented.text.contains("line0"));
+        assert!(!presented.text.contains("line99") || presented.text.contains("saved to"));
         let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn under_limit_no_spill() {
+        let dir = std::env::temp_dir().join(format!("one-nospill-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = tool_output_limits();
+        set_tool_output_limits(ToolOutputLimits {
+            max_lines: 100,
+            max_bytes: 10_000,
+        });
+        let presented =
+            present_tool_output("a\nb\nc", "grep", &dir, PreviewStyle::Head);
+        set_tool_output_limits(prev);
+        assert!(!presented.truncated);
+        assert!(presented.spill_path.is_none());
+        assert_eq!(presented.text, "a\nb\nc");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn limits_resolve() {
+        let l = ToolOutputLimits::resolve(Some(100), Some(2048));
+        assert_eq!(l.max_lines, 100);
+        assert_eq!(l.max_bytes, 2048);
+        let d = ToolOutputLimits::resolve(None, None);
+        assert_eq!(d, ToolOutputLimits::default());
+    }
+
+    #[test]
+    fn cleanup_removes_files_before_cutoff() {
+        let root = std::env::temp_dir().join(format!(
+            "one-cleanup-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let proj = root.join("--proj--");
+        std::fs::create_dir_all(&proj).unwrap();
+        let file = proj.join("stale.txt");
+        std::fs::write(&file, "stale-data").unwrap();
+        // Cutoff in the future → every existing mtime is "old".
+        let future = SystemTime::now() + std::time::Duration::from_secs(3600);
+        let report = cleanup_tool_outputs_before(&root, future);
+        assert_eq!(report.removed_files, 1);
+        assert!(!file.exists());
+        // Empty project dir should be pruned.
+        assert!(!proj.exists() || std::fs::read_dir(&proj).map(|d| d.count()).unwrap_or(0) == 0);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn cleanup_keeps_files_after_cutoff() {
+        let root = std::env::temp_dir().join(format!(
+            "one-cleanup-keep-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let proj = root.join("--proj--");
+        std::fs::create_dir_all(&proj).unwrap();
+        let file = proj.join("fresh.txt");
+        std::fs::write(&file, "fresh").unwrap();
+        // Cutoff in the past → file is newer than cutoff, keep.
+        let past = SystemTime::now()
+            .checked_sub(std::time::Duration::from_secs(7 * 24 * 3600))
+            .unwrap_or(UNIX_EPOCH);
+        let report = cleanup_tool_outputs_before(&root, past);
+        assert_eq!(report.removed_files, 0);
+        assert!(file.exists());
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

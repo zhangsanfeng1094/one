@@ -168,8 +168,36 @@ base = base - deny
 if not mcp: strip all mcp__* / server__*
 else: filter by mcp_allow if non-empty
 base += extra
-→ 最终 ToolSpec[] 注入本 run 的 Agent
+→ ToolRegistry.materialize(base) → 最终 Tool[] 注入本 run 的 Agent
 ```
+
+**实现（2026-07）：** 工具名 → 实现由 `one_tools::ToolRegistry` 统一注册；
+harness / CLI 只做 `ToolsSpec` 解析 + `materialize`。新增 builtin：在 registry 注册工厂即可，无需改 harness match。
+子 agent 默认 `read_only` 空 allow 走 **Explore** 硬白名单（无 ask_user）。
+主会话 Act 工具同样经 registry 物化；MCP/extension 以 instance 挂入，并同步到 `TaskToolHost.dynamic_tools`，子 run 的 `tools.mcp: true` 可用。
+含 write/edit/bash 的 harness run（**且** isolation=none）会占用进程级 **write lock**；`isolation=worktree` 时可并行写各自树。
+
+**主会话 Act：** 工具列表由 **main AgentSpec.tools**（`.one/agents/main.json` 或 builtin）物化，不再写死 coding 全套。`--read-only` 仍强制 read_only 面。`task` 由 `spawn_policy` 注入，不依赖 tools.allow。
+
+**isolation：**
+
+| 值 | 含义 |
+|----|------|
+| `none` | 与父/CLI 共享 cwd |
+| `worktree` | `git worktree add` 到 `.one/worktrees/<id>`；成功删除，失败保留；**不**自动 merge |
+
+CLI：`one agent run … --isolation worktree`  
+task：`isolation=worktree`；background + 可写工具默认升 worktree。
+
+#### 磁盘 agent 形态
+
+| 路径 | 说明 |
+|------|------|
+| `.one/agents/<name>.json` | 完整 AgentSpec JSON |
+| `.one/agents/<name>.md` | YAML frontmatter + body→`system_prompt` |
+| `~/.one/agent/agents/*` | 用户级；项目同名覆盖用户 |
+
+`main` / `default` 为父 agent 自身；其余文件自动进入 `spawn_policy.allow` + `agents` 表。
 
 **同构含义**：子 agent 的 `tools` 与根 **同一 schema**；不是另一套「subagent 工具枚举」。
 

@@ -138,6 +138,45 @@ fn refresh_skills_rows(app: &mut App, runtime: &AppRuntime) {
     app.set_skills_rows(rows);
 }
 
+fn refresh_agents_rows(app: &mut App, runtime: &AppRuntime) {
+    use crate::runtime::presets::{list_agents, project_agents_dir, user_agents_dir};
+    let project = project_agents_dir(&runtime.cwd);
+    let user = user_agents_dir();
+    let project_s = project.display().to_string();
+    let user_s = user.display().to_string();
+    let rows: Vec<(String, String, String, String, String)> = list_agents(&runtime.cwd)
+        .into_iter()
+        .map(|e| {
+            let path = e
+                .path
+                .as_ref()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|| "builtin".into());
+            let mut detail = if e.description.is_empty() {
+                e.tools_preview.clone()
+            } else {
+                format!("{} · {}", e.description, e.tools_preview)
+            };
+            if detail.chars().count() > 90 {
+                detail = detail.chars().take(87).collect::<String>() + "…";
+            }
+            let turns = e
+                .max_turns
+                .map(|t| format!(" · turns={t}"))
+                .unwrap_or_default();
+            let label = format!("{} [{}]{turns}", e.name, e.source.as_str());
+            (
+                e.name,
+                label,
+                detail,
+                path,
+                e.source.as_str().to_string(),
+            )
+        })
+        .collect();
+    app.set_agents_rows(rows, project_s, user_s);
+}
+
 fn refresh_features_rows(app: &mut App, runtime: &AppRuntime) {
     // Show desired settings state (includes pending toggles not yet applied).
     let s = crate::settings::load();
@@ -398,8 +437,15 @@ async fn apply_config_op(
             match crate::settings::set_key(&mut s, &key, &apply_value) {
                 Ok(()) => {
                     let _ = crate::settings::save(&s);
+                    // set_key already applies tool_output limits for those keys.
+                    let lim = one_tools::tool_output_limits();
+                    app.set_tool_output_limits(lim.max_lines, lim.max_bytes);
                     app.set_notice(format!("settings.{key} = {apply_value}"));
-                    app.open_settings_float();
+                    if key.contains("tool_output") {
+                        app.open_settings_tool_output();
+                    } else {
+                        app.open_settings_float();
+                    }
                 }
                 Err(err) => app.set_notice(format!("settings: {err}")),
             }
@@ -525,6 +571,10 @@ pub async fn run_interactive(
     refresh_model_catalog(&mut app, providers);
     app.set_current_model(&providers.provider_id, providers.as_llm().model());
     app.set_thinking_level(runtime.thinking_level().await.as_str());
+    {
+        let lim = one_tools::tool_output_limits();
+        app.set_tool_output_limits(lim.max_lines, lim.max_bytes);
+    }
     let ctx = providers.context_window();
     app.set_context_window(ctx);
     runtime.set_context_window(ctx);
@@ -1340,6 +1390,78 @@ async fn handle_slash(
             }
             Ok(SlashAction::Consumed)
         }
+        Some("/agents") => {
+            refresh_agents_rows(app, runtime);
+            let sub = parts.get(1).copied().unwrap_or("");
+            match sub {
+                "" => {
+                    app.open_agents_float();
+                    Ok(SlashAction::Consumed)
+                }
+                "list" => {
+                    use crate::runtime::presets::list_agents;
+                    let rows: Vec<(String, String)> = list_agents(&runtime.cwd)
+                        .into_iter()
+                        .map(|e| {
+                            let path = e
+                                .path
+                                .as_ref()
+                                .map(|p| p.display().to_string())
+                                .unwrap_or_else(|| "builtin".into());
+                            (
+                                format!("{} [{}]", e.name, e.source.as_str()),
+                                path,
+                            )
+                        })
+                        .collect();
+                    if rows.is_empty() {
+                        app.set_notice("no agents · add .one/agents/<name>.json");
+                    } else {
+                        app.open_info_float("Agents", &rows);
+                    }
+                    Ok(SlashAction::Consumed)
+                }
+                "path" | "inspect" => {
+                    let name = parts.get(2..).map(|p| p.join(" ")).unwrap_or_default();
+                    if name.is_empty() {
+                        app.set_notice(format!("usage: /agents {sub} <name>"));
+                        return Ok(SlashAction::Consumed);
+                    }
+                    use crate::runtime::presets::{list_agents, resolve_agent_path};
+                    refresh_agents_rows(app, runtime);
+                    if let Some(p) = resolve_agent_path(&name, &runtime.cwd) {
+                        app.set_notice(format!("{name} · {}", p.display()));
+                    } else if list_agents(&runtime.cwd).iter().any(|e| e.name == name) {
+                        app.set_notice(format!("{name} · builtin (no disk file)"));
+                    } else {
+                        app.set_notice(format!("unknown agent `{name}` · /agents"));
+                        return Ok(SlashAction::Consumed);
+                    }
+                    if sub == "inspect" {
+                        app.open_agent_detail_float(&name);
+                    }
+                    Ok(SlashAction::Consumed)
+                }
+                "dirs" => {
+                    use crate::runtime::presets::{project_agents_dir, user_agents_dir};
+                    let rows = vec![
+                        (
+                            "project".into(),
+                            project_agents_dir(&runtime.cwd).display().to_string(),
+                        ),
+                        ("user".into(), user_agents_dir().display().to_string()),
+                    ];
+                    app.open_info_float("Agent directories", &rows);
+                    Ok(SlashAction::Consumed)
+                }
+                other => {
+                    app.set_notice(format!(
+                        "unknown /agents {other} · try: /agents | list | path|inspect <name> | dirs"
+                    ));
+                    Ok(SlashAction::Consumed)
+                }
+            }
+        }
         Some("/skills") => {
             refresh_skills_rows(app, runtime);
             let sub = parts.get(1).copied().unwrap_or("");
@@ -1714,6 +1836,10 @@ async fn handle_slash(
                             let n = providers.context_window();
                             app.set_context_window(n);
                             runtime.set_context_window(n);
+                        }
+                        if key.contains("tool_output") {
+                            let lim = one_tools::tool_output_limits();
+                            app.set_tool_output_limits(lim.max_lines, lim.max_bytes);
                         }
                         if key.eq_ignore_ascii_case("provider") || key.eq_ignore_ascii_case("model")
                         {

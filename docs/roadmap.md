@@ -92,6 +92,7 @@
 - [ ] TUI 差分渲染优化 / 贴图 / `@` 模糊搜索增强
 - [ ] 与官方 Pi session 全量兼容性回归测试
 - [ ] 更准的 per-model pricing 表
+- [ ] **分层 Memory**（跨 session）— 设计见 [memory.md](./memory.md)；**暂不实现**（L2 索引常驻 + L3/L4 按需；不限磁盘容量）
 
 ### 程序化执行 · Subagent · Workflow（对齐 Claude，见设计）
 
@@ -126,9 +127,9 @@
 #### P4 — Background · Worktree · Teams（见 worktree-background plan）
 - [x] **BG0** `task(background=true)` + `AgentJobRegistry` + 共享 notification_queue + `job_output`/`job_kill`
 - [x] **BG1** 粗进度（turns/max）/ 父 abort→`kill_all` / wall-time（`ONE_JOB_MAX_WALL_MS`，默认 300s）
-- [ ] **WT0** `WorktreeManager` + `one agent run --isolation worktree`
-- [ ] **WT1** `task isolation=` + harness PathPolicy 绑 worktree cwd（不自动 merge）
-- [ ] **CMB** general + bg 默认 worktree；并行写警告
+- [x] **WT0** `WorktreeManager` + `one agent run --isolation worktree`
+- [x] **WT1** `task isolation=` + harness PathPolicy 绑 worktree cwd（不自动 merge）
+- [x] **CMB** bg + 可写工具默认 worktree；共享 cwd 写串行
 - [ ] Agent Teams 式 peer 协作（仅在有明确需求时）
 
 ### MCP（平台基础能力，设计见 [mcp.md](./mcp.md)）

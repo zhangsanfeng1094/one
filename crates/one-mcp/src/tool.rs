@@ -1,11 +1,15 @@
 //! Wrap an MCP remote tool as `one_core::Tool`.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use one_core::tool::{tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use one_core::Result as CoreResult;
+use one_tools::{
+    present_tool_output_with, tool_output_limits, PreviewStyle, ToolOutputLimits,
+};
 use rmcp::model::{CallToolRequestParams, ContentBlock};
 use rmcp::service::ServerSink;
 use serde_json::{json, Value};
@@ -134,48 +138,37 @@ impl Tool for McpTool {
             };
         }
 
-        let truncated = truncate_bytes(&text, self.max_output_bytes);
+        // OpenCode unified strategy: line+byte cap, spill full output when over.
+        let global = tool_output_limits();
+        let max_bytes = if self.max_output_bytes == 0 {
+            global.max_bytes
+        } else {
+            // Per-server / mcp.json maxOutputBytes and process limits: use the tighter.
+            self.max_output_bytes.min(global.max_bytes)
+        };
+        let limits = ToolOutputLimits {
+            max_lines: global.max_lines,
+            max_bytes,
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+        let presented = present_tool_output_with(
+            &text,
+            &self.public_name,
+            &cwd,
+            PreviewStyle::Head,
+            Some(limits),
+        );
         let details = json!({
             "mcp_server": self.server,
             "mcp_tool": self.remote_name,
             "is_error": is_error,
-            "truncated": truncated.was_truncated,
-            "original_bytes": truncated.original_bytes,
+            "truncated": presented.truncated,
+            "original_bytes": presented.total_bytes,
+            "spill_path": presented.spill_path.as_ref().map(|p| p.display().to_string()),
         });
 
         // Tool-level MCP errors still return content to the model (not a protocol error).
-        Ok(ToolOutput::text_with_details(truncated.text, details))
-    }
-}
-
-struct Truncated {
-    text: String,
-    was_truncated: bool,
-    original_bytes: usize,
-}
-
-fn truncate_bytes(s: &str, max: usize) -> Truncated {
-    let original_bytes = s.len();
-    if max == 0 || s.len() <= max {
-        return Truncated {
-            text: s.to_string(),
-            was_truncated: false,
-            original_bytes,
-        };
-    }
-    // Cut on char boundary
-    let mut end = max.saturating_sub(80);
-    while end > 0 && !s.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut text = s[..end].to_string();
-    text.push_str(&format!(
-        "\n\n…[truncated: {original_bytes} bytes → {max}; set ONE_MAX_MCP_OUTPUT_BYTES or mcp.json maxOutputBytes]"
-    ));
-    Truncated {
-        text,
-        was_truncated: true,
-        original_bytes,
+        Ok(ToolOutput::text_with_details(presented.text, details))
     }
 }
 

@@ -11,6 +11,7 @@ pub mod path_policy;
 pub mod permissions;
 pub mod plan;
 pub mod read;
+pub mod registry;
 pub mod sandbox;
 pub mod sandbox_permissions;
 pub mod tasks;
@@ -51,16 +52,22 @@ pub use plan::{
 pub use read::ReadTool;
 pub use tasks::BackgroundTaskRegistry;
 pub use truncate::{
-    apply_head_default, apply_tail_default, format_size, max_inline_output_chars,
-    present_file_read, present_tool_output, spill_full_output, truncate_head, truncate_line,
-    truncate_tail, DEFAULT_BASH_MAX_OUTPUT_CHARS, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
-    DEFAULT_SPILL_PREVIEW_CHARS, GREP_MAX_LINE_LENGTH, PreviewStyle, PresentedOutput,
+    apply_head_default, apply_tail_default, cleanup_tool_outputs, cleanup_tool_outputs_before,
+    format_size, present_file_read, present_tool_output, present_tool_output_with,
+    set_tool_output_limits, spill_full_output, tool_output_limits, tool_outputs_root, truncate_head,
+    truncate_line, truncate_tail, CleanupReport, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
+    GREP_MAX_LINE_LENGTH, TOOL_OUTPUT_RETENTION_DAYS, PreviewStyle, PresentedOutput,
+    ToolOutputLimits,
 };
 pub use write::WriteTool;
 #[cfg(feature = "network")]
 pub use web_fetch::WebFetchTool;
 #[cfg(feature = "network")]
 pub use web_search::WebSearchTool;
+pub use registry::{
+    materialize_coding, materialize_explore, materialize_read_only, resolve_tool_names,
+    BuiltinToolProfile, ToolBuildContext, ToolRegistry, UnknownToolError,
+};
 
 /// Options for building the default coding tool set.
 #[derive(Clone)]
@@ -144,35 +151,7 @@ pub fn coding_tools_with_registry(
 
 /// Build coding tools with an explicit path policy (workspace / full-access).
 pub fn coding_tools_with_options(opts: ToolBuildOptions) -> Vec<Arc<dyn Tool>> {
-    let policy = opts.policy;
-    let ask_handler = opts
-        .ask_user
-        .clone()
-        .unwrap_or_else(|| Arc::new(FailClosedAskUser) as Arc<dyn AskUserHandler>);
-    #[allow(unused_mut)] // mut when `network` feature pushes extra tools
-    let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ReadTool::with_policy(policy.clone())),
-        Arc::new(WriteTool::with_policy(policy.clone())),
-        Arc::new(EditTool::with_policy(policy.clone())),
-        Arc::new(BashTool::with_policy_and_gate(
-            policy.clone(),
-            opts.auto_approve,
-            opts.registry.clone(),
-            opts.tool_gate.clone(),
-        )),
-        Arc::new(BashOutputTool::new(opts.registry.clone())),
-        Arc::new(BashKillTool::new(opts.registry)),
-        Arc::new(GrepTool::with_policy(policy.clone())),
-        Arc::new(FindTool::with_policy(policy.clone())),
-        Arc::new(LsTool::with_policy(policy)),
-        Arc::new(AskUserTool::new(ask_handler)),
-    ];
-    #[cfg(feature = "network")]
-    {
-        tools.push(Arc::new(WebSearchTool::new()));
-        tools.push(Arc::new(WebFetchTool::new()));
-    }
-    tools
+    materialize_coding(&ToolBuildContext::from_options(opts))
 }
 
 pub fn read_only_tools(cwd: std::path::PathBuf) -> Vec<Arc<dyn Tool>> {
@@ -187,20 +166,9 @@ pub fn read_only_tools_with_ask(
     policy: PathPolicy,
     ask_user: Option<Arc<dyn AskUserHandler>>,
 ) -> Vec<Arc<dyn Tool>> {
-    let ask_handler =
-        ask_user.unwrap_or_else(|| Arc::new(FailClosedAskUser) as Arc<dyn AskUserHandler>);
-    #[allow(unused_mut)] // mut when `network` feature pushes extra tools
-    let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ReadTool::with_policy(policy.clone())),
-        Arc::new(GrepTool::with_policy(policy.clone())),
-        Arc::new(FindTool::with_policy(policy.clone())),
-        Arc::new(LsTool::with_policy(policy)),
-        Arc::new(AskUserTool::new(ask_handler)),
-    ];
-    #[cfg(feature = "network")]
-    {
-        tools.push(Arc::new(WebSearchTool::new()));
-        tools.push(Arc::new(WebFetchTool::new()));
+    let mut ctx = ToolBuildContext::workspace(policy.cwd().to_path_buf()).with_policy(policy);
+    if let Some(h) = ask_user {
+        ctx = ctx.with_ask_user(h);
     }
-    tools
+    materialize_read_only(&ctx)
 }

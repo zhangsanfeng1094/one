@@ -29,7 +29,7 @@
       "headers": { "Authorization": "Bearer ${LINEAR_TOKEN}" }
     }
   },
-  "maxOutputBytes": 20000,
+  "maxOutputBytes": 51200,
   "disabledServers": []
 }
 ```
@@ -43,7 +43,8 @@
 
 逃生阀（不推荐）：`ONE_MCP_MERGE_FOREIGN=1` 恢复旧版多源自动 merge。
 
-超时 / 输出：`ONE_MCP_STARTUP_TIMEOUT_SECS`、`MCP_TIMEOUT`（毫秒）、`ONE_MAX_MCP_OUTPUT_BYTES`。
+超时 / 输出：`ONE_MCP_STARTUP_TIMEOUT_SECS`、`MCP_TIMEOUT`（毫秒）、`ONE_MAX_MCP_OUTPUT_BYTES`（覆盖 `maxOutputBytes`）。  
+MCP 结果走 **OpenCode 统一 truncate/spill**（行+字节，全文落盘）；与全局 `tool_output` 取更紧的字节上限。
 
 ---
 

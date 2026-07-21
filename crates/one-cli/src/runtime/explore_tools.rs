@@ -1,11 +1,11 @@
 //! Explore-mode tool set: **hard whitelist**, not coding-minus-writes.
+//!
+//! Implemented via [`one_tools::ToolRegistry`] (Explore profile).
 
 use std::sync::Arc;
 
 use one_core::tool::Tool;
-use one_tools::{
-    FindTool, GrepTool, LsTool, PathPolicy, ReadTool,
-};
+use one_tools::{materialize_explore, PathPolicy, ToolBuildContext};
 
 /// Canonical explore tool names (docs + tests must stay aligned).
 pub const EXPLORE_TOOL_NAMES: &[&str] = &[
@@ -21,19 +21,8 @@ pub const EXPLORE_TOOL_NAMES: &[&str] = &[
 
 /// Build explore tools only. Never includes write/edit/bash/ask_user/task/MCP.
 pub fn explore_tools(policy: PathPolicy) -> Vec<Arc<dyn Tool>> {
-    #[allow(unused_mut)]
-    let mut tools: Vec<Arc<dyn Tool>> = vec![
-        Arc::new(ReadTool::with_policy(policy.clone())),
-        Arc::new(GrepTool::with_policy(policy.clone())),
-        Arc::new(FindTool::with_policy(policy.clone())),
-        Arc::new(LsTool::with_policy(policy)),
-    ];
-    #[cfg(feature = "network")]
-    {
-        tools.push(Arc::new(one_tools::WebSearchTool::new()));
-        tools.push(Arc::new(one_tools::WebFetchTool::new()));
-    }
-    tools
+    let ctx = ToolBuildContext::workspace(policy.cwd().to_path_buf()).with_policy(policy);
+    materialize_explore(&ctx)
 }
 
 /// Names actually registered (order may match construction).

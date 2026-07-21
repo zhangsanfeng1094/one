@@ -6,7 +6,7 @@
 > 2. **现在做了什么 / 还没做什么**  
 > 3. **实现是否干净、边界是否清楚**
 
-**最近修订**：2026-07-19（程序化/subagent 路线入矩阵；不嵌 QuickJS；OAuth/文档同步）
+**最近修订**：2026-07-21（分层 Memory 设计入矩阵，暂不实现；见 [memory.md](./memory.md)）
 
 ---
 
@@ -87,8 +87,9 @@ flowchart TB
 | 权限门控 allow/deny/ask | ✅ | `one-cli/approval` + `ToolGate` | 规则 + 交互 |
 | Session JSONL 树 | ✅ | `one-session` | v3 子集 + 迁移 |
 | Session UX（continue/resume/new/tree） | ✅ | runtime + TUI | export/share 有 |
-| AGENTS.md / CLAUDE.md | ✅ | `one-resources` | 向上发现 |
+| AGENTS.md / CLAUDE.md | ✅ | `one-resources` | 向上发现（静态 L1） |
 | Skills progressive disclosure | ✅ | `one-resources/skills` | catalog + read |
+| 分层 Memory（跨 session） | 📝 | [memory.md](./memory.md) | L0–L4 工作集选择；**暂不实现** |
 | Prompt 模板 `/name` | ✅ | `one-resources/prompts` | |
 | Compaction | ✅ | `one-core/compaction` + runtime | LLM 摘要 + overflow 重试 |
 | 四模式 Interactive/Print/JSON/RPC | ✅ | `one-cli/modes` | |
@@ -295,12 +296,14 @@ Core 只看见 `ToolGate` + `Tool`；**不知道** Permission 规则长什么样
 
 ```text
 DEFAULT_SYSTEM_PROMPT          # core role + tool policy（无 feature 包）
-  + AGENTS.md / CLAUDE.md（向上合并）
+  + AGENTS.md / CLAUDE.md（向上合并）          # L1 静态
   + skills catalog XML（name/description/location only）
   + plugin system overlays
   + extension contribute_context()
   + [feature subagent on] TASK_TOOL_PROMPT_HINT
   + [Plan 模式] plan_mode_system_overlay
+  # 设计中 · 暂未实现：memory catalog（L2 索引，session 冻结）
+  # 见 docs/memory.md — body 不进 system，按需 read
 ```
 
 **Settings features**（`settings.json` → `features`）：能力包开关（V1：`subagent`）。  
@@ -500,6 +503,7 @@ flowchart LR
 | [claude-workflow-model.md](./claude-workflow-model.md) | Claude 分层对照 + 程序化路线 + 不嵌 QuickJS |
 | [protocol.md](./protocol.md) | **Harness JSON**：Agent≡Subagent（prompt/tools/spawn） |
 | [subagents.md](./subagents.md) | 子 agent 设计 |
+| [memory.md](./memory.md) | 分层 Memory（工作集选择；暂不实现） |
 | [plans/2026-07-19-programmatic-subagents.md](./plans/2026-07-19-programmatic-subagents.md) | W0–W2 实现计划 |
 
 ---
@@ -508,6 +512,7 @@ flowchart LR
 
 | 日期 | 说明 |
 |------|------|
+| 2026-07-21 | 分层 Memory 设计（[memory.md](./memory.md)）入矩阵与 §6.3 注释；暂不实现 |
 | 2026-07-19 | 子 agent 从「非目标」改为分阶段 📝；程序化/workflow 文档索引；不嵌 QuickJS |
 | 2026-07-19 | 状态矩阵补 OAuth / bash_output·kill；模块地图补 auth/bench/langfuse/trace；文档索引补 harness/compat |
 | 2026-07-17 | `one-cli` runtime 拆为 build/plan/tools/prompt/session/reload 等；洁净度 C→B |

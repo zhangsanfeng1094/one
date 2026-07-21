@@ -423,6 +423,11 @@ pub struct App {
     pub settings_model_rows: Vec<(String, String)>,
     /// Skills manager rows: `(path, label, detail, enabled)`.
     pub skills_rows: Vec<(String, String, String, bool)>,
+    /// Agents catalog rows: `(id, label, detail, path, source)`.
+    pub agents_rows: Vec<(String, String, String, String, String)>,
+    /// Project / user agent directory paths for the agents panel header.
+    pub agents_project_dir: String,
+    pub agents_user_dir: String,
     /// Features manager rows: `(id, label, detail, enabled, affects_context)`.
     pub features_rows: Vec<(String, String, String, bool, bool)>,
     /// MCP manager rows: `(name, label, detail, enabled)`.
@@ -431,6 +436,10 @@ pub struct App {
     pub mcp_import_rows: Vec<(String, String, String, bool)>,
     /// Short MCP summary for Settings root.
     pub mcp_summary: String,
+    /// Effective tool_output max_lines (for Settings UI).
+    pub tool_output_max_lines: usize,
+    /// Effective tool_output max_bytes (for Settings UI).
+    pub tool_output_max_bytes: usize,
     /// Status-bar / prompt-meta chip, e.g. `MCP 4/5…`. Empty = hidden.
     pub mcp_chip_text: String,
     /// 0=hide 1=loading 2=ok 3=partial 4=error
@@ -569,10 +578,15 @@ impl App {
             settings_provider_field_rows: Vec::new(),
             settings_model_rows: Vec::new(),
             skills_rows: Vec::new(),
+            agents_rows: Vec::new(),
+            agents_project_dir: String::new(),
+            agents_user_dir: String::new(),
             features_rows: Vec::new(),
             mcp_rows: Vec::new(),
             mcp_import_rows: Vec::new(),
             mcp_summary: "none".into(),
+            tool_output_max_lines: 2000,
+            tool_output_max_bytes: 50 * 1024,
             mcp_chip_text: String::new(),
             mcp_chip_kind: 0,
             toast: None,
@@ -825,6 +839,32 @@ impl App {
             &self.current_provider,
             &self.current_model,
             &self.mcp_summary,
+            &self.tool_output_summary(),
+        ));
+        self.clear_notice();
+    }
+
+    /// Sync tool_output limits into Settings UI state.
+    pub fn set_tool_output_limits(&mut self, max_lines: usize, max_bytes: usize) {
+        self.tool_output_max_lines = max_lines.max(1);
+        self.tool_output_max_bytes = max_bytes.max(1);
+    }
+
+    fn tool_output_summary(&self) -> String {
+        let b = self.tool_output_max_bytes;
+        let size = if b >= 1024 {
+            format!("{:.1}KB", b as f64 / 1024.0)
+        } else {
+            format!("{b}B")
+        };
+        format!("{} lines · {size}", self.tool_output_max_lines)
+    }
+
+    /// Nested Settings → Tool output panel.
+    pub fn open_settings_tool_output(&mut self) {
+        self.float = Some(FloatMenu::settings_tool_output(
+            self.tool_output_max_lines,
+            self.tool_output_max_bytes,
         ));
         self.clear_notice();
     }
@@ -832,6 +872,17 @@ impl App {
     /// Populate skills manager rows (path, label, detail, enabled).
     pub fn set_skills_rows(&mut self, rows: Vec<(String, String, String, bool)>) {
         self.skills_rows = rows;
+    }
+
+    pub fn set_agents_rows(
+        &mut self,
+        rows: Vec<(String, String, String, String, String)>,
+        project_dir: String,
+        user_dir: String,
+    ) {
+        self.agents_rows = rows;
+        self.agents_project_dir = project_dir;
+        self.agents_user_dir = user_dir;
     }
 
     /// Populate features manager rows (id, label, detail, enabled, affects_context).
@@ -870,6 +921,47 @@ impl App {
         self.clear_select_prompt();
         self.float = Some(FloatMenu::skills_manager(&self.skills_rows));
         self.clear_notice();
+    }
+
+    /// Open agents catalog panel (`/agents`) — paths + tools for presets.
+    pub fn open_agents_float(&mut self) {
+        self.close_float();
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::agents_manager(
+            &self.agents_rows,
+            &self.agents_project_dir,
+            &self.agents_user_dir,
+        ));
+        self.clear_notice();
+    }
+
+    /// Show one agent detail (path, tools, isolation…) as an info float.
+    pub fn open_agent_detail_float(&mut self, id: &str) {
+        let Some(row) = self.agents_rows.iter().find(|r| r.0 == id) else {
+            self.set_notice(format!("unknown agent `{id}`"));
+            return;
+        };
+        let (name, label, detail, path, source) = row;
+        let rows = vec![
+            ("name".into(), label.clone()),
+            ("source".into(), source.clone()),
+            ("path".into(), path.clone()),
+            ("summary".into(), detail.clone()),
+            (
+                "dirs".into(),
+                format!(
+                    "project={} · user={}",
+                    self.agents_project_dir, self.agents_user_dir
+                ),
+            ),
+            (
+                "hint".into(),
+                "edit JSON/MD on disk · one agent dump/inspect · task agent=<name>".into(),
+            ),
+        ];
+        // Keep name for title
+        let _ = name;
+        self.open_info_float(&format!("Agent · {label}"), &rows);
     }
 
     /// Re-open skills panel after a toggle (keeps rows already updated by CLI).
@@ -1085,6 +1177,10 @@ impl App {
                 self.close_float();
                 true
             }
+            FloatKind::SettingsToolOutput => {
+                self.open_settings_float();
+                true
+            }
             FloatKind::SettingsProviders => {
                 self.open_settings_float();
                 true
@@ -1133,6 +1229,11 @@ impl App {
             }
             FloatKind::Skills => {
                 // Same as Thinking: Esc returns to Settings root.
+                self.open_settings_float();
+                true
+            }
+            FloatKind::Agents => {
+                // From Settings → Agents, Esc goes back to Settings; from /agents just close.
                 self.open_settings_float();
                 true
             }
@@ -2028,6 +2129,11 @@ impl App {
                 self.input.clear();
                 self.open_skills_float();
                 return RunOutcome::Noop;
+            }
+            "/agents" => {
+                // Handled via slash in interactive (refresh rows first).
+                self.input.clear();
+                return RunOutcome::Prompt("/agents".into());
             }
             "/mcp" => {
                 self.input.clear();
@@ -3618,6 +3724,7 @@ impl App {
                 RunOutcome::Noop
             }
             FloatKind::Settings => self.confirm_settings_root(&entry.item.id),
+            FloatKind::SettingsToolOutput => self.confirm_settings_tool_output(&entry.item.id),
             FloatKind::SettingsProviders => self.confirm_settings_providers(&entry.item.id),
             FloatKind::SettingsProviderDetail => {
                 self.confirm_settings_provider_detail(&entry.item.id)
@@ -3634,6 +3741,7 @@ impl App {
             FloatKind::SettingsModelDetail => self.confirm_settings_model_detail(&entry.item.id),
             FloatKind::SettingsModelAdd => self.confirm_settings_model_add(&entry.item.id),
             FloatKind::Skills => self.confirm_skills_toggle(&entry.item.id),
+            FloatKind::Agents => self.confirm_agents_item(&entry.item.id),
             FloatKind::Features => self.confirm_features_toggle(&entry.item.id),
             FloatKind::Mcp => self.confirm_mcp_action(&entry.item.id),
             FloatKind::McpImport => self.confirm_mcp_import(&entry.item.id),
@@ -3650,6 +3758,39 @@ impl App {
         RunOutcome::ConfigOp(ConfigOp::SkillToggle {
             path: id.to_string(),
         })
+    }
+
+    fn confirm_agents_item(&mut self, id: &str) -> RunOutcome {
+        match id {
+            "_empty" | "" => RunOutcome::Noop,
+            "_dir_project" => {
+                let p = self.agents_project_dir.clone();
+                self.set_notice(if p.is_empty() {
+                    "project agents: <cwd>/.one/agents".into()
+                } else {
+                    format!("project agents dir · {p}")
+                });
+                RunOutcome::Noop
+            }
+            "_dir_user" => {
+                let p = self.agents_user_dir.clone();
+                self.set_notice(if p.is_empty() {
+                    "user agents: ~/.one/agent/agents".into()
+                } else {
+                    format!("user agents dir · {p}")
+                });
+                RunOutcome::Noop
+            }
+            id => {
+                // Show path + tools detail; notice also echoes path for copy-friendly UX.
+                if let Some(row) = self.agents_rows.iter().find(|r| r.0 == id) {
+                    let path = &row.3;
+                    self.set_notice(format!("{} · {}", row.1, path));
+                }
+                self.open_agent_detail_float(id);
+                RunOutcome::Noop
+            }
+        }
     }
 
     fn confirm_features_toggle(&mut self, id: &str) -> RunOutcome {
@@ -3718,8 +3859,16 @@ impl App {
                     value: "cycle".into(),
                 })
             }
+            "tool_output" => {
+                self.open_settings_tool_output();
+                RunOutcome::Noop
+            }
             "skills" => {
                 self.open_skills_float();
+                RunOutcome::Noop
+            }
+            "agents" => {
+                self.open_agents_float();
                 RunOutcome::Noop
             }
             "features" => {
@@ -3736,6 +3885,36 @@ impl App {
             }
             "switch_model" => {
                 self.open_model_select();
+                RunOutcome::Noop
+            }
+            _ => RunOutcome::Noop,
+        }
+    }
+
+    fn confirm_settings_tool_output(&mut self, id: &str) -> RunOutcome {
+        match id {
+            "max_lines" => {
+                let initial = self.tool_output_max_lines.to_string();
+                self.start_settings_inline_edit(
+                    "setting:tool_output.max_lines",
+                    "max lines",
+                    initial,
+                );
+                RunOutcome::Noop
+            }
+            "max_bytes" => {
+                let initial = self.tool_output_max_bytes.to_string();
+                self.start_settings_inline_edit(
+                    "setting:tool_output.max_bytes",
+                    "max bytes",
+                    initial,
+                );
+                RunOutcome::Noop
+            }
+            "hint" => {
+                self.set_notice(
+                    "Over limit → spill to ~/.one/agent/tool-outputs/ (7-day cleanup)",
+                );
                 RunOutcome::Noop
             }
             _ => RunOutcome::Noop,
@@ -4144,6 +4323,12 @@ impl App {
             "skills" => {
                 self.open_skills_float();
                 RunOutcome::Noop
+            }
+            "agents" => {
+                // Need runtime refresh of rows — slash path ensures list is up to date.
+                self.close_float();
+                self.input.clear();
+                RunOutcome::Prompt("/agents".into())
             }
             "mcp" => {
                 self.close_float();
@@ -4640,6 +4825,16 @@ fn cycle_tri_display(current: &str) -> &'static str {
 /// Parse Settings field-edit op + typed value into a [`ConfigOp`].
 fn config_op_from_field(op: &str, value: &str) -> Option<ConfigOp> {
     let value = value.trim();
+    // setting:<key> — Settings panel free-text fields (tool_output, …).
+    if let Some(key) = op.strip_prefix("setting:") {
+        if key.is_empty() || value.is_empty() {
+            return None;
+        }
+        return Some(ConfigOp::SettingSet {
+            key: key.to_string(),
+            value: value.to_string(),
+        });
+    }
     if op == "provider_add_id" {
         if value.is_empty() {
             return None;
@@ -4731,6 +4926,20 @@ mod tests {
         }
         assert_eq!(app.messages.last().unwrap().content, "hello");
         assert_eq!(app.prompt_history, vec!["hello".to_string()]);
+    }
+
+    #[test]
+    fn settings_tool_output_panel_opens() {
+        let mut app = App::new("test");
+        app.set_tool_output_limits(100, 4096);
+        app.open_settings_tool_output();
+        let f = app.float.as_ref().unwrap();
+        assert_eq!(f.kind, FloatKind::SettingsToolOutput);
+        assert!(f
+            .sections
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .any(|i| i.id == "max_lines"));
     }
 
     #[test]

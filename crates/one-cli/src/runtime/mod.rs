@@ -27,7 +27,9 @@ mod reload;
 mod session;
 mod subscribe;
 pub mod task_tool;
+pub mod tool_materialize;
 mod tools;
+pub mod worktree;
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -90,6 +92,8 @@ pub struct AppRuntime {
     langfuse: Option<Arc<LangfuseTraceSink>>,
     /// Host for the `task` meta-tool (None when spawn disabled).
     pub task_host: Option<Arc<TaskToolHost>>,
+    /// Parent / main AgentSpec (tools face for Act mode materialize).
+    pub main_agent: crate::protocol::AgentSpec,
     /// Feature flags currently driving tools + system prompt.
     applied_features: FeatureState,
     /// Settings features that differ from `applied_features` (awaiting `/new`).
@@ -104,6 +108,19 @@ impl AppRuntime {
         if let Some(host) = &self.task_host {
             host.bind_provider(provider).await;
         }
+    }
+
+    /// Push current extension + MCP tools into the task host so children with
+    /// `tools.mcp: true` (or allow-listed MCP names) can materialize them.
+    pub async fn refresh_task_dynamic_tools(&self) {
+        let Some(host) = &self.task_host else {
+            return;
+        };
+        let mut dyn_tools = self.extensions.tools();
+        if self.mode != AgentMode::Plan {
+            dyn_tools.extend(self.mcp.tools());
+        }
+        host.set_dynamic_tools(dyn_tools).await;
     }
 
     /// Refresh session id on the task host (after session open / resume).

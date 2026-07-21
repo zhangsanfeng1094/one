@@ -225,9 +225,9 @@ duration_ms: 12300
 
 | mode | 工具组装方式 | 阶段 |
 |------|--------------|------|
-| `explore`（默认） | **硬编码白名单**（§3.2.1），禁止「coding 减工具」 | **MVP** |
-| `general` | coding profile − spawn 工具；PermissionGate | **v1.1** |
-| `plan` | plan 工具集 | 延后 |
+| `explore`（默认） | **硬编码白名单**（§3.2.1），禁止「coding 减工具」 | **已落地** |
+| 自定义 / 可写 | `ToolsSpec` allow/profile + `ToolRegistry` 物化；写工具全局串行 | **已落地** |
+| `plan` | plan 工具集 | 主会话；子 agent 一般不用 |
 
 规则：
 

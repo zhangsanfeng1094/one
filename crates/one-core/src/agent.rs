@@ -31,7 +31,7 @@ Tool choice (prefer specialized tools over bash — Claude Code style):
 - Edit: `edit` / `write` — not shell redirection or sed/awk rewrites.
 - Run: `bash` only for real process work (build, test, git, package managers, long-running commands). Always pass a short `description` for bash commands.
 - Never use bash echo (or similar) to talk to the user; reply in normal assistant text.
-- Do not assume host extras exist (`rg`, `tree`, `eza`, `fd`, …). The `grep` tool uses ripgrep when available; if a tool fails with missing binary, fall back to another tool or plain `grep`/`find` via bash only when needed.
+- Do not assume host extras exist (`rg`, `tree`, `eza`, `fd`, …). The `grep` tool is built in (in-process, no host `rg` required) — prefer it over shell `rg`/`grep`.
 - You may request multiple independent tool calls in one turn; read-only tools (read/grep/find/ls/…) may run concurrently, while write/edit/bash and similar run serially.
 - Path args accept `path` or Claude-style `file_path`.
 
@@ -41,7 +41,7 @@ File changes:
 - Read a file before editing it when you need its current contents.
 
 Search:
-- Prefer `grep` with `glob` / `type` / `output_mode` / `head_limit` / context (`-A`/`-B`/`-C`) over shell ripgrep.
+- Prefer `grep` with `glob` / `type` / `output_mode` / `head_limit` / context (`-A`/`-B`/`-C`) over any shell search.
 
 Bash / sandbox:
 - Default bash runs under an OS sandbox (workspace-write): workspace is writable; home and system paths are mostly read-only. Prefer the dedicated file tools so path policy and truncation stay consistent.

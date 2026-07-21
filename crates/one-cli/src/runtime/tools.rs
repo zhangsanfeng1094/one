@@ -1,15 +1,18 @@
 //! Tool list assembly (builtin + extensions + MCP) and MCP sync.
+//!
+//! Act mode materializes tools from **main AgentSpec.tools** (ToolsSpec) via
+//! [`ToolRegistry`], then appends task/job meta-tools when spawn is allowed.
 
 use std::sync::Arc;
 
 use one_core::tool::Tool;
-use one_tools::{
-    coding_tools_with_options, read_only_tools_with_ask, ToolBuildOptions,
-};
+use one_tools::{ToolBuildContext, ToolRegistry};
 
 use super::job_tools::{JobKillTool, JobOutputTool, WaitTasksTool};
 use super::task_tool::TaskTool;
+use super::tool_materialize::{materialize_tools, resolve_names};
 use super::{AgentMode, AppRuntime};
+use crate::protocol::{ToolProfile, ToolsSpec};
 
 impl AppRuntime {
     /// Whether task/job tools should be registered under current applied features.
@@ -46,29 +49,73 @@ impl AppRuntime {
         Ok(())
     }
 
-    /// Rebuild the Act-mode tool list (builtin + extensions + current MCP snapshot).
-    pub(super) async fn rebuild_act_tools(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let mut tools: Vec<Arc<dyn Tool>> = if self.read_only {
-            read_only_tools_with_ask(
-                self.path_policy.clone(),
-                Some(self.ask_user_handler.clone()),
-            )
-        } else {
-            coding_tools_with_options(ToolBuildOptions {
-                policy: self.path_policy.clone(),
-                auto_approve: self.auto_approve,
-                registry: self.bg_registry.clone(),
-                ask_user: Some(self.ask_user_handler.clone()),
-                tool_gate: Some(self.permission_gate.clone()),
-            })
-        };
-        self.push_task_tools(&mut tools);
-        tools.extend(self.extensions.tools());
-        // MCP tools only outside Plan mode (external side effects).
-        if self.mode != AgentMode::Plan {
-            tools.extend(self.mcp.tools());
+    /// ToolsSpec that drives the live main session (CLI read_only overrides).
+    pub(super) fn effective_main_tools_spec(&self) -> ToolsSpec {
+        if self.read_only {
+            let mut t = ToolsSpec::read_only();
+            // Keep ask_user for interactive main; deny only if main asked.
+            if self
+                .main_agent
+                .tools
+                .deny
+                .iter()
+                .any(|d| d == "ask_user")
+            {
+                t.deny.push("ask_user".into());
+            }
+            t.mcp = false;
+            return t;
         }
+        self.main_agent.tools.clone()
+    }
+
+    /// Rebuild the Act-mode tool list from main AgentSpec.tools + MCP/ext.
+    pub(super) async fn rebuild_act_tools(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let ctx = ToolBuildContext {
+            policy: self.path_policy.clone(),
+            auto_approve: self.auto_approve,
+            bg_registry: self.bg_registry.clone(),
+            ask_user: Some(self.ask_user_handler.clone()),
+            tool_gate: Some(self.permission_gate.clone()),
+        };
+        let mut registry = ToolRegistry::with_builtins();
+        let ext = self.extensions.tools();
+        registry.register_instances(ext.iter().cloned());
+        let mcp_tools = if self.mode != AgentMode::Plan {
+            self.mcp.tools()
+        } else {
+            vec![]
+        };
+        registry.register_instances(mcp_tools.iter().cloned());
+
+        let tools_spec = self.effective_main_tools_spec();
+        // When main tools.mcp is true, registered MCP instances are appended.
+        // When false, materialize_tools strips MCP-looking names.
+        let mut tools = materialize_tools(&tools_spec, &registry, &ctx, false).map_err(|e| {
+            format!("main tools materialize failed: {e}")
+        })?;
+
+        // Extensions always available in Act (unless ToolsSpec deny listed them —
+        // materialize won't include them unless in allow/extra when allow non-empty).
+        // If profile coding with empty allow, builtins only — re-append ext not in list.
+        if tools_spec.allow.is_empty() && matches!(tools_spec.profile, ToolProfile::Coding | ToolProfile::ReadOnly | ToolProfile::None) {
+            let existing: std::collections::HashSet<_> =
+                tools.iter().map(|t| t.definition().name).collect();
+            for t in ext {
+                let n = t.definition().name;
+                if !existing.contains(&n)
+                    && !tools_spec.deny.iter().any(|d| d == &n)
+                {
+                    tools.push(t);
+                }
+            }
+        }
+
+        self.push_task_tools(&mut tools);
         self.mcp_tools_generation = self.mcp.generation();
+
+        // Keep child harness MCP/ext set in sync.
+        self.refresh_task_dynamic_tools().await;
 
         let mut agent = self.agent.lock().await;
         agent.set_tools(tools);
@@ -85,6 +132,12 @@ impl AppRuntime {
             }
         }
         Ok(())
+    }
+
+    /// Preview resolved main tool names (for status / debug).
+    pub fn main_tool_names_preview(&self) -> Vec<String> {
+        let spec = self.effective_main_tools_spec();
+        resolve_names(&spec, false)
     }
 
     /// If background MCP load advanced, re-apply tools onto the agent.

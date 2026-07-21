@@ -182,6 +182,8 @@ impl ToolsSpec {
     /// Resolve final tool **names** from a profile catalog.
     ///
     /// `profile_tools(profile)` returns the default name list for that profile.
+    /// Prefer [`crate::runtime::tool_materialize::resolve_names`] for harness paths
+    /// (explore hard-whitelist + MCP filtering).
     pub fn resolve_names(&self, profile_tools: &dyn Fn(&ToolProfile) -> Vec<String>) -> Vec<String> {
         let mut base = if !self.allow.is_empty() {
             self.allow.clone()
@@ -196,6 +198,11 @@ impl ToolsSpec {
         }
         // MCP stripping is done by harness when building real tools (names unknown here).
         base
+    }
+
+    /// Resolve names using the shared builtin catalogs (`one_tools`).
+    pub fn resolve_names_builtin(&self) -> Vec<String> {
+        crate::runtime::tool_materialize::resolve_names(self, false)
     }
 }
 
@@ -269,6 +276,45 @@ impl SpawnPolicy {
     }
 }
 
+/// Where a harness run may read/write files.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum IsolationMode {
+    /// Parent / CLI cwd (shared workspace).
+    #[default]
+    None,
+    /// Fresh git worktree under `.one/worktrees/` (no auto-merge).
+    Worktree,
+}
+
+impl IsolationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Worktree => "worktree",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "false" | "0" => Some(Self::None),
+            "worktree" | "wt" | "git" => Some(Self::Worktree),
+            _ => None,
+        }
+    }
+}
+
+/// Git worktree used for an isolated harness run (never auto-merged).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorktreeInfo {
+    pub path: String,
+    pub branch: String,
+    pub base_ref: String,
+    /// True when the worktree was kept after the run (e.g. on error).
+    #[serde(default)]
+    pub kept: bool,
+}
+
 // ── AgentSpec ──────────────────────────────────────────────────────────
 
 /// Harness configuration for **one** agent run (root or sub — same type).
@@ -309,6 +355,9 @@ pub struct AgentSpec {
     /// Child role table; values are nested AgentSpecs (isomorphic).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub agents: std::collections::BTreeMap<String, AgentSpec>,
+    /// File isolation for this run (CLI / task can override).
+    #[serde(default)]
+    pub isolation: IsolationMode,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub meta: Value,
 }
@@ -334,6 +383,7 @@ impl Default for AgentSpec {
             resources: ResourcesSpec::default(),
             spawn_policy: SpawnPolicy::explore_only(),
             agents: std::collections::BTreeMap::new(),
+            isolation: IsolationMode::None,
             meta: Value::Null,
         }
     }
@@ -405,6 +455,7 @@ impl AgentSpec {
             },
             spawn_policy: SpawnPolicy::none(),
             agents: std::collections::BTreeMap::new(),
+            isolation: IsolationMode::None,
             meta: Value::Null,
         }
     }
@@ -656,6 +707,9 @@ pub struct RunResult {
     pub parent: Option<RunParent>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<Value>,
+    /// Present when this run used `isolation=worktree`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worktree: Option<WorktreeInfo>,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub meta: Value,
 }
@@ -680,6 +734,7 @@ impl Default for RunResult {
             agent: None,
             parent: None,
             children: vec![],
+            worktree: None,
             meta: Value::Null,
         }
     }
@@ -735,6 +790,11 @@ impl RunResult {
         self
     }
 
+    pub fn with_worktree(mut self, info: WorktreeInfo) -> Self {
+        self.worktree = Some(info);
+        self
+    }
+
     pub fn exit_code(&self) -> i32 {
         if self.ok {
             0
@@ -759,45 +819,14 @@ impl RunResult {
 
 // ── Profile tool catalogs (names only; harness maps to real Tool impls) ─
 
-/// Default tool names per profile (must stay aligned with `one-tools` assembly).
+/// Default tool names per profile (source of truth: `one_tools::BuiltinToolProfile`).
 pub fn profile_tool_names(profile: &ToolProfile) -> Vec<String> {
+    use one_tools::BuiltinToolProfile;
     match profile {
-        ToolProfile::None => vec![],
-        ToolProfile::ReadOnly => vec![
-            "read".into(),
-            "grep".into(),
-            "find".into(),
-            "ls".into(),
-            "ask_user".into(),
-            "web_search".into(),
-            "web_fetch".into(),
-        ],
-        ToolProfile::Plan => vec![
-            "read".into(),
-            "grep".into(),
-            "find".into(),
-            "ls".into(),
-            "ask_user".into(),
-            "web_search".into(),
-            "web_fetch".into(),
-            // plan tools registered by runtime; names documented here
-            "plan".into(),
-            "exit_plan_mode".into(),
-        ],
-        ToolProfile::Coding => vec![
-            "read".into(),
-            "write".into(),
-            "edit".into(),
-            "bash".into(),
-            "bash_output".into(),
-            "bash_kill".into(),
-            "grep".into(),
-            "find".into(),
-            "ls".into(),
-            "ask_user".into(),
-            "web_search".into(),
-            "web_fetch".into(),
-        ],
+        ToolProfile::None => BuiltinToolProfile::None.tool_names(),
+        ToolProfile::ReadOnly => BuiltinToolProfile::ReadOnly.tool_names(),
+        ToolProfile::Plan => BuiltinToolProfile::Plan.tool_names(),
+        ToolProfile::Coding => BuiltinToolProfile::Coding.tool_names(),
     }
 }
 

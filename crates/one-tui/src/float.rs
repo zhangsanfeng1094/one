@@ -56,6 +56,8 @@ pub enum FloatKind {
     Info,
     /// Settings root (Ctrl+G).
     Settings,
+    /// Tool-output truncation limits (under Settings).
+    SettingsToolOutput,
     /// Provider list under Settings.
     SettingsProviders,
     /// Actions for one provider.
@@ -76,6 +78,8 @@ pub enum FloatKind {
     SettingsModelAdd,
     /// Skills manager — list + enable/disable (Codex-style).
     Skills,
+    /// Agent presets (disk JSON/MD + builtins) — paths + tools.
+    Agents,
     /// Runtime feature flags (subagent, …).
     Features,
     /// MCP servers — status + enable/disable.
@@ -382,15 +386,18 @@ impl FloatMenu {
     /// Hierarchy: Settings → Providers → Provider → Models → Model
     /// (no standalone global Models entry).
     pub fn settings_root(thinking: &str, provider: &str, model: &str) -> Self {
-        Self::settings_root_with_mcp(thinking, provider, model, "open /mcp")
+        Self::settings_root_with_mcp(thinking, provider, model, "open /mcp", "2000 · 50KB")
     }
 
-    /// Settings root with live MCP status line.
+    /// Settings root with live MCP status line and tool_output summary.
+    ///
+    /// `tool_output_summary` is e.g. `"2000 lines · 50.0KB"`.
     pub fn settings_root_with_mcp(
         thinking: &str,
         provider: &str,
         model: &str,
         mcp_summary: &str,
+        tool_output_summary: &str,
     ) -> Self {
         Self {
             kind: FloatKind::Settings,
@@ -419,10 +426,22 @@ impl FloatMenu {
                             "cycle",
                         ),
                         item(
+                            "tool_output",
+                            "Tool output",
+                            tool_output_summary,
+                            "edit",
+                        ),
+                        item(
                             "skills",
                             "Skills",
                             "enable / disable discovered skills",
                             "/skills",
+                        ),
+                        item(
+                            "agents",
+                            "Agents",
+                            "presets · paths · tools (task workers)",
+                            "/agents",
                         ),
                         item(
                             "features",
@@ -456,6 +475,47 @@ impl FloatMenu {
                     ],
                 },
             ],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Nested tool_output editor under Settings (OpenCode-style limits).
+    pub fn settings_tool_output(max_lines: usize, max_bytes: usize) -> Self {
+        let bytes_label = if max_bytes >= 1024 {
+            format!("{:.1}KB", max_bytes as f64 / 1024.0)
+        } else {
+            format!("{max_bytes}B")
+        };
+        Self {
+            kind: FloatKind::SettingsToolOutput,
+            title: "Tool output".into(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: "Limits (spill when exceeded)".into(),
+                items: vec![
+                    item(
+                        "max_lines",
+                        "Max lines",
+                        &format!("{max_lines} lines kept inline"),
+                        "edit",
+                    ),
+                    item(
+                        "max_bytes",
+                        "Max bytes",
+                        &format!("{bytes_label} ({max_bytes} bytes)"),
+                        "edit",
+                    ),
+                    item(
+                        "hint",
+                        "Spill path",
+                        "~/.one/agent/tool-outputs/ · 7-day cleanup",
+                        "info",
+                    ),
+                ],
+            }],
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
@@ -574,6 +634,98 @@ impl FloatMenu {
                 title: format!("Candidates ({})", rows.len()),
                 items,
             }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Agents catalog: rows are `(id, label, detail, path_or_builtin, source)`.
+    ///
+    /// `source` is `project` | `user` | `builtin`. Path is absolute when on disk.
+    pub fn agents_manager(
+        rows: &[(String, String, String, String, String)],
+        project_dir: &str,
+        user_dir: &str,
+    ) -> Self {
+        let mut project_items = Vec::new();
+        let mut user_items = Vec::new();
+        let mut builtin_items = Vec::new();
+        for (id, label, detail, path_hint, source) in rows {
+            let item = FloatItem {
+                id: id.clone(),
+                label: label.clone(),
+                detail: detail.clone(),
+                hint: path_hint.clone(),
+                style: FloatItemStyle::Normal,
+            };
+            match source.as_str() {
+                "project" => project_items.push(item),
+                "user" => user_items.push(item),
+                _ => builtin_items.push(item),
+            }
+        }
+        let mut sections = Vec::new();
+        sections.push(FloatSection {
+            title: "Directories".into(),
+            items: vec![
+                item(
+                    "_dir_project",
+                    "Project dir",
+                    if project_dir.is_empty() {
+                        "(cwd)/.one/agents"
+                    } else {
+                        project_dir
+                    },
+                    "path",
+                ),
+                item(
+                    "_dir_user",
+                    "User dir",
+                    if user_dir.is_empty() {
+                        "~/.one/agent/agents"
+                    } else {
+                        user_dir
+                    },
+                    "path",
+                ),
+            ],
+        });
+        if !project_items.is_empty() {
+            sections.push(FloatSection {
+                title: format!("Project agents ({})", project_items.len()),
+                items: project_items,
+            });
+        }
+        if !user_items.is_empty() {
+            sections.push(FloatSection {
+                title: format!("User agents ({})", user_items.len()),
+                items: user_items,
+            });
+        }
+        if !builtin_items.is_empty() {
+            sections.push(FloatSection {
+                title: format!("Builtin ({})", builtin_items.len()),
+                items: builtin_items,
+            });
+        }
+        if sections.len() == 1 {
+            sections.push(FloatSection {
+                title: "Agents".into(),
+                items: vec![item(
+                    "_empty",
+                    "(no agent files)",
+                    "add <name>.json under .one/agents or ~/.one/agent/agents",
+                    "",
+                )],
+            });
+        }
+        Self {
+            kind: FloatKind::Agents,
+            title: "Agents".into(),
+            search: String::new(),
+            sections,
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),
@@ -1549,6 +1701,12 @@ fn default_command_sections() -> Vec<FloatSection> {
                     "Manage Skills",
                     "list · enable · disable",
                     "/skills",
+                ),
+                item(
+                    "agents",
+                    "Manage Agents",
+                    "presets · JSON paths · tools",
+                    "/agents",
                 ),
                 item(
                     "mcp",

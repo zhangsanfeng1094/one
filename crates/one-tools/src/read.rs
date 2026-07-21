@@ -95,10 +95,11 @@ impl Tool for ReadTool {
 
         let lines: Vec<&str> = content.lines().collect();
         let start = offset.saturating_sub(1);
-        // Cap explicit limit at DEFAULT_MAX_LINES so a huge limit cannot flood context.
+        // Cap explicit limit at tool_output max_lines so a huge limit cannot flood context.
+        let line_cap = crate::truncate::tool_output_limits().max_lines;
         let max_window = limit
-            .map(|n| (n as usize).min(crate::truncate::DEFAULT_MAX_LINES))
-            .unwrap_or(crate::truncate::DEFAULT_MAX_LINES);
+            .map(|n| (n as usize).min(line_cap))
+            .unwrap_or(line_cap);
         let end = (start + max_window).min(lines.len());
         let slice = &lines[start..end];
 

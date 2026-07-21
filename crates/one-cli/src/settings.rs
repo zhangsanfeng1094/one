@@ -24,6 +24,19 @@ fn default_true() -> bool {
     true
 }
 
+/// OpenCode-style tool output caps (settings key `tool_output`).
+///
+/// Defaults when omitted: 2000 lines / 50 KiB. Over either limit → full spill
+/// under `~/.one/agent/tool-outputs/` + preview + path for the model.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ToolOutputSettings {
+    /// Max lines kept inline before spill (default 2000).
+    pub max_lines: Option<usize>,
+    /// Max UTF-8 bytes kept inline before spill (default 51200).
+    pub max_bytes: Option<usize>,
+}
+
 /// User settings — single source for durable interactive preferences.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -50,9 +63,22 @@ pub struct Settings {
     /// Runtime feature flags (id → enabled). Omitted ids use registry defaults.
     /// See `runtime/features.rs` (e.g. `subagent` → task tools + prompt section).
     pub features: Option<HashMap<String, bool>>,
+    /// Unified tool-output truncation (OpenCode `tool_output`).
+    pub tool_output: Option<ToolOutputSettings>,
 }
 
 impl Settings {
+    /// Apply `tool_output` (+ env overrides) to the process-wide truncate limits.
+    pub fn apply_tool_output_limits(&self) {
+        let (lines, bytes) = self
+            .tool_output
+            .as_ref()
+            .map(|t| (t.max_lines, t.max_bytes))
+            .unwrap_or((None, None));
+        let lim = one_tools::ToolOutputLimits::from_env_and_overrides(lines, bytes);
+        one_tools::set_tool_output_limits(lim);
+    }
+
     /// Effective feature value (registry default when omitted).
     pub fn feature_enabled(&self, id: &str, default: bool) -> bool {
         self.features
@@ -204,6 +230,32 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             let v = value.trim().to_ascii_lowercase();
             settings.bash_sandbox = Some(matches!(v.as_str(), "1" | "true" | "yes" | "on"));
         }
+        "tool_output_max_lines" | "tool-output-max-lines" | "tool_output.max_lines" => {
+            let n: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| "tool_output.max_lines must be a positive number".to_string())?;
+            if n < 1 {
+                return Err("tool_output.max_lines must be >= 1".into());
+            }
+            let mut t = settings.tool_output.clone().unwrap_or_default();
+            t.max_lines = Some(n);
+            settings.tool_output = Some(t);
+            settings.apply_tool_output_limits();
+        }
+        "tool_output_max_bytes" | "tool-output-max-bytes" | "tool_output.max_bytes" => {
+            let n: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| "tool_output.max_bytes must be a positive number".to_string())?;
+            if n < 1 {
+                return Err("tool_output.max_bytes must be >= 1".into());
+            }
+            let mut t = settings.tool_output.clone().unwrap_or_default();
+            t.max_bytes = Some(n);
+            settings.tool_output = Some(t);
+            settings.apply_tool_output_limits();
+        }
         // Feature flags: /settings feature.subagent off  or  /settings features.subagent on
         key if key.starts_with("feature.") || key.starts_with("features.") => {
             let id = key
@@ -254,7 +306,8 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
         other => {
             return Err(format!(
                 "unknown setting `{other}` · known: provider model thinking auto_approve \
-                 context_window sandbox add_dir bash_sandbox feature.<id> allow deny ask"
+                 context_window sandbox add_dir bash_sandbox tool_output.max_lines \
+                 tool_output.max_bytes feature.<id> allow deny ask"
             ));
         }
     }
@@ -353,6 +406,16 @@ pub fn rows(settings: &Settings) -> Vec<(String, String)> {
                 })
                 .unwrap_or_else(|| "(defaults)".into()),
         ),
+        {
+            let lim = one_tools::tool_output_limits();
+            (
+                "tool_output".into(),
+                format!(
+                    "max_lines={} max_bytes={}",
+                    lim.max_lines, lim.max_bytes
+                ),
+            )
+        },
         ("path".into(), path_display()),
     ]
 }
@@ -390,10 +453,27 @@ mod tests {
                 enabled: false,
             }]),
             features: Some(HashMap::from([("subagent".into(), false)])),
+            tool_output: Some(ToolOutputSettings {
+                max_lines: Some(5000),
+                max_bytes: Some(204_800),
+            }),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn tool_output_set_key() {
+        let mut s = Settings::default();
+        set_key(&mut s, "tool_output.max_lines", "100").unwrap();
+        assert_eq!(s.tool_output.as_ref().unwrap().max_lines, Some(100));
+        set_key(&mut s, "tool_output.max_bytes", "4096").unwrap();
+        assert_eq!(s.tool_output.as_ref().unwrap().max_bytes, Some(4096));
+        assert_eq!(one_tools::tool_output_limits().max_lines, 100);
+        assert_eq!(one_tools::tool_output_limits().max_bytes, 4096);
+        // Restore defaults for other tests in the same process.
+        one_tools::set_tool_output_limits(one_tools::ToolOutputLimits::default());
     }
 
     #[test]

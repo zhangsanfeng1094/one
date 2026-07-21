@@ -73,6 +73,12 @@ impl Tool for FindTool {
         matches.sort();
 
         let joined = matches.join("\n");
-        Ok(ToolOutput::text(crate::truncate::apply_head_default(&joined)))
+        let presented = crate::truncate::present_tool_output(
+            &joined,
+            "find",
+            self.policy.cwd(),
+            crate::truncate::PreviewStyle::Head,
+        );
+        Ok(ToolOutput::text(presented.text))
     }
 }

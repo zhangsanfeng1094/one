@@ -20,7 +20,7 @@ use super::job_tools::{JobKillTool, JobOutputTool, WaitTasksTool};
 use super::policy::build_path_policy;
 use super::prompt_compose::compose_base_system_prompt;
 use super::task_tool::{
-    harness_opts_from_policy, main_parent_agent_spec, TaskTool, TaskToolHost,
+    harness_opts_from_policy, main_parent_agent_spec_for_cwd, TaskTool, TaskToolHost,
 };
 use super::{AgentMode, AppRuntime};
 use crate::approval::PermissionGate;
@@ -73,6 +73,22 @@ impl AppRuntime {
         }
 
         let user_settings = crate::settings::load();
+        // OpenCode-style unified tool_output limits (settings + env).
+        user_settings.apply_tool_output_limits();
+        // Prune spilled tool outputs older than 7 days (OpenCode Truncate.cleanup).
+        {
+            let report =
+                one_tools::cleanup_tool_outputs(one_tools::TOOL_OUTPUT_RETENTION_DAYS);
+            if report.removed_files > 0 || report.removed_dirs > 0 {
+                tracing::info!(
+                    removed_files = report.removed_files,
+                    removed_bytes = report.removed_bytes,
+                    removed_dirs = report.removed_dirs,
+                    errors = report.errors,
+                    "tool-outputs cleanup"
+                );
+            }
+        }
         // Codex-style skills enable/disable (settings.skills_config).
         resources.apply_skills_config(&user_settings.skills_config_entries());
         let no_subagent_process = cli.no_subagent || env_no_subagent();
@@ -124,6 +140,9 @@ impl AppRuntime {
                 .unwrap_or_else(|| agent_dir.join("plans").join("_none.md")),
         )));
 
+        // Main AgentSpec drives Act tool face + task spawn table.
+        let main_agent = main_parent_agent_spec_for_cwd(&cwd);
+
         // Task meta-tool host (same harness as `one agent run`). Enabled for
         // main agents that can spawn (not pure --read-only research shells).
         let task_host = {
@@ -136,7 +155,7 @@ impl AppRuntime {
             );
             Some(TaskToolHost::new(
                 opts,
-                main_parent_agent_spec(),
+                main_agent.clone(),
                 agent_jobs.clone(),
             ))
         };
@@ -365,6 +384,7 @@ impl AppRuntime {
             mcp_tools_generation,
             langfuse: langfuse_sink,
             task_host,
+            main_agent,
             applied_features,
             pending_features: None,
             no_subagent_process,
@@ -372,6 +392,14 @@ impl AppRuntime {
 
         // Seed session id for task parent metadata.
         runtime.sync_task_session().await;
+        // MCP/extension tools for child harness (tools.mcp / allow MCP names).
+        runtime.refresh_task_dynamic_tools().await;
+        // Materialize Act tools from main AgentSpec.tools (not a fixed coding bag).
+        if !start_plan {
+            if let Err(e) = runtime.rebuild_act_tools().await {
+                tracing::warn!(error = %e, "main ToolsSpec materialize failed; using bootstrap tools");
+            }
+        }
 
         // Restore plan path + mode from session custom entry if present.
         if !cli.read_only {

@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 one-core.workspace = true
+one-tools.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 serde.workspace = true

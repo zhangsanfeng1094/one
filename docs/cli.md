@@ -480,17 +480,35 @@ tail -n 5 ~/.one/agent/cache-debug/log.jsonl
 
 重点字段：`analysis.breakpoints`、`usage.cache_read_tokens` / `cache_write_tokens`、`hint`。
 
-### 工具输出截断（Pi + Claude 风格）
+### 工具输出截断（OpenCode 统一策略）
+
+所有工具结果（`bash` / `grep` / `find` / MCP …）走同一条管道：
 
 | 规则 | 默认 |
 |------|------|
-| 进模型的行数上限 | 2000 行 |
-| 进模型的字节上限 | 50KB |
-| bash 超大输出（Claude spill） | 超过 **30000 字符**（或 50KB）时，**全文写入** `~/.one/agent/tool-outputs/`，模型只看到 **开头 ~4KB 预览 + 文件路径** |
-| 可调 | `BASH_MAX_OUTPUT_LENGTH` 或 `ONE_BASH_MAX_OUTPUT_LENGTH`（1000–150000） |
-| read 大文件 | `PARTIAL view` 提示 + `offset`/`limit` 继续读 |
+| 进模型的行数上限 | **2000** 行 |
+| 进模型的字节上限 | **50 KiB** |
+| 超限时 | **全文 spill** 到 `~/.one/agent/tool-outputs/`，模型看到 **可容纳的预览** + 路径 hint（`read` / `grep` 再取） |
+| settings | `tool_output.max_lines` / `tool_output.max_bytes`（`~/.one/agent/settings.json`） |
+| env（覆盖 settings） | `ONE_TOOL_OUTPUT_MAX_LINES` / `ONE_TOOL_OUTPUT_MAX_BYTES` |
+| slash | `/settings tool_output.max_lines 5000` · `/settings tool_output.max_bytes 204800` |
+| MCP | 同上；`mcp.json` `maxOutputBytes` 与全局取更紧 |
+| read 大文件 | `PARTIAL view` + `offset`/`limit`（用同一 max_lines） |
 
-该路径在 `~/.one/agent` 下，默认 **只读** 对模型开放，可用 `read`/`grep` 再取全文。
+```json
+// ~/.one/agent/settings.json
+{
+  "tool_output": {
+    "max_lines": 5000,
+    "max_bytes": 204800
+  }
+}
+```
+
+spill 目录在 `~/.one/agent/tool-outputs/` 下，默认对模型 **只读**，可用 `read`/`grep` 再取全文。  
+启动时会按 **7 天**清理过期 spill（OpenCode 同款；mtime）。
+
+**Settings 面板（Ctrl+G）**：General → **Tool output** → 编辑 Max lines / Max bytes。
 
 ### 上下文压缩（compaction harness）
 

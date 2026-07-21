@@ -94,6 +94,14 @@ impl TaskToolHost {
         *self.opts.write().await = opts;
     }
 
+    /// Refresh MCP / extension tools available to child harness runs (`tools.mcp`).
+    pub async fn set_dynamic_tools(
+        &self,
+        tools: Vec<std::sync::Arc<dyn one_core::tool::Tool>>,
+    ) {
+        self.opts.write().await.dynamic_tools = tools;
+    }
+
     pub fn set_depth(&self, depth: u32) {
         self.parent_depth.store(depth, Ordering::Relaxed);
     }
@@ -176,18 +184,44 @@ impl TaskTool {
 #[async_trait]
 impl Tool for TaskTool {
     fn definition(&self) -> ToolDefinition {
+        let allowed = match self.host.parent_agent.try_read() {
+            Ok(a) if !a.spawn_policy.allow.is_empty() => a.spawn_policy.allow.join(", "),
+            _ => "explore".into(),
+        };
+        let child_blurb = match self.host.parent_agent.try_read() {
+            Ok(a) => {
+                let mut parts = Vec::new();
+                for name in &a.spawn_policy.allow {
+                    if name == "*" {
+                        continue;
+                    }
+                    if let Some(child) = a.agents.get(name) {
+                        if let Some(d) = &child.description {
+                            parts.push(format!("{name}: {d}"));
+                            continue;
+                        }
+                    }
+                    parts.push(name.clone());
+                }
+                if parts.is_empty() {
+                    String::new()
+                } else {
+                    format!(" Available agents — {}.", parts.join(" | "))
+                }
+            }
+            Err(_) => String::new(),
+        };
         ToolDefinition {
             name: "task".into(),
-            description: "\
-Run a sub-agent via the same harness as `one agent run` (Agent ≡ Subagent). \
-Default agent=explore: read-only multi-file research; returns a concise summary \
-so this conversation stays small. Do not use for a single trivial file read. \
-MVP supports agent=explore (or equivalent agent_spec). \
-Set background=true for long research that should not block this turn: returns \
+            description: format!(
+                "Run a sub-agent via the same harness as `one agent run` (Agent ≡ Subagent). \
+Default agent=explore when allowed. Returns a concise summary so this conversation stays small. \
+Do not use for a single trivial file read. Allowed agent names: [{allowed}].{child_blurb} \
+Set background=true for long work that should not block this turn: returns \
 status=started + job_id immediately; when done a [job completed] notice is \
 injected before the next LLM turn (or poll with job_output). \
 The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR:."
-                .into(),
+            ),
             parameters: json!({
                 "type": "object",
                 "required": ["prompt"],
@@ -202,11 +236,13 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                     },
                     "agent": {
                         "type": "string",
-                        "description": "Preset / child name under spawn_policy.allow (default: explore)"
+                        "description": format!(
+                            "Preset / child name under spawn_policy.allow (one of: {allowed}; default explore if allowed)"
+                        )
                     },
                     "mode": {
                         "type": "string",
-                        "description": "Alias for agent (Claude-style); e.g. explore"
+                        "description": "Alias for agent (Claude-style)"
                     },
                     "agent_spec": {
                         "type": "object",
@@ -215,6 +251,10 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                     "background": {
                         "type": "boolean",
                         "description": "If true, return immediately with job_id; result arrives as [job completed] notification"
+                    },
+                    "isolation": {
+                        "type": "string",
+                        "description": "none (default, shared cwd) | worktree (isolated git worktree under .one/worktrees; no auto-merge). Prefer worktree for writable agents."
                     }
                 }
             }),
@@ -243,6 +283,11 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             .get("background")
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
+        let isolation_arg = call
+            .arguments
+            .get("isolation")
+            .and_then(|v| v.as_str())
+            .and_then(crate::protocol::IsolationMode::parse);
 
         // Logical concurrency (independent of physical LLM permit).
         let slot = self
@@ -265,7 +310,7 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             depth: child_depth,
         };
 
-        let req = match build_child_request(
+        let mut req = match build_child_request(
             &parent_agent,
             &agent_name,
             &prompt,
@@ -283,24 +328,25 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                 ));
             }
         };
+        // task arg overrides AgentSpec.isolation when provided.
+        if let Some(iso) = isolation_arg {
+            req.agent.isolation = iso;
+        }
+        // Default: writable children in background → worktree when still none.
+        if background
+            && matches!(req.agent.isolation, crate::protocol::IsolationMode::None)
+            && child_tools_look_writable(&req.agent)
+        {
+            req.agent.isolation = crate::protocol::IsolationMode::Worktree;
+        }
 
-        // MVP: only explore / read_only children.
-        if !is_supported_child(&req.agent) {
+        // Validate tools can materialize before spending a slot on LLM work.
+        if let Err(e) = validate_child_tools(&req.agent) {
             drop(slot);
             return Ok(format_task_output(
                 &agent_name,
                 description.as_deref(),
-                &RunResult::failure(
-                    ProtocolError::new(
-                        error_code::SPAWN_NOT_ALLOWED,
-                        format!(
-                            "MVP task only supports explore / read_only agents (got `{}`)",
-                            req.agent.display_name()
-                        ),
-                    ),
-                    0,
-                )
-                .with_status(TaskExitStatus::RuntimeError),
+                &RunResult::failure(e, 0).with_status(TaskExitStatus::RuntimeError),
             ));
         }
 
@@ -364,13 +410,73 @@ fn resolve_agent_name(args: &Value) -> String {
     "explore".into()
 }
 
-fn is_supported_child(spec: &AgentSpec) -> bool {
-    let name = spec.display_name();
-    name == "explore"
-        || matches!(
-            spec.tools.profile,
-            crate::protocol::ToolProfile::ReadOnly
+fn child_tools_look_writable(spec: &AgentSpec) -> bool {
+    use super::tool_materialize::resolve_names;
+    let prefer = spec.display_name() == "explore"
+        || (matches!(spec.tools.profile, crate::protocol::ToolProfile::ReadOnly)
+            && spec.tools.allow.is_empty());
+    let names = resolve_names(&spec.tools, prefer);
+    names.iter().any(|n| {
+        matches!(
+            n.as_str(),
+            "write" | "edit" | "bash" | "bash_output" | "bash_kill"
         )
+    })
+}
+
+/// Ensure AgentSpec.tools resolve against the builtin registry.
+/// MCP names are allowed when `tools.mcp` is true (filled at run from host dynamic_tools).
+fn validate_child_tools(spec: &AgentSpec) -> std::result::Result<(), ProtocolError> {
+    use super::tool_materialize::{
+        harness_build_context, harness_registry, resolve_names,
+    };
+    use one_tools::PathPolicy;
+    let prefer_explore = spec.display_name() == "explore"
+        || (matches!(spec.tools.profile, crate::protocol::ToolProfile::ReadOnly)
+            && spec.tools.allow.is_empty());
+    let names = resolve_names(&spec.tools, prefer_explore);
+    let reg = harness_registry();
+    let mut unknown = Vec::new();
+    for n in &names {
+        let is_mcp = n.contains("__");
+        if is_mcp {
+            if !spec.tools.mcp {
+                unknown.push(format!("{n} (MCP tool but tools.mcp=false)"));
+            }
+            continue;
+        }
+        if n == "plan" || n == "exit_plan_mode" {
+            // plan tools are main-session only unless registered as instances
+            unknown.push(n.clone());
+            continue;
+        }
+        if !reg.contains(n) {
+            unknown.push(n.clone());
+        }
+    }
+    if !unknown.is_empty() {
+        return Err(ProtocolError::new(
+            error_code::INVALID_AGENT_SPEC,
+            format!(
+                "unknown tool(s) for agent `{}`: {}",
+                spec.display_name(),
+                unknown.join(", ")
+            ),
+        ));
+    }
+    // Dry-run materialize builtins (ensures factories work).
+    let ctx = harness_build_context(PathPolicy::workspace(std::path::PathBuf::from(".")), true);
+    let builtin_only: Vec<String> = names
+        .into_iter()
+        .filter(|n| !n.contains("__") && n != "plan" && n != "exit_plan_mode")
+        .collect();
+    reg.materialize(&builtin_only, &ctx).map_err(|e| {
+        ProtocolError::new(
+            error_code::INVALID_AGENT_SPEC,
+            format!("tool materialize failed: {e}"),
+        )
+    })?;
+    Ok(())
 }
 
 fn build_child_request(
@@ -533,6 +639,7 @@ pub fn format_task_output(
         "error": result.error,
         "usage": result.usage,
         "parent": result.parent,
+        "worktree": result.worktree,
     });
 
     ToolOutput::text_with_details(text, details)
@@ -540,11 +647,44 @@ pub fn format_task_output(
 
 /// One-liner for main agent system prompt.
 pub const TASK_TOOL_PROMPT_HINT: &str = "\
-- For large exploration across many files, use the `task` tool (agent=explore) so findings return as a summary without bloating this conversation. Do not use task for a trivial single-file read. For long research that should not block this turn, use task(background=true); when you have spawned all background tasks and have nothing else to do, call wait_tasks (mode=all) to block until they finish and receive each completion in order — or wait_tasks(mode=any) for the next one. job_output polls without waiting.";
+- To delegate work to a sub-agent, use the `task` tool with `agent` set to a name allowed by spawn policy (default: explore for multi-file research). Findings return as a summary so this conversation stays small. Do not use task for a trivial single-file read. For long work that should not block this turn, use task(background=true); when you have spawned all background tasks and have nothing else to do, call wait_tasks (mode=all) to block until they finish — or wait_tasks(mode=any) for the next one. job_output polls without waiting. For agents that write/edit/bash, prefer isolation=worktree (or background, which defaults worktree for writable tools) so changes stay under .one/worktrees and are not auto-merged.";
 
-/// Build default parent AgentSpec for the interactive / -p main agent.
+/// Build parent AgentSpec for the interactive / -p main agent.
+///
+/// Load order:
+/// 1. `cwd/.one/agents/main.json` or `default.json`
+/// 2. `~/.one/agent/agents/main.json` or `default.json`
+/// 3. builtin main (spawn allow: explore only)
+///
+/// Then merges every other `*.json` under project/user agents dirs into
+/// `agents` + `spawn_policy.allow` (so defining a new worker is drop-a-file).
 pub fn main_parent_agent_spec() -> AgentSpec {
-    AgentSpec::builtin_main()
+    main_parent_agent_spec_for_cwd(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
+}
+
+/// Same as [`main_parent_agent_spec`] with an explicit project cwd.
+pub fn main_parent_agent_spec_for_cwd(cwd: &std::path::Path) -> AgentSpec {
+    let mut spec = if let Ok(s) = super::presets::load_preset("main", cwd) {
+        s
+    } else if let Ok(s) = super::presets::load_preset("default", cwd) {
+        s
+    } else {
+        AgentSpec::builtin_main()
+    };
+    merge_disk_main(&mut spec);
+    super::presets::merge_discovered_agents(&mut spec, cwd);
+    spec
+}
+
+fn merge_disk_main(spec: &mut AgentSpec) {
+    if spec.name.is_none() {
+        spec.name = Some("main".into());
+    }
+    // Ensure explore child exists when allow lists explore but agents table omits it.
+    if spec.spawn_allowed("explore") && !spec.agents.contains_key("explore") {
+        spec.agents
+            .insert("explore".into(), AgentSpec::builtin_explore());
+    }
 }
 
 /// HarnessOptions from runtime path policy fields.
@@ -559,6 +699,7 @@ pub fn harness_opts_from_policy(
         full_access,
         add_dirs,
         auto_approve,
+        dynamic_tools: vec![],
     }
 }
 

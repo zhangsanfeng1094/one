@@ -43,6 +43,10 @@ pub struct AgentRunArgs {
     /// Output: text or json (RunResult envelope). Default json.
     #[arg(long = "output-format", default_value = "json")]
     pub output_format: String,
+
+    /// File isolation: none (shared cwd) or worktree (git worktree under .one/worktrees).
+    #[arg(long = "isolation", value_name = "MODE", default_value = "none")]
+    pub isolation: String,
 }
 
 /// Top-level `one run` (alias surface for --preset / --spec).
@@ -62,6 +66,10 @@ pub struct RunCli {
 
     #[arg(long = "output-format", default_value = "json")]
     pub output_format: String,
+
+    /// File isolation: none | worktree.
+    #[arg(long = "isolation", value_name = "MODE", default_value = "none")]
+    pub isolation: String,
 }
 
 pub async fn run_agent_command(
@@ -84,8 +92,18 @@ pub async fn run_agent_command(
             println!("max_turns: {:?}", spec.max_turns);
             println!("permission_mode: {:?}", spec.permission_mode);
             println!("tools.profile: {:?}", spec.tools.profile);
+            println!("tools.allow: {:?}", spec.tools.allow);
+            println!("tools.deny: {:?}", spec.tools.deny);
+            println!("tools.extra: {:?}", spec.tools.extra);
             println!("tools.mcp: {}", spec.tools.mcp);
+            let resolved = crate::runtime::harness::preview_tool_names(&spec);
+            println!("tools.resolved: {resolved:?}");
+            println!("isolation: {:?}", spec.isolation);
             println!("spawn_policy.allow: {:?}", spec.spawn_policy.allow);
+            if !spec.agents.is_empty() {
+                let kids: Vec<_> = spec.agents.keys().cloned().collect();
+                println!("agents: {kids:?}");
+            }
             if let Some(sys) = &spec.system_prompt {
                 let preview: String = sys.chars().take(200).collect();
                 println!("system_prompt (preview): {preview}…");
@@ -106,6 +124,7 @@ pub async fn run_agent_command(
                 Some(args.preset.as_str()),
                 &prompt,
                 &args.output_format,
+                &args.isolation,
             )
             .await
         }
@@ -131,6 +150,7 @@ pub async fn run_run_cli(
         run.preset.as_deref(),
         &prompt,
         &run.output_format,
+        &run.isolation,
     )
     .await
 }
@@ -142,6 +162,7 @@ async fn execute_run(
     preset: Option<&str>,
     prompt: &str,
     output_format: &str,
+    isolation: &str,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let agent_ref = if let Some(path) = spec_path {
         let spec = if path.as_os_str() == "-" {
@@ -157,7 +178,15 @@ async fn execute_run(
         AgentRef::Preset(preset.unwrap_or("explore").to_string())
     };
 
-    let spec = presets::resolve_agent_ref(&agent_ref, cwd)?;
+    let mut spec = presets::resolve_agent_ref(&agent_ref, cwd)?;
+    if let Some(iso) = crate::protocol::IsolationMode::parse(isolation) {
+        spec.isolation = iso;
+    } else if !isolation.is_empty() && isolation != "none" {
+        return Err(format!(
+            "unknown --isolation `{isolation}` (use none|worktree)"
+        )
+        .into());
+    }
     let mut req = RunRequest::new(spec, prompt);
     req.session.mode = SessionMode::Ephemeral;
 
