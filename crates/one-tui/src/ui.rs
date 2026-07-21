@@ -582,6 +582,7 @@ fn float_footer_text(menu: &FloatMenu) -> String {
             " ↑/↓ Navigate  ·  Enter Add  ·  Ctrl+F Re-import  ·  Esc Back "
         }
         FloatKind::SettingsToolOutput => " ↑/↓ Navigate  ·  Enter Edit  ·  Esc Back ",
+        FloatKind::SettingsCompaction => " ↑/↓ Navigate  ·  Enter Edit/Toggle  ·  Esc Back ",
         FloatKind::SettingsProviders
         | FloatKind::SettingsProviderApi
         | FloatKind::SettingsThinkingFormat
@@ -1932,10 +1933,13 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
     if app.usage_tokens > 0 {
         meta_spans.push(Span::styled("  ", Theme::bg()));
-        meta_spans.push(Span::styled(
-            format!("~{}", format_tokens(app.usage_tokens)),
-            Theme::status_faint(),
-        ));
+        let tok = format_tokens(app.usage_tokens);
+        let label = if app.usage_tokens_estimated {
+            format!("~{tok}")
+        } else {
+            tok
+        };
+        meta_spans.push(Span::styled(label, Theme::status_faint()));
     }
     // Live MCP progress chip (e.g. MCP 4/5…) — coarse, no connection noise.
     if !app.mcp_chip_text.is_empty() {
@@ -2438,15 +2442,26 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         }
         if app.context_window > 0 && app.usage_tokens > 0 {
             let pct = (app.usage_tokens * 100) / app.context_window.max(1);
-            usage.push_str(&format!("ctx {pct}%  "));
+            // ctx uses last provider prompt size when known (no ~).
+            let approx = if app.usage_tokens_estimated { "~" } else { "" };
+            usage.push_str(&format!(
+                "ctx {approx}{} {}%  ",
+                format_tokens(app.usage_tokens),
+                pct
+            ));
         }
         right.push(Span::styled(usage, Theme::status_faint()));
     } else if app.usage_tokens > 0 {
+        let approx = if app.usage_tokens_estimated { "~" } else { "" };
         let usage = if app.context_window > 0 {
             let pct = (app.usage_tokens * 100) / app.context_window.max(1);
-            format!("~{} tok {}%  ", format_tokens(app.usage_tokens), pct)
+            format!(
+                "{approx}{} tok {}%  ",
+                format_tokens(app.usage_tokens),
+                pct
+            )
         } else {
-            format!("~{} tok  ", format_tokens(app.usage_tokens))
+            format!("{approx}{} tok  ", format_tokens(app.usage_tokens))
         };
         right.push(Span::styled(usage, Theme::status_faint()));
     }

@@ -440,9 +440,12 @@ async fn apply_config_op(
                     // set_key already applies tool_output limits for those keys.
                     let lim = one_tools::tool_output_limits();
                     app.set_tool_output_limits(lim.max_lines, lim.max_bytes);
+                    sync_compaction_settings(app, &s);
                     app.set_notice(format!("settings.{key} = {apply_value}"));
                     if key.contains("tool_output") {
                         app.open_settings_tool_output();
+                    } else if key.contains("compaction") {
+                        app.open_settings_compaction();
                     } else {
                         app.open_settings_float();
                     }
@@ -574,6 +577,8 @@ pub async fn run_interactive(
     {
         let lim = one_tools::tool_output_limits();
         app.set_tool_output_limits(lim.max_lines, lim.max_bytes);
+        let s = crate::settings::load();
+        sync_compaction_settings(&mut app, &s);
     }
     let ctx = providers.context_window();
     app.set_context_window(ctx);
@@ -835,8 +840,11 @@ pub async fn run_interactive(
 }
 
 async fn refresh_usage(app: &mut App, runtime: &AppRuntime) {
-    let tokens = runtime.estimated_tokens().await;
+    // Context %: last provider-reported prompt size (OpenCode-style), else char/4.
+    let (tokens, estimated) = runtime.context_tokens().await;
     app.set_usage_tokens(tokens);
+    app.set_usage_tokens_estimated(estimated);
+    // ↑↓ / cost: session-cumulative provider usage (billing semantics).
     let usage = runtime.token_usage().await;
     app.set_usage_io(usage.input_tokens, usage.output_tokens);
     app.set_usage_cache(usage.cache_read_tokens, usage.cache_write_tokens);
@@ -847,6 +855,21 @@ async fn refresh_usage(app: &mut App, runtime: &AppRuntime) {
         &usage,
     );
     app.set_usage_cost_usd(cost);
+}
+
+fn sync_compaction_settings(app: &mut App, s: &crate::settings::Settings) {
+    let c = s.compaction_or_default();
+    app.set_compaction_settings(
+        c.auto.unwrap_or(true),
+        c.ratio.unwrap_or(one_core::DEFAULT_COMPACT_RATIO),
+        c.threshold,
+        c.keep_recent.unwrap_or(12),
+        c.prune.unwrap_or(false),
+        c.prune_protect_tokens
+            .unwrap_or(one_core::DEFAULT_PRUNE_PROTECT_TOKENS),
+        c.prune_max_chars
+            .unwrap_or(one_core::DEFAULT_PRUNE_MAX_CHARS),
+    );
 }
 
 /// Very rough public list prices (USD per 1M tokens). Zero when unknown.
@@ -1368,9 +1391,11 @@ async fn handle_slash(
             }
             runtime.maybe_compact(providers.as_llm(), true).await?;
             refresh_usage(app, runtime).await;
+            let (toks, estimated) = runtime.context_tokens().await;
             app.set_notice(format!(
-                "compacted · ~{} tokens",
-                runtime.estimated_tokens().await
+                "compacted · {}{} tokens",
+                if estimated { "~" } else { "" },
+                toks
             ));
             Ok(SlashAction::Consumed)
         }
@@ -1840,6 +1865,9 @@ async fn handle_slash(
                         if key.contains("tool_output") {
                             let lim = one_tools::tool_output_limits();
                             app.set_tool_output_limits(lim.max_lines, lim.max_bytes);
+                        }
+                        if key.contains("compaction") {
+                            sync_compaction_settings(app, &s);
                         }
                         if key.eq_ignore_ascii_case("provider") || key.eq_ignore_ascii_case("model")
                         {

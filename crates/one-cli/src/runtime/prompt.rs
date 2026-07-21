@@ -2,8 +2,8 @@
 
 use one_core::agent::{CompletionRequest, LlmProvider, ThinkingLevel};
 use one_core::compaction::{
-    compact_messages, should_compact_tokens, split_for_compaction, summarization_prompt,
-    tokens_for_compaction, CompactionConfig,
+    compact_messages, prune_old_tool_outputs, should_compact_tokens, split_for_compaction,
+    summarization_prompt, tokens_for_compaction, CompactionConfig,
 };
 use one_core::message::AgentMessage;
 use one_ext::ExtensionEvent;
@@ -115,17 +115,31 @@ impl AppRuntime {
         Ok(())
     }
 
-    /// Compact when over threshold, or when `force` (e.g. context overflow recovery).
+    /// Compact when over threshold, or when `force` (e.g. context overflow recovery / `/compact`).
     ///
-    /// Threshold is ~70% of [`Self::context_window`] when known; otherwise 80k.
+    /// Strategy from `settings.compaction` (auto / ratio|threshold / keep_recent;
+    /// optional prune default **off**).
     /// Token pressure prefers last provider-reported prompt size over char/4 estimate.
+    ///
+    /// Flow:
+    /// 1. Optional pre-pass (`prune=on`): clear tool bodies **outside** keep_recent tail
+    ///    (recent turns untouched). Cheap; does not replace summarization.
+    /// 2. If still over threshold (or forced) → LLM/extractive summary of older messages,
+    ///    keep_recent tail kept verbatim (including their tools).
     pub async fn maybe_compact(
         &mut self,
         provider: &dyn LlmProvider,
         force: bool,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let config = CompactionConfig::from_context_window(self.context_window);
-        let (messages, last_prompt) = {
+        let settings = crate::settings::load();
+        let config = settings.compaction_config(self.context_window);
+
+        // Manual force (/compact, API overflow) always proceeds; auto respects `enabled`.
+        if !force && !config.enabled {
+            return Ok(());
+        }
+
+        let (mut messages, last_prompt) = {
             let agent = self.agent.lock().await;
             (agent.messages.clone(), agent.last_prompt_tokens)
         };
@@ -134,12 +148,33 @@ impl AppRuntime {
         } else {
             None
         };
-        let tokens = tokens_for_compaction(&messages, observed);
+        let mut tokens = tokens_for_compaction(&messages, observed);
 
         if !force && !should_compact_tokens(tokens, &config) {
             return Ok(());
         }
+
+        // 1) Optional prune of old tool outputs (cheaper than full summary).
+        let mut did_prune = false;
+        if config.prune {
+            let n = prune_old_tool_outputs(&mut messages, &config);
+            if n > 0 {
+                did_prune = true;
+                // After prune, re-estimate (provider last_prompt is stale for size).
+                tokens = tokens_for_compaction(&messages, None);
+                let mut agent = self.agent.lock().await;
+                agent.messages = messages.clone();
+                // Stale API size no longer matches pruned buffer.
+                agent.last_prompt_tokens = 0;
+            }
+        }
+
+        // Prune alone relieved pressure — skip summary unless forced.
+        if !force && did_prune && !should_compact_tokens(tokens, &config) {
+            return Ok(());
+        }
         if split_for_compaction(&messages, &config).is_none() {
+            // Nothing left to summarize (too few messages); prune may still have applied.
             return Ok(());
         }
 

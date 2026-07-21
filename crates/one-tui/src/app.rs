@@ -440,6 +440,14 @@ pub struct App {
     pub tool_output_max_lines: usize,
     /// Effective tool_output max_bytes (for Settings UI).
     pub tool_output_max_bytes: usize,
+    /// Compaction strategy display state (Settings UI).
+    pub compaction_auto: bool,
+    pub compaction_ratio: f64,
+    pub compaction_threshold: Option<usize>,
+    pub compaction_keep_recent: usize,
+    pub compaction_prune: bool,
+    pub compaction_prune_protect: usize,
+    pub compaction_prune_max_chars: usize,
     /// Status-bar / prompt-meta chip, e.g. `MCP 4/5…`. Empty = hidden.
     pub mcp_chip_text: String,
     /// 0=hide 1=loading 2=ok 3=partial 4=error
@@ -467,8 +475,11 @@ pub struct App {
     pub settings_inline_op: Option<String>,
     /// Thinking level label: off | low | medium | high.
     pub thinking_level: String,
-    /// Estimated context tokens (messages) — char/4 heuristic.
+    /// Context tokens for window %: last provider prompt size when known,
+    /// else char/4 message estimate (see `usage_tokens_estimated`).
     pub usage_tokens: usize,
+    /// True when `usage_tokens` is a local char/4 estimate (not last API usage).
+    pub usage_tokens_estimated: bool,
     /// Provider-reported cumulative input tokens.
     pub usage_input: u64,
     /// Provider-reported cumulative output tokens.
@@ -587,6 +598,13 @@ impl App {
             mcp_summary: "none".into(),
             tool_output_max_lines: 2000,
             tool_output_max_bytes: 50 * 1024,
+            compaction_auto: true,
+            compaction_ratio: 0.70,
+            compaction_threshold: None,
+            compaction_keep_recent: 12,
+            compaction_prune: false,
+            compaction_prune_protect: 40_000,
+            compaction_prune_max_chars: 2_000,
             mcp_chip_text: String::new(),
             mcp_chip_kind: 0,
             toast: None,
@@ -601,6 +619,7 @@ impl App {
             settings_inline_op: None,
             thinking_level: "off".into(),
             usage_tokens: 0,
+            usage_tokens_estimated: true,
             usage_input: 0,
             usage_output: 0,
             usage_cache_read: 0,
@@ -840,6 +859,7 @@ impl App {
             &self.current_model,
             &self.mcp_summary,
             &self.tool_output_summary(),
+            &self.compaction_summary(),
         ));
         self.clear_notice();
     }
@@ -848,6 +868,30 @@ impl App {
     pub fn set_tool_output_limits(&mut self, max_lines: usize, max_bytes: usize) {
         self.tool_output_max_lines = max_lines.max(1);
         self.tool_output_max_bytes = max_bytes.max(1);
+    }
+
+    /// Sync compaction strategy into Settings UI state.
+    pub fn set_compaction_settings(
+        &mut self,
+        auto: bool,
+        ratio: f64,
+        threshold: Option<usize>,
+        keep_recent: usize,
+        prune: bool,
+        prune_protect: usize,
+        prune_max_chars: usize,
+    ) {
+        self.compaction_auto = auto;
+        self.compaction_ratio = if ratio.is_finite() && ratio > 0.0 && ratio <= 1.0 {
+            ratio
+        } else {
+            0.70
+        };
+        self.compaction_threshold = threshold.filter(|n| *n > 0);
+        self.compaction_keep_recent = keep_recent.max(1);
+        self.compaction_prune = prune;
+        self.compaction_prune_protect = prune_protect;
+        self.compaction_prune_max_chars = prune_max_chars;
     }
 
     fn tool_output_summary(&self) -> String {
@@ -860,11 +904,48 @@ impl App {
         format!("{} lines · {size}", self.tool_output_max_lines)
     }
 
+    fn compaction_summary(&self) -> String {
+        let auto = if self.compaction_auto { "auto" } else { "manual" };
+        let thresh = if let Some(n) = self.compaction_threshold {
+            if n >= 1000 {
+                format!("{}k", n / 1000)
+            } else {
+                n.to_string()
+            }
+        } else {
+            format!("{}%", (self.compaction_ratio * 100.0).round() as u32)
+        };
+        let prune = if self.compaction_prune {
+            "old-tools prune"
+        } else {
+            "no prune"
+        };
+        format!(
+            "{auto} {thresh} · keep {} · {prune}",
+            self.compaction_keep_recent
+        )
+    }
+
     /// Nested Settings → Tool output panel.
     pub fn open_settings_tool_output(&mut self) {
         self.float = Some(FloatMenu::settings_tool_output(
             self.tool_output_max_lines,
             self.tool_output_max_bytes,
+        ));
+        self.clear_notice();
+    }
+
+    /// Nested Settings → Compaction strategy panel.
+    pub fn open_settings_compaction(&mut self) {
+        let ratio_pct = (self.compaction_ratio * 100.0).round() as u32;
+        self.float = Some(FloatMenu::settings_compaction(
+            self.compaction_auto,
+            ratio_pct,
+            self.compaction_threshold,
+            self.compaction_keep_recent,
+            self.compaction_prune,
+            self.compaction_prune_protect,
+            self.compaction_prune_max_chars,
         ));
         self.clear_notice();
     }
@@ -1178,6 +1259,10 @@ impl App {
                 true
             }
             FloatKind::SettingsToolOutput => {
+                self.open_settings_float();
+                true
+            }
+            FloatKind::SettingsCompaction => {
                 self.open_settings_float();
                 true
             }
@@ -1802,6 +1887,10 @@ impl App {
 
     pub fn set_usage_tokens(&mut self, tokens: usize) {
         self.usage_tokens = tokens;
+    }
+
+    pub fn set_usage_tokens_estimated(&mut self, estimated: bool) {
+        self.usage_tokens_estimated = estimated;
     }
 
     pub fn set_usage_io(&mut self, input: u64, output: u64) {
@@ -3725,6 +3814,7 @@ impl App {
             }
             FloatKind::Settings => self.confirm_settings_root(&entry.item.id),
             FloatKind::SettingsToolOutput => self.confirm_settings_tool_output(&entry.item.id),
+            FloatKind::SettingsCompaction => self.confirm_settings_compaction(&entry.item.id),
             FloatKind::SettingsProviders => self.confirm_settings_providers(&entry.item.id),
             FloatKind::SettingsProviderDetail => {
                 self.confirm_settings_provider_detail(&entry.item.id)
@@ -3863,6 +3953,10 @@ impl App {
                 self.open_settings_tool_output();
                 RunOutcome::Noop
             }
+            "compaction" => {
+                self.open_settings_compaction();
+                RunOutcome::Noop
+            }
             "skills" => {
                 self.open_skills_float();
                 RunOutcome::Noop
@@ -3914,6 +4008,77 @@ impl App {
             "hint" => {
                 self.set_notice(
                     "Over limit → spill to ~/.one/agent/tool-outputs/ (7-day cleanup)",
+                );
+                RunOutcome::Noop
+            }
+            _ => RunOutcome::Noop,
+        }
+    }
+
+    fn confirm_settings_compaction(&mut self, id: &str) -> RunOutcome {
+        match id {
+            "auto" => {
+                self.close_float();
+                RunOutcome::ConfigOp(ConfigOp::SettingSet {
+                    key: "compaction.auto".into(),
+                    value: "toggle".into(),
+                })
+            }
+            "ratio" => {
+                let pct = (self.compaction_ratio * 100.0).round() as u32;
+                self.start_settings_inline_edit(
+                    "setting:compaction.ratio",
+                    "threshold % (e.g. 70 or 0.7)",
+                    pct.to_string(),
+                );
+                RunOutcome::Noop
+            }
+            "threshold" => {
+                let initial = self
+                    .compaction_threshold
+                    .map(|n| n.to_string())
+                    .unwrap_or_else(|| "auto".into());
+                self.start_settings_inline_edit(
+                    "setting:compaction.threshold",
+                    "token threshold (or auto)",
+                    initial,
+                );
+                RunOutcome::Noop
+            }
+            "keep_recent" => {
+                self.start_settings_inline_edit(
+                    "setting:compaction.keep_recent",
+                    "keep recent messages",
+                    self.compaction_keep_recent.to_string(),
+                );
+                RunOutcome::Noop
+            }
+            "prune" => {
+                self.close_float();
+                RunOutcome::ConfigOp(ConfigOp::SettingSet {
+                    key: "compaction.prune".into(),
+                    value: "toggle".into(),
+                })
+            }
+            "prune_protect" => {
+                self.start_settings_inline_edit(
+                    "setting:compaction.prune_protect_tokens",
+                    "protect recent tool tokens",
+                    self.compaction_prune_protect.to_string(),
+                );
+                RunOutcome::Noop
+            }
+            "prune_max_chars" => {
+                self.start_settings_inline_edit(
+                    "setting:compaction.prune_max_chars",
+                    "pruned preview chars",
+                    self.compaction_prune_max_chars.to_string(),
+                );
+                RunOutcome::Noop
+            }
+            "hint" => {
+                self.set_notice(
+                    "Main: summarize older turns, keep recent N intact. Prune (off by default): only clears tool bodies outside that tail before summary.",
                 );
                 RunOutcome::Noop
             }
@@ -4943,6 +5108,34 @@ mod tests {
     }
 
     #[test]
+    fn settings_compaction_panel_opens() {
+        let mut app = App::new("test");
+        app.set_compaction_settings(true, 0.8, None, 10, true, 20_000, 1000);
+        app.open_settings_compaction();
+        let f = app.float.as_ref().unwrap();
+        assert_eq!(f.kind, FloatKind::SettingsCompaction);
+        let ids: Vec<_> = f
+            .sections
+            .iter()
+            .flat_map(|s| s.items.iter().map(|i| i.id.as_str()))
+            .collect();
+        assert!(ids.contains(&"auto"));
+        assert!(ids.contains(&"prune"));
+        assert!(ids.contains(&"ratio"));
+        // Esc returns to settings root.
+        assert!(app.settings_go_back());
+        assert_eq!(app.float.as_ref().unwrap().kind, FloatKind::Settings);
+        assert!(app
+            .float
+            .as_ref()
+            .unwrap()
+            .sections
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .any(|i| i.id == "compaction"));
+    }
+
+    #[test]
     fn ctrl_g_opens_settings_float() {
         let mut app = App::new("test");
         let out = app.handle_key(key(KeyCode::Char('g'), KeyModifiers::CONTROL));
@@ -4950,6 +5143,11 @@ mod tests {
         let f = app.float.as_ref().expect("settings float open");
         assert_eq!(f.kind, FloatKind::Settings);
         assert!(!f.filtered_entries().is_empty());
+        assert!(f
+            .sections
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .any(|i| i.id == "compaction"));
     }
 
     #[test]

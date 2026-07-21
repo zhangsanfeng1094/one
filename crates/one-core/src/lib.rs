@@ -17,9 +17,11 @@ pub use agent::{
 pub use streaming::{race_abort, wait_until_aborted, StreamEvent, ABORT_POLL_INTERVAL};
 pub use compaction::{
     compact_messages, estimate_tokens, extractive_summary, is_context_overflow_error,
-    should_compact, should_compact_tokens, split_for_compaction, summarization_prompt,
-    threshold_for_context_window, tokens_for_compaction, CompactionConfig,
-    DEFAULT_COMPACT_RATIO, FALLBACK_COMPACT_THRESHOLD, MIN_COMPACT_THRESHOLD,
+    prune_old_tool_outputs, should_compact, should_compact_tokens, split_for_compaction,
+    summarization_prompt, threshold_for_context_window, threshold_for_context_window_ratio,
+    tokens_for_compaction, CompactionConfig, DEFAULT_COMPACT_RATIO, DEFAULT_PRUNE_MAX_CHARS,
+    DEFAULT_PRUNE_PROTECT_TOKENS, FALLBACK_COMPACT_THRESHOLD, MIN_COMPACT_THRESHOLD,
+    PRUNED_TOOL_PLACEHOLDER,
 };
 pub use error::{OneError, Result};
 pub use events::AgentEvent;

@@ -1,4 +1,4 @@
-use crate::message::{AgentMessage, ContentBlock, UserContent};
+use crate::message::{AgentMessage, ContentBlock, TextOrImage, UserContent};
 
 /// Fraction of the model context window at which auto-compact fires.
 pub const DEFAULT_COMPACT_RATIO: f64 = 0.70;
@@ -6,14 +6,32 @@ pub const DEFAULT_COMPACT_RATIO: f64 = 0.70;
 pub const MIN_COMPACT_THRESHOLD: usize = 16_000;
 /// Used when `context_window` is unknown (0).
 pub const FALLBACK_COMPACT_THRESHOLD: usize = 80_000;
+/// Recent tool-output tokens kept intact when pruning older tool results.
+pub const DEFAULT_PRUNE_PROTECT_TOKENS: usize = 40_000;
+/// Max chars kept on a pruned tool result body.
+pub const DEFAULT_PRUNE_MAX_CHARS: usize = 2_000;
+/// Marker left in place of cleared tool output (idempotent for re-prune).
+pub const PRUNED_TOOL_PLACEHOLDER: &str = "[Old tool result content cleared]";
 
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
+    /// When false, auto-compact (threshold path) is a no-op; force still works if caller allows.
     pub enabled: bool,
+    /// Fire auto-compact when observed/estimated tokens ≥ this.
     pub token_threshold: usize,
+    /// Messages kept verbatim after summary (tail of the transcript).
     pub keep_recent_messages: usize,
     /// Max chars of the fallback extract summary (when LLM summary is unavailable).
     pub max_summary_chars: usize,
+    /// When true, as a cheap pre-pass before LLM summary: clear tool *bodies*
+    /// that sit **outside** the keep_recent tail (recent turns are never pruned).
+    /// Default false — most users only need threshold + keep_recent.
+    pub prune: bool,
+    /// Within the older (pre-tail) region only: keep about this many tokens of
+    /// the newest old tool outputs before clearing older ones (char/4).
+    pub prune_protect_tokens: usize,
+    /// Max chars retained on a pruned tool result (plus placeholder).
+    pub prune_max_chars: usize,
 }
 
 impl Default for CompactionConfig {
@@ -23,6 +41,9 @@ impl Default for CompactionConfig {
             token_threshold: FALLBACK_COMPACT_THRESHOLD,
             keep_recent_messages: 12,
             max_summary_chars: 6_000,
+            prune: false,
+            prune_protect_tokens: DEFAULT_PRUNE_PROTECT_TOKENS,
+            prune_max_chars: DEFAULT_PRUNE_MAX_CHARS,
         }
     }
 }
@@ -32,8 +53,14 @@ impl CompactionConfig {
     ///
     /// When `context_window` is 0, keeps [`FALLBACK_COMPACT_THRESHOLD`].
     pub fn from_context_window(context_window: usize) -> Self {
+        Self::from_window_and_ratio(context_window, DEFAULT_COMPACT_RATIO)
+    }
+
+    /// Threshold from window × ratio (clamped). Absolute `token_threshold` override
+    /// should be applied by the caller after this helper when settings provide one.
+    pub fn from_window_and_ratio(context_window: usize, ratio: f64) -> Self {
         Self {
-            token_threshold: threshold_for_context_window(context_window),
+            token_threshold: threshold_for_context_window_ratio(context_window, ratio),
             ..Default::default()
         }
     }
@@ -41,10 +68,22 @@ impl CompactionConfig {
 
 /// Compact when estimated/observed tokens reach this many of the model window.
 pub fn threshold_for_context_window(context_window: usize) -> usize {
+    threshold_for_context_window_ratio(context_window, DEFAULT_COMPACT_RATIO)
+}
+
+/// Like [`threshold_for_context_window`] with a custom ratio in `(0, 1]`.
+///
+/// Invalid ratios fall back to [`DEFAULT_COMPACT_RATIO`].
+pub fn threshold_for_context_window_ratio(context_window: usize, ratio: f64) -> usize {
     if context_window == 0 {
         return FALLBACK_COMPACT_THRESHOLD;
     }
-    let raw = ((context_window as f64) * DEFAULT_COMPACT_RATIO).round() as usize;
+    let r = if ratio.is_finite() && ratio > 0.0 && ratio <= 1.0 {
+        ratio
+    } else {
+        DEFAULT_COMPACT_RATIO
+    };
+    let raw = ((context_window as f64) * r).round() as usize;
     // Leave a little headroom under the hard window for the summary turn + tools.
     let capped = raw.min(context_window.saturating_sub(4_096).max(MIN_COMPACT_THRESHOLD));
     capped.max(MIN_COMPACT_THRESHOLD)
@@ -109,6 +148,105 @@ pub fn should_compact(messages: &[AgentMessage], config: &CompactionConfig) -> b
 /// (e.g. from [`tokens_for_compaction`]).
 pub fn should_compact_tokens(tokens: usize, config: &CompactionConfig) -> bool {
     config.enabled && tokens >= config.token_threshold
+}
+
+/// Cheap pre-pass before LLM summary (Hermes/OpenCode-style).
+///
+/// **When:** only if `config.prune` is true (default off) and the session still
+/// holds older messages beyond [`CompactionConfig::keep_recent_messages`].
+///
+/// **What:** clear tool *result bodies* in the **pre-tail** region (everything
+/// before the last `keep_recent` messages). The keep_recent **tail is never
+/// pruned** — those turns keep full tool outputs.
+///
+/// Within the pre-tail only, the newest ~[`CompactionConfig::prune_protect_tokens`]
+/// of tool output can stay intact so a mid-history tool dump is not wiped if it
+/// is still relatively recent among the old messages.
+///
+/// Returns the number of tool results that were pruned.
+pub fn prune_old_tool_outputs(
+    messages: &mut [AgentMessage],
+    config: &CompactionConfig,
+) -> usize {
+    if !config.prune {
+        return 0;
+    }
+    let n = messages.len();
+    if n == 0 {
+        return 0;
+    }
+    // Hard floor: last keep_recent messages (and any tool results inside them)
+    // are never pruned — same boundary as summarization tail.
+    let keep = config.keep_recent_messages.max(1);
+    let tail_start = n.saturating_sub(keep);
+    if tail_start == 0 {
+        return 0; // entire buffer is the protected tail
+    }
+
+    let protect = config.prune_protect_tokens;
+    let max_chars = config.prune_max_chars;
+    let mut protected = 0usize;
+    let mut pruned = 0usize;
+
+    // Pre-tail tool results only, newest → oldest.
+    let mut indices: Vec<usize> = messages[..tail_start]
+        .iter()
+        .enumerate()
+        .filter_map(|(i, m)| matches!(m, AgentMessage::ToolResult(_)).then_some(i))
+        .collect();
+    indices.reverse();
+
+    for i in indices {
+        let Some(AgentMessage::ToolResult(result)) = messages.get_mut(i) else {
+            continue;
+        };
+        let text_len: usize = result
+            .content
+            .iter()
+            .map(|b| match b {
+                TextOrImage::Text { text } => text.len(),
+                TextOrImage::Image { .. } => 256,
+            })
+            .sum();
+        // Already pruned placeholders cost almost nothing and stay as-is.
+        if result
+            .content
+            .iter()
+            .all(|b| matches!(b, TextOrImage::Text { text } if text.contains(PRUNED_TOOL_PLACEHOLDER)))
+        {
+            continue;
+        }
+        let est = text_len / 4;
+        // Soft budget inside pre-tail: keep the newest old tool dumps first.
+        if protected < protect {
+            protected = protected.saturating_add(est);
+            continue;
+        }
+        // Prune this older tool result.
+        let head = result
+            .content
+            .iter()
+            .find_map(|b| match b {
+                TextOrImage::Text { text } if !text.is_empty() => Some(text.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        let preview = if max_chars == 0 || head.is_empty() {
+            String::new()
+        } else {
+            let take = max_chars.min(head.chars().count());
+            let s: String = head.chars().take(take).collect();
+            if head.chars().count() > take {
+                format!("{s}…\n")
+            } else {
+                format!("{s}\n")
+            }
+        };
+        let body = format!("{preview}{PRUNED_TOOL_PLACEHOLDER}");
+        result.content = vec![TextOrImage::Text { text: body }];
+        pruned += 1;
+    }
+    pruned
 }
 
 /// Split messages into (older to summarize, recent to keep).
@@ -363,5 +501,111 @@ mod tests {
         // Zero observed → fall back to estimate.
         let est = tokens_for_compaction(&messages, Some(0));
         assert_eq!(est, estimate_tokens(&messages));
+    }
+
+    #[test]
+    fn threshold_custom_ratio() {
+        let t = threshold_for_context_window_ratio(100_000, 0.5);
+        assert_eq!(t, 50_000);
+        // Invalid ratio → default 70%.
+        assert_eq!(
+            threshold_for_context_window_ratio(100_000, 0.0),
+            threshold_for_context_window(100_000)
+        );
+    }
+
+    fn tool_result(name: &str, body: &str) -> AgentMessage {
+        AgentMessage::ToolResult(crate::message::ToolResultMessage {
+            tool_call_id: format!("c-{name}"),
+            tool_name: name.into(),
+            content: vec![TextOrImage::Text {
+                text: body.into(),
+            }],
+            is_error: false,
+            timestamp: 0,
+        })
+    }
+
+    #[test]
+    fn prune_clears_old_tool_outputs() {
+        let big = "x".repeat(8_000); // ~2000 tokens
+        // Layout: [old tool] [filler…] [recent tool in tail]
+        // keep_recent=2 → last two messages never pruned.
+        let mut messages = vec![
+            AgentMessage::user_text("start"),
+            tool_result("old", &big),
+            AgentMessage::user_text("mid"),
+            tool_result("recent", &big),
+        ];
+        let config = CompactionConfig {
+            prune: true,
+            keep_recent_messages: 2, // protects "mid" + "recent" tool
+            prune_protect_tokens: 0, // clear all pre-tail tools
+            prune_max_chars: 32,
+            ..Default::default()
+        };
+        let n = prune_old_tool_outputs(&mut messages, &config);
+        assert!(n >= 1, "expected at least one pruned tool result");
+        // Tail tool result must stay full (keep_recent hard floor).
+        if let AgentMessage::ToolResult(r) = &messages[3] {
+            let t = match &r.content[0] {
+                TextOrImage::Text { text } => text.as_str(),
+                _ => "",
+            };
+            assert!(!t.contains(PRUNED_TOOL_PLACEHOLDER));
+            assert_eq!(t.len(), big.len());
+        } else {
+            panic!("expected tool result");
+        }
+        // Older (pre-tail) should be pruned.
+        if let AgentMessage::ToolResult(r) = &messages[1] {
+            let t = match &r.content[0] {
+                TextOrImage::Text { text } => text.as_str(),
+                _ => "",
+            };
+            assert!(t.contains(PRUNED_TOOL_PLACEHOLDER));
+        } else {
+            panic!("expected tool result");
+        }
+        // Second prune is idempotent.
+        assert_eq!(prune_old_tool_outputs(&mut messages, &config), 0);
+    }
+
+    #[test]
+    fn prune_never_touches_keep_recent_tail() {
+        let big = "x".repeat(4_000);
+        let mut messages = vec![
+            tool_result("a", &big),
+            tool_result("b", &big),
+            tool_result("c", &big),
+        ];
+        let config = CompactionConfig {
+            prune: true,
+            keep_recent_messages: 3, // entire buffer is tail
+            prune_protect_tokens: 0,
+            ..Default::default()
+        };
+        assert_eq!(prune_old_tool_outputs(&mut messages, &config), 0);
+        for m in &messages {
+            if let AgentMessage::ToolResult(r) = m {
+                let t = match &r.content[0] {
+                    TextOrImage::Text { text } => text.as_str(),
+                    _ => "",
+                };
+                assert!(!t.contains(PRUNED_TOOL_PLACEHOLDER));
+            }
+        }
+    }
+
+    #[test]
+    fn prune_disabled_is_noop() {
+        let mut messages = vec![tool_result("t", &"y".repeat(4_000))];
+        let config = CompactionConfig {
+            prune: false,
+            prune_protect_tokens: 0,
+            keep_recent_messages: 1,
+            ..Default::default()
+        };
+        assert_eq!(prune_old_tool_outputs(&mut messages, &config), 0);
     }
 }

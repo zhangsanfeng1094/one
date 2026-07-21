@@ -197,19 +197,26 @@ impl TokenUsage {
             && self.cache_write_tokens == 0
     }
 
-    /// Best-effort size of the **prompt/context** for this completion (for compaction).
+    /// Best-effort size of the **prompt/context** for this completion
+    /// (compaction threshold + UI context %).
     ///
-    /// Anthropic reports cache fields disjoint from `input_tokens`; OpenAI folds
-    /// cache hits into `input_tokens`. Prefer expanded size when write-cache is set.
+    /// Accounting (provider-dependent):
+    /// - **Anthropic-style** (cache fields *disjoint* from `input_tokens`): use
+    ///   input + cache_read + cache_write. Detected when `cache_write > 0` or
+    ///   `cache_read > input` (cache hit larger than uncached tail — impossible
+    ///   under OpenAI subset semantics).
+    /// - **OpenAI-style** (`cache_read` ⊆ `input_tokens`): use `input_tokens` alone
+    ///   so we never double-count cache.
     pub fn context_size_tokens(&self) -> u64 {
         if self.is_zero() {
             return 0;
         }
-        if self.cache_write_tokens > 0 {
-            self.prompt_tokens_expanded()
-        } else {
-            self.input_tokens
+        // Disjoint cache (Anthropic / Bedrock-style reporting).
+        if self.cache_write_tokens > 0 || self.cache_read_tokens > self.input_tokens {
+            return self.prompt_tokens_expanded();
         }
+        // Inclusive cache (OpenAI / many OpenAI-compatible): input already full prompt.
+        self.input_tokens
     }
 }
 
@@ -1586,6 +1593,18 @@ mod tests {
             cache_write_tokens: 50,
         };
         assert_eq!(u.context_size_tokens(), 1050); // input + read + write
+    }
+
+    #[test]
+    fn context_size_tokens_anthropic_cache_hit_without_write() {
+        // Pure cache hit: uncached tail << cached prefix (disjoint fields).
+        let u = TokenUsage {
+            input_tokens: 50,
+            output_tokens: 20,
+            cache_read_tokens: 12_000,
+            cache_write_tokens: 0,
+        };
+        assert_eq!(u.context_size_tokens(), 12_050);
     }
 
     #[test]

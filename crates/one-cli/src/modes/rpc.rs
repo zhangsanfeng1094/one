@@ -129,7 +129,8 @@ async fn handle(
         "status" => {
             let usage = runtime.token_usage().await;
             let thinking = runtime.thinking_level().await;
-            let tokens = runtime.estimated_tokens().await;
+            let (context_tokens, context_estimated) = runtime.context_tokens().await;
+            let last_prompt = runtime.last_prompt_tokens().await;
             json!({
                 "id": id,
                 "ok": true,
@@ -138,7 +139,12 @@ async fn handle(
                     "model": provider.model(),
                     "mode": format!("{:?}", runtime.mode()),
                     "thinking": thinking.as_str(),
-                    "estimated_tokens": tokens,
+                    // Preferred: last provider prompt size; falls back to char/4.
+                    "context_tokens": context_tokens,
+                    "context_tokens_estimated": context_estimated,
+                    "last_prompt_tokens": last_prompt,
+                    // Kept for older clients (same as context_tokens).
+                    "estimated_tokens": context_tokens,
                     "usage": {
                         "input_tokens": usage.input_tokens,
                         "output_tokens": usage.output_tokens,
@@ -177,11 +183,15 @@ async fn handle(
 
         "compact" => match runtime.maybe_compact(provider, true).await {
             Ok(()) => {
-                let tokens = runtime.estimated_tokens().await;
+                let (tokens, estimated) = runtime.context_tokens().await;
                 json!({
                     "id": id,
                     "ok": true,
-                    "result": {"estimated_tokens": tokens}
+                    "result": {
+                        "estimated_tokens": tokens,
+                        "context_tokens": tokens,
+                        "context_tokens_estimated": estimated,
+                    }
                 })
             }
             Err(e) => json!({"id": id, "ok": false, "error": e.to_string()}),

@@ -37,6 +37,88 @@ pub struct ToolOutputSettings {
     pub max_bytes: Option<usize>,
 }
 
+/// Context compaction strategy (settings key `compaction`).
+///
+/// Main path: auto threshold + keep_recent summary (OpenCode/Claude-style).
+/// Optional `prune` (default **off**): before summarization, clear tool bodies
+/// **outside** the keep_recent tail — does not touch recent turns.
+/// Omitted fields use defaults in [`CompactionSettings::to_config`].
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CompactionSettings {
+    /// Auto-compact when over threshold before a turn (default true).
+    pub auto: Option<bool>,
+    /// Fraction of context_window that triggers compact (0.0–1.0, default 0.70).
+    /// Ignored when [`Self::threshold`] is set.
+    pub ratio: Option<f64>,
+    /// Absolute token threshold override (takes precedence over ratio).
+    pub threshold: Option<usize>,
+    /// Recent messages kept after LLM/extractive summary (default 12).
+    /// These turns (including their tool outputs) are never pruned.
+    pub keep_recent: Option<usize>,
+    /// Pre-pass: clear **old** tool bodies outside keep_recent (default false).
+    pub prune: Option<bool>,
+    /// Within pre-tail only: soft-protect this many tokens of the newest old tools.
+    pub prune_protect_tokens: Option<usize>,
+    /// Max chars of original text kept on a pruned tool result (default 2000).
+    pub prune_max_chars: Option<usize>,
+}
+
+impl CompactionSettings {
+    /// Resolve into a runtime [`one_core::CompactionConfig`] for `context_window`.
+    pub fn to_config(&self, context_window: usize) -> one_core::CompactionConfig {
+        let ratio = self
+            .ratio
+            .filter(|r| r.is_finite() && *r > 0.0 && *r <= 1.0)
+            .unwrap_or(one_core::DEFAULT_COMPACT_RATIO);
+        let mut cfg = one_core::CompactionConfig::from_window_and_ratio(context_window, ratio);
+        cfg.enabled = self.auto.unwrap_or(true);
+        if let Some(n) = self.threshold.filter(|n| *n > 0) {
+            cfg.token_threshold = n;
+        }
+        if let Some(n) = self.keep_recent.filter(|n| *n > 0) {
+            cfg.keep_recent_messages = n;
+        }
+        cfg.prune = self.prune.unwrap_or(false);
+        if let Some(n) = self.prune_protect_tokens {
+            cfg.prune_protect_tokens = n;
+        }
+        if let Some(n) = self.prune_max_chars {
+            cfg.prune_max_chars = n;
+        }
+        cfg
+    }
+
+    /// One-line summary for Settings UI, e.g. `auto 70% · keep 12 · prune off`.
+    pub fn summary_line(&self) -> String {
+        let auto = if self.auto.unwrap_or(true) {
+            "auto"
+        } else {
+            "manual"
+        };
+        let thresh = if let Some(n) = self.threshold.filter(|n| *n > 0) {
+            if n >= 1000 {
+                format!("{}k", n / 1000)
+            } else {
+                n.to_string()
+            }
+        } else {
+            let r = self
+                .ratio
+                .filter(|r| r.is_finite() && *r > 0.0 && *r <= 1.0)
+                .unwrap_or(one_core::DEFAULT_COMPACT_RATIO);
+            format!("{}%", (r * 100.0).round() as u32)
+        };
+        let keep = self.keep_recent.unwrap_or(12);
+        let prune = if self.prune.unwrap_or(false) {
+            "old-tools prune"
+        } else {
+            "no prune"
+        };
+        format!("{auto} {thresh} · keep {keep} · {prune}")
+    }
+}
+
 /// User settings — single source for durable interactive preferences.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -65,9 +147,30 @@ pub struct Settings {
     pub features: Option<HashMap<String, bool>>,
     /// Unified tool-output truncation (OpenCode `tool_output`).
     pub tool_output: Option<ToolOutputSettings>,
+    /// Context compaction strategy (threshold + optional tool prune).
+    pub compaction: Option<CompactionSettings>,
 }
 
 impl Settings {
+    /// Effective compaction config for the active context window.
+    pub fn compaction_config(&self, context_window: usize) -> one_core::CompactionConfig {
+        self.compaction
+            .as_ref()
+            .map(|c| c.to_config(context_window))
+            .unwrap_or_else(|| one_core::CompactionConfig::from_context_window(context_window))
+    }
+
+    pub fn compaction_or_default(&self) -> CompactionSettings {
+        self.compaction.clone().unwrap_or_default()
+    }
+
+    fn compaction_mut(&mut self) -> &mut CompactionSettings {
+        if self.compaction.is_none() {
+            self.compaction = Some(CompactionSettings::default());
+        }
+        self.compaction.as_mut().expect("just set")
+    }
+
     /// Apply `tool_output` (+ env overrides) to the process-wide truncate limits.
     pub fn apply_tool_output_limits(&self) {
         let (lines, bytes) = self
@@ -256,6 +359,90 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             settings.tool_output = Some(t);
             settings.apply_tool_output_limits();
         }
+        // Compaction strategy: /settings compaction.ratio 0.8  ·  compaction.prune on
+        "compaction.auto" | "compaction_auto" => {
+            let v = value.trim().to_ascii_lowercase();
+            let c = settings.compaction_mut();
+            match v.as_str() {
+                "1" | "true" | "yes" | "on" => c.auto = Some(true),
+                "0" | "false" | "no" | "off" => c.auto = Some(false),
+                "toggle" => c.auto = Some(!c.auto.unwrap_or(true)),
+                other => {
+                    return Err(format!("compaction.auto must be on|off|toggle (got `{other}`)"));
+                }
+            }
+        }
+        "compaction.ratio" | "compaction_ratio" => {
+            let r: f64 = value
+                .trim()
+                .trim_end_matches('%')
+                .parse()
+                .map_err(|_| "compaction.ratio must be a number (0–1 or percent)".to_string())?;
+            // Allow 70 or 0.70
+            let r = if r > 1.0 && r <= 100.0 { r / 100.0 } else { r };
+            if !(r > 0.0 && r <= 1.0) {
+                return Err("compaction.ratio must be in (0, 1] (or 1–100 as percent)".into());
+            }
+            let c = settings.compaction_mut();
+            c.ratio = Some(r);
+            // Absolute threshold and ratio are alternatives — clear override.
+            c.threshold = None;
+        }
+        "compaction.threshold" | "compaction_threshold" => {
+            let v = value.trim().to_ascii_lowercase();
+            let c = settings.compaction_mut();
+            if matches!(v.as_str(), "0" | "auto" | "none" | "clear" | "") {
+                c.threshold = None;
+            } else {
+                let n: usize = v
+                    .parse()
+                    .map_err(|_| "compaction.threshold must be a positive token count or auto".to_string())?;
+                if n < 1 {
+                    return Err("compaction.threshold must be >= 1 (or auto to use ratio)".into());
+                }
+                c.threshold = Some(n);
+            }
+        }
+        "compaction.keep_recent" | "compaction_keep_recent" | "compaction.keep-recent" => {
+            let n: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| "compaction.keep_recent must be a positive number".to_string())?;
+            if n < 1 {
+                return Err("compaction.keep_recent must be >= 1".into());
+            }
+            settings.compaction_mut().keep_recent = Some(n);
+        }
+        "compaction.prune" | "compaction_prune" => {
+            let v = value.trim().to_ascii_lowercase();
+            let c = settings.compaction_mut();
+            match v.as_str() {
+                "1" | "true" | "yes" | "on" => c.prune = Some(true),
+                "0" | "false" | "no" | "off" => c.prune = Some(false),
+                "toggle" => c.prune = Some(!c.prune.unwrap_or(false)),
+                other => {
+                    return Err(format!("compaction.prune must be on|off|toggle (got `{other}`)"));
+                }
+            }
+        }
+        "compaction.prune_protect_tokens"
+        | "compaction.prune-protect-tokens"
+        | "compaction_prune_protect" => {
+            let n: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| "compaction.prune_protect_tokens must be a number".to_string())?;
+            settings.compaction_mut().prune_protect_tokens = Some(n);
+        }
+        "compaction.prune_max_chars"
+        | "compaction.prune-max-chars"
+        | "compaction_prune_max_chars" => {
+            let n: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| "compaction.prune_max_chars must be a number".to_string())?;
+            settings.compaction_mut().prune_max_chars = Some(n);
+        }
         // Feature flags: /settings feature.subagent off  or  /settings features.subagent on
         key if key.starts_with("feature.") || key.starts_with("features.") => {
             let id = key
@@ -307,7 +494,8 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             return Err(format!(
                 "unknown setting `{other}` · known: provider model thinking auto_approve \
                  context_window sandbox add_dir bash_sandbox tool_output.max_lines \
-                 tool_output.max_bytes feature.<id> allow deny ask"
+                 tool_output.max_bytes compaction.auto|ratio|threshold|keep_recent|prune \
+                 |prune_protect_tokens|prune_max_chars feature.<id> allow deny ask"
             ));
         }
     }
@@ -416,6 +604,10 @@ pub fn rows(settings: &Settings) -> Vec<(String, String)> {
                 ),
             )
         },
+        (
+            "compaction".into(),
+            settings.compaction_or_default().summary_line(),
+        ),
         ("path".into(), path_display()),
     ]
 }
@@ -457,10 +649,41 @@ mod tests {
                 max_lines: Some(5000),
                 max_bytes: Some(204_800),
             }),
+            compaction: Some(CompactionSettings {
+                auto: Some(true),
+                ratio: Some(0.8),
+                threshold: None,
+                keep_recent: Some(10),
+                prune: Some(true),
+                prune_protect_tokens: Some(20_000),
+                prune_max_chars: Some(1000),
+            }),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn compaction_set_key_and_config() {
+        let mut s = Settings::default();
+        set_key(&mut s, "compaction.ratio", "80").unwrap();
+        set_key(&mut s, "compaction.prune", "on").unwrap();
+        set_key(&mut s, "compaction.keep_recent", "8").unwrap();
+        let cfg = s.compaction_config(100_000);
+        assert!(cfg.enabled);
+        assert_eq!(cfg.token_threshold, 80_000);
+        assert!(cfg.prune);
+        assert_eq!(cfg.keep_recent_messages, 8);
+        set_key(&mut s, "compaction.threshold", "50000").unwrap();
+        let cfg2 = s.compaction_config(100_000);
+        assert_eq!(cfg2.token_threshold, 50_000);
+        set_key(&mut s, "compaction.auto", "off").unwrap();
+        assert!(!s.compaction_config(100_000).enabled);
+        assert!(s
+            .compaction_or_default()
+            .summary_line()
+            .contains("old-tools prune"));
     }
 
     #[test]

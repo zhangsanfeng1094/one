@@ -58,6 +58,8 @@ pub enum FloatKind {
     Settings,
     /// Tool-output truncation limits (under Settings).
     SettingsToolOutput,
+    /// Context compaction strategy (under Settings).
+    SettingsCompaction,
     /// Provider list under Settings.
     SettingsProviders,
     /// Actions for one provider.
@@ -386,18 +388,27 @@ impl FloatMenu {
     /// Hierarchy: Settings → Providers → Provider → Models → Model
     /// (no standalone global Models entry).
     pub fn settings_root(thinking: &str, provider: &str, model: &str) -> Self {
-        Self::settings_root_with_mcp(thinking, provider, model, "open /mcp", "2000 · 50KB")
+        Self::settings_root_with_mcp(
+            thinking,
+            provider,
+            model,
+            "open /mcp",
+            "2000 · 50KB",
+            "auto 70% · keep 12 · no prune",
+        )
     }
 
-    /// Settings root with live MCP status line and tool_output summary.
+    /// Settings root with live MCP status, tool_output, and compaction summaries.
     ///
     /// `tool_output_summary` is e.g. `"2000 lines · 50.0KB"`.
+    /// `compaction_summary` is e.g. `"auto 70% · keep 12 · no prune"`.
     pub fn settings_root_with_mcp(
         thinking: &str,
         provider: &str,
         model: &str,
         mcp_summary: &str,
         tool_output_summary: &str,
+        compaction_summary: &str,
     ) -> Self {
         Self {
             kind: FloatKind::Settings,
@@ -429,6 +440,12 @@ impl FloatMenu {
                             "tool_output",
                             "Tool output",
                             tool_output_summary,
+                            "edit",
+                        ),
+                        item(
+                            "compaction",
+                            "Compaction",
+                            compaction_summary,
                             "edit",
                         ),
                         item(
@@ -516,6 +533,103 @@ impl FloatMenu {
                     ),
                 ],
             }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Nested compaction strategy editor under Settings.
+    ///
+    /// Args are already-resolved display values (defaults applied by caller).
+    pub fn settings_compaction(
+        auto: bool,
+        ratio_pct: u32,
+        threshold: Option<usize>,
+        keep_recent: usize,
+        prune: bool,
+        prune_protect: usize,
+        prune_max_chars: usize,
+    ) -> Self {
+        let thresh_detail = match threshold {
+            Some(n) => format!("{n} tokens (overrides ratio)"),
+            None => format!("use ratio ({ratio_pct}%)"),
+        };
+        Self {
+            kind: FloatKind::SettingsCompaction,
+            title: "Compaction".into(),
+            search: String::new(),
+            sections: vec![
+                FloatSection {
+                    title: "Main (when to summarize)".into(),
+                    items: vec![
+                        item(
+                            "auto",
+                            "Auto-compact",
+                            if auto {
+                                "on · before turn when over threshold"
+                            } else {
+                                "off · only /compact or overflow recovery"
+                            },
+                            "toggle",
+                        ),
+                        item(
+                            "ratio",
+                            "Threshold ratio",
+                            &format!("{ratio_pct}% of context window"),
+                            "edit",
+                        ),
+                        item(
+                            "threshold",
+                            "Absolute threshold",
+                            &thresh_detail,
+                            "edit",
+                        ),
+                        item(
+                            "keep_recent",
+                            "Keep recent messages",
+                            &format!(
+                                "{keep_recent} turns kept verbatim (incl. their tools)"
+                            ),
+                            "edit",
+                        ),
+                    ],
+                },
+                FloatSection {
+                    title: "Optional pre-pass (default off)".into(),
+                    items: vec![
+                        item(
+                            "prune",
+                            "Prune old tool bodies",
+                            if prune {
+                                "on · before summary, only outside keep_recent"
+                            } else {
+                                "off · recommended; use tool_output for live caps"
+                            },
+                            "toggle",
+                        ),
+                        item(
+                            "prune_protect",
+                            "Pre-tail soft protect",
+                            &format!("~{prune_protect} tok of newest *old* tools"),
+                            "edit",
+                        ),
+                        item(
+                            "prune_max_chars",
+                            "Pruned preview chars",
+                            &format!("{prune_max_chars} chars + placeholder"),
+                            "edit",
+                        ),
+                        item(
+                            "hint",
+                            "When prune runs",
+                            "only if on + over threshold: clear old tool dumps, never the keep_recent tail",
+                            "info",
+                        ),
+                    ],
+                },
+            ],
             selected: 0,
             edit_mode: false,
             edit_label: String::new(),

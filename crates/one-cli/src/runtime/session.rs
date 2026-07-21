@@ -117,6 +117,24 @@ impl AppRuntime {
         one_core::estimate_tokens(&agent.messages)
     }
 
+    /// Last completion's provider-reported prompt/context size (0 if unknown).
+    ///
+    /// Prefer this over [`Self::estimated_tokens`] for context-window % (OpenCode-style:
+    /// display last API usage, not char/4).
+    pub async fn last_prompt_tokens(&self) -> u64 {
+        self.agent.lock().await.last_prompt_tokens
+    }
+
+    /// Context size for UI / RPC: last provider prompt tokens when available,
+    /// otherwise char/4 message estimate. `estimated` is true when falling back.
+    pub async fn context_tokens(&self) -> (usize, bool) {
+        let agent = self.agent.lock().await;
+        if agent.last_prompt_tokens > 0 {
+            return (agent.last_prompt_tokens as usize, false);
+        }
+        (one_core::estimate_tokens(&agent.messages), true)
+    }
+
     /// Provider-reported cumulative usage (input/output) for this runtime.
     pub async fn token_usage(&self) -> one_core::TokenUsage {
         self.agent.lock().await.token_usage
