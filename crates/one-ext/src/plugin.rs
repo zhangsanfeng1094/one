@@ -134,12 +134,12 @@ pub async fn discover_plugins_in(dir: &Path) -> crate::Result<Vec<DiscoveredPlug
 }
 
 /// Default discovery roots (project → user).
-pub async fn discover_plugins(cwd: &Path, agent_dir: &Path) -> crate::Result<Vec<DiscoveredPlugin>> {
+pub async fn discover_plugins(
+    cwd: &Path,
+    agent_dir: &Path,
+) -> crate::Result<Vec<DiscoveredPlugin>> {
     let mut all = Vec::new();
-    let roots = [
-        cwd.join(".one").join("plugins"),
-        agent_dir.join("plugins"),
-    ];
+    let roots = [cwd.join(".one").join("plugins"), agent_dir.join("plugins")];
     for root in roots {
         all.extend(discover_plugins_in(&root).await?);
     }

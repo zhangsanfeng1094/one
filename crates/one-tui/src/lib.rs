@@ -31,11 +31,11 @@ pub mod theme;
 pub mod tool_view;
 pub mod ui;
 
-pub use app::{expand_at_files, App, InteractiveApp};
 pub use crate::state::{
     ApprovalAnswer, ApprovalPrompt, ConfigOp, ModelDraft, PendingImage, PendingText, RunOutcome,
     SelectKind, SelectPos, Toast,
 };
+pub use app::{expand_at_files, App, InteractiveApp};
 pub use error::Result;
 pub use float::{FloatItem, FloatKind, FloatMenu, FloatSection};
 pub use message::{AlertLevel, Message, MessageRole, ToolStatus};

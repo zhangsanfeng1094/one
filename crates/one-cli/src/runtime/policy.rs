@@ -42,8 +42,7 @@ pub(super) fn build_path_policy(
     }
 
     // Progressive disclosure allowlist (agentskills.io / Codex).
-    let skill_roots =
-        skill_allowlist_roots(cwd, &resources.agent_dir, resources.all_skills());
+    let skill_roots = skill_allowlist_roots(cwd, &resources.agent_dir, resources.all_skills());
     policy = policy.with_readable_roots(skill_roots);
 
     policy

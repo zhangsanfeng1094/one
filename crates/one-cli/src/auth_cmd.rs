@@ -71,10 +71,7 @@ impl AuthInteraction for CliAuthInteraction {
                 let line = read_stdin_line().await?;
                 let line = line.trim();
                 if line.is_empty() {
-                    return Ok(options
-                        .first()
-                        .map(|o| o.id.clone())
-                        .unwrap_or_default());
+                    return Ok(options.first().map(|o| o.id.clone()).unwrap_or_default());
                 }
                 if let Ok(n) = line.parse::<usize>() {
                     if let Some(opt) = options.get(n.saturating_sub(1)) {
@@ -128,7 +125,12 @@ pub async fn run_login(cli: LoginCli) -> Result<String, Box<dyn std::error::Erro
     let storage = AuthStorage::create()?;
     let mut ix = CliAuthInteraction::new();
 
-    let provider = match cli.provider.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    let provider = match cli
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         Some(raw) => normalize_provider(raw),
         None => {
             // No provider on argv → pick from catalog (Codex / OpenCode Zen / Go …).
@@ -265,10 +267,7 @@ fn seed_after_login(provider: &str) -> Result<(), Box<dyn std::error::Error>> {
                     "Use: one --provider xai --model {} -p \"hello\"",
                     report.default_model
                 );
-                eprintln!(
-                    "  or: /model xai:{}  inside the TUI",
-                    report.default_model
-                );
+                eprintln!("  or: /model xai:{}  inside the TUI", report.default_model);
             }
             Err(e) => {
                 eprintln!("! failed to seed models.json: {e}");

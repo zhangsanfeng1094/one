@@ -247,9 +247,7 @@ async fn validate_api_key(provider: &str, key: &str) -> Result<(), String> {
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         let head: String = text.chars().take(240).collect();
-        Err(format!(
-            "OpenCode rejected API key ({status}): {head}"
-        ))
+        Err(format!("OpenCode rejected API key ({status}): {head}"))
     }
 }
 

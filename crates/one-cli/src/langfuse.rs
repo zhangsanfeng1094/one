@@ -36,9 +36,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use one_core::{TraceEvent, TraceGateDecision, TraceRunStatus, TraceSink};
-use opentelemetry::trace::{
-    Span, SpanKind, Status, TraceContextExt, Tracer, TracerProvider as _,
-};
+use opentelemetry::trace::{Span, SpanKind, Status, TraceContextExt, Tracer, TracerProvider as _};
 use opentelemetry::{Array, Context, KeyValue, StringValue, Value};
 use opentelemetry_otlp::{Protocol, SpanExporter, WithExportConfig, WithHttpConfig};
 use opentelemetry_sdk::runtime::Tokio;
@@ -185,7 +183,10 @@ fn build_propagated(
         attrs.push(KeyValue::new("user.id", uid.to_string()));
     }
     if let Some(t) = task_id {
-        attrs.push(KeyValue::new("langfuse.trace.metadata.task_id", t.to_string()));
+        attrs.push(KeyValue::new(
+            "langfuse.trace.metadata.task_id",
+            t.to_string(),
+        ));
     }
     if let Some(p) = provider {
         attrs.push(KeyValue::new(
@@ -194,7 +195,10 @@ fn build_propagated(
         ));
     }
     if let Some(m) = model {
-        attrs.push(KeyValue::new("langfuse.trace.metadata.model", m.to_string()));
+        attrs.push(KeyValue::new(
+            "langfuse.trace.metadata.model",
+            m.to_string(),
+        ));
     }
     // Flatten config object keys for filterable top-level metadata.
     if let Some(cfg) = config {
@@ -204,10 +208,7 @@ fn build_propagated(
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                attrs.push(KeyValue::new(
-                    format!("langfuse.trace.metadata.{k}"),
-                    val,
-                ));
+                attrs.push(KeyValue::new(format!("langfuse.trace.metadata.{k}"), val));
             }
         } else {
             attrs.push(KeyValue::new(
@@ -283,10 +284,7 @@ impl LangfuseTraceSink {
         let mut headers = HashMap::new();
         headers.insert("Authorization".to_string(), config.basic_auth_header());
         // Fast Preview / current ingestion pipeline
-        headers.insert(
-            "x-langfuse-ingestion-version".to_string(),
-            "4".to_string(),
-        );
+        headers.insert("x-langfuse-ingestion-version".to_string(), "4".to_string());
 
         let exporter = SpanExporter::builder()
             .with_http()
@@ -422,10 +420,7 @@ impl LangfuseTraceSink {
                 return cx.clone();
             }
         }
-        state
-            .root
-            .clone()
-            .unwrap_or_else(Context::current)
+        state.root.clone().unwrap_or_else(Context::current)
     }
 
     fn with_propagated(state: &RunState, mut attrs: Vec<KeyValue>) -> Vec<KeyValue> {
@@ -558,18 +553,13 @@ impl LangfuseTraceSink {
                     span.set_attribute(KeyValue::new("langfuse.observation.output", output));
                     // Also set trace-level output for the whole run.
                     if let Some(preview) = final_text_preview {
-                        span.set_attribute(KeyValue::new(
-                            "langfuse.trace.output",
-                            preview.clone(),
-                        ));
+                        span.set_attribute(KeyValue::new("langfuse.trace.output", preview.clone()));
                     }
                     match status {
                         TraceRunStatus::Ok => span.set_status(Status::Ok),
-                        TraceRunStatus::Error => {
-                            span.set_status(Status::error(error.clone().unwrap_or_else(|| {
-                                "run error".into()
-                            })))
-                        }
+                        TraceRunStatus::Error => span.set_status(Status::error(
+                            error.clone().unwrap_or_else(|| "run error".into()),
+                        )),
                         TraceRunStatus::Aborted | TraceRunStatus::MaxTurns => {
                             span.set_status(Status::error(status_str));
                         }
@@ -606,9 +596,7 @@ impl LangfuseTraceSink {
                 if let Some(p) = last_prompt_tokens {
                     span.set_attribute(KeyValue::new("last_prompt_tokens", *p as i64));
                 }
-                state
-                    .turns
-                    .insert(*turn, Context::current_with_span(span));
+                state.turns.insert(*turn, Context::current_with_span(span));
             }
             TraceEvent::LlmRequest {
                 ts_ms,
@@ -629,10 +617,7 @@ impl LangfuseTraceSink {
                     KeyValue::new("system_prompt_len", *system_prompt_len as i64),
                 ];
                 if let Some(preview) = input_preview {
-                    attrs.push(KeyValue::new(
-                        "langfuse.observation.input",
-                        preview.clone(),
-                    ));
+                    attrs.push(KeyValue::new("langfuse.observation.input", preview.clone()));
                 }
                 attrs = Self::with_propagated(&state, attrs);
                 let span = self
@@ -1049,9 +1034,7 @@ fn format_iso_ms(ms: u64) -> String {
     // Prefer chrono if available in crate.
     use chrono::{TimeZone, Utc};
     match Utc.timestamp_millis_opt(ms as i64) {
-        chrono::LocalResult::Single(dt) => {
-            dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true)
-        }
+        chrono::LocalResult::Single(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
         _ => "1970-01-01T00:00:00.000Z".into(),
     }
 }

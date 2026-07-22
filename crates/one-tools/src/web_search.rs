@@ -140,10 +140,7 @@ async fn brave_search(
             .get("title")
             .and_then(|v| v.as_str())
             .unwrap_or("(no title)");
-        let url = item
-            .get("url")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let url = item.get("url").and_then(|v| v.as_str()).unwrap_or("");
         let desc = item
             .get("description")
             .and_then(|v| v.as_str())
@@ -161,10 +158,7 @@ async fn brave_search(
 
 async fn ddg_search(client: &reqwest::Client, query: &str, count: usize) -> Result<String> {
     // DuckDuckGo HTML endpoint — no API key. Best-effort parse of result links.
-    let url = format!(
-        "https://html.duckduckgo.com/html/?q={}",
-        urlencoding(query)
-    );
+    let url = format!("https://html.duckduckgo.com/html/?q={}", urlencoding(query));
     let response = client
         .get(&url)
         .send()
@@ -225,7 +219,9 @@ fn parse_ddg_html(html: &str, count: usize) -> Vec<(String, String, String)> {
         if let Some(uddg) = extract_uddg(&link) {
             link = uddg;
         }
-        let after_tag = after_href[end_href..].find('>').map(|i| &after_href[end_href + i + 1..]);
+        let after_tag = after_href[end_href..]
+            .find('>')
+            .map(|i| &after_href[end_href + i + 1..]);
         let Some(title_src) = after_tag else {
             rest = &rest[1..];
             continue;

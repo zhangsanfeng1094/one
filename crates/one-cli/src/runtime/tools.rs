@@ -54,13 +54,7 @@ impl AppRuntime {
         if self.read_only {
             let mut t = ToolsSpec::read_only();
             // Keep ask_user for interactive main; deny only if main asked.
-            if self
-                .main_agent
-                .tools
-                .deny
-                .iter()
-                .any(|d| d == "ask_user")
-            {
+            if self.main_agent.tools.deny.iter().any(|d| d == "ask_user") {
                 t.deny.push("ask_user".into());
             }
             t.mcp = false;
@@ -91,21 +85,23 @@ impl AppRuntime {
         let tools_spec = self.effective_main_tools_spec();
         // When main tools.mcp is true, registered MCP instances are appended.
         // When false, materialize_tools strips MCP-looking names.
-        let mut tools = materialize_tools(&tools_spec, &registry, &ctx, false).map_err(|e| {
-            format!("main tools materialize failed: {e}")
-        })?;
+        let mut tools = materialize_tools(&tools_spec, &registry, &ctx, false)
+            .map_err(|e| format!("main tools materialize failed: {e}"))?;
 
         // Extensions always available in Act (unless ToolsSpec deny listed them —
         // materialize won't include them unless in allow/extra when allow non-empty).
         // If profile coding with empty allow, builtins only — re-append ext not in list.
-        if tools_spec.allow.is_empty() && matches!(tools_spec.profile, ToolProfile::Coding | ToolProfile::ReadOnly | ToolProfile::None) {
+        if tools_spec.allow.is_empty()
+            && matches!(
+                tools_spec.profile,
+                ToolProfile::Coding | ToolProfile::ReadOnly | ToolProfile::None
+            )
+        {
             let existing: std::collections::HashSet<_> =
                 tools.iter().map(|t| t.definition().name).collect();
             for t in ext {
                 let n = t.definition().name;
-                if !existing.contains(&n)
-                    && !tools_spec.deny.iter().any(|d| d == &n)
-                {
+                if !existing.contains(&n) && !tools_spec.deny.iter().any(|d| d == &n) {
                     tools.push(t);
                 }
             }

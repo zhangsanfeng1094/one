@@ -31,7 +31,12 @@ pub struct OAuthCredential {
     /// Absolute expiry time in milliseconds since Unix epoch.
     pub expires: u64,
     /// OpenAI Codex: ChatGPT account id extracted from JWT.
-    #[serde(default, rename = "accountId", alias = "account_id", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "accountId",
+        alias = "account_id",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub account_id: Option<String>,
     /// Extra provider-specific fields preserved on round-trip.
     #[serde(flatten)]

@@ -28,9 +28,8 @@ mod inner {
 
     impl AnthropicProvider {
         pub fn from_env() -> Result<Self> {
-            let api_key = std::env::var("ANTHROPIC_API_KEY").map_err(|_| {
-                OneError::Provider("ANTHROPIC_API_KEY is not set".to_string())
-            })?;
+            let api_key = std::env::var("ANTHROPIC_API_KEY")
+                .map_err(|_| OneError::Provider("ANTHROPIC_API_KEY is not set".to_string()))?;
             Ok(Self::new(api_key, DEFAULT_MODEL))
         }
 
@@ -117,10 +116,7 @@ mod inner {
             }
             // Legacy fine-grained tool streaming when eager tool input is unsupported.
             if !self.compat.supports_eager_tool_input_streaming && !request.tools.is_empty() {
-                req = req.header(
-                    "anthropic-beta",
-                    "fine-grained-tool-streaming-2025-05-14",
-                );
+                req = req.header("anthropic-beta", "fine-grained-tool-streaming-2025-05-14");
             }
             if self.compat.send_session_affinity_headers {
                 req = req.header("x-session-affinity", &self.session_id);
@@ -135,7 +131,9 @@ mod inner {
                     "error",
                     Some(&body),
                     None,
-                    Some(json!({ "status": status.as_u16(), "body_head": text.chars().take(500).collect::<String>() })),
+                    Some(
+                        json!({ "status": status.as_u16(), "body_head": text.chars().take(500).collect::<String>() }),
+                    ),
                 );
                 return Err(OneError::Provider(format!("anthropic {status}: {text}")));
             }
@@ -148,179 +146,198 @@ mod inner {
             let mut usage = TokenUsage::default();
 
             let aborted = matches!(
-                crate::sse::read_sse_response(response, &mut |data| {
-                let Ok(value) = serde_json::from_str::<Value>(data) else {
-                    return;
-                };
-                match value.get("type").and_then(|t| t.as_str()) {
-                    Some("content_block_start") => {
-                        let index = value
-                            .get("index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
-                        let btype = value
-                            .pointer("/content_block/type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
-                        match btype {
-                            "text" => {
-                                blocks.insert(index, PartialBlock::Text {
-                                    text: String::new(),
-                                });
-                            }
-                            "thinking" => {
-                                blocks.insert(index, PartialBlock::Thinking {
-                                    thinking: String::new(),
-                                    signature: String::new(),
-                                    redacted: false,
-                                });
-                            }
-                            "redacted_thinking" => {
-                                let data = value
-                                    .pointer("/content_block/data")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                blocks.insert(index, PartialBlock::Thinking {
-                                    thinking: "[Reasoning redacted]".into(),
-                                    signature: data,
-                                    redacted: true,
-                                });
-                            }
-                            "tool_use" => {
-                                let id = value
-                                    .pointer("/content_block/id")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                let name = value
-                                    .pointer("/content_block/name")
-                                    .and_then(|v| v.as_str())
-                                    .unwrap_or("")
-                                    .to_string();
-                                blocks.insert(index, PartialBlock::Tool {
-                                    id,
-                                    name,
-                                    arguments: String::new(),
-                                });
-                            }
-                            _ => {}
-                        }
-                    }
-                    Some("content_block_delta") => {
-                        let index = value
-                            .get("index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
-                        let dtype = value
-                            .pointer("/delta/type")
-                            .and_then(|t| t.as_str())
-                            .unwrap_or("");
-                        match dtype {
-                            "text_delta" => {
-                                if let Some(text) =
-                                    value.pointer("/delta/text").and_then(|t| t.as_str())
-                                {
-                                    if let Some(PartialBlock::Text { text: buf }) =
-                                        blocks.get_mut(&index)
-                                    {
-                                        buf.push_str(text);
-                                    } else {
+                crate::sse::read_sse_response(
+                    response,
+                    &mut |data| {
+                        let Ok(value) = serde_json::from_str::<Value>(data) else {
+                            return;
+                        };
+                        match value.get("type").and_then(|t| t.as_str()) {
+                            Some("content_block_start") => {
+                                let index = value.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                                    as usize;
+                                let btype = value
+                                    .pointer("/content_block/type")
+                                    .and_then(|t| t.as_str())
+                                    .unwrap_or("");
+                                match btype {
+                                    "text" => {
                                         blocks.insert(
                                             index,
                                             PartialBlock::Text {
-                                                text: text.to_string(),
+                                                text: String::new(),
                                             },
                                         );
                                     }
-                                    on_event(StreamEvent::TextDelta(text.to_string()));
-                                }
-                            }
-                            "thinking_delta" => {
-                                if let Some(delta) =
-                                    value.pointer("/delta/thinking").and_then(|t| t.as_str())
-                                {
-                                    if let Some(PartialBlock::Thinking { thinking, .. }) =
-                                        blocks.get_mut(&index)
-                                    {
-                                        thinking.push_str(delta);
-                                    } else {
+                                    "thinking" => {
                                         blocks.insert(
                                             index,
                                             PartialBlock::Thinking {
-                                                thinking: delta.to_string(),
+                                                thinking: String::new(),
                                                 signature: String::new(),
                                                 redacted: false,
                                             },
                                         );
                                     }
-                                    on_event(StreamEvent::ThinkingDelta(delta.to_string()));
-                                }
-                            }
-                            "signature_delta" => {
-                                if let Some(sig) =
-                                    value.pointer("/delta/signature").and_then(|t| t.as_str())
-                                {
-                                    if let Some(PartialBlock::Thinking { signature, .. }) =
-                                        blocks.get_mut(&index)
-                                    {
-                                        signature.push_str(sig);
+                                    "redacted_thinking" => {
+                                        let data = value
+                                            .pointer("/content_block/data")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        blocks.insert(
+                                            index,
+                                            PartialBlock::Thinking {
+                                                thinking: "[Reasoning redacted]".into(),
+                                                signature: data,
+                                                redacted: true,
+                                            },
+                                        );
                                     }
+                                    "tool_use" => {
+                                        let id = value
+                                            .pointer("/content_block/id")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        let name = value
+                                            .pointer("/content_block/name")
+                                            .and_then(|v| v.as_str())
+                                            .unwrap_or("")
+                                            .to_string();
+                                        blocks.insert(
+                                            index,
+                                            PartialBlock::Tool {
+                                                id,
+                                                name,
+                                                arguments: String::new(),
+                                            },
+                                        );
+                                    }
+                                    _ => {}
                                 }
                             }
-                            "input_json_delta" => {
-                                if let Some(partial) = value
-                                    .pointer("/delta/partial_json")
+                            Some("content_block_delta") => {
+                                let index = value.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                                    as usize;
+                                let dtype = value
+                                    .pointer("/delta/type")
                                     .and_then(|t| t.as_str())
-                                {
-                                    if let Some(PartialBlock::Tool { arguments, .. }) =
-                                        blocks.get_mut(&index)
-                                    {
-                                        arguments.push_str(partial);
+                                    .unwrap_or("");
+                                match dtype {
+                                    "text_delta" => {
+                                        if let Some(text) =
+                                            value.pointer("/delta/text").and_then(|t| t.as_str())
+                                        {
+                                            if let Some(PartialBlock::Text { text: buf }) =
+                                                blocks.get_mut(&index)
+                                            {
+                                                buf.push_str(text);
+                                            } else {
+                                                blocks.insert(
+                                                    index,
+                                                    PartialBlock::Text {
+                                                        text: text.to_string(),
+                                                    },
+                                                );
+                                            }
+                                            on_event(StreamEvent::TextDelta(text.to_string()));
+                                        }
+                                    }
+                                    "thinking_delta" => {
+                                        if let Some(delta) = value
+                                            .pointer("/delta/thinking")
+                                            .and_then(|t| t.as_str())
+                                        {
+                                            if let Some(PartialBlock::Thinking {
+                                                thinking, ..
+                                            }) = blocks.get_mut(&index)
+                                            {
+                                                thinking.push_str(delta);
+                                            } else {
+                                                blocks.insert(
+                                                    index,
+                                                    PartialBlock::Thinking {
+                                                        thinking: delta.to_string(),
+                                                        signature: String::new(),
+                                                        redacted: false,
+                                                    },
+                                                );
+                                            }
+                                            on_event(StreamEvent::ThinkingDelta(delta.to_string()));
+                                        }
+                                    }
+                                    "signature_delta" => {
+                                        if let Some(sig) = value
+                                            .pointer("/delta/signature")
+                                            .and_then(|t| t.as_str())
+                                        {
+                                            if let Some(PartialBlock::Thinking {
+                                                signature, ..
+                                            }) = blocks.get_mut(&index)
+                                            {
+                                                signature.push_str(sig);
+                                            }
+                                        }
+                                    }
+                                    "input_json_delta" => {
+                                        if let Some(partial) = value
+                                            .pointer("/delta/partial_json")
+                                            .and_then(|t| t.as_str())
+                                        {
+                                            if let Some(PartialBlock::Tool { arguments, .. }) =
+                                                blocks.get_mut(&index)
+                                            {
+                                                arguments.push_str(partial);
+                                            }
+                                        }
+                                    }
+                                    _ => {
+                                        // Fallback: older/proxied streams may only send /delta/text
+                                        if let Some(text) =
+                                            value.pointer("/delta/text").and_then(|t| t.as_str())
+                                        {
+                                            if let Some(PartialBlock::Text { text: buf }) =
+                                                blocks.get_mut(&index)
+                                            {
+                                                buf.push_str(text);
+                                            }
+                                            on_event(StreamEvent::TextDelta(text.to_string()));
+                                        }
                                     }
                                 }
                             }
-                            _ => {
-                                // Fallback: older/proxied streams may only send /delta/text
-                                if let Some(text) =
-                                    value.pointer("/delta/text").and_then(|t| t.as_str())
-                                {
-                                    if let Some(PartialBlock::Text { text: buf }) =
-                                        blocks.get_mut(&index)
-                                    {
-                                        buf.push_str(text);
-                                    }
-                                    on_event(StreamEvent::TextDelta(text.to_string()));
+                            Some("message_start") => {
+                                if let Some(u) = value.pointer("/message/usage") {
+                                    merge_anthropic_usage(&mut usage, u);
                                 }
                             }
+                            Some("message_delta") => {
+                                if let Some(reason) =
+                                    value.pointer("/delta/stop_reason").and_then(|v| v.as_str())
+                                {
+                                    let has_tools = blocks
+                                        .values()
+                                        .any(|b| matches!(b, PartialBlock::Tool { .. }));
+                                    stop_reason = map_stop_reason(reason, has_tools);
+                                }
+                                if let Some(u) = value.get("usage") {
+                                    merge_anthropic_usage(&mut usage, u);
+                                }
+                            }
+                            _ => {}
                         }
-                    }
-                    Some("message_start") => {
-                        if let Some(u) = value.pointer("/message/usage") {
-                            merge_anthropic_usage(&mut usage, u);
-                        }
-                    }
-                    Some("message_delta") => {
-                        if let Some(reason) =
-                            value.pointer("/delta/stop_reason").and_then(|v| v.as_str())
-                        {
-                            let has_tools = blocks
-                                .values()
-                                .any(|b| matches!(b, PartialBlock::Tool { .. }));
-                            stop_reason = map_stop_reason(reason, has_tools);
-                        }
-                        if let Some(u) = value.get("usage") {
-                            merge_anthropic_usage(&mut usage, u);
-                        }
-                    }
-                    _ => {}
-                }
-            }, abort)
+                    },
+                    abort
+                )
                 .await,
                 Err(OneError::Aborted)
             );
 
-            let content: Vec<ContentBlock> = blocks.into_values().filter_map(|b| b.into_block()).collect();
+            let content: Vec<ContentBlock> = blocks
+                .into_values()
+                .filter_map(|b| b.into_block())
+                .collect();
             let has_tools = content
                 .iter()
                 .any(|b| matches!(b, ContentBlock::ToolCall { .. }));
@@ -509,10 +526,7 @@ mod inner {
             if let Some(obj) = body.as_object_mut() {
                 obj.insert("thinking".into(), json!({ "type": "adaptive" }));
                 if let Some(effort) = request.thinking_level.effort() {
-                    obj.insert(
-                        "output_config".into(),
-                        json!({ "effort": effort }),
-                    );
+                    obj.insert("output_config".into(), json!({ "effort": effort }));
                 }
             }
         } else {
@@ -548,7 +562,11 @@ mod inner {
                         ContentBlock::Text { text } => {
                             blocks.push(json!({ "type": "text", "text": text }));
                         }
-                        ContentBlock::ToolCall { id, name, arguments } => {
+                        ContentBlock::ToolCall {
+                            id,
+                            name,
+                            arguments,
+                        } => {
                             blocks.push(json!({
                                 "type": "tool_use",
                                 "id": id,
@@ -571,9 +589,7 @@ mod inner {
                                         "data": data,
                                     }));
                                 }
-                            } else if let Some(sig) =
-                                signature.as_ref().filter(|s| !s.is_empty())
-                            {
+                            } else if let Some(sig) = signature.as_ref().filter(|s| !s.is_empty()) {
                                 blocks.push(json!({
                                     "type": "thinking",
                                     "thinking": thinking,
@@ -625,7 +641,9 @@ mod inner {
     #[derive(Debug, Deserialize)]
     #[serde(tag = "type", rename_all = "snake_case")]
     enum AnthropicContentBlock {
-        Text { text: String },
+        Text {
+            text: String,
+        },
         Thinking {
             thinking: String,
             #[serde(default)]
@@ -716,9 +734,7 @@ mod inner {
                         timestamp: 0,
                     }),
                     one_core::AgentMessage::Assistant(one_core::message::AssistantMessage {
-                        content: vec![ContentBlock::Text {
-                            text: "yo".into(),
-                        }],
+                        content: vec![ContentBlock::Text { text: "yo".into() }],
                         provider: "anthropic".into(),
                         model: "m".into(),
                         stop_reason: StopReason::Stop,
@@ -789,7 +805,10 @@ mod inner {
             Some("tool_use") => StopReason::ToolUse,
             Some("max_tokens") => StopReason::Length,
             Some("end_turn") => StopReason::Stop,
-            _ if content.iter().any(|block| matches!(block, ContentBlock::ToolCall { .. })) => {
+            _ if content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::ToolCall { .. })) =>
+            {
                 StopReason::ToolUse
             }
             _ => StopReason::Stop,

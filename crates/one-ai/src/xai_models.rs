@@ -2,7 +2,7 @@
 
 use std::path::Path;
 
-use crate::auth::{XAI_BASE_URL, PROVIDER_XAI};
+use crate::auth::{PROVIDER_XAI, XAI_BASE_URL};
 use crate::models_file::{load_models_file, save_models_file, ModelsConfig};
 use crate::openai::ProviderApi;
 use crate::registry::{ModelEntry, ProviderConfig};
@@ -144,11 +144,7 @@ mod tests {
     fn seed_writes_models() {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "one-xai-seed-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir = std::env::temp_dir().join(format!("one-xai-seed-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("models.json");
         std::fs::write(

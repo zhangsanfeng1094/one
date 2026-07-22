@@ -48,10 +48,7 @@ pub fn cli_identity_headers() -> BTreeMap<String, String> {
     let mut h = BTreeMap::new();
     h.insert("X-XAI-Token-Auth".into(), "xai-grok-cli".into());
     h.insert("x-grok-client-version".into(), version.clone());
-    h.insert(
-        "User-Agent".into(),
-        format!("xai-grok-workspace/{version}"),
-    );
+    h.insert("User-Agent".into(), format!("xai-grok-workspace/{version}"));
     h
 }
 
@@ -94,7 +91,9 @@ async fn login_inner(interaction: &mut dyn AuthInteraction) -> Result<OAuthCrede
     }
 }
 
-pub async fn login_browser(interaction: &mut dyn AuthInteraction) -> Result<OAuthCredential, String> {
+pub async fn login_browser(
+    interaction: &mut dyn AuthInteraction,
+) -> Result<OAuthCredential, String> {
     #[cfg(not(feature = "http-providers"))]
     {
         let _ = interaction;
@@ -139,11 +138,7 @@ async fn login_browser_inner(
     let discovery = discover().await?;
     let pkce = generate_pkce();
     let state = random_hex(16);
-    let url = authorize_url(
-        &discovery.authorization_endpoint,
-        &pkce.challenge,
-        &state,
-    );
+    let url = authorize_url(&discovery.authorization_endpoint, &pkce.challenge, &state);
 
     let callback_host = std::env::var("ONE_OAUTH_CALLBACK_HOST")
         .ok()
@@ -286,10 +281,7 @@ async fn login_device_code_inner(
         .post(device_ep)
         .header("Content-Type", "application/x-www-form-urlencoded")
         .header("Accept", "application/json")
-        .body(form_encode(&[
-            ("client_id", CLIENT_ID),
-            ("scope", SCOPE),
-        ]))
+        .body(form_encode(&[("client_id", CLIENT_ID), ("scope", SCOPE)]))
         .send()
         .await
         .map_err(|e| format!("xAI device authorization failed: {e}"))?;
@@ -345,7 +337,8 @@ async fn login_device_code_inner(
         message: "Waiting for xAI device authorization...".into(),
     });
 
-    let deadline = SystemTime::now() + Duration::from_secs(expires_in.min(DEVICE_CODE_TIMEOUT_SECS));
+    let deadline =
+        SystemTime::now() + Duration::from_secs(expires_in.min(DEVICE_CODE_TIMEOUT_SECS));
     // RFC 8628: wait before first poll.
     tokio::time::sleep(Duration::from_millis(interval_ms)).await;
 
@@ -383,9 +376,11 @@ async fn login_device_code_inner(
 
         let status = poll.status().as_u16();
         let body = poll.text().await.unwrap_or_default();
-        let error = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|j| j.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()));
+        let error = serde_json::from_str::<Value>(&body).ok().and_then(|j| {
+            j.get("error")
+                .and_then(|e| e.as_str())
+                .map(|s| s.to_string())
+        });
 
         match error.as_deref() {
             Some("authorization_pending") | None if status == 400 => {
@@ -398,9 +393,7 @@ async fn login_device_code_inner(
             Some("expired_token") => return Err("xAI device authorization expired".into()),
             Some("access_denied") => return Err("xAI device authorization denied".into()),
             _ => {
-                return Err(format!(
-                    "xAI device token failed ({status}): {body}"
-                ));
+                return Err(format!("xAI device token failed ({status}): {body}"));
             }
         }
     }
@@ -527,10 +520,7 @@ async fn discover() -> Result<Discovery, String> {
         .await
         .map_err(|e| format!("xAI OIDC discovery failed: {e}"))?;
     if !resp.status().is_success() {
-        return Err(format!(
-            "xAI OIDC discovery returned {}",
-            resp.status()
-        ));
+        return Err(format!("xAI OIDC discovery returned {}", resp.status()));
     }
     let json: Value = resp
         .json()
@@ -719,9 +709,7 @@ fn start_callback_server(
         )));
         e.to_string()
     })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
     let deadline = SystemTime::now() + Duration::from_secs(DEVICE_CODE_TIMEOUT_SECS);
     // Keep accepting until we get a successful auth code.
@@ -900,9 +888,7 @@ mod tests {
 
     #[test]
     fn parse_redirect() {
-        let p = parse_authorization_input(
-            "http://127.0.0.1:56121/callback?code=abc&state=xyz",
-        );
+        let p = parse_authorization_input("http://127.0.0.1:56121/callback?code=abc&state=xyz");
         assert_eq!(p.code.as_deref(), Some("abc"));
         assert_eq!(p.state.as_deref(), Some("xyz"));
     }
@@ -910,6 +896,9 @@ mod tests {
     #[test]
     fn cli_headers_present() {
         let h = cli_identity_headers();
-        assert_eq!(h.get("X-XAI-Token-Auth").map(|s| s.as_str()), Some("xai-grok-cli"));
+        assert_eq!(
+            h.get("X-XAI-Token-Auth").map(|s| s.as_str()),
+            Some("xai-grok-cli")
+        );
     }
 }

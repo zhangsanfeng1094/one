@@ -186,13 +186,10 @@ impl Tool for PlanEditTool {
             apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success,
             normalize_to_lf,
         };
-        use crate::tool_args::{
-            bool_arg_names, new_string_arg, old_string_arg, path_arg,
-        };
+        use crate::tool_args::{bool_arg_names, new_string_arg, old_string_arg, path_arg};
 
-        let path = path_arg(&call.arguments).ok_or_else(|| {
-            invalid_args("edit", "missing `path` / `file_path` / `filePath`")
-        })?;
+        let path = path_arg(&call.arguments)
+            .ok_or_else(|| invalid_args("edit", "missing `path` / `file_path` / `filePath`"))?;
         let old_string = old_string_arg(&call.arguments).ok_or_else(|| {
             invalid_args("edit", "missing `old_string` / `oldString` / `oldText`")
         })?;
@@ -269,7 +266,8 @@ impl Tool for ExitPlanModeTool {
 Call this when you have finished writing the plan file and are ready for user approval. \
 This tool does NOT take the plan content — it reads the plan from the plan file path given \
 in the system prompt. Only use after a clear, unambiguous implementation plan is on disk. \
-Do NOT use for pure research/Q&A that needs no code changes.".to_string(),
+Do NOT use for pure research/Q&A that needs no code changes."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -374,8 +372,7 @@ pub fn plan_mode_tools_with_policy(
     // Allow reading/writing the plan file even when it lives under ~/.one/agent/plans.
     let policy = policy.with_allowed_file(plan_path.clone());
     let ask_handler = ask_user.unwrap_or_else(|| {
-        Arc::new(crate::ask_user::FailClosedAskUser)
-            as Arc<dyn crate::ask_user::AskUserHandler>
+        Arc::new(crate::ask_user::FailClosedAskUser) as Arc<dyn crate::ask_user::AskUserHandler>
     });
     #[allow(unused_mut)] // mut when `network` feature pushes extra tools
     let mut tools: Vec<Arc<dyn Tool>> = vec![

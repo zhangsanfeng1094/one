@@ -278,10 +278,7 @@ impl AgentHooks for RuntimeAgentHooks {
     async fn on_agent_end(&self) {}
 
     async fn on_turn_start(&self, turn: usize) {
-        let _ = self
-            .runtime
-            .emit(&ExtensionEvent::TurnStart { turn })
-            .await;
+        let _ = self.runtime.emit(&ExtensionEvent::TurnStart { turn }).await;
     }
 
     async fn on_turn_end(&self, turn: usize) {

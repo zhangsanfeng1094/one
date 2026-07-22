@@ -112,10 +112,7 @@ impl McpProgressHandle {
         let loading = self.shared.loading.load(Ordering::SeqCst)
             || self.shared.pending.load(Ordering::SeqCst) > 0;
 
-        let ready = live
-            .iter()
-            .filter(|s| !disabled.contains(&s.name))
-            .count();
+        let ready = live.iter().filter(|s| !disabled.contains(&s.name)).count();
         let failed = failures
             .iter()
             .filter(|(n, _)| !disabled.contains(n))
@@ -291,7 +288,8 @@ impl McpManager {
     }
 
     pub fn spawn_with_loaded(loaded: LoadedMcpConfig) -> Result<Self> {
-        let disabled_set: HashSet<String> = loaded.config.disabled_servers.iter().cloned().collect();
+        let disabled_set: HashSet<String> =
+            loaded.config.disabled_servers.iter().cloned().collect();
         let n_enabled = loaded.config.enabled_servers().count();
         let shared = Arc::new(SharedState {
             config: RwLock::new(loaded.config.clone()),
@@ -415,7 +413,10 @@ impl McpManager {
         if rows.is_empty() {
             return "none".into();
         }
-        let ok = rows.iter().filter(|r| r.enabled && r.status == "ok").count();
+        let ok = rows
+            .iter()
+            .filter(|r| r.enabled && r.status == "ok")
+            .count();
         let off = rows.iter().filter(|r| !r.enabled).count();
         let err = rows.iter().filter(|r| r.status == "error").count();
         let starting = rows
@@ -514,8 +515,8 @@ impl McpManager {
                 if let Some(src) = loaded.server_sources.get(name) {
                     sources.insert(name.clone(), *src);
                 }
-                let disabled = self.shared.disabled_names.read().contains(name)
-                    || cfg.enabled == Some(false);
+                let disabled =
+                    self.shared.disabled_names.read().contains(name) || cfg.enabled == Some(false);
                 let already_live = self.shared.live.read().iter().any(|s| &s.name == name);
                 if is_new && !disabled && !already_live {
                     to_connect.push((name.clone(), cfg.clone()));
@@ -532,7 +533,9 @@ impl McpManager {
     /// Toggle one server on/off (persists + reconnects or drops tools).
     pub async fn set_server_enabled(&self, name: &str, enabled: bool) -> Result<()> {
         if self.disabled {
-            return Err(McpError::other("MCP is disabled for this process (--no-mcp)"));
+            return Err(McpError::other(
+                "MCP is disabled for this process (--no-mcp)",
+            ));
         }
         if !self.shared.config.read().mcp_servers.contains_key(name) {
             return Err(McpError::other(format!("unknown MCP server `{name}`")));
@@ -600,7 +603,9 @@ impl McpManager {
         overwrite: bool,
     ) -> Result<ImportReport> {
         if self.disabled {
-            return Err(McpError::other("MCP is disabled for this process (--no-mcp)"));
+            return Err(McpError::other(
+                "MCP is disabled for this process (--no-mcp)",
+            ));
         }
 
         let report = import_servers_to_user(cwd, names, source_filter, overwrite)?;
@@ -674,9 +679,7 @@ impl McpManager {
                 },
                 tool_count: s.tools.len(),
                 tools: s.tools.iter().map(|t| t.definition().name).collect(),
-                source: self
-                    .server_source(&s.name)
-                    .map(|k| k.as_str().to_string()),
+                source: self.server_source(&s.name).map(|k| k.as_str().to_string()),
             });
         }
         let live_names: std::collections::HashSet<String> =
@@ -712,13 +715,7 @@ impl McpManager {
                 if live_names.contains(name) {
                     continue;
                 }
-                if self
-                    .shared
-                    .failures
-                    .read()
-                    .iter()
-                    .any(|(n, _)| n == name)
-                {
+                if self.shared.failures.read().iter().any(|(n, _)| n == name) {
                     continue;
                 }
                 out.push(ServerHealth {
@@ -862,8 +859,7 @@ fn humanize_mcp_error(raw: &str) -> String {
         || lower.contains("unauthorized")
         || lower.contains("401")
     {
-        return "needs OAuth / login (set token or authenticate the host MCP client first)"
-            .into();
+        return "needs OAuth / login (set token or authenticate the host MCP client first)".into();
     }
     if lower.contains("enotempty")
         || lower.contains("npm error")
@@ -947,7 +943,10 @@ async fn connect_stdio(
     let service = tokio::time::timeout(startup, ().serve(transport))
         .await
         .map_err(|_| {
-            McpError::server(name, format!("startup timed out after {}s", startup.as_secs()))
+            McpError::server(
+                name,
+                format!("startup timed out after {}s", startup.as_secs()),
+            )
         })?
         .map_err(|e| McpError::server(name, format!("handshake failed: {e}")))?;
 
@@ -972,9 +971,8 @@ async fn connect_http(
         use std::collections::HashMap;
         let mut headers = HashMap::new();
         for (k, v) in &cfg.headers {
-            let key = HeaderName::from_bytes(k.as_bytes()).map_err(|e| {
-                McpError::server(name, format!("invalid header name `{k}`: {e}"))
-            })?;
+            let key = HeaderName::from_bytes(k.as_bytes())
+                .map_err(|e| McpError::server(name, format!("invalid header name `{k}`: {e}")))?;
             let val = HeaderValue::from_str(v).map_err(|e| {
                 McpError::server(name, format!("invalid header value for `{k}`: {e}"))
             })?;
@@ -987,7 +985,10 @@ async fn connect_http(
     let service = tokio::time::timeout(startup, ().serve(transport))
         .await
         .map_err(|_| {
-            McpError::server(name, format!("startup timed out after {}s", startup.as_secs()))
+            McpError::server(
+                name,
+                format!("startup timed out after {}s", startup.as_secs()),
+            )
         })?
         .map_err(|e| McpError::server(name, format!("handshake failed: {e}")))?;
 
@@ -1009,14 +1010,7 @@ async fn finish_connect(
         .map_err(|e| McpError::server(name, format!("tools/list failed: {e}")))?;
 
     let allow = cfg.tools.as_deref();
-    let tools = tools_from_list(
-        name,
-        listed,
-        allow,
-        peer,
-        tool_timeout,
-        max_output_bytes,
-    );
+    let tools = tools_from_list(name, listed, allow, peer, tool_timeout, max_output_bytes);
 
     Ok(LiveServer {
         name: name.to_string(),
@@ -1055,4 +1049,3 @@ pub async fn probe_server(name: &str, cfg: &McpServerConfig) -> ServerHealth {
         },
     }
 }
-

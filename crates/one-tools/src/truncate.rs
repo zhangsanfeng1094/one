@@ -50,10 +50,7 @@ impl ToolOutputLimits {
 
     /// Defaults, then settings-style overrides, then env
     /// (`ONE_TOOL_OUTPUT_MAX_LINES` / `ONE_TOOL_OUTPUT_MAX_BYTES`).
-    pub fn from_env_and_overrides(
-        max_lines: Option<usize>,
-        max_bytes: Option<usize>,
-    ) -> Self {
+    pub fn from_env_and_overrides(max_lines: Option<usize>, max_bytes: Option<usize>) -> Self {
         let mut lim = Self::resolve(max_lines, max_bytes);
         if let Some(n) = env_usize("ONE_TOOL_OUTPUT_MAX_LINES") {
             lim.max_lines = n;
@@ -74,9 +71,7 @@ fn env_usize(key: &str) -> Option<usize> {
 
 fn limits_cell() -> &'static RwLock<ToolOutputLimits> {
     static CELL: OnceLock<RwLock<ToolOutputLimits>> = OnceLock::new();
-    CELL.get_or_init(|| {
-        RwLock::new(ToolOutputLimits::from_env_and_overrides(None, None))
-    })
+    CELL.get_or_init(|| RwLock::new(ToolOutputLimits::from_env_and_overrides(None, None)))
 }
 
 /// Install process-wide limits (CLI startup / `/settings` / tests).
@@ -88,10 +83,7 @@ pub fn set_tool_output_limits(limits: ToolOutputLimits) {
 
 /// Current process-wide limits.
 pub fn tool_output_limits() -> ToolOutputLimits {
-    limits_cell()
-        .read()
-        .map(|g| *g)
-        .unwrap_or_default()
+    limits_cell().read().map(|g| *g).unwrap_or_default()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -697,18 +689,20 @@ mod tests {
                 .unwrap_or(0)
         ));
         let _ = std::fs::create_dir_all(&dir);
-        // Override process limits for isolation.
-        let prev = tool_output_limits();
-        set_tool_output_limits(ToolOutputLimits {
-            max_lines: 10,
-            max_bytes: 1_000_000,
-        });
         let big = (0..100)
             .map(|i| format!("line{i}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let presented = present_tool_output(&big, "bash", &dir, PreviewStyle::Head);
-        set_tool_output_limits(prev);
+        let presented = present_tool_output_with(
+            &big,
+            "bash",
+            &dir,
+            PreviewStyle::Head,
+            Some(ToolOutputLimits {
+                max_lines: 10,
+                max_bytes: 1_000_000,
+            }),
+        );
 
         assert!(presented.truncated);
         assert!(presented.spill_path.is_some());
@@ -728,14 +722,16 @@ mod tests {
     fn under_limit_no_spill() {
         let dir = std::env::temp_dir().join(format!("one-nospill-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
-        let prev = tool_output_limits();
-        set_tool_output_limits(ToolOutputLimits {
-            max_lines: 100,
-            max_bytes: 10_000,
-        });
-        let presented =
-            present_tool_output("a\nb\nc", "grep", &dir, PreviewStyle::Head);
-        set_tool_output_limits(prev);
+        let presented = present_tool_output_with(
+            "a\nb\nc",
+            "grep",
+            &dir,
+            PreviewStyle::Head,
+            Some(ToolOutputLimits {
+                max_lines: 100,
+                max_bytes: 10_000,
+            }),
+        );
         assert!(!presented.truncated);
         assert!(presented.spill_path.is_none());
         assert_eq!(presented.text, "a\nb\nc");

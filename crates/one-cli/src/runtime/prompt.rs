@@ -23,8 +23,7 @@ impl AppRuntime {
         // - Once any tools exist, proceed immediately (more servers trickle in
         //   and attach on subsequent turns via generation sync).
         if self.mcp.is_loading() && self.mcp.tool_count() == 0 {
-            let deadline =
-                tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
             while self.mcp.is_loading()
                 && self.mcp.tool_count() == 0
                 && tokio::time::Instant::now() < deadline
@@ -39,9 +38,7 @@ impl AppRuntime {
 
         let _ = self
             .extensions
-            .emit(&ExtensionEvent::UserPromptSubmit {
-                text: text.clone(),
-            })
+            .emit(&ExtensionEvent::UserPromptSubmit { text: text.clone() })
             .await;
 
         let mut before = {

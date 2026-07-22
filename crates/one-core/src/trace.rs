@@ -350,9 +350,9 @@ pub fn last_user_preview(messages: &[AgentMessage], max_chars: usize) -> Option<
                 UserContent::Text(text) => text.clone(),
                 UserContent::Blocks(blocks) => blocks
                     .iter()
-                    .filter_map(|b| match b {
-                        crate::message::TextOrImage::Text { text } => Some(text.as_str()),
-                        crate::message::TextOrImage::Image { .. } => Some("[image]"),
+                    .map(|b| match b {
+                        crate::message::TextOrImage::Text { text } => text.as_str(),
+                        crate::message::TextOrImage::Image { .. } => "[image]",
                     })
                     .collect::<Vec<_>>()
                     .join("\n"),
@@ -383,9 +383,9 @@ pub fn llm_input_preview(
                     UserContent::Text(text) => text.clone(),
                     UserContent::Blocks(blocks) => blocks
                         .iter()
-                        .filter_map(|b| match b {
-                            crate::message::TextOrImage::Text { text } => Some(text.as_str()),
-                            crate::message::TextOrImage::Image { .. } => Some("[image]"),
+                        .map(|b| match b {
+                            crate::message::TextOrImage::Text { text } => text.as_str(),
+                            crate::message::TextOrImage::Image { .. } => "[image]",
                         })
                         .collect::<Vec<_>>()
                         .join("\n"),
@@ -398,9 +398,7 @@ pub fn llm_input_preview(
                     .iter()
                     .filter_map(|b| match b {
                         crate::message::ContentBlock::Text { text } => Some(text.as_str()),
-                        crate::message::ContentBlock::ToolCall { name, .. } => {
-                            Some(name.as_str())
-                        }
+                        crate::message::ContentBlock::ToolCall { name, .. } => Some(name.as_str()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()
@@ -411,9 +409,9 @@ pub fn llm_input_preview(
                 let text = t
                     .content
                     .iter()
-                    .filter_map(|b| match b {
-                        crate::message::TextOrImage::Text { text } => Some(text.as_str()),
-                        crate::message::TextOrImage::Image { .. } => Some("[image]"),
+                    .map(|b| match b {
+                        crate::message::TextOrImage::Text { text } => text.as_str(),
+                        crate::message::TextOrImage::Image { .. } => "[image]",
                     })
                     .collect::<Vec<_>>()
                     .join("\n");
@@ -509,8 +507,7 @@ impl TraceStats {
                     ..
                 } => {
                     s.llm_calls += 1;
-                    s.total_llm_latency_ms =
-                        s.total_llm_latency_ms.saturating_add(*latency_ms);
+                    s.total_llm_latency_ms = s.total_llm_latency_ms.saturating_add(*latency_ms);
                     if let Some(t) = ttft_ms {
                         s.ttft_samples_ms.push(*t);
                     }
@@ -610,10 +607,7 @@ impl TraceStats {
             self.tool_errors,
             self.tool_error_rate() * 100.0
         ));
-        lines.push(format!(
-            "tool_ms:    {}",
-            self.total_tool_duration_ms
-        ));
+        lines.push(format!("tool_ms:    {}", self.total_tool_duration_ms));
         if self.gate_denies > 0 || self.gate_rewrites > 0 {
             lines.push(format!(
                 "gates:      denies={} rewrites={}",
@@ -801,7 +795,7 @@ mod tests {
 
     #[test]
     fn last_user_preview_takes_latest() {
-        use crate::message::{AgentMessage, UserMessage, UserContent};
+        use crate::message::{AgentMessage, UserContent, UserMessage};
         let messages = vec![
             AgentMessage::User(UserMessage {
                 content: UserContent::Text("first".into()),

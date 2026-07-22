@@ -33,9 +33,8 @@ impl Tool for WriteTool {
                 self.policy.cwd().display()
             )
         };
-        let mut properties = path_properties(
-            "File path to create or overwrite (Claude Code alias: `file_path`)",
-        );
+        let mut properties =
+            path_properties("File path to create or overwrite (Claude Code alias: `file_path`)");
         if let Some(obj) = properties.as_object_mut() {
             obj.insert(
                 "content".into(),
@@ -98,10 +97,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_path_outside_workspace() {
-        let dir = std::env::temp_dir().join(format!(
-            "one-write-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("one-write-test-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = WriteTool::new(dir.clone());
         let outside = format!("/etc/one-write-deny-{}", std::process::id());
@@ -113,19 +109,13 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("outside workspace"),
-            "{err}"
-        );
+        assert!(err.to_string().contains("outside workspace"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
     async fn writes_inside_workspace() {
-        let dir = std::env::temp_dir().join(format!(
-            "one-write-ok-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("one-write-ok-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = WriteTool::new(dir.clone());
         tool.execute(&ToolCall {

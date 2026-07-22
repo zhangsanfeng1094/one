@@ -45,10 +45,7 @@ impl Extension for DemoExtension {
         }]
     }
 
-    async fn before_tool(
-        &self,
-        call: &ToolCall,
-    ) -> one_ext::Result<PreToolDecision> {
+    async fn before_tool(&self, call: &ToolCall) -> one_ext::Result<PreToolDecision> {
         if call.name == "bash" {
             // Example: refuse rm -rf /
             let cmd = call
@@ -103,6 +100,16 @@ async fn main() {
     };
     runtime.load_all(&ctx).await.expect("load");
     println!("loaded extensions: {:?}", runtime.names());
-    println!("tools: {:?}", runtime.tools().iter().map(|t| t.definition().name).collect::<Vec<_>>());
-    println!("overlay:\n{}", runtime.system_prompt_overlay().unwrap_or_default());
+    println!(
+        "tools: {:?}",
+        runtime
+            .tools()
+            .iter()
+            .map(|t| t.definition().name)
+            .collect::<Vec<_>>()
+    );
+    println!(
+        "overlay:\n{}",
+        runtime.system_prompt_overlay().unwrap_or_default()
+    );
 }

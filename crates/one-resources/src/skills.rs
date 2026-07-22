@@ -43,9 +43,7 @@ pub struct SkillConfigEntry {
 impl Skill {
     /// Directory containing `SKILL.md` (base for relative scripts/references).
     pub fn base_dir(&self) -> &Path {
-        self.location
-            .parent()
-            .unwrap_or_else(|| Path::new("."))
+        self.location.parent().unwrap_or_else(|| Path::new("."))
     }
 }
 
@@ -125,9 +123,7 @@ pub fn parse_skill_md(content: &str, path: &Path) -> Option<Skill> {
     let (fm, body) = split_frontmatter(content);
     let meta = parse_frontmatter_fields(&fm);
 
-    let description = meta
-        .description
-        .filter(|d| !d.trim().is_empty())?;
+    let description = meta.description.filter(|d| !d.trim().is_empty())?;
 
     let dir_name = path
         .parent()
@@ -136,14 +132,9 @@ pub fn parse_skill_md(content: &str, path: &Path) -> Option<Skill> {
         .unwrap_or("skill")
         .to_string();
 
-    let name = meta
-        .name
-        .filter(|n| !n.is_empty())
-        .unwrap_or(dir_name);
+    let name = meta.name.filter(|n| !n.is_empty()).unwrap_or(dir_name);
 
-    let location = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let location = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
 
     Some(Skill {
         name,
@@ -191,11 +182,7 @@ pub fn is_path_enabled(config: &[SkillConfigEntry], location: &Path) -> bool {
 }
 
 /// Upsert a path entry in the skills config list.
-pub fn set_skill_enabled(
-    config: &mut Vec<SkillConfigEntry>,
-    location: &Path,
-    enabled: bool,
-) {
+pub fn set_skill_enabled(config: &mut Vec<SkillConfigEntry>, location: &Path, enabled: bool) {
     let path = location
         .canonicalize()
         .unwrap_or_else(|_| location.to_path_buf())
@@ -234,7 +221,10 @@ fn split_frontmatter(content: &str) -> (String, String) {
     }
     let after = &trimmed[3..];
     // Skip optional newline after opening ---
-    let after = after.strip_prefix('\n').or_else(|| after.strip_prefix("\r\n")).unwrap_or(after);
+    let after = after
+        .strip_prefix('\n')
+        .or_else(|| after.strip_prefix("\r\n"))
+        .unwrap_or(after);
     // Find closing ---
     if let Some(end) = after.find("\n---") {
         let fm = after[..end].to_string();
@@ -293,7 +283,12 @@ fn parse_frontmatter_fields(fm: &str) -> Frontmatter {
 /// Returns `(value, extra_lines_consumed)`.
 fn parse_yaml_scalar(value: &str, rest: &[&str]) -> (String, usize) {
     let value = value.trim();
-    if value == ">" || value == "|" || value == ">-" || value == "|-" || value == ">+" || value == "|+"
+    if value == ">"
+        || value == "|"
+        || value == ">-"
+        || value == "|-"
+        || value == ">+"
+        || value == "|+"
     {
         let folded = value.starts_with('>');
         let (body, n) = take_indented_block(rest);
@@ -454,9 +449,7 @@ pub fn force_load_message(skill: &Skill, user_args: &str) -> String {
     } else {
         skill.body.as_str()
     };
-    let body = body
-        .replace("{baseDir}", &dir)
-        .replace("{BASE_DIR}", &dir);
+    let body = body.replace("{baseDir}", &dir).replace("{BASE_DIR}", &dir);
     let mut msg = format!(
         "<skill_content name=\"{}\">\n\
          Skill directory: {dir}\n\
@@ -565,8 +558,7 @@ description: >
         )
         .unwrap();
         let skills = [skill];
-        let (s, extra) =
-            resolve_skill_invocation(&skills, "/skill:review focus on auth").unwrap();
+        let (s, extra) = resolve_skill_invocation(&skills, "/skill:review focus on auth").unwrap();
         assert_eq!(s.name, "review");
         assert_eq!(extra, "focus on auth");
     }

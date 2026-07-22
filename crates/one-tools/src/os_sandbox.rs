@@ -57,14 +57,8 @@ impl OsSandbox {
         Self {
             enabled,
             cwd: policy.cwd().to_path_buf(),
-            writable_roots: policy
-                .writable_roots()
-                .map(|p| p.to_path_buf())
-                .collect(),
-            readable_roots: policy
-                .readable_roots()
-                .map(|p| p.to_path_buf())
-                .collect(),
+            writable_roots: policy.writable_roots().map(|p| p.to_path_buf()).collect(),
+            readable_roots: policy.readable_roots().map(|p| p.to_path_buf()).collect(),
         }
     }
 
@@ -86,10 +80,7 @@ impl OsSandbox {
     /// Always ends with running the user command via `bash -lc`.
     pub fn command_line(&self, user_command: &str) -> (String, Vec<String>) {
         if !self.enabled {
-            return (
-                "bash".into(),
-                vec!["-lc".into(), user_command.to_string()],
-            );
+            return ("bash".into(), vec!["-lc".into(), user_command.to_string()]);
         }
         let Some(bwrap) = which_bwrap() else {
             if !WARNED_NO_BWRAP.swap(true, Ordering::Relaxed) {
@@ -98,10 +89,7 @@ impl OsSandbox {
                      (install bubblewrap, or set ONE_BASH_SANDBOX=0 to silence)"
                 );
             }
-            return (
-                "bash".into(),
-                vec!["-lc".into(), user_command.to_string()],
-            );
+            return ("bash".into(), vec!["-lc".into(), user_command.to_string()]);
         };
 
         let mut args = Vec::new();
@@ -256,7 +244,8 @@ mod tests {
         assert!(args.iter().any(|a| a == "--die-with-parent"));
         // Codex-style full-disk RO root.
         assert!(
-            args.windows(3).any(|w| w[0] == "--ro-bind" && w[1] == "/" && w[2] == "/"),
+            args.windows(3)
+                .any(|w| w[0] == "--ro-bind" && w[1] == "/" && w[2] == "/"),
             "expected --ro-bind / / in {args:?}"
         );
         assert!(args.iter().any(|a| a == "echo hi"));
@@ -270,7 +259,9 @@ mod tests {
         }
         // Workspace under /tmp (writable). Leak target under $HOME (RO via /).
         let dir = unique_dir("one-os-sb-block");
-        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/tmp"));
         let outside = home.join(format!(
             ".one-os-sb-outside-{}-{}",
             std::process::id(),
@@ -342,8 +333,7 @@ mod tests {
         let target = dir.join("ok.txt");
         let mut sb = OsSandbox::from_policy(&PathPolicy::workspace(dir.clone()));
         sb.enabled = true;
-        let (prog, args) =
-            sb.command_line(&format!("echo hi > '{}'", target.display()));
+        let (prog, args) = sb.command_line(&format!("echo hi > '{}'", target.display()));
         let out = std::process::Command::new(&prog)
             .args(&args)
             .current_dir(&dir)

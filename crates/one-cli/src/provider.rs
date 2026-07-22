@@ -768,8 +768,8 @@ fn apply_provider_kv(p: &mut ProviderConfig, kv: &[(String, String)]) -> Result<
                     p.compat = None;
                 } else {
                     // Full JSON object replacement.
-                    let c: one_ai::CompatConfig = serde_json::from_str(value)
-                        .map_err(|e| format!("compat JSON: {e}"))?;
+                    let c: one_ai::CompatConfig =
+                        serde_json::from_str(value).map_err(|e| format!("compat JSON: {e}"))?;
                     p.compat = if c.is_empty() { None } else { Some(c) };
                 }
             }
@@ -783,9 +783,10 @@ fn apply_provider_kv(p: &mut ProviderConfig, kv: &[(String, String)]) -> Result<
                 c.set_max_tokens_field(value)?;
                 p.compat = if c.is_empty() { None } else { Some(c) };
             }
-            other if other.starts_with("compat.")
-                || other.starts_with("compat_")
-                || is_compat_field(other) =>
+            other
+                if other.starts_with("compat.")
+                    || other.starts_with("compat_")
+                    || is_compat_field(other) =>
             {
                 let mut c = p.compat.clone().unwrap_or_default();
                 apply_compat_field(&mut c, key_raw, value)?;
@@ -825,11 +826,7 @@ fn is_compat_field(key: &str) -> bool {
     )
 }
 
-fn apply_compat_field(
-    c: &mut one_ai::CompatConfig,
-    key: &str,
-    value: &str,
-) -> Result<(), String> {
+fn apply_compat_field(c: &mut one_ai::CompatConfig, key: &str, value: &str) -> Result<(), String> {
     let n = one_ai::normalize_compat_key(key);
     match n.as_str() {
         "thinking_format" => c.set_thinking_format(value),
@@ -928,10 +925,7 @@ fn apply_model_kv(m: &mut ModelEntry, kv: &[(String, String)]) -> Result<(), Str
                     m.reasoning = Some(parse_bool(value)?);
                 }
             }
-            "thinking_level_map"
-            | "thinkinglevelmap"
-            | "thinking-level-map"
-            | "thinking_map" => {
+            "thinking_level_map" | "thinkinglevelmap" | "thinking-level-map" | "thinking_map" => {
                 if value.is_empty() || value.eq_ignore_ascii_case("clear") {
                     m.thinking_level_map = None;
                 } else {
@@ -946,8 +940,8 @@ fn apply_model_kv(m: &mut ModelEntry, kv: &[(String, String)]) -> Result<(), Str
                 {
                     m.compat = None;
                 } else {
-                    let c: one_ai::CompatConfig = serde_json::from_str(value)
-                        .map_err(|e| format!("compat JSON: {e}"))?;
+                    let c: one_ai::CompatConfig =
+                        serde_json::from_str(value).map_err(|e| format!("compat JSON: {e}"))?;
                     m.compat = if c.is_empty() { None } else { Some(c) };
                 }
             }
@@ -961,9 +955,10 @@ fn apply_model_kv(m: &mut ModelEntry, kv: &[(String, String)]) -> Result<(), Str
                 c.set_max_tokens_field(value)?;
                 m.compat = if c.is_empty() { None } else { Some(c) };
             }
-            other if other.starts_with("compat.")
-                || other.starts_with("compat_")
-                || is_compat_field(other) =>
+            other
+                if other.starts_with("compat.")
+                    || other.starts_with("compat_")
+                    || is_compat_field(other) =>
             {
                 let mut c = m.compat.clone().unwrap_or_default();
                 apply_compat_field(&mut c, key_raw, value)?;
@@ -1176,9 +1171,7 @@ fn resolve_settings(cli: &Cli, cfg: &ModelsConfig, provider_id: &str) -> Resolve
         openai_compat = openai_compat.with_thinking_level_map(map);
     }
     let anthropic_compat = partial.anthropic().resolve();
-    let reasoning_model = model_entry
-        .and_then(|m| m.reasoning)
-        .unwrap_or(false);
+    let reasoning_model = model_entry.and_then(|m| m.reasoning).unwrap_or(false);
 
     Resolved {
         model: model_id,
@@ -1277,14 +1270,12 @@ fn env_base_url_for(provider_id: &str) -> Option<String> {
         "deepseek" => std::env::var("DEEPSEEK_BASE_URL")
             .ok()
             .or_else(|| Some("https://api.deepseek.com".into())),
-        "gemini" => std::env::var("GEMINI_BASE_URL").ok().or_else(|| {
-            Some("https://generativelanguage.googleapis.com/v1beta".into())
-        }),
+        "gemini" => std::env::var("GEMINI_BASE_URL")
+            .ok()
+            .or_else(|| Some("https://generativelanguage.googleapis.com/v1beta".into())),
         PROVIDER_OPENCODE | "zen" | "opencode-zen" => Some("https://opencode.ai/zen/v1".into()),
         PROVIDER_OPENCODE_GO | "go" => Some("https://opencode.ai/zen/go/v1".into()),
-        PROVIDER_XAI | "grok" | "supergrok" => {
-            Some("https://cli-chat-proxy.grok.com/v1".into())
-        }
+        PROVIDER_XAI | "grok" | "supergrok" => Some("https://cli-chat-proxy.grok.com/v1".into()),
         _ => None,
     }
 }
@@ -1299,9 +1290,11 @@ fn env_api_key_for(provider_id: &str) -> Option<String> {
             .ok()
             .or_else(|| std::env::var("GOOGLE_API_KEY").ok()),
         "ollama" => Some("ollama".into()),
-        PROVIDER_OPENCODE | PROVIDER_OPENCODE_GO | "zen" | "go" => std::env::var("OPENCODE_API_KEY")
-            .ok()
-            .or_else(|| std::env::var("OPENCODE_ZEN_API_KEY").ok()),
+        PROVIDER_OPENCODE | PROVIDER_OPENCODE_GO | "zen" | "go" => {
+            std::env::var("OPENCODE_API_KEY")
+                .ok()
+                .or_else(|| std::env::var("OPENCODE_ZEN_API_KEY").ok())
+        }
         PROVIDER_XAI | "grok" | "supergrok" => std::env::var("XAI_API_KEY")
             .ok()
             .or_else(|| std::env::var("XAI_OAUTH_TOKEN").ok()),
@@ -1520,7 +1513,10 @@ fn build_provider_llm(
                 .unwrap_or_else(|| {
                     std::env::var("OLLAMA_HOST").unwrap_or_else(|_| "http://127.0.0.1:11434".into())
                 });
-            return Ok(std::sync::Arc::new(OllamaProvider::new(host, &resolved.model)));
+            return Ok(std::sync::Arc::new(OllamaProvider::new(
+                host,
+                &resolved.model,
+            )));
         }
         #[cfg(not(feature = "network"))]
         {
@@ -1552,10 +1548,7 @@ fn build_provider_llm(
     }
 
     // OpenAI Codex (ChatGPT OAuth subscription).
-    if provider_id == PROVIDER_OPENAI_CODEX
-        || provider_id == "codex"
-        || provider_id == "chatgpt"
-    {
+    if provider_id == PROVIDER_OPENAI_CODEX || provider_id == "codex" || provider_id == "chatgpt" {
         #[cfg(feature = "http-providers")]
         {
             let key = resolved.api_key.clone().ok_or_else(|| {
@@ -1633,9 +1626,10 @@ fn build_provider_llm(
                     )
                 }
             })?;
-            let base = resolved.base_url.clone().unwrap_or_else(|| {
-                "https://generativelanguage.googleapis.com/v1beta".into()
-            });
+            let base = resolved
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://generativelanguage.googleapis.com/v1beta".into());
             return Ok(std::sync::Arc::new(GeminiProvider::with_base(
                 key,
                 &resolved.model,

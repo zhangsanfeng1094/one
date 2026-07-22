@@ -304,12 +304,9 @@ impl BashTool {
         match gate.check(&escalate_call).await {
             ToolGateDecision::Allow | ToolGateDecision::Rewrite { .. } => {
                 let sandbox = OsSandbox::disabled(self.cwd.clone());
-                let timeout_secs = resolve_timeout_secs(&call.arguments)
-                    .unwrap_or(DEFAULT_TIMEOUT_SECS);
-                match self
-                    .run_command(command, &sandbox, timeout_secs)
-                    .await
-                {
+                let timeout_secs =
+                    resolve_timeout_secs(&call.arguments).unwrap_or(DEFAULT_TIMEOUT_SECS);
+                match self.run_command(command, &sandbox, timeout_secs).await {
                     Ok((status, out, err)) => Some((status, out, err, sandbox)),
                     Err(_) => None,
                 }
@@ -544,10 +541,9 @@ fn resolve_timeout_secs(args: &serde_json::Value) -> Option<u64> {
     if let Some(s) = args.get("timeout_secs").and_then(|v| v.as_u64()) {
         return Some(s);
     }
-    let t = args.get("timeout").and_then(|v| {
-        v.as_u64()
-            .or_else(|| v.as_i64().map(|n| n.max(0) as u64))
-    })?;
+    let t = args
+        .get("timeout")
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)))?;
     // Claude Code historically uses milliseconds for `timeout`.
     if t >= 1000 {
         Some((t / 1000).max(1))
@@ -660,6 +656,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_cannot_create_host_file_outside_workspace() {
         if !OsSandbox::bwrap_available() {
@@ -674,11 +671,44 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        let outside = std::env::temp_dir().join(format!(
-            "one-bash-leak-{}",
-            std::process::id()
+        let temp_roots = [
+            Some(PathBuf::from("/tmp")),
+            Some(PathBuf::from("/var/tmp")),
+            std::env::var_os("TMPDIR").map(PathBuf::from),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .filter(|path| path.is_absolute())
+        .collect::<Vec<_>>();
+        let canonical_dir = dir.canonicalize().unwrap();
+        let outside_base = [
+            std::env::var_os("HOME").map(PathBuf::from),
+            std::env::current_dir().ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .filter_map(|path| path.canonicalize().ok())
+        .find(|path| {
+            !path.starts_with(&canonical_dir)
+                && !temp_roots.iter().any(|root| path.starts_with(root))
+        });
+        let Some(outside_base) = outside_base else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+        let outside = outside_base.join(format!(
+            ".one-bash-leak-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         let _ = std::fs::remove_file(&outside);
+        let outside_link = dir.join("outside-link");
+        std::os::unix::fs::symlink(&outside, &outside_link).unwrap();
 
         let tool = BashTool::with_policy(
             PathPolicy::workspace(dir.clone()),
@@ -690,17 +720,20 @@ mod tests {
                 id: "1".into(),
                 name: "bash".into(),
                 arguments: json!({
-                    "command": format!("echo leaked > {}", outside.display())
+                    "command": "echo leaked > outside-link"
                 }),
             })
             .await;
 
+        let leaked = outside.exists();
+        let _ = std::fs::remove_file(&outside_link);
+        let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
         assert!(
-            !outside.exists(),
+            !leaked,
             "bash OS sandbox must not create host file {}",
             outside.display()
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

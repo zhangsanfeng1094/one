@@ -269,9 +269,8 @@ pub fn save(settings: &Settings) -> std::io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let data = serde_json::to_string_pretty(settings).map_err(|err| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, err)
-    })?;
+    let data = serde_json::to_string_pretty(settings)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     fs::write(path, data)
 }
 
@@ -368,16 +367,17 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                 "0" | "false" | "no" | "off" => c.auto = Some(false),
                 "toggle" => c.auto = Some(!c.auto.unwrap_or(true)),
                 other => {
-                    return Err(format!("compaction.auto must be on|off|toggle (got `{other}`)"));
+                    return Err(format!(
+                        "compaction.auto must be on|off|toggle (got `{other}`)"
+                    ));
                 }
             }
         }
         "compaction.ratio" | "compaction_ratio" => {
-            let r: f64 = value
-                .trim()
-                .trim_end_matches('%')
-                .parse()
-                .map_err(|_| "compaction.ratio must be a number (0–1 or percent)".to_string())?;
+            let r: f64 =
+                value.trim().trim_end_matches('%').parse().map_err(|_| {
+                    "compaction.ratio must be a number (0–1 or percent)".to_string()
+                })?;
             // Allow 70 or 0.70
             let r = if r > 1.0 && r <= 100.0 { r / 100.0 } else { r };
             if !(r > 0.0 && r <= 1.0) {
@@ -394,9 +394,9 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             if matches!(v.as_str(), "0" | "auto" | "none" | "clear" | "") {
                 c.threshold = None;
             } else {
-                let n: usize = v
-                    .parse()
-                    .map_err(|_| "compaction.threshold must be a positive token count or auto".to_string())?;
+                let n: usize = v.parse().map_err(|_| {
+                    "compaction.threshold must be a positive token count or auto".to_string()
+                })?;
                 if n < 1 {
                     return Err("compaction.threshold must be >= 1 (or auto to use ratio)".into());
                 }
@@ -421,7 +421,9 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                 "0" | "false" | "no" | "off" => c.prune = Some(false),
                 "toggle" => c.prune = Some(!c.prune.unwrap_or(false)),
                 other => {
-                    return Err(format!("compaction.prune must be on|off|toggle (got `{other}`)"));
+                    return Err(format!(
+                        "compaction.prune must be on|off|toggle (got `{other}`)"
+                    ));
                 }
             }
         }
@@ -517,10 +519,7 @@ pub fn rows(settings: &Settings) -> Vec<(String, String)> {
         ),
         (
             "thinking".into(),
-            settings
-                .thinking
-                .clone()
-                .unwrap_or_else(|| "off".into()),
+            settings.thinking.clone().unwrap_or_else(|| "off".into()),
         ),
         (
             "auto_approve".into(),
@@ -598,10 +597,7 @@ pub fn rows(settings: &Settings) -> Vec<(String, String)> {
             let lim = one_tools::tool_output_limits();
             (
                 "tool_output".into(),
-                format!(
-                    "max_lines={} max_bytes={}",
-                    lim.max_lines, lim.max_bytes
-                ),
+                format!("max_lines={} max_bytes={}", lim.max_lines, lim.max_bytes),
             )
         },
         (

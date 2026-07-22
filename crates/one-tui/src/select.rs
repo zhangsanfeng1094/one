@@ -225,9 +225,8 @@ impl SelectPrompt {
         p.type_on_ids.insert("deny".into());
         p.ctrl_o_id = Some("always".into());
         let esc_hint = if escalate { "Esc:deny" } else { "Esc:cancel" };
-        p.footer_hint = format!(
-            "↑↓/1-{n}:select  Enter:confirm  Ctrl+o:always-approve  {esc_hint}"
-        );
+        p.footer_hint =
+            format!("↑↓/1-{n}:select  Enter:confirm  Ctrl+o:always-approve  {esc_hint}");
         p.other_label = "Feedback for the model (Enter empty to skip)".into();
         p
     }
@@ -729,8 +728,12 @@ mod tests {
         assert!(p.body.contains("$ "), "{}", p.body);
         // Long command is truncated for the dock.
         assert!(
-            p.body.lines().any(|l| l.starts_with("$ ") && l.contains('…'))
-                || p.body.lines().any(|l| l.starts_with("$ ") && l.len() <= 110),
+            p.body
+                .lines()
+                .any(|l| l.starts_with("$ ") && l.contains('…'))
+                || p.body
+                    .lines()
+                    .any(|l| l.starts_with("$ ") && l.len() <= 110),
             "expected short command preview, body:\n{}",
             p.body
         );
@@ -803,11 +806,7 @@ mod tests {
             p.options.iter().map(|o| &o.id).collect::<Vec<_>>()
         );
         let prefix = p.options.iter().find(|o| o.id == "prefix").unwrap();
-        assert!(
-            prefix.label.contains("git push"),
-            "{}",
-            prefix.label
-        );
+        assert!(prefix.label.contains("git push"), "{}", prefix.label);
         // once, session, prefix, always, deny
         assert_eq!(p.options.len(), 5);
         assert!(p.footer_hint.contains("1-5"));

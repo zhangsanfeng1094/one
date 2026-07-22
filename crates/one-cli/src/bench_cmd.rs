@@ -262,7 +262,11 @@ pub async fn run_bench(cli: BenchCli) -> Result<(), Box<dyn std::error::Error>> 
     std::fs::write(&md_path, &md)?;
 
     println!();
-    println!("summary: {}  ({passed}/{} passed)", summary_path.display(), results.len());
+    println!(
+        "summary: {}  ({passed}/{} passed)",
+        summary_path.display(),
+        results.len()
+    );
     println!("{md}");
 
     if passed < results.len() {
@@ -284,7 +288,10 @@ async fn run_one_task(
     // If task sets test_filter and rubric has no command check, add one cargo
     // test invocation per filter pattern (cargo accepts only one TESTNAME).
     if let Some(filters) = &meta.test_filter {
-        let has_cmd = rubric.checks.iter().any(|c| matches!(c, Check::Command { .. }));
+        let has_cmd = rubric
+            .checks
+            .iter()
+            .any(|c| matches!(c, Check::Command { .. }));
         if !has_cmd {
             for filter in filters {
                 rubric.checks.push(Check::Command {
@@ -303,19 +310,11 @@ async fn run_one_task(
             let label = format!("langfuse:{}", cfg.project_url_hint());
             let lf_events = lf.clone();
             langfuse_handle = Some(lf.clone());
-            (
-                lf,
-                Box::new(move || lf_events.events()),
-                label,
-            )
+            (lf, Box::new(move || lf_events.events()), label)
         } else {
             let mem = Arc::new(MemoryTrace::new());
             let mem_events = mem.clone();
-            (
-                mem,
-                Box::new(move || mem_events.events()),
-                "memory".into(),
-            )
+            (mem, Box::new(move || mem_events.events()), "memory".into())
         };
 
     let tools = default_tools(work.clone());
@@ -409,10 +408,8 @@ fn score_task(
 ) -> (bool, f64, Vec<ScoreCheckResult>) {
     if rubric.checks.is_empty() {
         // Default: run completed ok and produced something.
-        let pass = matches!(
-            stats.status,
-            Some(one_core::TraceRunStatus::Ok)
-        ) && (!final_text.is_empty() || stats.tool_calls > 0);
+        let pass = matches!(stats.status, Some(one_core::TraceRunStatus::Ok))
+            && (!final_text.is_empty() || stats.tool_calls > 0);
         return (
             pass,
             if pass { 1.0 } else { 0.0 },
@@ -506,7 +503,9 @@ fn score_task(
                 )
             }
             Check::FinalTextContains { text } => {
-                let pass = final_text.to_ascii_lowercase().contains(&text.to_ascii_lowercase());
+                let pass = final_text
+                    .to_ascii_lowercase()
+                    .contains(&text.to_ascii_lowercase());
                 (
                     format!("final_text_contains"),
                     pass,
@@ -515,11 +514,7 @@ fn score_task(
             }
         };
         let _ = events; // reserved for richer checks
-        results.push(ScoreCheckResult {
-            name,
-            pass,
-            detail,
-        });
+        results.push(ScoreCheckResult { name, pass, detail });
     }
 
     let passed_n = results.iter().filter(|c| c.pass).count();
@@ -528,7 +523,9 @@ fn score_task(
     (pass, score, results)
 }
 
-fn discover_tasks(tasks_dir: &Path) -> Result<Vec<(TaskMeta, PathBuf)>, Box<dyn std::error::Error>> {
+fn discover_tasks(
+    tasks_dir: &Path,
+) -> Result<Vec<(TaskMeta, PathBuf)>, Box<dyn std::error::Error>> {
     let mut out = Vec::new();
     if !tasks_dir.is_dir() {
         return Err(format!("tasks dir not found: {}", tasks_dir.display()).into());

@@ -32,8 +32,7 @@ pub fn load(path: &Path) -> crate::Result<Arc<dyn Extension>> {
         let name = CStr::from_ptr(name_ptr).to_string_lossy();
         // Keep library loaded for process lifetime by leaking (v0 ABI).
         std::mem::forget(lib);
-        builtin_by_name(name.as_ref()).ok_or_else(|| {
-            crate::ExtError::Load(format!("unknown dylib extension: {name}"))
-        })
+        builtin_by_name(name.as_ref())
+            .ok_or_else(|| crate::ExtError::Load(format!("unknown dylib extension: {name}")))
     }
 }

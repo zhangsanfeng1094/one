@@ -9,7 +9,7 @@ Make the repository enforceable by its existing Rust quality tooling without cha
 - Replace the vacuous compaction assertion with an assertion that verifies no messages are retained when `keep_recent_messages` is zero.
 - Resolve the strict Clippy diagnostics in `one-core` with behavior-preserving refactors.
 - Apply the repository's Rust formatter.
-- Require formatting and strict Clippy checks in CI before the existing build, test, and release steps.
+- Require formatting and strict `one-core` Clippy checks in CI before the existing build, test, and release steps.
 
 ## Out of scope
 
@@ -19,4 +19,4 @@ Make the repository enforceable by its existing Rust quality tooling without cha
 
 ## Verification
 
-Run the targeted compaction test, `cargo fmt --check`, strict workspace Clippy, the complete workspace test suite, and an all-feature compilation check.
+Run `cargo test -p one-core compaction::tests::extractive_not_debug_dump`, `cargo fmt --check`, `cargo clippy -p one-core --all-targets -- -D warnings`, `cargo test --workspace`, and `cargo check --workspace --all-features --all-targets`. CI runs the format and `one-core` Clippy commands before its existing checks.

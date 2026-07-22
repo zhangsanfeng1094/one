@@ -25,7 +25,8 @@ pub fn migrate_jsonl(content: &str) -> Result<String> {
         }
     }
 
-    let mut header: SessionHeader = if first.get("type").and_then(|t| t.as_str()) == Some("session") {
+    let mut header: SessionHeader = if first.get("type").and_then(|t| t.as_str()) == Some("session")
+    {
         serde_json::from_value(first.clone())?
     } else {
         return Err(SessionError::InvalidFormat("missing session header".into()));
@@ -38,13 +39,15 @@ pub fn migrate_jsonl(content: &str) -> Result<String> {
     let mut parent_id: Option<String> = None;
     for line in lines.iter().skip(1) {
         let value: Value = serde_json::from_str(line)?;
-        let entry_type = value.get("type").and_then(|t| t.as_str()).unwrap_or("message");
+        let entry_type = value
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("message");
 
         if entry_type == "message" {
-            let message = value
-                .get("message")
-                .cloned()
-                .ok_or_else(|| SessionError::InvalidFormat("message entry missing message".into()))?;
+            let message = value.get("message").cloned().ok_or_else(|| {
+                SessionError::InvalidFormat("message entry missing message".into())
+            })?;
             let base = new_entry_base(parent_id.clone());
             parent_id = Some(base.id.clone());
             let entry = SessionEntry::Message {

@@ -205,11 +205,7 @@ mod tests {
     fn seed_writes_all_models() {
         static N: AtomicU64 = AtomicU64::new(0);
         let n = N.fetch_add(1, Ordering::SeqCst);
-        let dir = std::env::temp_dir().join(format!(
-            "one-codex-seed-{}-{}",
-            std::process::id(),
-            n
-        ));
+        let dir = std::env::temp_dir().join(format!("one-codex-seed-{}-{}", std::process::id(), n));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("models.json");
         // No built-in merge — only what we seed.
@@ -226,8 +222,12 @@ mod tests {
 
         let cfg = load_models_file(&path);
         assert!(cfg.find_model(PROVIDER_OPENAI_CODEX, "gpt-5.5").is_some());
-        assert!(cfg.find_model(PROVIDER_OPENAI_CODEX, "gpt-5.6-sol").is_some());
-        assert!(cfg.find_model(PROVIDER_OPENAI_CODEX, "gpt-5.3-codex").is_none());
+        assert!(cfg
+            .find_model(PROVIDER_OPENAI_CODEX, "gpt-5.6-sol")
+            .is_some());
+        assert!(cfg
+            .find_model(PROVIDER_OPENAI_CODEX, "gpt-5.3-codex")
+            .is_none());
 
         // Second seed: all updates, no new.
         let report2 = seed_openai_codex_models(&path).unwrap();

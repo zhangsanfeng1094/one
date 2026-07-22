@@ -248,9 +248,7 @@ impl BackgroundTaskRegistry {
             // Take child for exclusive wait.
             let mut child = {
                 let mut tasks = registry.tasks.lock().expect("tasks lock");
-                tasks
-                    .get_mut(&task_id)
-                    .and_then(|t| t.child.take())
+                tasks.get_mut(&task_id).and_then(|t| t.child.take())
             };
 
             let wait_result = async {
@@ -307,12 +305,7 @@ impl BackgroundTaskRegistry {
                             }
                         }
                     } else {
-                        registry.finalize(
-                            &task_id,
-                            TaskState::Completed,
-                            status.code(),
-                            None,
-                        );
+                        registry.finalize(&task_id, TaskState::Completed, status.code(), None);
                     }
                 }
                 Ok(None) => {
@@ -348,13 +341,7 @@ impl BackgroundTaskRegistry {
         }
     }
 
-    fn finalize(
-        &self,
-        id: &str,
-        state: TaskState,
-        exit_code: Option<i32>,
-        error: Option<String>,
-    ) {
+    fn finalize(&self, id: &str, state: TaskState, exit_code: Option<i32>, error: Option<String>) {
         let mut tasks = self.tasks.lock().expect("tasks lock");
         let Some(task) = tasks.get_mut(id) else {
             return;
@@ -420,14 +407,11 @@ impl BackgroundTaskRegistry {
 
         let secs = timeout_secs.unwrap_or(0);
         if secs == 0 {
-            return self
-                .get(id)
-                .ok_or_else(|| format!("unknown task_id: {id}"));
+            return self.get(id).ok_or_else(|| format!("unknown task_id: {id}"));
         }
 
         let _ = timeout(Duration::from_secs(secs), done.notified()).await;
-        self.get(id)
-            .ok_or_else(|| format!("unknown task_id: {id}"))
+        self.get(id).ok_or_else(|| format!("unknown task_id: {id}"))
     }
 
     /// Kill a running task.
@@ -477,8 +461,7 @@ impl BackgroundTaskRegistry {
 
         // Brief yield so wait() reapers can settle.
         tokio::task::yield_now().await;
-        self.get(id)
-            .ok_or_else(|| format!("unknown task_id: {id}"))
+        self.get(id).ok_or_else(|| format!("unknown task_id: {id}"))
     }
 }
 

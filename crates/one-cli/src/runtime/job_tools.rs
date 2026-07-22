@@ -7,9 +7,7 @@ use one_core::error::Result;
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
-use super::jobs::{
-    format_job_list, format_job_snapshot, AgentJobRegistry, JobState, JoinMode,
-};
+use super::jobs::{format_job_list, format_job_snapshot, AgentJobRegistry, JobState, JoinMode};
 
 pub struct JobOutputTool {
     jobs: Arc<AgentJobRegistry>,
@@ -268,8 +266,7 @@ impl Tool for JobKillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "job_kill".into(),
-            description: "Stop a background agent job started with task(background=true)."
-                .into(),
+            description: "Stop a background agent job started with task(background=true).".into(),
             parameters: json!({
                 "type": "object",
                 "required": ["job_id"],
@@ -293,10 +290,7 @@ impl Tool for JobKillTool {
             .ok_or_else(|| invalid_args("job_kill", "missing job_id"))?
             .to_string();
 
-        let snap = self
-            .jobs
-            .kill(&id)
-            .map_err(|e| tool_error("job_kill", e))?;
+        let snap = self.jobs.kill(&id).map_err(|e| tool_error("job_kill", e))?;
 
         let text = format!(
             "job_id: {}\nstate: {}\nstatus: {}\n",

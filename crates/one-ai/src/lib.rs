@@ -16,12 +16,12 @@ pub mod opencode_models;
 #[cfg(feature = "http-providers")]
 pub mod openrouter;
 pub mod registry;
-pub mod xai_models;
 #[cfg(feature = "network")]
 pub mod remote_models;
 #[cfg(feature = "network")]
 pub mod sse;
 pub mod thinking;
+pub mod xai_models;
 
 pub use anthropic::AnthropicProvider;
 pub use auth::{

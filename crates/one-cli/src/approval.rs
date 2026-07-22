@@ -286,19 +286,15 @@ impl ToolGate for PermissionGate {
                             | Ok(ApprovalChoice::Always) => ToolGateDecision::Allow,
                             Ok(ApprovalChoice::Deny { feedback }) => {
                                 let msg = match feedback {
-                                    Some(fb) if !fb.trim().is_empty() => format!(
-                                        "user denied tool `{}` ({reason}): {fb}",
-                                        call.name
-                                    ),
+                                    Some(fb) if !fb.trim().is_empty() => {
+                                        format!("user denied tool `{}` ({reason}): {fb}", call.name)
+                                    }
                                     _ => format!("user denied tool `{}` ({reason})", call.name),
                                 };
                                 ToolGateDecision::Deny { message: msg }
                             }
                             Err(_) => ToolGateDecision::Deny {
-                                message: format!(
-                                    "user denied tool `{}` ({reason})",
-                                    call.name
-                                ),
+                                message: format!("user denied tool `{}` ({reason})", call.name),
                             },
                         }
                     }
@@ -397,7 +393,11 @@ mod tests {
         });
         for _ in 0..50 {
             if let Some(req) = gate.poll_request() {
-                assert!(req.reason.starts_with("sandbox escalation:"), "{}", req.reason);
+                assert!(
+                    req.reason.starts_with("sandbox escalation:"),
+                    "{}",
+                    req.reason
+                );
                 assert!(req.summary.contains("outside sandbox"), "{}", req.summary);
                 break;
             }
@@ -493,7 +493,10 @@ mod tests {
         }
         assert!(gate.poll_request().is_some());
         assert!(gate.respond(ApprovalChoice::Deny { feedback: None }));
-        assert!(matches!(handle2.await.unwrap(), ToolGateDecision::Deny { .. }));
+        assert!(matches!(
+            handle2.await.unwrap(),
+            ToolGateDecision::Deny { .. }
+        ));
     }
 
     #[tokio::test]

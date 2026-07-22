@@ -9,7 +9,10 @@ use serde_json::json;
 
 #[tokio::test]
 async fn mock_agent_lists_files_end_to_end() {
-    let mut agent = Agent::new(AgentConfig::default(), default_tools(std::env::current_dir().unwrap()));
+    let mut agent = Agent::new(
+        AgentConfig::default(),
+        default_tools(std::env::current_dir().unwrap()),
+    );
     let provider = MockProvider::new();
     let output = agent
         .prompt(&provider, "list files in current directory")
@@ -34,11 +37,15 @@ async fn mock_agent_trace_records_run_and_tools() {
 
     let events = mem.events();
     assert!(
-        events.iter().any(|e| matches!(e, TraceEvent::RunStart { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::RunStart { .. })),
         "expected run_start"
     );
     assert!(
-        events.iter().any(|e| matches!(e, TraceEvent::LlmResponse { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::LlmResponse { .. })),
         "expected llm_response"
     );
     assert!(
@@ -49,7 +56,9 @@ async fn mock_agent_trace_records_run_and_tools() {
         "expected bash tool_start"
     );
     assert!(
-        events.iter().any(|e| matches!(e, TraceEvent::RunEnd { .. })),
+        events
+            .iter()
+            .any(|e| matches!(e, TraceEvent::RunEnd { .. })),
         "expected run_end"
     );
     let stats = TraceStats::from_events(&events);
@@ -135,7 +144,7 @@ async fn bash_background_start_poll_and_notify() {
     use std::sync::Arc;
 
     use one_core::tool::{Tool, ToolCall};
-    use one_tools::{BashKillTool, BashOutputTool, BashTool, BackgroundTaskRegistry};
+    use one_tools::{BackgroundTaskRegistry, BashKillTool, BashOutputTool, BashTool};
     use serde_json::json;
 
     let registry = Arc::new(BackgroundTaskRegistry::new());
@@ -181,7 +190,9 @@ async fn bash_background_start_poll_and_notify() {
 
     let notes = registry.notification_queue().lock().unwrap().clone();
     assert!(
-        notes.iter().any(|n| n.contains("[Background task completed]")),
+        notes
+            .iter()
+            .any(|n| n.contains("[Background task completed]")),
         "expected completion notice: {notes:?}"
     );
 
@@ -297,10 +308,6 @@ async fn write_tool_denies_outside_workspace() {
     })
     .await
     .expect("workspace write ok");
-    assert_eq!(
-        std::fs::read_to_string(dir.join("ok.txt")).unwrap(),
-        "yes"
-    );
+    assert_eq!(std::fs::read_to_string(dir.join("ok.txt")).unwrap(), "yes");
     let _ = std::fs::remove_dir_all(&dir);
 }
-

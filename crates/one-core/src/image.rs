@@ -34,7 +34,10 @@ pub fn ext_for_mime(mime: &str) -> &'static str {
 /// Write raw image bytes into the media store. Returns `(absolute_path, mime)`.
 ///
 /// `mime_hint` is ignored when magic bytes sniff succeeds (always required).
-pub fn store_image_bytes(bytes: &[u8], _mime_hint: Option<&str>) -> Result<(PathBuf, String), String> {
+pub fn store_image_bytes(
+    bytes: &[u8],
+    _mime_hint: Option<&str>,
+) -> Result<(PathBuf, String), String> {
     if bytes.is_empty() {
         return Err("image is empty".into());
     }
@@ -56,18 +59,17 @@ pub fn store_image_bytes(bytes: &[u8], _mime_hint: Option<&str>) -> Result<(Path
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    let name = format!(
-        "{nanos:x}_{:x}.{}",
-        std::process::id(),
-        ext_for_mime(&mime)
-    );
+    let name = format!("{nanos:x}_{:x}.{}", std::process::id(), ext_for_mime(&mime));
     let path = dir.join(name);
     std::fs::write(&path, bytes).map_err(|e| format!("write media: {e}"))?;
     Ok((path, mime))
 }
 
 /// Decode base64 and store into the media dir.
-pub fn store_image_base64(data_b64: &str, mime_hint: Option<&str>) -> Result<(PathBuf, String), String> {
+pub fn store_image_base64(
+    data_b64: &str,
+    mime_hint: Option<&str>,
+) -> Result<(PathBuf, String), String> {
     let bytes = decode_base64(data_b64).map_err(|e| format!("base64: {e}"))?;
     store_image_bytes(&bytes, mime_hint)
 }
@@ -130,8 +132,8 @@ pub fn image_token_backspace_len(s: &str) -> Option<usize> {
     if s.is_empty() {
         return None;
     }
-    let (core, trail) = if s.ends_with(' ') {
-        (&s[..s.len() - 1], 1usize)
+    let (core, trail) = if let Some(core) = s.strip_suffix(' ') {
+        (core, 1usize)
     } else {
         (s, 0usize)
     };
@@ -149,8 +151,7 @@ pub fn image_token_backspace_len(s: &str) -> Option<usize> {
 pub fn parse_image_token_at(s: &str) -> Option<(u32, usize)> {
     let prefix = "[图片.";
     let suffix = ".img]";
-    if s.starts_with(prefix) {
-        let after = &s[prefix.len()..];
+    if let Some(after) = s.strip_prefix(prefix) {
         if let Some(end) = after.find(suffix) {
             let num = &after[..end];
             if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
@@ -212,7 +213,10 @@ pub fn should_collapse_paste(text: &str) -> bool {
 
 /// Short label for notices / tooltips, e.g. `12 lines · 3.4KB`.
 pub fn text_blob_summary(body: &str) -> String {
-    let lines = body.lines().count().max(if body.is_empty() { 0 } else { 1 });
+    let lines = body
+        .lines()
+        .count()
+        .max(if body.is_empty() { 0 } else { 1 });
     let bytes = body.len();
     let size = if bytes < 1024 {
         format!("{bytes}B")
@@ -254,8 +258,8 @@ pub fn text_token_backspace_len(s: &str) -> Option<usize> {
     if s.is_empty() {
         return None;
     }
-    let (core, trail) = if s.ends_with(' ') {
-        (&s[..s.len() - 1], 1usize)
+    let (core, trail) = if let Some(core) = s.strip_suffix(' ') {
+        (core, 1usize)
     } else {
         (s, 0usize)
     };
@@ -271,8 +275,7 @@ pub fn text_token_backspace_len(s: &str) -> Option<usize> {
 pub fn parse_text_token_at(s: &str) -> Option<(u32, usize)> {
     let prefix = "[文本.";
     let suffix = ".txt]";
-    if s.starts_with(prefix) {
-        let after = &s[prefix.len()..];
+    if let Some(after) = s.strip_prefix(prefix) {
         if let Some(end) = after.find(suffix) {
             let num = &after[..end];
             if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
@@ -298,10 +301,7 @@ pub fn strip_text_tokens(text: &str) -> String {
 /// Backspace length for either image or text paste chip at end of input.
 pub fn paste_chip_backspace_len(s: &str) -> Option<usize> {
     // Prefer longer match if both somehow apply (they never share suffix).
-    match (
-        image_token_backspace_len(s),
-        text_token_backspace_len(s),
-    ) {
+    match (image_token_backspace_len(s), text_token_backspace_len(s)) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (Some(a), None) => Some(a),
         (None, Some(b)) => Some(b),
@@ -453,9 +453,7 @@ pub fn image_label_bytes(mime_type: &str, bytes: usize) -> String {
     } else {
         format!("{}KB", (bytes + 512) / 1024)
     };
-    let short = mime_type
-        .strip_prefix("image/")
-        .unwrap_or(mime_type);
+    let short = mime_type.strip_prefix("image/").unwrap_or(mime_type);
     format!("[image · {short} · {size}]")
 }
 
@@ -466,7 +464,9 @@ pub fn image_label(mime_type: &str, data_b64: &str) -> String {
 
 /// Label for a local image file (uses on-disk size when available).
 pub fn image_label_path(mime_type: &str, path: &Path) -> String {
-    let bytes = std::fs::metadata(path).map(|m| m.len() as usize).unwrap_or(0);
+    let bytes = std::fs::metadata(path)
+        .map(|m| m.len() as usize)
+        .unwrap_or(0);
     image_label_bytes(mime_type, bytes)
 }
 

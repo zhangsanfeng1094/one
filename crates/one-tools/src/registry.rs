@@ -116,12 +116,7 @@ impl BuiltinToolProfile {
             Self::None => vec![],
             Self::Explore => {
                 #[allow(unused_mut)]
-                let mut v = vec![
-                    "read".into(),
-                    "grep".into(),
-                    "find".into(),
-                    "ls".into(),
-                ];
+                let mut v = vec!["read".into(), "grep".into(), "find".into(), "ls".into()];
                 #[cfg(feature = "network")]
                 {
                     v.push("web_search".into());
@@ -247,7 +242,10 @@ impl ToolRegistry {
         self
     }
 
-    pub fn register_instances(&mut self, tools: impl IntoIterator<Item = Arc<dyn Tool>>) -> &mut Self {
+    pub fn register_instances(
+        &mut self,
+        tools: impl IntoIterator<Item = Arc<dyn Tool>>,
+    ) -> &mut Self {
         for t in tools {
             self.register_instance(t);
         }
@@ -450,12 +448,8 @@ mod tests {
 
     #[test]
     fn deny_strips_from_profile() {
-        let names = resolve_tool_names(
-            BuiltinToolProfile::ReadOnly,
-            &[],
-            &["ask_user".into()],
-            &[],
-        );
+        let names =
+            resolve_tool_names(BuiltinToolProfile::ReadOnly, &[], &["ask_user".into()], &[]);
         assert!(!names.iter().any(|n| n == "ask_user"));
         assert!(names.iter().any(|n| n == "read"));
     }

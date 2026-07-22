@@ -95,10 +95,7 @@ impl TaskToolHost {
     }
 
     /// Refresh MCP / extension tools available to child harness runs (`tools.mcp`).
-    pub async fn set_dynamic_tools(
-        &self,
-        tools: Vec<std::sync::Arc<dyn one_core::tool::Tool>>,
-    ) {
+    pub async fn set_dynamic_tools(&self, tools: Vec<std::sync::Arc<dyn one_core::tool::Tool>>) {
         self.opts.write().await.dynamic_tools = tools;
     }
 
@@ -178,7 +175,6 @@ impl TaskTool {
     pub fn with_harness(host: Arc<TaskToolHost>, harness: Arc<dyn TaskHarness>) -> Self {
         Self { harness, host }
     }
-
 }
 
 #[async_trait]
@@ -427,9 +423,7 @@ fn child_tools_look_writable(spec: &AgentSpec) -> bool {
 /// Ensure AgentSpec.tools resolve against the builtin registry.
 /// MCP names are allowed when `tools.mcp` is true (filled at run from host dynamic_tools).
 fn validate_child_tools(spec: &AgentSpec) -> std::result::Result<(), ProtocolError> {
-    use super::tool_materialize::{
-        harness_build_context, harness_registry, resolve_names,
-    };
+    use super::tool_materialize::{harness_build_context, harness_registry, resolve_names};
     use one_tools::PathPolicy;
     let prefer_explore = spec.display_name() == "explore"
         || (matches!(spec.tools.profile, crate::protocol::ToolProfile::ReadOnly)
@@ -560,9 +554,7 @@ pub fn format_task_started(
     description: Option<&str>,
     job_id: &str,
 ) -> ToolOutput {
-    let desc_part = description
-        .map(|d| format!(" · {d}"))
-        .unwrap_or_default();
+    let desc_part = description.map(|d| format!(" · {d}")).unwrap_or_default();
     let text = format!(
         "[task · {agent_name}{desc_part} · status=started · id={job_id}]\n\
          Background job started. Continue other work.\n\
@@ -586,17 +578,13 @@ pub fn format_task_output(
     description: Option<&str>,
     result: &RunResult,
 ) -> ToolOutput {
-    let status = result
-        .status
-        .unwrap_or(if result.ok {
-            TaskExitStatus::Success
-        } else {
-            TaskExitStatus::RuntimeError
-        });
+    let status = result.status.unwrap_or(if result.ok {
+        TaskExitStatus::Success
+    } else {
+        TaskExitStatus::RuntimeError
+    });
     let status_s = status.as_str();
-    let desc_part = description
-        .map(|d| format!(" · {d}"))
-        .unwrap_or_default();
+    let desc_part = description.map(|d| format!(" · {d}")).unwrap_or_default();
     let header = format!("[task · {agent_name}{desc_part} · status={status_s}]");
 
     let mut body = result.result.clone();
@@ -717,11 +705,8 @@ mod tests {
     #[async_trait]
     impl TaskHarness for FakeHarness {
         async fn run(&self, req: RunRequest) -> RunResult {
-            let mut rr = RunResult::success(
-                format!("{}|{}", self.summary, req.prompt.text),
-                42,
-            )
-            .with_status(self.status);
+            let mut rr = RunResult::success(format!("{}|{}", self.summary, req.prompt.text), 42)
+                .with_status(self.status);
             rr.turns = Some(2);
             rr.parent = req.parent;
             if !self.status.is_ok() {
@@ -820,12 +805,7 @@ mod tests {
                 RunResult::success("ok", 1)
             }
         }
-        let tool = TaskTool::with_harness(
-            host,
-            Arc::new(Capture {
-                seen: seen.clone(),
-            }),
-        );
+        let tool = TaskTool::with_harness(host, Arc::new(Capture { seen: seen.clone() }));
         let _ = tool
             .execute(&ToolCall {
                 id: "c4".into(),
@@ -875,7 +855,9 @@ mod tests {
         }
         let notes = host.jobs().notification_queue().lock().unwrap().clone();
         assert!(
-            notes.iter().any(|n| n.contains("[job completed]") && n.contains(&job_id)),
+            notes
+                .iter()
+                .any(|n| n.contains("[job completed]") && n.contains(&job_id)),
             "notes={notes:?}"
         );
     }
@@ -885,11 +867,7 @@ mod tests {
         let mut parent = AgentSpec::builtin_main();
         parent.spawn_policy = crate::protocol::SpawnPolicy::none();
         let jobs = AgentJobRegistry::new(Arc::new(std::sync::Mutex::new(Vec::new())));
-        let host = TaskToolHost::new(
-            HarnessOptions::from_cwd(std::env::temp_dir()),
-            parent,
-            jobs,
-        );
+        let host = TaskToolHost::new(HarnessOptions::from_cwd(std::env::temp_dir()), parent, jobs);
         let tool = TaskTool::with_harness(
             host,
             Arc::new(FakeHarness {
@@ -906,14 +884,19 @@ mod tests {
             .await
             .unwrap();
         let text = out.as_text();
-        assert!(text.contains("status=runtime_error") || text.contains("not in spawn"), "{text}");
+        assert!(
+            text.contains("status=runtime_error") || text.contains("not in spawn"),
+            "{text}"
+        );
     }
 
     #[test]
     fn format_trailer_stable() {
         let rr = RunResult::success("hello", 10);
         let out = format_task_output("explore", Some("scan"), &rr);
-        assert!(out.as_text().starts_with("[task · explore · scan · status=success]"));
+        assert!(out
+            .as_text()
+            .starts_with("[task · explore · scan · status=success]"));
     }
 
     #[tokio::test]
@@ -999,7 +982,10 @@ mod tests {
             .expect("task with agent_spec");
         let text = out.as_text();
         assert!(text.contains("[task · explore"), "{text}");
-        assert!(!text.contains("status=runtime_error") || text.contains("status=success"), "{text}");
+        assert!(
+            !text.contains("status=runtime_error") || text.contains("status=success"),
+            "{text}"
+        );
     }
 
     /// Parent Agent has only `task`; scripted LLM emits one task call then final text.
@@ -1023,12 +1009,16 @@ mod tests {
             fn model(&self) -> &str {
                 "script-v1"
             }
-            async fn complete(&self, request: CompletionRequest) -> one_core::error::Result<CompletionResponse> {
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> one_core::error::Result<CompletionResponse> {
                 let step = self.n.fetch_add(1, Ordering::SeqCst);
                 // After tool results, finish.
-                let has_tool = request.messages.iter().any(|m| {
-                    matches!(m, one_core::message::AgentMessage::ToolResult(_))
-                });
+                let has_tool = request
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, one_core::message::AgentMessage::ToolResult(_)));
                 if has_tool || step >= 1 {
                     return Ok(CompletionResponse {
                         provider: "scripted".into(),

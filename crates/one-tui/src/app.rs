@@ -14,11 +14,11 @@ use crate::message::{
     ToolStatus,
 };
 use crate::slash::{self, ModelChoice, PopupKind, PopupRow};
-use crate::tool_view;
 use crate::state::{
     display_col_to_caret, ApprovalAnswer, ApprovalPrompt, ModelDraft, PendingImage, PendingText,
     RunOutcome, SelectKind, SelectPos, Toast, WELCOME_TRY_PROMPTS,
 };
+use crate::tool_view;
 
 /// Background clipboard/image import job (placeholder chip already in the input).
 struct ImagePasteJob {
@@ -961,11 +961,7 @@ impl App {
         }
         let id = self.begin_loading_image("clipboard.png");
         let (tx, rx) = std::sync::mpsc::channel();
-        self.image_jobs.push(ImagePasteJob {
-            id,
-            report_err,
-            rx,
-        });
+        self.image_jobs.push(ImagePasteJob { id, report_err, rx });
         std::thread::spawn(move || {
             let _ = tx.send(crate::clipboard::paste_image());
         });
@@ -974,11 +970,10 @@ impl App {
 
     /// Fast check: text looks like an existing image file path (no copy yet).
     fn quick_image_path_candidate(&self, text: &str) -> Option<PathBuf> {
-        let path = crate::clipboard::normalize_pasted_path(text)
-            .or_else(|| {
-                let t = text.trim().trim_matches(|c| c == '"' || c == '\'');
-                Some(PathBuf::from(t))
-            })?;
+        let path = crate::clipboard::normalize_pasted_path(text).or_else(|| {
+            let t = text.trim().trim_matches(|c| c == '"' || c == '\'');
+            Some(PathBuf::from(t))
+        })?;
         if !one_core::image::is_image_path(&path) {
             return None;
         }
@@ -2217,9 +2212,8 @@ impl App {
                 rx,
             });
             std::thread::spawn(move || {
-                let r = one_core::image::store_image_base64(&data, Some(&mime)).map(
-                    |(path, mime)| (mime, path, "paste.png".into()),
-                );
+                let r = one_core::image::store_image_base64(&data, Some(&mime))
+                    .map(|(path, mime)| (mime, path, "paste.png".into()));
                 let _ = tx.send(r);
             });
             return;
@@ -2622,7 +2616,6 @@ impl App {
         }
     }
 
-
     /// Progressive Ctrl+C — never exit on a single accidental press.
     ///
     /// | State | 1st Ctrl+C | 2nd (within ~900ms) |
@@ -2946,7 +2939,6 @@ impl App {
             }
         }
     }
-
 
     /// Shared handler for command-palette / help rows.
     fn dispatch_command_item(&mut self, id: &str, hint: &str) -> RunOutcome {
@@ -3481,7 +3473,6 @@ fn is_ui_slash(text: &str) -> bool {
             | "/build"
     )
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -4240,7 +4231,10 @@ mod tests {
         let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
         assert!(matches!(outcome, RunOutcome::Noop));
         let toast = app.toast.as_ref().map(|t| t.text.as_str()).unwrap_or("");
-        assert!(toast.contains("pasting") || toast.contains("still"), "{toast}");
+        assert!(
+            toast.contains("pasting") || toast.contains("still"),
+            "{toast}"
+        );
     }
 
     #[test]
@@ -4389,7 +4383,10 @@ mod tests {
 
         // Confirm first option (Enter).
         app.handle_busy_key(key(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(app.select_prompt().is_none(), "dock should close after confirm");
+        assert!(
+            app.select_prompt().is_none(),
+            "dock should close after confirm"
+        );
 
         // Simulate the old buggy drain order: re-surface pending HITL before
         // taking the answer. Must not wipe select_result.
@@ -4405,7 +4402,9 @@ mod tests {
         reopen.allow_other = true;
         app.set_select_prompt(SelectKind::AskUser { id: 1 }, reopen);
 
-        let (kind, result) = app.take_select_result().expect("result must survive reopen");
+        let (kind, result) = app
+            .take_select_result()
+            .expect("result must survive reopen");
         assert!(matches!(kind, SelectKind::AskUser { id: 1 }));
         assert_eq!(
             result,
@@ -4418,7 +4417,7 @@ mod tests {
 
     #[test]
     fn ask_user_tab_enters_other_typing() {
-        use crate::select::{SelectOption, SelectPrompt, SelectPhase, SelectResult};
+        use crate::select::{SelectOption, SelectPhase, SelectPrompt, SelectResult};
 
         let mut app = App::new("test");
         app.begin_busy();

@@ -280,10 +280,13 @@ pub fn try_load_models_file(path: &Path) -> Result<ModelsConfig, String> {
         let api = provider_api
             .as_deref()
             .and_then(OpenaiWireApi::parse)
-            .or_else(|| entry.provider_type.as_deref().and_then(OpenaiWireApi::parse));
-        let provider_type = api
-            .map(|a| a.as_str().to_string())
-            .or(entry.provider_type);
+            .or_else(|| {
+                entry
+                    .provider_type
+                    .as_deref()
+                    .and_then(OpenaiWireApi::parse)
+            });
+        let provider_type = api.map(|a| a.as_str().to_string()).or(entry.provider_type);
         providers.push(ProviderConfig {
             id: id.clone(),
             provider_type,
@@ -620,10 +623,15 @@ mod tests {
             Some(crate::compat::ThinkingFormat::Openai)
         );
 
-        let resolved = c.openai.resolve("ollama", "http://127.0.0.1:11434/v1", "gpt-oss:20b");
+        let resolved = c
+            .openai
+            .resolve("ollama", "http://127.0.0.1:11434/v1", "gpt-oss:20b");
         assert!(!resolved.supports_developer_role);
         assert!(resolved.supports_reasoning_effort);
-        assert_eq!(resolved.thinking_format, crate::compat::ThinkingFormat::Openai);
+        assert_eq!(
+            resolved.thinking_format,
+            crate::compat::ThinkingFormat::Openai
+        );
     }
 
     #[test]

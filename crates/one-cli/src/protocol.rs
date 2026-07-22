@@ -184,7 +184,10 @@ impl ToolsSpec {
     /// `profile_tools(profile)` returns the default name list for that profile.
     /// Prefer [`crate::runtime::tool_materialize::resolve_names`] for harness paths
     /// (explore hard-whitelist + MCP filtering).
-    pub fn resolve_names(&self, profile_tools: &dyn Fn(&ToolProfile) -> Vec<String>) -> Vec<String> {
+    pub fn resolve_names(
+        &self,
+        profile_tools: &dyn Fn(&ToolProfile) -> Vec<String>,
+    ) -> Vec<String> {
         let mut base = if !self.allow.is_empty() {
             self.allow.clone()
         } else {
@@ -490,7 +493,10 @@ impl AgentSpec {
     }
 
     pub fn spawn_allowed(&self, name: &str) -> bool {
-        self.spawn_policy.allow.iter().any(|a| a == name || a == "*")
+        self.spawn_policy
+            .allow
+            .iter()
+            .any(|a| a == name || a == "*")
     }
 }
 
@@ -934,8 +940,7 @@ mod tests {
 
     #[test]
     fn task_exit_status_in_run_result() {
-        let rr = RunResult::success("partial", 1)
-            .with_status(TaskExitStatus::MaxTurnsExceeded);
+        let rr = RunResult::success("partial", 1).with_status(TaskExitStatus::MaxTurnsExceeded);
         assert!(!rr.ok);
         let v: Value = serde_json::from_str(&rr.to_json_line()).unwrap();
         assert_eq!(v["status"], "max_turns_exceeded");

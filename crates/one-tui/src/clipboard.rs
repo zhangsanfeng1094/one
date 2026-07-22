@@ -227,11 +227,7 @@ pub fn normalize_pasted_path(pasted: &str) -> Option<PathBuf> {
     let unquoted = pasted
         .strip_prefix('"')
         .and_then(|s| s.strip_suffix('"'))
-        .or_else(|| {
-            pasted
-                .strip_prefix('\'')
-                .and_then(|s| s.strip_suffix('\''))
-        })
+        .or_else(|| pasted.strip_prefix('\'').and_then(|s| s.strip_suffix('\'')))
         .unwrap_or(pasted)
         .trim();
     if unquoted.is_empty() || unquoted.contains('\n') {
@@ -240,9 +236,7 @@ pub fn normalize_pasted_path(pasted: &str) -> Option<PathBuf> {
 
     if let Some(rest) = unquoted.strip_prefix("file://") {
         // file:///tmp/x.png or file://localhost/tmp/x.png
-        let path = rest
-            .strip_prefix("localhost")
-            .unwrap_or(rest);
+        let path = rest.strip_prefix("localhost").unwrap_or(rest);
         let path = if path.starts_with('/') {
             PathBuf::from(path)
         } else {
@@ -321,10 +315,9 @@ fn paste_image_via_unix_tools() -> Result<PastedImage, String> {
             }
         }
         // xclip -selection clipboard -t image/png -o
-        if let Ok(bytes) = capture_stdout(
-            &["xclip", "-selection", "clipboard", "-t", mime, "-o"],
-            &[],
-        ) {
+        if let Ok(bytes) =
+            capture_stdout(&["xclip", "-selection", "clipboard", "-t", mime, "-o"], &[])
+        {
             if let Ok(v) = image_bytes_to_pasted(&bytes, "clipboard") {
                 return Ok(v);
             }

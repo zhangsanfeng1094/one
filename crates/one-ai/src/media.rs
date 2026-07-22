@@ -25,7 +25,9 @@ pub fn anthropic_user_content(user: &UserMessage) -> Value {
 
 /// Anthropic tool_result `content`: string or array of text/image blocks.
 pub fn anthropic_tool_result_content(blocks: &[TextOrImage]) -> Value {
-    let has_image = blocks.iter().any(|b| matches!(b, TextOrImage::Image { .. }));
+    let has_image = blocks
+        .iter()
+        .any(|b| matches!(b, TextOrImage::Image { .. }));
     if !has_image {
         let text = blocks
             .iter()
@@ -71,7 +73,10 @@ pub fn openai_chat_user_content(user: &UserMessage) -> Value {
     match &user.content {
         UserContent::Text(text) => json!(text),
         UserContent::Blocks(blocks) => {
-            if !blocks.iter().any(|b| matches!(b, TextOrImage::Image { .. })) {
+            if !blocks
+                .iter()
+                .any(|b| matches!(b, TextOrImage::Image { .. }))
+            {
                 return json!(user.content.as_plain_text());
             }
             let parts: Vec<Value> = blocks.iter().filter_map(openai_chat_part).collect();

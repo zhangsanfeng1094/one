@@ -13,9 +13,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionVerdict {
     Allow,
-    Deny { reason: String },
+    Deny {
+        reason: String,
+    },
     /// Needs user confirmation (interactive) or fail-closed (print/RPC).
-    Ask { reason: String },
+    Ask {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -220,9 +224,35 @@ pub fn suggested_command_prefix_from_cmd(command: &str) -> Option<String> {
         "sudo", "doas", "nice", "nohup", "time", "command", "builtin", "exec",
     ];
     const MULTI: &[&str] = &[
-        "git", "cargo", "npm", "pnpm", "yarn", "bun", "pip", "pip3", "docker", "kubectl", "gh",
-        "systemctl", "apt", "apt-get", "brew", "podman", "terraform", "aws", "gcloud", "go",
-        "make", "cmake", "mvn", "gradle", "poetry", "uv", "rustup", "npx", "deno",
+        "git",
+        "cargo",
+        "npm",
+        "pnpm",
+        "yarn",
+        "bun",
+        "pip",
+        "pip3",
+        "docker",
+        "kubectl",
+        "gh",
+        "systemctl",
+        "apt",
+        "apt-get",
+        "brew",
+        "podman",
+        "terraform",
+        "aws",
+        "gcloud",
+        "go",
+        "make",
+        "cmake",
+        "mvn",
+        "gradle",
+        "poetry",
+        "uv",
+        "rustup",
+        "npx",
+        "deno",
     ];
 
     let mut i = 0usize;

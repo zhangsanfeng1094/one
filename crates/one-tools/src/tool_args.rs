@@ -109,15 +109,9 @@ mod tests {
 
     #[test]
     fn edit_string_aliases() {
-        assert_eq!(
-            old_string_arg(&json!({"oldString": "x"})),
-            Some("x")
-        );
+        assert_eq!(old_string_arg(&json!({"oldString": "x"})), Some("x"));
         assert_eq!(old_string_arg(&json!({"oldText": "y"})), Some("y"));
-        assert_eq!(
-            new_string_arg(&json!({"newString": "z"})),
-            Some("z")
-        );
+        assert_eq!(new_string_arg(&json!({"newString": "z"})), Some("z"));
         // empty is still present (caller decides validity)
         assert_eq!(old_string_arg(&json!({"old_string": ""})), Some(""));
     }
@@ -129,7 +123,10 @@ mod tests {
             Some(true)
         );
         assert_eq!(
-            bool_arg_names(&json!({"replace_all": false}), &["replace_all", "replaceAll"]),
+            bool_arg_names(
+                &json!({"replace_all": false}),
+                &["replace_all", "replaceAll"]
+            ),
             Some(false)
         );
     }

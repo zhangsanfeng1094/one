@@ -138,8 +138,7 @@ mod inner {
                             return;
                         };
 
-                        if let Some(reason) =
-                            candidate.get("finishReason").and_then(|r| r.as_str())
+                        if let Some(reason) = candidate.get("finishReason").and_then(|r| r.as_str())
                         {
                             stop_reason = map_finish_reason(reason, false);
                         }
@@ -603,11 +602,15 @@ mod inner {
             let parts = contents[2]["parts"].as_array().unwrap();
             assert_eq!(parts.len(), 2);
             assert_eq!(
-                parts[0].pointer("/functionResponse/name").and_then(|v| v.as_str()),
+                parts[0]
+                    .pointer("/functionResponse/name")
+                    .and_then(|v| v.as_str()),
                 Some("read")
             );
             assert_eq!(
-                parts[1].pointer("/functionResponse/name").and_then(|v| v.as_str()),
+                parts[1]
+                    .pointer("/functionResponse/name")
+                    .and_then(|v| v.as_str()),
                 Some("ls")
             );
         }

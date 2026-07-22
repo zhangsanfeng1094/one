@@ -234,9 +234,7 @@ impl McpServerConfig {
     pub fn startup_timeout(&self) -> std::time::Duration {
         // Env overrides (Grok / Claude Code compat), then per-server, then default.
         if let Some(secs) = env_startup_timeout_secs() {
-            return std::time::Duration::from_secs(
-                self.startup_timeout_sec.unwrap_or(secs),
-            );
+            return std::time::Duration::from_secs(self.startup_timeout_sec.unwrap_or(secs));
         }
         std::time::Duration::from_secs(
             self.startup_timeout_sec
@@ -742,8 +740,8 @@ pub fn load_file(path: &Path) -> Result<McpConfig> {
 }
 
 pub fn parse_config_json(text: &str) -> Result<McpConfig> {
-    let value: serde_json::Value = serde_json::from_str(text)
-        .map_err(|e| McpError::config(format!("invalid JSON: {e}")))?;
+    let value: serde_json::Value =
+        serde_json::from_str(text).map_err(|e| McpError::config(format!("invalid JSON: {e}")))?;
 
     if value.get("mcpServers").is_some()
         || value.get("mcp_servers").is_some()
@@ -770,8 +768,8 @@ pub fn parse_config_json(text: &str) -> Result<McpConfig> {
 fn load_claude_json(path: &Path, cwd: &Path) -> Result<McpConfig> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| McpError::config(format!("read {}: {e}", path.display())))?;
-    let value: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| McpError::config(format!("claude.json: {e}")))?;
+    let value: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| McpError::config(format!("claude.json: {e}")))?;
 
     let mut cfg = McpConfig::empty();
 
@@ -830,8 +828,8 @@ pub fn load_codex_toml(path: &Path) -> Result<McpConfig> {
 }
 
 pub fn parse_codex_toml(text: &str) -> Result<McpConfig> {
-    let value: toml::Value = toml::from_str(text)
-        .map_err(|e| McpError::config(format!("codex config.toml: {e}")))?;
+    let value: toml::Value =
+        toml::from_str(text).map_err(|e| McpError::config(format!("codex config.toml: {e}")))?;
 
     let Some(servers) = value.get("mcp_servers").and_then(|v| v.as_table()) else {
         return Ok(McpConfig::empty());
@@ -1031,7 +1029,10 @@ approval_mode = "approve"
         assert_eq!(cfg.mcp_servers["n8n"].command.as_deref(), Some("npx"));
         assert_eq!(cfg.mcp_servers["n8n"].args, vec!["n8n-mcp"]);
         assert_eq!(
-            cfg.mcp_servers["n8n"].env.get("N8N_API_KEY").map(String::as_str),
+            cfg.mcp_servers["n8n"]
+                .env
+                .get("N8N_API_KEY")
+                .map(String::as_str),
             Some("secret")
         );
         // tools approval map must not become allowlist / must not break parse

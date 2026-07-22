@@ -1,15 +1,13 @@
 //! Built-in extensions compiled into the binary.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use one_core::tool::{Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::{json, Value};
 
-use crate::events::{
-    ExtensionCommand, ExtensionContext, ExtensionEvent, PromptFragment,
-};
+use crate::events::{ExtensionCommand, ExtensionContext, ExtensionEvent, PromptFragment};
 use crate::traits::Extension;
 
 /// Lightweight status extension: tools + context + event counters.
@@ -86,20 +84,13 @@ impl Extension for StatusExtension {
         vec![ExtensionCommand {
             name: "ext-status".into(),
             description: "Print extension runtime status".into(),
-            handler: |_| {
-                format!(
-                    "one extension runtime ok, pid={}",
-                    std::process::id()
-                )
-            },
+            handler: |_| format!("one extension runtime ok, pid={}", std::process::id()),
         }]
     }
 
     fn custom_state(&self) -> Option<(String, Value)> {
         let state = self.state.lock().ok()?;
-        state
-            .clone()
-            .map(|data| ("ext.status".to_string(), data))
+        state.clone().map(|data| ("ext.status".to_string(), data))
     }
 
     fn restore_state(&self, custom_type: &str, data: &Value) -> crate::Result<()> {

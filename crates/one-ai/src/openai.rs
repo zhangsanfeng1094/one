@@ -74,10 +74,7 @@ impl ProviderApi {
 
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "openai-completions"
-            | "openai-compatible"
-            | "chat-completions"
-            | "completions"
+            "openai-completions" | "openai-compatible" | "chat-completions" | "completions"
             | "chat" => Some(Self::OpenaiCompletions),
             "openai-responses" | "responses" | "response" => Some(Self::OpenaiResponses),
             "anthropic-messages" | "anthropic" | "messages" => Some(Self::AnthropicMessages),
@@ -242,10 +239,7 @@ mod inner {
             }
         }
 
-        fn apply_request_headers(
-            &self,
-            req: reqwest::RequestBuilder,
-        ) -> reqwest::RequestBuilder {
+        fn apply_request_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
             let mut req = req.bearer_auth(&self.api_key);
             // OpenCode Zen/Go attribution (Pi sends x-opencode-client / session).
             if self.provider_id == "opencode"
@@ -369,7 +363,8 @@ mod inner {
                     self.complete_chat(request, false, &mut |_| {}, None).await
                 }
                 OpenaiWireApi::OpenaiResponses => {
-                    self.complete_responses(request, false, &mut |_| {}, None).await
+                    self.complete_responses(request, false, &mut |_| {}, None)
+                        .await
                 }
                 OpenaiWireApi::AnthropicMessages | OpenaiWireApi::GeminiGenerateContent => {
                     Err(OneError::Provider(
@@ -394,7 +389,8 @@ mod inner {
                     self.complete_chat(request, true, on_event, abort).await
                 }
                 OpenaiWireApi::OpenaiResponses => {
-                    self.complete_responses(request, true, on_event, abort).await
+                    self.complete_responses(request, true, on_event, abort)
+                        .await
                 }
                 OpenaiWireApi::AnthropicMessages | OpenaiWireApi::GeminiGenerateContent => {
                     Err(OneError::Provider(
@@ -440,10 +436,7 @@ mod inner {
                     "cache_control_format": self.compat.cache_control_format,
                 })),
             );
-            let url = format!(
-                "{}/chat/completions",
-                self.base_url.trim_end_matches('/')
-            );
+            let url = format!("{}/chat/completions", self.base_url.trim_end_matches('/'));
             let response = crate::sse::send_with_abort(
                 self.apply_request_headers(self.client.post(&url))
                     .json(&body),
@@ -459,7 +452,9 @@ mod inner {
                     "error",
                     Some(&body),
                     None,
-                    Some(json!({ "status": status.as_u16(), "body_head": text.chars().take(500).collect::<String>() })),
+                    Some(
+                        json!({ "status": status.as_u16(), "body_head": text.chars().take(500).collect::<String>() }),
+                    ),
                 );
                 return Err(OneError::Provider(format!(
                     "openai chat/completions {status}: {text}"
@@ -477,7 +472,9 @@ mod inner {
                     "response",
                     Some(&body),
                     Some(&parsed.usage),
-                    Some(json!({ "model": self.model, "wire": "chat/completions", "stream": false })),
+                    Some(
+                        json!({ "model": self.model, "wire": "chat/completions", "stream": false }),
+                    ),
                 );
                 return Ok(parsed);
             }
@@ -489,65 +486,69 @@ mod inner {
             let mut usage = TokenUsage::default();
 
             let aborted = matches!(
-                crate::sse::read_sse_response(response, &mut |data| {
-                let Ok(value) = serde_json::from_str::<Value>(data) else {
-                    return;
-                };
-                let chunk_usage = parse_openai_usage(&value);
-                if !chunk_usage.is_zero() {
-                    usage = chunk_usage;
-                }
-                if let Some(reason) = value
-                    .pointer("/choices/0/finish_reason")
-                    .and_then(|v| v.as_str())
-                    .filter(|r| !r.is_empty() && *r != "null")
-                {
-                    finish_reason = Some(reason.to_string());
-                }
-                // Open thinking channels used across OpenAI-compat (DeepSeek, OR, …).
-                if let Some(delta) = extract_chat_reasoning_delta(&value) {
-                    if !delta.is_empty() {
-                        thinking_text.push_str(&delta);
-                        on_event(StreamEvent::ThinkingDelta(delta));
-                    }
-                }
-                if let Some(delta) = value
-                    .pointer("/choices/0/delta/content")
-                    .and_then(|v| v.as_str())
-                {
-                    if !delta.is_empty() {
-                        full_text.push_str(delta);
-                        on_event(StreamEvent::TextDelta(delta.to_string()));
-                    }
-                }
-                if let Some(arr) = value
-                    .pointer("/choices/0/delta/tool_calls")
-                    .and_then(|v| v.as_array())
-                {
-                    for item in arr {
-                        let index = item.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        let entry = tool_acc.entry(index).or_default();
-                        if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
-                            if !id.is_empty() {
-                                entry.id = id.to_string();
-                            }
+                crate::sse::read_sse_response(
+                    response,
+                    &mut |data| {
+                        let Ok(value) = serde_json::from_str::<Value>(data) else {
+                            return;
+                        };
+                        let chunk_usage = parse_openai_usage(&value);
+                        if !chunk_usage.is_zero() {
+                            usage = chunk_usage;
                         }
-                        if let Some(name) =
-                            item.pointer("/function/name").and_then(|v| v.as_str())
+                        if let Some(reason) = value
+                            .pointer("/choices/0/finish_reason")
+                            .and_then(|v| v.as_str())
+                            .filter(|r| !r.is_empty() && *r != "null")
                         {
-                            if !name.is_empty() {
-                                entry.name = name.to_string();
+                            finish_reason = Some(reason.to_string());
+                        }
+                        // Open thinking channels used across OpenAI-compat (DeepSeek, OR, …).
+                        if let Some(delta) = extract_chat_reasoning_delta(&value) {
+                            if !delta.is_empty() {
+                                thinking_text.push_str(&delta);
+                                on_event(StreamEvent::ThinkingDelta(delta));
                             }
                         }
-                        if let Some(args) = item
-                            .pointer("/function/arguments")
+                        if let Some(delta) = value
+                            .pointer("/choices/0/delta/content")
                             .and_then(|v| v.as_str())
                         {
-                            entry.arguments.push_str(args);
+                            if !delta.is_empty() {
+                                full_text.push_str(delta);
+                                on_event(StreamEvent::TextDelta(delta.to_string()));
+                            }
                         }
-                    }
-                }
-            }, abort)
+                        if let Some(arr) = value
+                            .pointer("/choices/0/delta/tool_calls")
+                            .and_then(|v| v.as_array())
+                        {
+                            for item in arr {
+                                let index = item.get("index").and_then(|v| v.as_u64()).unwrap_or(0)
+                                    as usize;
+                                let entry = tool_acc.entry(index).or_default();
+                                if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                                    if !id.is_empty() {
+                                        entry.id = id.to_string();
+                                    }
+                                }
+                                if let Some(name) =
+                                    item.pointer("/function/name").and_then(|v| v.as_str())
+                                {
+                                    if !name.is_empty() {
+                                        entry.name = name.to_string();
+                                    }
+                                }
+                                if let Some(args) =
+                                    item.pointer("/function/arguments").and_then(|v| v.as_str())
+                                {
+                                    entry.arguments.push_str(args);
+                                }
+                            }
+                        }
+                    },
+                    abort
+                )
                 .await,
                 Err(OneError::Aborted)
             );
@@ -623,190 +624,205 @@ mod inner {
             let mut usage = TokenUsage::default();
 
             let aborted = matches!(
-                crate::sse::read_sse_response(response, &mut |data| {
-                let Ok(value) = serde_json::from_str::<Value>(data) else {
-                    return;
-                };
-                let etype = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
-                let chunk_usage = parse_openai_usage(&value);
-                if !chunk_usage.is_zero() {
-                    usage = chunk_usage;
-                }
+                crate::sse::read_sse_response(
+                    response,
+                    &mut |data| {
+                        let Ok(value) = serde_json::from_str::<Value>(data) else {
+                            return;
+                        };
+                        let etype = value.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                        let chunk_usage = parse_openai_usage(&value);
+                        if !chunk_usage.is_zero() {
+                            usage = chunk_usage;
+                        }
 
-                match etype {
-                    "response.output_text.delta" | "response.refusal.delta" => {
-                        if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
-                            if !delta.is_empty() {
-                                full_text.push_str(delta);
-                                on_event(StreamEvent::TextDelta(delta.to_string()));
-                            }
-                        }
-                    }
-                    // Reasoning summary / text deltas (o-series, GPT-5, …).
-                    "response.reasoning_summary_text.delta"
-                    | "response.reasoning_text.delta"
-                    | "response.reasoning.delta" => {
-                        if let Some(delta) = value
-                            .get("delta")
-                            .and_then(|v| v.as_str())
-                            .or_else(|| value.pointer("/delta/text").and_then(|v| v.as_str()))
-                        {
-                            if !delta.is_empty() {
-                                thinking_text.push_str(delta);
-                                on_event(StreamEvent::ThinkingDelta(delta.to_string()));
-                            }
-                        }
-                    }
-                    "response.output_item.added" => {
-                        let index = value
-                            .get("output_index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
-                        let item = value.get("item");
-                        if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
-                            == Some("function_call")
-                        {
-                            let entry = tool_acc.entry(index).or_default();
-                            if let Some(id) = item
-                                .and_then(|i| i.get("call_id"))
-                                .and_then(|v| v.as_str())
-                            {
-                                entry.id = id.to_string();
-                            }
-                            if let Some(name) =
-                                item.and_then(|i| i.get("name")).and_then(|v| v.as_str())
-                            {
-                                entry.name = name.to_string();
-                            }
-                            if let Some(args) = item
-                                .and_then(|i| i.get("arguments"))
-                                .and_then(|v| v.as_str())
-                            {
-                                entry.arguments = args.to_string();
-                            }
-                        }
-                    }
-                    "response.function_call_arguments.delta" => {
-                        let index = value
-                            .get("output_index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
-                        if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
-                            tool_acc.entry(index).or_default().arguments.push_str(delta);
-                        }
-                    }
-                    "response.function_call_arguments.done" => {
-                        let index = value
-                            .get("output_index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
-                        if let Some(args) = value.get("arguments").and_then(|v| v.as_str()) {
-                            let entry = tool_acc.entry(index).or_default();
-                            // Prefer final full arguments when provided.
-                            if !args.is_empty() {
-                                entry.arguments = args.to_string();
-                            }
-                        }
-                    }
-                    "response.output_item.done" => {
-                        let index = value
-                            .get("output_index")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0) as usize;
-                        let item = value.get("item");
-                        if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
-                            == Some("function_call")
-                        {
-                            let entry = tool_acc.entry(index).or_default();
-                            if let Some(id) = item
-                                .and_then(|i| i.get("call_id"))
-                                .and_then(|v| v.as_str())
-                            {
-                                if !id.is_empty() {
-                                    entry.id = id.to_string();
+                        match etype {
+                            "response.output_text.delta" | "response.refusal.delta" => {
+                                if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                                    if !delta.is_empty() {
+                                        full_text.push_str(delta);
+                                        on_event(StreamEvent::TextDelta(delta.to_string()));
+                                    }
                                 }
                             }
-                            if let Some(name) =
-                                item.and_then(|i| i.get("name")).and_then(|v| v.as_str())
-                            {
-                                if !name.is_empty() {
-                                    entry.name = name.to_string();
-                                }
-                            }
-                            if let Some(args) = item
-                                .and_then(|i| i.get("arguments"))
-                                .and_then(|v| v.as_str())
-                            {
-                                if !args.is_empty() {
-                                    entry.arguments = args.to_string();
-                                }
-                            }
-                        } else if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
-                            == Some("reasoning")
-                        {
-                            // Final reasoning summary if deltas were empty.
-                            if thinking_text.is_empty() {
-                                if let Some(summary) =
-                                    item.and_then(|i| i.get("summary")).and_then(|s| s.as_array())
+                            // Reasoning summary / text deltas (o-series, GPT-5, …).
+                            "response.reasoning_summary_text.delta"
+                            | "response.reasoning_text.delta"
+                            | "response.reasoning.delta" => {
+                                if let Some(delta) =
+                                    value.get("delta").and_then(|v| v.as_str()).or_else(|| {
+                                        value.pointer("/delta/text").and_then(|v| v.as_str())
+                                    })
                                 {
-                                    for part in summary {
-                                        if let Some(t) = part.get("text").and_then(|x| x.as_str()) {
+                                    if !delta.is_empty() {
+                                        thinking_text.push_str(delta);
+                                        on_event(StreamEvent::ThinkingDelta(delta.to_string()));
+                                    }
+                                }
+                            }
+                            "response.output_item.added" => {
+                                let index = value
+                                    .get("output_index")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    as usize;
+                                let item = value.get("item");
+                                if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                                    == Some("function_call")
+                                {
+                                    let entry = tool_acc.entry(index).or_default();
+                                    if let Some(id) =
+                                        item.and_then(|i| i.get("call_id")).and_then(|v| v.as_str())
+                                    {
+                                        entry.id = id.to_string();
+                                    }
+                                    if let Some(name) =
+                                        item.and_then(|i| i.get("name")).and_then(|v| v.as_str())
+                                    {
+                                        entry.name = name.to_string();
+                                    }
+                                    if let Some(args) = item
+                                        .and_then(|i| i.get("arguments"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        entry.arguments = args.to_string();
+                                    }
+                                }
+                            }
+                            "response.function_call_arguments.delta" => {
+                                let index = value
+                                    .get("output_index")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    as usize;
+                                if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
+                                    tool_acc.entry(index).or_default().arguments.push_str(delta);
+                                }
+                            }
+                            "response.function_call_arguments.done" => {
+                                let index = value
+                                    .get("output_index")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    as usize;
+                                if let Some(args) = value.get("arguments").and_then(|v| v.as_str())
+                                {
+                                    let entry = tool_acc.entry(index).or_default();
+                                    // Prefer final full arguments when provided.
+                                    if !args.is_empty() {
+                                        entry.arguments = args.to_string();
+                                    }
+                                }
+                            }
+                            "response.output_item.done" => {
+                                let index = value
+                                    .get("output_index")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0)
+                                    as usize;
+                                let item = value.get("item");
+                                if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                                    == Some("function_call")
+                                {
+                                    let entry = tool_acc.entry(index).or_default();
+                                    if let Some(id) =
+                                        item.and_then(|i| i.get("call_id")).and_then(|v| v.as_str())
+                                    {
+                                        if !id.is_empty() {
+                                            entry.id = id.to_string();
+                                        }
+                                    }
+                                    if let Some(name) =
+                                        item.and_then(|i| i.get("name")).and_then(|v| v.as_str())
+                                    {
+                                        if !name.is_empty() {
+                                            entry.name = name.to_string();
+                                        }
+                                    }
+                                    if let Some(args) = item
+                                        .and_then(|i| i.get("arguments"))
+                                        .and_then(|v| v.as_str())
+                                    {
+                                        if !args.is_empty() {
+                                            entry.arguments = args.to_string();
+                                        }
+                                    }
+                                } else if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                                    == Some("reasoning")
+                                {
+                                    // Final reasoning summary if deltas were empty.
+                                    if thinking_text.is_empty() {
+                                        if let Some(summary) = item
+                                            .and_then(|i| i.get("summary"))
+                                            .and_then(|s| s.as_array())
+                                        {
+                                            for part in summary {
+                                                if let Some(t) =
+                                                    part.get("text").and_then(|x| x.as_str())
+                                                {
+                                                    thinking_text.push_str(t);
+                                                }
+                                            }
+                                        }
+                                        if let Some(t) = item
+                                            .and_then(|i| i.get("content"))
+                                            .and_then(|c| c.as_str())
+                                        {
                                             thinking_text.push_str(t);
                                         }
                                     }
-                                }
-                                if let Some(t) =
-                                    item.and_then(|i| i.get("content")).and_then(|c| c.as_str())
+                                } else if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
+                                    == Some("message")
                                 {
-                                    thinking_text.push_str(t);
-                                }
-                            }
-                        } else if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
-                            == Some("message")
-                        {
-                            // Finalize text from completed message if stream deltas were empty.
-                            if full_text.is_empty() {
-                                if let Some(parts) =
-                                    item.and_then(|i| i.get("content")).and_then(|c| c.as_array())
-                                {
-                                    for p in parts {
-                                        let t = p.get("type").and_then(|x| x.as_str());
-                                        if t == Some("output_text") || t == Some("refusal") {
-                                            if let Some(text) =
-                                                p.get("text").and_then(|x| x.as_str())
-                                            {
-                                                full_text.push_str(text);
-                                            }
-                                            if let Some(text) =
-                                                p.get("refusal").and_then(|x| x.as_str())
-                                            {
-                                                full_text.push_str(text);
+                                    // Finalize text from completed message if stream deltas were empty.
+                                    if full_text.is_empty() {
+                                        if let Some(parts) = item
+                                            .and_then(|i| i.get("content"))
+                                            .and_then(|c| c.as_array())
+                                        {
+                                            for p in parts {
+                                                let t = p.get("type").and_then(|x| x.as_str());
+                                                if t == Some("output_text") || t == Some("refusal")
+                                                {
+                                                    if let Some(text) =
+                                                        p.get("text").and_then(|x| x.as_str())
+                                                    {
+                                                        full_text.push_str(text);
+                                                    }
+                                                    if let Some(text) =
+                                                        p.get("refusal").and_then(|x| x.as_str())
+                                                    {
+                                                        full_text.push_str(text);
+                                                    }
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
+                            "response.completed" | "response.incomplete" => {
+                                status = value
+                                    .pointer("/response/status")
+                                    .and_then(|v| v.as_str())
+                                    .map(|s| s.to_string());
+                            }
+                            "response.failed" | "error" => {
+                                // Surface later via empty content + error if needed; store message.
+                                if let Some(msg) = value
+                                    .pointer("/response/error/message")
+                                    .or_else(|| value.get("message"))
+                                    .and_then(|v| v.as_str())
+                                {
+                                    on_event(StreamEvent::TextDelta(format!(
+                                        "[openai error] {msg}"
+                                    )));
+                                }
+                            }
+                            _ => {}
                         }
-                    }
-                    "response.completed" | "response.incomplete" => {
-                        status = value
-                            .pointer("/response/status")
-                            .and_then(|v| v.as_str())
-                            .map(|s| s.to_string());
-                    }
-                    "response.failed" | "error" => {
-                        // Surface later via empty content + error if needed; store message.
-                        if let Some(msg) = value
-                            .pointer("/response/error/message")
-                            .or_else(|| value.get("message"))
-                            .and_then(|v| v.as_str())
-                        {
-                            on_event(StreamEvent::TextDelta(format!("[openai error] {msg}")));
-                        }
-                    }
-                    _ => {}
-                }
-            }, abort)
+                    },
+                    abort
+                )
                 .await,
                 Err(OneError::Aborted)
             );
@@ -1230,11 +1246,7 @@ mod inner {
 
         // Prefer Pi compat thinkingFormat; fall back to legacy ThinkingWire::Auto dual-shape.
         if matches!(thinking_wire, crate::thinking::ThinkingWire::Auto) {
-            crate::thinking::apply_chat_thinking(
-                &mut body,
-                request.thinking_level,
-                thinking_wire,
-            );
+            crate::thinking::apply_chat_thinking(&mut body, request.thinking_level, thinking_wire);
         } else {
             compat.apply_thinking(&mut body, request.thinking_level, reasoning_model);
         }

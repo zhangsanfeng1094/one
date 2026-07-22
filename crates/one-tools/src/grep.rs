@@ -42,9 +42,7 @@ impl OutputMode {
     fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
             "content" | "" => Some(Self::Content),
-            "files_with_matches" | "files" | "files-with-matches" => {
-                Some(Self::FilesWithMatches)
-            }
+            "files_with_matches" | "files" | "files-with-matches" => Some(Self::FilesWithMatches),
             "count" => Some(Self::Count),
             _ => None,
         }
@@ -151,8 +149,8 @@ impl Tool for GrepTool {
             .to_string();
 
         let path = path_arg(&call.arguments).unwrap_or(".").to_string();
-        let ignore_case = bool_arg(&call.arguments, "case_insensitive", Some("ignore_case"))
-            .unwrap_or(false);
+        let ignore_case =
+            bool_arg(&call.arguments, "case_insensitive", Some("ignore_case")).unwrap_or(false);
         let multiline = bool_arg(&call.arguments, "multiline", None).unwrap_or(false);
         let glob = call
             .arguments
@@ -387,9 +385,11 @@ fn run_search(root: PathBuf, opts: SearchOpts, policy: PathPolicy) -> Result<Sea
                         }
                         total_hits += 1;
                         let text = file_lines.get(idx).copied().unwrap_or("");
-                        let truncated =
-                            crate::truncate::truncate_line(text, crate::truncate::GREP_MAX_LINE_LENGTH)
-                                .0;
+                        let truncated = crate::truncate::truncate_line(
+                            text,
+                            crate::truncate::GREP_MAX_LINE_LENGTH,
+                        )
+                        .0;
                         lines.push(format!("{display}:{}:{truncated}", idx + 1));
                     }
                 } else {
@@ -397,7 +397,8 @@ fn run_search(root: PathBuf, opts: SearchOpts, policy: PathPolicy) -> Result<Sea
                     let mut ranges: Vec<(usize, usize, Vec<usize>)> = Vec::new();
                     for &idx in &match_idxs {
                         let start = idx.saturating_sub(opts.context_before);
-                        let end = (idx + opts.context_after).min(file_lines.len().saturating_sub(1));
+                        let end =
+                            (idx + opts.context_after).min(file_lines.len().saturating_sub(1));
                         if let Some(last) = ranges.last_mut() {
                             if start <= last.1.saturating_add(1) {
                                 last.1 = last.1.max(end);
@@ -450,8 +451,8 @@ fn run_search(root: PathBuf, opts: SearchOpts, policy: PathPolicy) -> Result<Sea
         }
     }
 
-    let head_limit_applied = stopped_early
-        || limit.is_some_and(|l| total_hits > l || lines.len() > l);
+    let head_limit_applied =
+        stopped_early || limit.is_some_and(|l| total_hits > l || lines.len() > l);
     // For content without early stop, total_hits == match lines; keep total_before as total_hits.
     let total_before_head_limit = total_hits.max(lines.len());
 
@@ -516,11 +517,7 @@ fn collect_files(root: &Path, glob: Option<&str>, policy: &PathPolicy) -> Result
                     return WalkState::Continue;
                 }
             };
-            if !entry
-                .file_type()
-                .map(|ft| ft.is_file())
-                .unwrap_or(false)
-            {
+            if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                 return WalkState::Continue;
             }
             let path = entry.path();

@@ -19,8 +19,8 @@ use one_session::export_html;
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Cli, Commands, RunMode};
-use crate::provider::ProviderSet;
 use crate::protocol::{RunResult, UsageSnapshot};
+use crate::provider::ProviderSet;
 use crate::runtime::AppRuntime;
 use std::process::ExitCode;
 use std::time::Instant;
@@ -185,19 +185,17 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     if cli.list_providers {
         let set = ProviderSet::build(&cli)?;
-        println!(
-            "{:<14} {:<36} {}",
-            "provider", "description", "auth"
-        );
+        println!("{:<14} {:<36} {}", "provider", "description", "auth");
         println!("{}", "-".repeat(72));
         for (id, desc, auth) in one_ai::ModelRegistry::builtin_provider_catalog() {
             println!("{id:<14} {desc:<36} {auth}");
         }
         // Extra providers from models.json not in builtins.
-        let builtins: std::collections::HashSet<&str> = one_ai::ModelRegistry::builtin_provider_catalog()
-            .iter()
-            .map(|(id, _, _)| *id)
-            .collect();
+        let builtins: std::collections::HashSet<&str> =
+            one_ai::ModelRegistry::builtin_provider_catalog()
+                .iter()
+                .map(|(id, _, _)| *id)
+                .collect();
         for id in set.available_providers() {
             if !builtins.contains(id.as_str()) {
                 println!("{id:<14} {:<36} models.json", "custom");
@@ -233,7 +231,9 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 return Err("no session to share (use interactive mode or --session)".into());
             };
             let html = export_html(session);
-            let title = session.session_name().unwrap_or_else(|| "One Session".to_string());
+            let title = session
+                .session_name()
+                .unwrap_or_else(|| "One Session".to_string());
             let url = one_session::share_to_gist(html, title).await?;
             println!("shared: {url}");
             return Ok(ExitCode::SUCCESS);
@@ -309,13 +309,8 @@ async fn run_print_envelope(
     prompt: &str,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     let t0 = Instant::now();
-    let session_id = runtime
-        .session
-        .as_ref()
-        .map(|s| s.header().id.clone());
-    let session_path = runtime
-        .session_path()
-        .map(|p| p.display().to_string());
+    let session_id = runtime.session.as_ref().map(|s| s.header().id.clone());
+    let session_path = runtime.session_path().map(|p| p.display().to_string());
 
     match runtime.prompt(provider, prompt).await {
         Ok(text) => {

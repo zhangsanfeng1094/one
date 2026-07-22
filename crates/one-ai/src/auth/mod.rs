@@ -54,13 +54,8 @@ pub async fn login_provider(
                 .map_err(|e| e.to_string())?;
             Ok(AuthCredential::OAuth(cred))
         }
-        PROVIDER_OPENCODE
-        | "zen"
-        | "opencode-zen"
-        | "opencode_zen"
-        | PROVIDER_OPENCODE_GO
-        | "go"
-        | "opencode_go" => login_opencode(storage, provider_id, interaction).await,
+        PROVIDER_OPENCODE | "zen" | "opencode-zen" | "opencode_zen" | PROVIDER_OPENCODE_GO
+        | "go" | "opencode_go" => login_opencode(storage, provider_id, interaction).await,
         other => Err(format!(
             "unknown login provider `{other}` · available: {}",
             oauth_provider_catalog()

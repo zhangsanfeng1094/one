@@ -27,7 +27,12 @@ pub struct SessionInfo {
 impl SessionInfo {
     /// Label for `/resume` lists and notices: named → first prompt → short id.
     pub fn display_label(&self) -> String {
-        if let Some(name) = self.name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(name) = self
+            .name
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             return name.to_string();
         }
         if let Some(preview) = self
@@ -68,7 +73,10 @@ impl SessionManager {
         fs::create_dir_all(&dir).await?;
 
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
-        let file = dir.join(format!("{timestamp}_{}.jsonl", uuid::Uuid::new_v4().simple()));
+        let file = dir.join(format!(
+            "{timestamp}_{}.jsonl",
+            uuid::Uuid::new_v4().simple()
+        ));
 
         let mut manager = Self::in_memory(&cwd);
         manager.file = Some(file.clone());
@@ -265,13 +273,10 @@ impl SessionManager {
     }
 
     pub fn session_name(&self) -> Option<String> {
-        self.entries
-            .iter()
-            .rev()
-            .find_map(|entry| match entry {
-                SessionEntry::SessionInfo { name, .. } => Some(name.clone()),
-                _ => None,
-            })
+        self.entries.iter().rev().find_map(|entry| match entry {
+            SessionEntry::SessionInfo { name, .. } => Some(name.clone()),
+            _ => None,
+        })
     }
 
     /// First user message in file order, truncated for list labels.
@@ -622,7 +627,10 @@ mod tests {
         let sm = SessionManager::from_jsonl(&jsonl).unwrap();
         let real_id = entries[0].id().to_string();
         let (text, imgs) = sm.user_prompt_for_edit(&real_id).unwrap();
-        assert!(text.contains(one_core::image::IMAGE_TOKEN) || text.contains("[图片"), "{text}");
+        assert!(
+            text.contains(one_core::image::IMAGE_TOKEN) || text.contains("[图片"),
+            "{text}"
+        );
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].0, "image/png");
         assert!(std::path::Path::new(&imgs[0].1).is_file());

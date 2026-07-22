@@ -58,11 +58,8 @@ impl LlmProvider for OllamaProvider {
         let url = format!("{}/api/chat", self.base_url.trim_end_matches('/'));
         let body = build_body(&request, &self.model, true);
 
-        let response = crate::sse::send_with_abort(
-            self.client.post(&url).json(&body),
-            abort,
-        )
-        .await?;
+        let response =
+            crate::sse::send_with_abort(self.client.post(&url).json(&body), abort).await?;
 
         if !response.status().is_success() {
             let status = response.status();

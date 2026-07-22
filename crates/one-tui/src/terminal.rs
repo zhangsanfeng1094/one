@@ -30,9 +30,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
 use crate::app::App;
-use crate::state::RunOutcome;
 use crate::clipboard;
 use crate::error::Result;
+use crate::state::RunOutcome;
 use crate::ui;
 
 /// Ctrl+C during a busy turn — leave interactive mode immediately.

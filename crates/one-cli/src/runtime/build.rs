@@ -51,8 +51,7 @@ impl AppRuntime {
 
         // Harness / isolation: omit skills catalog + skill force-load.
         let disable_skills = cli.no_skills
-            || std::env::var_os("ONE_DISABLE_SKILLS")
-                .is_some_and(|v| v != "0" && v != "false");
+            || std::env::var_os("ONE_DISABLE_SKILLS").is_some_and(|v| v != "0" && v != "false");
         if disable_skills {
             tracing::info!("skills disabled (--no-skills / ONE_DISABLE_SKILLS)");
             resources.clear_skills();
@@ -77,8 +76,7 @@ impl AppRuntime {
         user_settings.apply_tool_output_limits();
         // Prune spilled tool outputs older than 7 days (OpenCode Truncate.cleanup).
         {
-            let report =
-                one_tools::cleanup_tool_outputs(one_tools::TOOL_OUTPUT_RETENTION_DAYS);
+            let report = one_tools::cleanup_tool_outputs(one_tools::TOOL_OUTPUT_RETENTION_DAYS);
             if report.removed_files > 0 || report.removed_dirs > 0 {
                 tracing::info!(
                     removed_files = report.removed_files,
@@ -92,8 +90,8 @@ impl AppRuntime {
         // Codex-style skills enable/disable (settings.skills_config).
         resources.apply_skills_config(&user_settings.skills_config_entries());
         let no_subagent_process = cli.no_subagent || env_no_subagent();
-        let applied_features = FeatureState::from_settings(&user_settings)
-            .with_process_overrides(no_subagent_process);
+        let applied_features =
+            FeatureState::from_settings(&user_settings).with_process_overrides(no_subagent_process);
         if no_subagent_process {
             tracing::info!("subagent feature disabled (--no-subagent / ONE_DISABLE_SUBAGENT)");
         }
@@ -147,12 +145,8 @@ impl AppRuntime {
         // main agents that can spawn (not pure --read-only research shells).
         let task_host = {
             let add_dirs = cli.add_dir.clone();
-            let opts = harness_opts_from_policy(
-                cwd.clone(),
-                cli.full_access,
-                add_dirs,
-                auto_approve,
-            );
+            let opts =
+                harness_opts_from_policy(cwd.clone(), cli.full_access, add_dirs, auto_approve);
             Some(TaskToolHost::new(
                 opts,
                 main_agent.clone(),
@@ -282,14 +276,16 @@ impl AppRuntime {
                     eprintln!(
                         "trace: requested but Langfuse keys missing — set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY"
                     );
-                    tracing::warn!("--trace/--langfuse ignored: Langfuse credentials not configured");
+                    tracing::warn!(
+                        "--trace/--langfuse ignored: Langfuse credentials not configured"
+                    );
                 }
             }
         }
         // Claude-style: completed background bash + agent jobs → conversation notice.
         // Wire when coding tools or subagent task tools are active.
-        let wire_notifications = !cli.read_only
-            || (applied_features.subagent_enabled() && can_spawn);
+        let wire_notifications =
+            !cli.read_only || (applied_features.subagent_enabled() && can_spawn);
         if wire_notifications {
             agent.set_notification_queue(shared_notifications);
         }

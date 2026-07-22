@@ -16,9 +16,7 @@ use crate::edit_diff::{
     apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success, normalize_to_lf,
 };
 use crate::path_policy::{AccessKind, PathPolicy};
-use crate::tool_args::{
-    bool_arg_names, new_string_arg, old_string_arg, path_arg, path_properties,
-};
+use crate::tool_args::{bool_arg_names, new_string_arg, old_string_arg, path_arg, path_properties};
 
 pub struct EditTool {
     policy: PathPolicy,
@@ -57,9 +55,8 @@ impl Tool for EditTool {
                 self.policy.cwd().display()
             )
         };
-        let mut properties = path_properties(
-            "Existing file path (aliases: `file_path`, `filePath`)",
-        );
+        let mut properties =
+            path_properties("Existing file path (aliases: `file_path`, `filePath`)");
         if let Some(obj) = properties.as_object_mut() {
             obj.insert(
                 "old_string".into(),
@@ -103,23 +100,13 @@ impl Tool for EditTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = path_arg(&call.arguments).ok_or_else(|| {
-            invalid_args(
-                "edit",
-                "missing `path` / `file_path` / `filePath`",
-            )
-        })?;
+        let path = path_arg(&call.arguments)
+            .ok_or_else(|| invalid_args("edit", "missing `path` / `file_path` / `filePath`"))?;
         let old_string = old_string_arg(&call.arguments).ok_or_else(|| {
-            invalid_args(
-                "edit",
-                "missing `old_string` / `oldString` / `oldText`",
-            )
+            invalid_args("edit", "missing `old_string` / `oldString` / `oldText`")
         })?;
         let new_string = new_string_arg(&call.arguments).ok_or_else(|| {
-            invalid_args(
-                "edit",
-                "missing `new_string` / `newString` / `newText`",
-            )
+            invalid_args("edit", "missing `new_string` / `newString` / `newText`")
         })?;
         let replace_all =
             bool_arg_names(&call.arguments, &["replace_all", "replaceAll"]).unwrap_or(false);

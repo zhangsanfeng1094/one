@@ -27,7 +27,10 @@ impl ExtensionRegistryBuilder {
         self
     }
 
-    pub fn install_all(&mut self, extensions: impl IntoIterator<Item = Arc<dyn Extension>>) -> &mut Self {
+    pub fn install_all(
+        &mut self,
+        extensions: impl IntoIterator<Item = Arc<dyn Extension>>,
+    ) -> &mut Self {
         for ext in extensions {
             self.install(ext);
         }

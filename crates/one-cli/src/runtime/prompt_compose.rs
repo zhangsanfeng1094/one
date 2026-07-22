@@ -30,8 +30,7 @@ pub fn compose_base_system_prompt(
     resources: &ResourceLoader,
     can_spawn: bool,
 ) -> String {
-    let mut base =
-        resources.build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
+    let mut base = resources.build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
     if features.subagent_enabled() && can_spawn {
         base.push('\n');
         base.push_str(TASK_TOOL_PROMPT_HINT);
@@ -41,11 +40,7 @@ pub fn compose_base_system_prompt(
 
 /// Full system prompt for the current mode (base + optional plan overlay).
 pub fn compose_system_prompt(input: PromptComposeInput<'_>) -> String {
-    let base = compose_base_system_prompt(
-        input.features,
-        input.resources,
-        input.can_spawn,
-    );
+    let base = compose_base_system_prompt(input.features, input.resources, input.can_spawn);
     if input.mode == AgentMode::Plan {
         if let Some(path) = input.plan_path {
             return format!("{}{}", base, plan_mode_system_overlay(path));

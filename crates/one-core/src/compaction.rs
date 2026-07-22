@@ -85,7 +85,11 @@ pub fn threshold_for_context_window_ratio(context_window: usize, ratio: f64) -> 
     };
     let raw = ((context_window as f64) * r).round() as usize;
     // Leave a little headroom under the hard window for the summary turn + tools.
-    let capped = raw.min(context_window.saturating_sub(4_096).max(MIN_COMPACT_THRESHOLD));
+    let capped = raw.min(
+        context_window
+            .saturating_sub(4_096)
+            .max(MIN_COMPACT_THRESHOLD),
+    );
     capped.max(MIN_COMPACT_THRESHOLD)
 }
 
@@ -96,10 +100,7 @@ pub fn estimate_tokens(messages: &[AgentMessage]) -> usize {
 }
 
 /// Prefer provider-reported last-prompt size when available; else char estimate.
-pub fn tokens_for_compaction(
-    messages: &[AgentMessage],
-    last_prompt_tokens: Option<u64>,
-) -> usize {
+pub fn tokens_for_compaction(messages: &[AgentMessage], last_prompt_tokens: Option<u64>) -> usize {
     match last_prompt_tokens {
         Some(n) if n > 0 => n as usize,
         _ => estimate_tokens(messages),
@@ -124,9 +125,9 @@ fn message_chars(message: &AgentMessage) -> usize {
             .map(|block| match block {
                 ContentBlock::Text { text } => text.len(),
                 ContentBlock::Thinking { thinking, .. } => thinking.len(),
-                ContentBlock::ToolCall { name, arguments, .. } => {
-                    name.len() + arguments.to_string().len() + 32
-                }
+                ContentBlock::ToolCall {
+                    name, arguments, ..
+                } => name.len() + arguments.to_string().len() + 32,
             })
             .sum(),
         AgentMessage::ToolResult(result) => result
@@ -164,10 +165,7 @@ pub fn should_compact_tokens(tokens: usize, config: &CompactionConfig) -> bool {
 /// is still relatively recent among the old messages.
 ///
 /// Returns the number of tool results that were pruned.
-pub fn prune_old_tool_outputs(
-    messages: &mut [AgentMessage],
-    config: &CompactionConfig,
-) -> usize {
+pub fn prune_old_tool_outputs(messages: &mut [AgentMessage], config: &CompactionConfig) -> usize {
     if !config.prune {
         return 0;
     }
@@ -209,11 +207,9 @@ pub fn prune_old_tool_outputs(
             })
             .sum();
         // Already pruned placeholders cost almost nothing and stay as-is.
-        if result
-            .content
-            .iter()
-            .all(|b| matches!(b, TextOrImage::Text { text } if text.contains(PRUNED_TOOL_PLACEHOLDER)))
-        {
+        if result.content.iter().all(
+            |b| matches!(b, TextOrImage::Text { text } if text.contains(PRUNED_TOOL_PLACEHOLDER)),
+        ) {
             continue;
         }
         let est = text_len / 4;
@@ -438,8 +434,7 @@ mod tests {
         // keep_recent 0 → split at len, all older
         assert!(summary.contains("User:"));
         assert!(!summary.contains("UserMessage"));
-        assert!(kept.is_empty() || !kept.is_empty() || true);
-        let _ = kept;
+        assert!(kept.is_empty());
     }
 
     #[test]
@@ -472,13 +467,13 @@ mod tests {
 
     #[test]
     fn threshold_from_context_window() {
-        assert_eq!(
-            threshold_for_context_window(0),
-            FALLBACK_COMPACT_THRESHOLD
-        );
+        assert_eq!(threshold_for_context_window(0), FALLBACK_COMPACT_THRESHOLD);
         let t = threshold_for_context_window(200_000);
         assert_eq!(t, 140_000); // 70%
-        assert!(should_compact_tokens(140_000, &CompactionConfig::from_context_window(200_000)));
+        assert!(should_compact_tokens(
+            140_000,
+            &CompactionConfig::from_context_window(200_000)
+        ));
         assert!(!should_compact_tokens(
             100_000,
             &CompactionConfig::from_context_window(200_000)
@@ -518,9 +513,7 @@ mod tests {
         AgentMessage::ToolResult(crate::message::ToolResultMessage {
             tool_call_id: format!("c-{name}"),
             tool_name: name.into(),
-            content: vec![TextOrImage::Text {
-                text: body.into(),
-            }],
+            content: vec![TextOrImage::Text { text: body.into() }],
             is_error: false,
             timestamp: 0,
         })
@@ -529,8 +522,8 @@ mod tests {
     #[test]
     fn prune_clears_old_tool_outputs() {
         let big = "x".repeat(8_000); // ~2000 tokens
-        // Layout: [old tool] [filler…] [recent tool in tail]
-        // keep_recent=2 → last two messages never pruned.
+                                     // Layout: [old tool] [filler…] [recent tool in tail]
+                                     // keep_recent=2 → last two messages never pruned.
         let mut messages = vec![
             AgentMessage::user_text("start"),
             tool_result("old", &big),

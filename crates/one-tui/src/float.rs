@@ -153,12 +153,7 @@ impl FloatMenu {
     /// Each row: `(id, label, detail, logged_in)`.
     pub fn login_picker(rows: &[(String, String, String, bool)]) -> Self {
         let items = if rows.is_empty() {
-            vec![item(
-                "_empty",
-                "(no providers)",
-                "catalog empty",
-                "",
-            )]
+            vec![item("_empty", "(no providers)", "catalog empty", "")]
         } else {
             rows.iter()
                 .map(|(id, label, detail, logged_in)| {
@@ -245,7 +240,7 @@ impl FloatMenu {
                     .into(),
                     hint: format!("/thinking {l}"),
                     style: FloatItemStyle::Normal,
-}
+                }
             })
             .collect();
         Self {
@@ -274,7 +269,7 @@ impl FloatMenu {
                 detail: detail.clone(),
                 hint: hint.clone(),
                 style: FloatItemStyle::Normal,
-})
+            })
             .collect();
         Self {
             kind: FloatKind::Sessions,
@@ -306,7 +301,7 @@ impl FloatMenu {
                 detail: detail.clone(),
                 hint: id.chars().take(8).collect(),
                 style: FloatItemStyle::Normal,
-})
+            })
             .collect();
         Self {
             kind: FloatKind::Tree,
@@ -335,7 +330,7 @@ impl FloatMenu {
                 detail: "restore conversation before this · edit prompt".into(),
                 hint: format!("#{}", i + 1),
                 style: FloatItemStyle::Normal,
-})
+            })
             .collect();
         Self {
             kind: FloatKind::Rewind,
@@ -366,7 +361,7 @@ impl FloatMenu {
                 detail: v.clone(),
                 hint: String::new(),
                 style: FloatItemStyle::Normal,
-})
+            })
             .collect();
         Self {
             kind: FloatKind::Info,
@@ -436,18 +431,8 @@ impl FloatMenu {
                             "workspace-write / full-access",
                             "cycle",
                         ),
-                        item(
-                            "tool_output",
-                            "Tool output",
-                            tool_output_summary,
-                            "edit",
-                        ),
-                        item(
-                            "compaction",
-                            "Compaction",
-                            compaction_summary,
-                            "edit",
-                        ),
+                        item("tool_output", "Tool output", tool_output_summary, "edit"),
+                        item("compaction", "Compaction", compaction_summary, "edit"),
                         item(
                             "skills",
                             "Skills",
@@ -466,12 +451,7 @@ impl FloatMenu {
                             "subagent (task) · context packages",
                             "toggle",
                         ),
-                        item(
-                            "mcp",
-                            "MCP",
-                            mcp_summary,
-                            "/mcp",
-                        ),
+                        item("mcp", "MCP", mcp_summary, "/mcp"),
                     ],
                 },
                 FloatSection {
@@ -648,11 +628,7 @@ impl FloatMenu {
                 id: id.clone(),
                 label: label.clone(),
                 detail: detail.clone(),
-                hint: if *on {
-                    "on".into()
-                } else {
-                    "off".into()
-                },
+                hint: if *on { "on".into() } else { "off".into() },
                 style: FloatItemStyle::Normal,
             };
             if *on {
@@ -724,7 +700,11 @@ impl FloatMenu {
                 id: id.clone(),
                 label: label.clone(),
                 detail: detail.clone(),
-                hint: if *owned { "owned".into() } else { "import".into() },
+                hint: if *owned {
+                    "owned".into()
+                } else {
+                    "import".into()
+                },
                 style: if *owned {
                     FloatItemStyle::Normal
                 } else {
@@ -862,7 +842,7 @@ impl FloatMenu {
                     "off · Enter on".into()
                 },
                 style: FloatItemStyle::Normal,
-};
+            };
             if *on {
                 enabled_items.push(item);
             } else {
@@ -944,12 +924,7 @@ impl FloatMenu {
         if sections.is_empty() {
             sections.push(FloatSection {
                 title: "Features".into(),
-                items: vec![item(
-                    "_empty",
-                    "(no features)",
-                    "registry empty",
-                    "",
-                )],
+                items: vec![item("_empty", "(no features)", "registry empty", "")],
             });
         }
         Self {
@@ -973,7 +948,7 @@ impl FloatMenu {
                 detail: detail.clone(),
                 hint: "→".into(),
                 style: FloatItemStyle::Normal,
-})
+            })
             .collect();
         items.push(item(
             "add_provider",
@@ -1062,7 +1037,11 @@ impl FloatMenu {
         ] {
             let display = fields
                 .iter()
-                .find(|(k, _)| k == &format!("compat.{label}") || k.ends_with(&format!(":{key}")) || k.ends_with(&format!("compat.{label}")))
+                .find(|(k, _)| {
+                    k == &format!("compat.{label}")
+                        || k.ends_with(&format!(":{key}"))
+                        || k.ends_with(&format!("compat.{label}"))
+                })
                 .map(|(_, v)| v.clone())
                 .or_else(|| {
                     // provider_field_rows uses `id:compat.Label`
@@ -1156,7 +1135,12 @@ impl FloatMenu {
                         "",
                     ),
                     item("tf:chat-template", "chat-template", "custom kwargs", ""),
-                    item("tf:string-thinking", "string-thinking", "thinking: string", ""),
+                    item(
+                        "tf:string-thinking",
+                        "string-thinking",
+                        "thinking: string",
+                        "",
+                    ),
                     item("tf:ant-ling", "ant-ling", "reasoning: { effort }", ""),
                 ],
             }],
@@ -1249,7 +1233,7 @@ impl FloatMenu {
                 detail: detail.clone(),
                 hint: "add".into(),
                 style: FloatItemStyle::Normal,
-})
+            })
             .collect();
         Self {
             kind: FloatKind::SettingsRemoteModels,
@@ -1289,7 +1273,7 @@ impl FloatMenu {
                     detail: detail.clone(),
                     hint: "→".into(),
                     style: FloatItemStyle::Normal,
-}
+                }
             })
             .collect();
         let n = model_items.len();
@@ -1354,12 +1338,7 @@ impl FloatMenu {
                         item("set_name", "name", short, "edit"),
                         item("set_ctx", "context_window", "e.g. 128000", "edit"),
                         item("set_reasoning", "reasoning", &reasoning, "cycle"),
-                        item(
-                            "set_thinking_level_map",
-                            "thinkingLevelMap",
-                            &tlm,
-                            "edit",
-                        ),
+                        item("set_thinking_level_map", "thinkingLevelMap", &tlm, "edit"),
                         item(
                             "set_thinking_format",
                             "thinkingFormat",
@@ -1520,7 +1499,7 @@ impl FloatMenu {
                         detail,
                         hint: m.provider.clone(),
                         style: FloatItemStyle::Normal,
-}
+                    }
                 })
                 .collect();
             if !items.is_empty() {
@@ -1822,12 +1801,7 @@ fn default_command_sections() -> Vec<FloatSection> {
                     "presets · JSON paths · tools",
                     "/agents",
                 ),
-                item(
-                    "mcp",
-                    "MCP Servers",
-                    "status · enable · disable",
-                    "/mcp",
-                ),
+                item("mcp", "MCP Servers", "status · enable · disable", "/mcp"),
                 item(
                     "skill",
                     "Force-load Skill",
@@ -1845,18 +1819,8 @@ fn default_command_sections() -> Vec<FloatSection> {
         FloatSection {
             title: "Account".into(),
             items: vec![
-                item(
-                    "login",
-                    "Login",
-                    "Codex · OpenCode Zen / Go",
-                    "/login",
-                ),
-                item(
-                    "logout",
-                    "Logout",
-                    "clear stored credentials",
-                    "/logout",
-                ),
+                item("login", "Login", "Codex · OpenCode Zen / Go", "/login"),
+                item("logout", "Logout", "clear stored credentials", "/logout"),
             ],
         },
         FloatSection {

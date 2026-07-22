@@ -50,7 +50,9 @@ impl AppRuntime {
                 });
                 println!("{line}");
             }
-            AgentEvent::TurnEnd { turn, tool_results, .. } if json => {
+            AgentEvent::TurnEnd {
+                turn, tool_results, ..
+            } if json => {
                 let line = serde_json::json!({
                     "type":"turn_end",
                     "turn": turn,

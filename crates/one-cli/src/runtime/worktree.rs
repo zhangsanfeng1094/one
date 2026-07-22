@@ -43,10 +43,7 @@ impl WorktreeManager {
         })?;
         let id = sanitize_id(job_id);
         let branch = format!("one/task-{id}");
-        let path = repo_root
-            .join(".one")
-            .join(WT_DIR)
-            .join(&id);
+        let path = repo_root.join(".one").join(WT_DIR).join(&id);
 
         if path.exists() {
             // Stale path from a previous crash — try force-remove first.
@@ -80,12 +77,7 @@ impl WorktreeManager {
             // Branch may already exist — try without -b.
             let retry = git_status(
                 &repo_root,
-                &[
-                    "worktree",
-                    "add",
-                    &path.display().to_string(),
-                    &branch,
-                ],
+                &["worktree", "add", &path.display().to_string(), &branch],
             );
             if retry.is_err() {
                 return Err(ProtocolError::new(
@@ -192,9 +184,7 @@ fn git_stdout(cwd: &Path, args: &[&str]) -> Result<String, ProtocolError> {
         .args(args)
         .current_dir(cwd)
         .output()
-        .map_err(|e| {
-            ProtocolError::new(error_code::INTERNAL, format!("spawn git: {e}"))
-        })?;
+        .map_err(|e| ProtocolError::new(error_code::INTERNAL, format!("spawn git: {e}")))?;
     if !out.status.success() {
         return Err(ProtocolError::new(
             error_code::INTERNAL,

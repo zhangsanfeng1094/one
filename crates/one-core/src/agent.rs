@@ -10,7 +10,7 @@ use crate::error::{OneError, Result};
 use crate::events::{AgentEvent, EventListener};
 use crate::hooks::AgentHooks;
 use crate::message::{
-    AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, now_ms,
+    now_ms, AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
 };
 use crate::tool::{resolve_tool_name, Tool, ToolCall, ToolOutput};
 use crate::tool_gate::{ToolGate, ToolGateDecision};
@@ -437,15 +437,20 @@ impl Agent {
     }
 
     pub fn has_queued_messages(&self) -> bool {
-        !self.steering_queue.lock().expect("steering queue lock").is_empty()
-            || !self.followup_queue.lock().expect("followup queue lock").is_empty()
+        !self
+            .steering_queue
+            .lock()
+            .expect("steering queue lock")
+            .is_empty()
+            || !self
+                .followup_queue
+                .lock()
+                .expect("followup queue lock")
+                .is_empty()
     }
 
     pub fn push_queue(queue: &Arc<Mutex<Vec<String>>>, text: impl Into<String>) {
-        queue
-            .lock()
-            .expect("queue lock")
-            .push(text.into());
+        queue.lock().expect("queue lock").push(text.into());
     }
 
     pub fn subscribe(&mut self, listener: EventListener) {
@@ -650,7 +655,7 @@ impl Agent {
             };
 
             let latency_ms = llm_start.elapsed().as_millis() as u64;
-            let ttft = ttft_ms.lock().expect("ttft").clone();
+            let ttft = *ttft_ms.lock().expect("ttft");
             let tool_calls = extract_tool_calls(&response.content);
             let text = extract_text(&response.content);
             let text_len = text.len();
@@ -658,11 +663,8 @@ impl Agent {
             // Always attach generation text (or tool-call summary) so Langfuse
             // observation.output is readable without --trace-full.
             // --trace-full only raises the preview budget (16k vs 240 chars).
-            let output_preview = crate::trace::llm_output_preview(
-                &text,
-                &tool_calls,
-                self.preview_limit(),
-            );
+            let output_preview =
+                crate::trace::llm_output_preview(&text, &tool_calls, self.preview_limit());
 
             self.record_trace(TraceEvent::LlmResponse {
                 ts_ms: now_ms(),
@@ -884,7 +886,8 @@ impl Agent {
 
         for (i, call) in tool_calls.iter().enumerate() {
             if self.is_aborted() {
-                self.execute_slots(&mut slots, turn, run_id, tool_results).await;
+                self.execute_slots(&mut slots, turn, run_id, tool_results)
+                    .await;
                 for call in &tool_calls[i..] {
                     self.emit_synthetic_skip(
                         call,
@@ -898,7 +901,8 @@ impl Agent {
             }
             if i > 0 && self.has_steering() {
                 // Finish already-gated tools, skip the rest with paired error results.
-                self.execute_slots(&mut slots, turn, run_id, tool_results).await;
+                self.execute_slots(&mut slots, turn, run_id, tool_results)
+                    .await;
                 for call in &tool_calls[i..] {
                     self.emit_synthetic_skip(
                         call,
@@ -950,7 +954,8 @@ impl Agent {
             }
         }
 
-        self.execute_slots(&mut slots, turn, run_id, tool_results).await;
+        self.execute_slots(&mut slots, turn, run_id, tool_results)
+            .await;
         if self.is_aborted() {
             return ToolBatchOutcome::Aborted;
         }
@@ -1028,10 +1033,12 @@ impl Agent {
                         &original,
                         turn,
                         run_id,
-                        output,
-                        is_error,
-                        gate,
-                        duration_ms,
+                        ToolExecutionResult {
+                            output,
+                            is_error,
+                            gate_decision: gate,
+                            duration_ms,
+                        },
                         tool_results,
                     );
                 }
@@ -1040,10 +1047,12 @@ impl Agent {
                         &original,
                         turn,
                         run_id,
-                        ToolOutput::text("internal error: tool not executed"),
-                        true,
-                        None,
-                        0,
+                        ToolExecutionResult {
+                            output: ToolOutput::text("internal error: tool not executed"),
+                            is_error: true,
+                            gate_decision: None,
+                            duration_ms: 0,
+                        },
                         tool_results,
                     );
                 }
@@ -1079,15 +1088,13 @@ impl Agent {
         let start = Instant::now();
         // Race tool work against Esc so long bash/network tools stop ~50ms after abort
         // (bash uses kill_on_drop; dropping the future cancels the child).
-        let res = match crate::streaming::race_abort(
-            tool.execute(&effective),
-            Some(&self.abort_flag),
-        )
-        .await
-        {
-            Ok(res) => res,
-            Err(()) => Err(OneError::Aborted),
-        };
+        let res =
+            match crate::streaming::race_abort(tool.execute(&effective), Some(&self.abort_flag))
+                .await
+            {
+                Ok(res) => res,
+                Err(()) => Err(OneError::Aborted),
+            };
         let duration_ms = start.elapsed().as_millis() as u64;
         let (output, is_error) = match res {
             Ok(output) => {
@@ -1130,8 +1137,7 @@ impl Agent {
             return;
         }
 
-        let mut jobs: Vec<(usize, ToolCall, ToolCall, Option<TraceGateDecision>, Arc<dyn Tool>)> =
-            Vec::with_capacity(indices.len());
+        let mut jobs: Vec<ParallelToolJob> = Vec::with_capacity(indices.len());
         for &i in indices {
             if let ToolSlot::Pending {
                 original,
@@ -1312,10 +1318,12 @@ impl Agent {
             call,
             turn,
             run_id,
-            ToolOutput::text(reason),
-            true,
-            None,
-            0,
+            ToolExecutionResult {
+                output: ToolOutput::text(reason),
+                is_error: true,
+                gate_decision: None,
+                duration_ms: 0,
+            },
             tool_results,
         );
     }
@@ -1325,12 +1333,15 @@ impl Agent {
         call: &ToolCall,
         turn: usize,
         run_id: &str,
-        output: ToolOutput,
-        is_error: bool,
-        gate_decision: Option<TraceGateDecision>,
-        duration_ms: u64,
+        execution: ToolExecutionResult,
         tool_results: &mut Vec<AgentMessage>,
     ) {
+        let ToolExecutionResult {
+            output,
+            is_error,
+            gate_decision,
+            duration_ms,
+        } = execution;
         let output_text = output.as_text();
         let output_bytes = output_text.len();
         // Same as generation: short preview by default; --trace-full expands budget.
@@ -1370,6 +1381,21 @@ impl Agent {
     }
 }
 
+type ParallelToolJob = (
+    usize,
+    ToolCall,
+    ToolCall,
+    Option<TraceGateDecision>,
+    Arc<dyn Tool>,
+);
+
+struct ToolExecutionResult {
+    output: ToolOutput,
+    is_error: bool,
+    gate_decision: Option<TraceGateDecision>,
+    duration_ms: u64,
+}
+
 /// Slot for concurrent tool execution (gate already applied).
 enum ToolSlot {
     Pending {
@@ -1403,7 +1429,6 @@ enum GateOutcome {
         gate: Option<TraceGateDecision>,
     },
 }
-
 
 /// Tools that only observe state and are safe to run concurrently with each other.
 ///
@@ -1474,10 +1499,7 @@ fn tool_output_indicates_error(tool_name: &str, output: &ToolOutput) -> bool {
             let text = output.as_text();
             // Foreground bash titles: "exit N" (ok) or "command failed (exit N|signal)".
             if let Some(rest) = text.strip_prefix("exit ") {
-                let code = rest
-                    .split(|c: char| c.is_whitespace())
-                    .next()
-                    .unwrap_or("");
+                let code = rest.split(|c: char| c.is_whitespace()).next().unwrap_or("");
                 if code == "signal" {
                     return true;
                 }
@@ -1508,7 +1530,11 @@ pub fn extract_tool_calls(content: &[ContentBlock]) -> Vec<ToolCall> {
     content
         .iter()
         .filter_map(|block| match block {
-            ContentBlock::ToolCall { id, name, arguments } => Some(ToolCall {
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => Some(ToolCall {
                 id: id.clone(),
                 name: name.clone(),
                 arguments: arguments.clone(),
@@ -1590,7 +1616,7 @@ mod tests {
         assert_eq!(u.total(), 1050);
         assert_eq!(u.uncached_input_tokens(), 200);
         assert_eq!(u.prompt_tokens_expanded(), 1800); // Anthropic-style only
-        // OpenAI-style: context size is input (cache already inside).
+                                                      // OpenAI-style: context size is input (cache already inside).
         assert_eq!(u.context_size_tokens(), 1000);
     }
 
@@ -1651,7 +1677,9 @@ mod tests {
                 on_event: &mut (dyn FnMut(crate::streaming::StreamEvent) + Send),
                 _abort: Option<&AtomicBool>,
             ) -> Result<CompletionResponse> {
-                on_event(crate::streaming::StreamEvent::TextDelta("partial".to_string()));
+                on_event(crate::streaming::StreamEvent::TextDelta(
+                    "partial".to_string(),
+                ));
                 Ok(CompletionResponse {
                     provider: self.name().to_string(),
                     model: self.model().to_string(),
@@ -1837,7 +1865,10 @@ mod tests {
                             .contains("[Background task completed]"),
                         _ => false,
                     });
-                    assert!(has_notice, "notification should be injected before LLM call");
+                    assert!(
+                        has_notice,
+                        "notification should be injected before LLM call"
+                    );
                 }
                 Ok(CompletionResponse {
                     provider: self.name().to_string(),
@@ -1852,9 +1883,7 @@ mod tests {
         }
 
         let mut agent = Agent::new(AgentConfig::default(), Vec::new());
-        agent.push_notification(
-            "[Background task completed]\ntask_id: bg_test_1\nexit: 0\n",
-        );
+        agent.push_notification("[Background task completed]\ntask_id: bg_test_1\nexit: 0\n");
         let out = agent
             .prompt(
                 &NoticeProvider {

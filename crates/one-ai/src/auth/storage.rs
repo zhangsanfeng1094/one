@@ -208,7 +208,9 @@ impl AuthStorage {
             return Ok(Some(opencode_model_auth(provider, key, "--api-key")));
         }
 
-        let cred = self.get(provider).or_else(|| self.get_shared_opencode(provider));
+        let cred = self
+            .get(provider)
+            .or_else(|| self.get_shared_opencode(provider));
         if let Some(AuthCredential::ApiKey(k)) = &cred {
             return Ok(Some(opencode_model_auth(
                 provider,
@@ -358,9 +360,7 @@ fn opencode_model_auth(provider: &str, key: String, source: &str) -> ModelAuth {
 
 async fn refresh_oauth(provider: &str, oauth: &OAuthCredential) -> AuthResult<OAuthCredential> {
     match provider {
-        PROVIDER_OPENAI_CODEX => oauth_codex::refresh(oauth)
-            .await
-            .map_err(AuthError::Msg),
+        PROVIDER_OPENAI_CODEX => oauth_codex::refresh(oauth).await.map_err(AuthError::Msg),
         PROVIDER_XAI | "grok" | "xai-oauth" | "supergrok" => {
             oauth_xai::refresh(oauth).await.map_err(AuthError::Msg)
         }
@@ -525,7 +525,10 @@ mod tests {
             .enable_all()
             .build()
             .unwrap();
-        let auth = rt.block_on(storage.resolve_api_key("openai")).unwrap().unwrap();
+        let auth = rt
+            .block_on(storage.resolve_api_key("openai"))
+            .unwrap()
+            .unwrap();
         assert_eq!(auth.api_key.as_deref(), Some("runtime-key"));
         assert_eq!(auth.source.as_deref(), Some("--api-key"));
         let _ = fs::remove_dir_all(dir);

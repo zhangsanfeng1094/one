@@ -116,10 +116,7 @@ pub fn load_spec_markdown(raw: &str, path: &Path) -> Result<AgentSpec, ProtocolE
     let obj = value.as_object_mut().ok_or_else(|| {
         ProtocolError::new(
             error_code::INVALID_AGENT_SPEC,
-            format!(
-                "{}: frontmatter must be a YAML mapping",
-                path.display()
-            ),
+            format!("{}: frontmatter must be a YAML mapping", path.display()),
         )
     })?;
     let body_trim = body.trim();
@@ -145,16 +142,16 @@ pub fn load_spec_markdown(raw: &str, path: &Path) -> Result<AgentSpec, ProtocolE
     }
     if !obj.contains_key("name") {
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-            obj.insert(
-                "name".into(),
-                serde_json::Value::String(stem.to_string()),
-            );
+            obj.insert("name".into(), serde_json::Value::String(stem.to_string()));
         }
     }
     serde_json::from_value(value).map_err(|e| {
         ProtocolError::new(
             error_code::INVALID_AGENT_SPEC,
-            format!("{}: frontmatter is not a valid AgentSpec: {e}", path.display()),
+            format!(
+                "{}: frontmatter is not a valid AgentSpec: {e}",
+                path.display()
+            ),
         )
     })
 }
@@ -185,9 +182,8 @@ fn split_frontmatter(content: &str) -> (String, String) {
 /// Serialize builtin/preset to pretty JSON (for `one agent dump`).
 pub fn dump_preset(name: &str, cwd: &Path) -> Result<String, ProtocolError> {
     let spec = load_preset(name, cwd)?;
-    serde_json::to_string_pretty(&spec).map_err(|e| {
-        ProtocolError::new(error_code::INTERNAL, format!("serialize AgentSpec: {e}"))
-    })
+    serde_json::to_string_pretty(&spec)
+        .map_err(|e| ProtocolError::new(error_code::INTERNAL, format!("serialize AgentSpec: {e}")))
 }
 
 /// Where an agent definition was loaded from.
@@ -307,10 +303,7 @@ fn scan_agent_dir(
     }
     for (stem, path) in by_stem {
         if let Ok(spec) = load_spec_file(&path) {
-            let name = spec
-                .name
-                .clone()
-                .unwrap_or_else(|| stem.clone());
+            let name = spec.name.clone().unwrap_or_else(|| stem.clone());
             let abs = path.canonicalize().unwrap_or(path);
             out.insert(
                 name.clone(),
@@ -333,11 +326,7 @@ fn catalog_from_spec(
     } else if tools.len() <= 6 {
         tools.join(", ")
     } else {
-        format!(
-            "{}, … (+{})",
-            tools[..5].join(", "),
-            tools.len() - 5
-        )
+        format!("{}, … (+{})", tools[..5].join(", "), tools.len() - 5)
     };
     let mut desc = spec.description.clone().unwrap_or_default();
     if desc.chars().count() > 100 {
@@ -405,9 +394,7 @@ pub fn merge_discovered_agents(parent: &mut AgentSpec, cwd: &Path) {
                 continue;
             }
             match by_stem.get(stem) {
-                Some(existing)
-                    if existing.extension().and_then(|e| e.to_str()) == Some("json") =>
-                {
+                Some(existing) if existing.extension().and_then(|e| e.to_str()) == Some("json") => {
                     // keep json
                 }
                 _ => {
@@ -507,7 +494,9 @@ mod tests {
         )
         .unwrap();
         let list = list_agents(&dir);
-        assert!(list.iter().any(|e| e.name == "research" && e.path.is_some()));
+        assert!(list
+            .iter()
+            .any(|e| e.name == "research" && e.path.is_some()));
         assert!(list.iter().any(|e| e.name == "explore"));
         let research = list.iter().find(|e| e.name == "research").unwrap();
         assert!(research

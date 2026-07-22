@@ -322,13 +322,10 @@ impl AgentJobRegistry {
         };
         let ms = wait_ms.unwrap_or(0);
         if ms == 0 {
-            return self
-                .get(id)
-                .ok_or_else(|| format!("unknown job_id: {id}"));
+            return self.get(id).ok_or_else(|| format!("unknown job_id: {id}"));
         }
         let _ = tokio::time::timeout(Duration::from_millis(ms), done.notified()).await;
-        self.get(id)
-            .ok_or_else(|| format!("unknown job_id: {id}"))
+        self.get(id).ok_or_else(|| format!("unknown job_id: {id}"))
     }
 
     /// Ids currently non-terminal (for default `wait_tasks` target set).
@@ -397,8 +394,7 @@ impl AgentJobRegistry {
         }
 
         let deadline = wait_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
-        let mut seen_terminal: std::collections::HashSet<String> =
-            std::collections::HashSet::new();
+        let mut seen_terminal: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut events: Vec<JobSnapshot> = Vec::new();
 
         // Seed: already-finished targets count as immediate "events".
@@ -410,9 +406,7 @@ impl AgentJobRegistry {
                 }
             }
         }
-        self.absorb_notifications_for(
-            &events.iter().map(|e| e.id.clone()).collect::<Vec<_>>(),
-        );
+        self.absorb_notifications_for(&events.iter().map(|e| e.id.clone()).collect::<Vec<_>>());
 
         // If nothing still running, return immediately (all already terminal).
         let pending_at_start: Vec<String> = targets
@@ -595,10 +589,7 @@ fn format_join_report(
         }
     }
 
-    let still: Vec<_> = finals
-        .iter()
-        .filter(|j| !j.state.is_terminal())
-        .collect();
+    let still: Vec<_> = finals.iter().filter(|j| !j.state.is_terminal()).collect();
     if !still.is_empty() {
         out.push_str("\n--- still running ---\n");
         for j in still {
@@ -613,9 +604,7 @@ fn format_join_report(
     let failed = finals
         .iter()
         .filter(|j| {
-            j.state.is_terminal()
-                && !j.ok
-                && !matches!(j.status, Some(TaskExitStatus::Success))
+            j.state.is_terminal() && !j.ok && !matches!(j.status, Some(TaskExitStatus::Success))
         })
         .count();
     let ok_n = finals
@@ -863,7 +852,9 @@ mod tests {
         assert_eq!(snap.state, JobState::Aborted);
         let notes = queue.lock().unwrap().clone();
         assert!(
-            notes.iter().any(|n| n.contains("status: aborted") || n.contains("aborted")),
+            notes
+                .iter()
+                .any(|n| n.contains("status: aborted") || n.contains("aborted")),
             "notes={notes:?}"
         );
     }
@@ -898,10 +889,7 @@ mod tests {
         let opts = HarnessOptions::from_cwd(std::env::temp_dir());
         let mut ids = Vec::new();
         for prompt in ["research a", "research b"] {
-            let mut req = RunRequest::new(
-                crate::protocol::AgentSpec::builtin_explore(),
-                prompt,
-            );
+            let mut req = RunRequest::new(crate::protocol::AgentSpec::builtin_explore(), prompt);
             req.session.mode = crate::protocol::SessionMode::Ephemeral;
             let id = reg.spawn(
                 req,
@@ -921,7 +909,11 @@ mod tests {
         assert_eq!(report.finals.len(), 2);
         assert!(report.finals.iter().all(|j| j.state.is_terminal()));
         assert!(report.message.contains("[wait_tasks"), "{}", report.message);
-        assert!(report.message.contains("completion stream"), "{}", report.message);
+        assert!(
+            report.message.contains("completion stream"),
+            "{}",
+            report.message
+        );
         // Notices absorbed so queue should not still list both (may be empty or unrelated).
         let notes = queue.lock().unwrap().clone();
         for id in &ids {
@@ -938,10 +930,7 @@ mod tests {
         let reg = AgentJobRegistry::new(queue);
         let provider = Arc::new(one_ai::MockProvider::new());
         let opts = HarnessOptions::from_cwd(std::env::temp_dir());
-        let mut req = RunRequest::new(
-            crate::protocol::AgentSpec::builtin_explore(),
-            "one job",
-        );
+        let mut req = RunRequest::new(crate::protocol::AgentSpec::builtin_explore(), "one job");
         req.session.mode = crate::protocol::SessionMode::Ephemeral;
         let id = reg.spawn(req, provider, opts, "explore".into(), None, None);
         let report = reg

@@ -78,12 +78,9 @@ pub fn materialize_tools(
         })
         .collect();
 
-    registry.materialize(&names, ctx).map_err(|e| {
-        ProtocolError::new(
-            error_code::INVALID_AGENT_SPEC,
-            format_unknown_tool(&e),
-        )
-    })
+    registry
+        .materialize(&names, ctx)
+        .map_err(|e| ProtocolError::new(error_code::INVALID_AGENT_SPEC, format_unknown_tool(&e)))
 }
 
 fn format_unknown_tool(e: &UnknownToolError) -> String {

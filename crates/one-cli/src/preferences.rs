@@ -28,9 +28,8 @@ pub fn save(provider: &str, model: &str) -> std::io::Result<()> {
         provider: provider.to_string(),
         model: model.to_string(),
     };
-    let data = serde_json::to_string_pretty(&prefs).map_err(|err| {
-        std::io::Error::new(std::io::ErrorKind::InvalidData, err)
-    })?;
+    let data = serde_json::to_string_pretty(&prefs)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
     fs::write(path, data)
 }
 

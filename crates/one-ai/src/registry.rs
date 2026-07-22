@@ -162,9 +162,7 @@ impl ModelRegistry {
                     name: "Gemini 2.5 Flash".into(),
                     context_window: Some(1_000_000),
                     api: Some("gemini-generate-content".into()),
-                    base_url: Some(
-                        "https://generativelanguage.googleapis.com/v1beta".into(),
-                    ),
+                    base_url: Some("https://generativelanguage.googleapis.com/v1beta".into()),
                     api_key: None,
                     reasoning: Some(true),
                     thinking_level_map: None,
@@ -176,9 +174,7 @@ impl ModelRegistry {
                     name: "Gemini 2.5 Pro".into(),
                     context_window: Some(1_000_000),
                     api: Some("gemini-generate-content".into()),
-                    base_url: Some(
-                        "https://generativelanguage.googleapis.com/v1beta".into(),
-                    ),
+                    base_url: Some("https://generativelanguage.googleapis.com/v1beta".into()),
                     api_key: None,
                     reasoning: Some(true),
                     thinking_level_map: None,

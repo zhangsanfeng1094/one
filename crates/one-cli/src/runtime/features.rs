@@ -65,8 +65,7 @@ impl FeatureState {
     /// Apply process-level kill-switches after settings (CLI / env).
     pub fn with_process_overrides(mut self, no_subagent: bool) -> Self {
         if no_subagent {
-            self.enabled
-                .insert(FEATURE_SUBAGENT.to_string(), false);
+            self.enabled.insert(FEATURE_SUBAGENT.to_string(), false);
         }
         self
     }
@@ -125,9 +124,7 @@ pub fn feature_def(id: &str) -> Option<&'static FeatureDef> {
 
 /// Whether toggling this feature changes model context (prompt/tools).
 pub fn feature_affects_context(id: &str) -> bool {
-    feature_def(id)
-        .map(|d| d.affects_context)
-        .unwrap_or(true)
+    feature_def(id).map(|d| d.affects_context).unwrap_or(true)
 }
 
 /// Parse on/off/toggle tokens for `/settings feature …`.

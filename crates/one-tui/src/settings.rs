@@ -64,7 +64,11 @@ impl App {
     }
 
     fn compaction_summary(&self) -> String {
-        let auto = if self.compaction_auto { "auto" } else { "manual" };
+        let auto = if self.compaction_auto {
+            "auto"
+        } else {
+            "manual"
+        };
         let thresh = if let Some(n) = self.compaction_threshold {
             if n >= 1000 {
                 format!("{}k", n / 1000)
@@ -644,9 +648,7 @@ impl App {
         if id == "_empty" || id.is_empty() {
             return RunOutcome::Noop;
         }
-        RunOutcome::ConfigOp(ConfigOp::FeatureToggle {
-            id: id.to_string(),
-        })
+        RunOutcome::ConfigOp(ConfigOp::FeatureToggle { id: id.to_string() })
     }
 
     pub(crate) fn confirm_mcp_action(&mut self, id: &str) -> RunOutcome {
@@ -763,9 +765,7 @@ impl App {
                 RunOutcome::Noop
             }
             "hint" => {
-                self.set_notice(
-                    "Over limit → spill to ~/.one/agent/tool-outputs/ (7-day cleanup)",
-                );
+                self.set_notice("Over limit → spill to ~/.one/agent/tool-outputs/ (7-day cleanup)");
                 RunOutcome::Noop
             }
             _ => RunOutcome::Noop,
@@ -930,7 +930,8 @@ impl App {
                     .find(|(k, _)| {
                         let kn = k.trim_start_matches("compat.");
                         kn.eq_ignore_ascii_case(&key)
-                            || kn.replace('_', "")
+                            || kn
+                                .replace('_', "")
                                 .eq_ignore_ascii_case(&key.replace('_', ""))
                     })
                     .map(|(_, v)| v)

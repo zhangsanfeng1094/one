@@ -23,11 +23,9 @@ pub struct FailClosedAskUser;
 #[async_trait]
 impl AskUserHandler for FailClosedAskUser {
     async fn ask(&self, _questions: Vec<Value>) -> std::result::Result<Value, String> {
-        Err(
-            "ask_user requires interactive mode (TUI). \
+        Err("ask_user requires interactive mode (TUI). \
              Re-run without -p / --mode print, or answer in a normal chat turn."
-                .into(),
-        )
+            .into())
     }
 }
 
@@ -120,12 +118,9 @@ impl Tool for AskUserTool {
                     format!("questions[{i}].question required"),
                 ));
             }
-            let opts = q
-                .get("options")
-                .and_then(|v| v.as_array())
-                .ok_or_else(|| {
-                    invalid_args("ask_user", format!("questions[{i}].options required"))
-                })?;
+            let opts = q.get("options").and_then(|v| v.as_array()).ok_or_else(|| {
+                invalid_args("ask_user", format!("questions[{i}].options required"))
+            })?;
             if opts.len() < 2 || opts.len() > 4 {
                 return Err(invalid_args(
                     "ask_user",
@@ -153,10 +148,7 @@ impl Tool for AskUserTool {
 fn format_answers_text(questions: &[Value], answers: &Value) -> String {
     let mut lines = Vec::new();
     for q in questions {
-        let qtext = q
-            .get("question")
-            .and_then(|v| v.as_str())
-            .unwrap_or("?");
+        let qtext = q.get("question").and_then(|v| v.as_str()).unwrap_or("?");
         let ans = answers.get(qtext);
         let rendered = match ans {
             Some(Value::Array(arr)) => arr

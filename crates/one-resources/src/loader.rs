@@ -306,10 +306,7 @@ mod tests {
             Path::new("/tmp/user/create-skill/SKILL.md"),
         )
         .unwrap()];
-        let tmp = std::env::temp_dir().join(format!(
-            "one-merge-builtin-{}",
-            std::process::id()
-        ));
+        let tmp = std::env::temp_dir().join(format!("one-merge-builtin-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 
@@ -325,10 +322,8 @@ mod tests {
     #[tokio::test]
     async fn merge_adds_create_skill_when_missing() {
         let mut skills = Vec::new();
-        let tmp = std::env::temp_dir().join(format!(
-            "one-merge-builtin-add-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("one-merge-builtin-add-{}", std::process::id()));
         let _ = tokio::fs::remove_dir_all(&tmp).await;
         tokio::fs::create_dir_all(&tmp).await.unwrap();
 

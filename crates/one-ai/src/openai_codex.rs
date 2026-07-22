@@ -101,11 +101,7 @@ mod inner {
         }
 
         fn apply_headers(&self, req: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-            let ua = format!(
-                "one ({}/{})",
-                std::env::consts::OS,
-                std::env::consts::ARCH
-            );
+            let ua = format!("one ({}/{})", std::env::consts::OS, std::env::consts::ARCH);
             req.bearer_auth(&self.api_key)
                 .header("chatgpt-account-id", &self.account_id)
                 .header("OpenAI-Beta", "responses=experimental")
@@ -128,8 +124,7 @@ mod inner {
         }
 
         async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-            self.complete_codex(request, false, &mut |_| {}, None)
-                .await
+            self.complete_codex(request, false, &mut |_| {}, None).await
         }
 
         async fn complete_streaming(
@@ -181,9 +176,7 @@ mod inner {
             if !response.status().is_success() {
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
-                return Err(OneError::Provider(format!(
-                    "openai-codex {status}: {text}"
-                )));
+                return Err(OneError::Provider(format!("openai-codex {status}: {text}")));
             }
 
             // Non-stream: parse final JSON (rare for Codex which prefers stream).
@@ -227,10 +220,8 @@ mod inner {
                             "response.reasoning_summary_text.delta"
                             | "response.reasoning_text.delta"
                             | "response.reasoning.delta" => {
-                                if let Some(delta) = value
-                                    .get("delta")
-                                    .and_then(|v| v.as_str())
-                                    .or_else(|| {
+                                if let Some(delta) =
+                                    value.get("delta").and_then(|v| v.as_str()).or_else(|| {
                                         value.pointer("/delta/text").and_then(|v| v.as_str())
                                     })
                                 {
@@ -251,9 +242,8 @@ mod inner {
                                     == Some("function_call")
                                 {
                                     let entry = tool_acc.entry(index).or_default();
-                                    if let Some(id) = item
-                                        .and_then(|i| i.get("call_id"))
-                                        .and_then(|v| v.as_str())
+                                    if let Some(id) =
+                                        item.and_then(|i| i.get("call_id")).and_then(|v| v.as_str())
                                     {
                                         entry.id = id.to_string();
                                     }
@@ -277,11 +267,7 @@ mod inner {
                                     .unwrap_or(0)
                                     as usize;
                                 if let Some(delta) = value.get("delta").and_then(|v| v.as_str()) {
-                                    tool_acc
-                                        .entry(index)
-                                        .or_default()
-                                        .arguments
-                                        .push_str(delta);
+                                    tool_acc.entry(index).or_default().arguments.push_str(delta);
                                 }
                             }
                             "response.function_call_arguments.done" => {
@@ -290,7 +276,8 @@ mod inner {
                                     .and_then(|v| v.as_u64())
                                     .unwrap_or(0)
                                     as usize;
-                                if let Some(args) = value.get("arguments").and_then(|v| v.as_str()) {
+                                if let Some(args) = value.get("arguments").and_then(|v| v.as_str())
+                                {
                                     let entry = tool_acc.entry(index).or_default();
                                     if !args.is_empty() {
                                         entry.arguments = args.to_string();
@@ -308,9 +295,8 @@ mod inner {
                                     == Some("function_call")
                                 {
                                     let entry = tool_acc.entry(index).or_default();
-                                    if let Some(id) = item
-                                        .and_then(|i| i.get("call_id"))
-                                        .and_then(|v| v.as_str())
+                                    if let Some(id) =
+                                        item.and_then(|i| i.get("call_id")).and_then(|v| v.as_str())
                                     {
                                         if !id.is_empty() {
                                             entry.id = id.to_string();
@@ -358,7 +344,8 @@ mod inner {
                                         {
                                             for p in parts {
                                                 let t = p.get("type").and_then(|x| x.as_str());
-                                                if t == Some("output_text") || t == Some("refusal") {
+                                                if t == Some("output_text") || t == Some("refusal")
+                                                {
                                                     if let Some(text) =
                                                         p.get("text").and_then(|x| x.as_str())
                                                     {

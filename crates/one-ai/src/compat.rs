@@ -364,9 +364,10 @@ impl OpenAiCompletionsCompat {
         let is_fireworks = p == "fireworks" || url.contains("api.fireworks.ai");
         let is_cerebras = p == "cerebras" || url.contains("cerebras.ai");
         let is_mistral = p == "mistral" || url.contains("api.mistral.ai");
-        let is_huggingface =
-            p == "huggingface" || p == "hf" || url.contains("api-inference.huggingface")
-                || url.contains("router.huggingface.co");
+        let is_huggingface = p == "huggingface"
+            || p == "hf"
+            || url.contains("api-inference.huggingface")
+            || url.contains("router.huggingface.co");
         let is_lmstudio = p == "lmstudio"
             || p == "lm-studio"
             || url.contains("1234")
@@ -456,8 +457,8 @@ impl OpenAiCompletionsCompat {
             && !is_minimax;
 
         // Local / many OpenAI-compat proxies don't accept `developer` role.
-        let supports_developer_role = is_openrouter_developer
-            || (!is_non_standard && !is_openrouter && !is_vercel_gateway);
+        let supports_developer_role =
+            is_openrouter_developer || (!is_non_standard && !is_openrouter && !is_vercel_gateway);
 
         Self {
             supports_store: Some(!is_non_standard),
@@ -760,12 +761,7 @@ impl ResolvedOpenAiCompat {
             return;
         };
         if let Some(routing) = &self.open_router_routing {
-            if !routing.is_null()
-                && routing
-                    .as_object()
-                    .map(|o| !o.is_empty())
-                    .unwrap_or(true)
-            {
+            if !routing.is_null() && routing.as_object().map(|o| !o.is_empty()).unwrap_or(true) {
                 obj.insert("provider".into(), routing.clone());
             }
         }
@@ -780,10 +776,7 @@ impl ResolvedOpenAiCompat {
                         gateway.insert("order".into(), order.clone());
                     }
                     if !gateway.is_empty() {
-                        obj.insert(
-                            "providerOptions".into(),
-                            json!({ "gateway": gateway }),
-                        );
+                        obj.insert("providerOptions".into(), json!({ "gateway": gateway }));
                     }
                 }
             }
@@ -1081,13 +1074,9 @@ impl CompatConfig {
             self.openai.thinking_format = None;
             return Ok(());
         }
-        self.openai.thinking_format = Some(
-            ThinkingFormat::parse(v).ok_or_else(|| {
-                format!(
-                    "invalid thinkingFormat `{v}` · openai|openrouter|deepseek|together|zai|qwen|…"
-                )
-            })?,
-        );
+        self.openai.thinking_format = Some(ThinkingFormat::parse(v).ok_or_else(|| {
+            format!("invalid thinkingFormat `{v}` · openai|openrouter|deepseek|together|zai|qwen|…")
+        })?);
         Ok(())
     }
 
@@ -1158,7 +1147,10 @@ impl CompatConfig {
 
 /// Normalize UI / models.json key names to snake_case identifiers.
 pub fn normalize_compat_key(key: &str) -> String {
-    let k = key.trim().trim_start_matches("compat.").trim_start_matches("compat_");
+    let k = key
+        .trim()
+        .trim_start_matches("compat.")
+        .trim_start_matches("compat_");
     // camelCase → snake_case
     let mut out = String::new();
     for (i, c) in k.chars().enumerate() {
@@ -1231,10 +1223,7 @@ mod tests {
         );
         assert_eq!(r.thinking_format, ThinkingFormat::Openrouter);
         assert!(r.supports_developer_role); // anthropic/ prefix
-        assert_eq!(
-            r.cache_control_format.as_deref(),
-            Some("anthropic")
-        );
+        assert_eq!(r.cache_control_format.as_deref(), Some("anthropic"));
     }
 
     #[test]

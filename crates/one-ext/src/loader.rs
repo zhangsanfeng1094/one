@@ -7,9 +7,7 @@ use serde::Deserialize;
 
 use crate::builtin::{builtin_by_name, StatusExtension};
 use crate::hooks::{load_hooks, HooksConfig};
-use crate::plugin::{
-    apply_plugin_enablement, discover_plugins, DiscoveredPlugin,
-};
+use crate::plugin::{apply_plugin_enablement, discover_plugins, DiscoveredPlugin};
 use crate::registry::ExtensionRegistryBuilder;
 use crate::runtime::ExtensionRuntime;
 use crate::traits::Extension;
@@ -93,11 +91,7 @@ pub async fn discover_all(cwd: &Path, agent_dir: &Path) -> crate::Result<Discove
     }
 
     let mut plugins = discover_plugins(cwd, agent_dir).await?;
-    apply_plugin_enablement(
-        &mut plugins,
-        &disabled_plugins,
-        enabled_plugins.as_deref(),
-    );
+    apply_plugin_enablement(&mut plugins, &disabled_plugins, enabled_plugins.as_deref());
 
     let mut skill_dirs = Vec::new();
     let mut prompt_dirs = Vec::new();

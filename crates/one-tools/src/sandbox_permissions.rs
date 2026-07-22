@@ -33,13 +33,8 @@ impl SandboxPermissions {
             "use_default" | "default" | "workspace" | "workspace_write" | "workspace-write" => {
                 Some(Self::UseDefault)
             }
-            "require_escalated"
-            | "escalated"
-            | "escalate"
-            | "full_access"
-            | "full-access"
-            | "danger-full-access"
-            | "unsandboxed" => Some(Self::RequireEscalated),
+            "require_escalated" | "escalated" | "escalate" | "full_access" | "full-access"
+            | "danger-full-access" | "unsandboxed" => Some(Self::RequireEscalated),
             // Recognized but not supported — treat as escalate request so we
             // still hit the approval path rather than silently ignoring.
             "with_additional_permissions" | "additional" => Some(Self::RequireEscalated),

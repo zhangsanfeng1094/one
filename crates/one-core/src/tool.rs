@@ -29,18 +29,14 @@ pub struct ToolOutput {
 impl ToolOutput {
     pub fn text(text: impl Into<String>) -> Self {
         Self {
-            content: vec![TextOrImage::Text {
-                text: text.into(),
-            }],
+            content: vec![TextOrImage::Text { text: text.into() }],
             details: None,
         }
     }
 
     pub fn text_with_details(text: impl Into<String>, details: Value) -> Self {
         Self {
-            content: vec![TextOrImage::Text {
-                text: text.into(),
-            }],
+            content: vec![TextOrImage::Text { text: text.into() }],
             details: Some(details),
         }
     }
@@ -154,17 +150,11 @@ pub fn resolve_tool_name(name: &str) -> &str {
         // write
         "write_file" | "Write" | "WriteFile" | "writeFile" | "create_file" => "write",
         // edit
-        "search_replace"
-        | "str_replace"
-        | "StrReplace"
-        | "Edit"
-        | "ApplyPatch"
-        | "replace_in_file"
-        | "multi_edit" => "edit",
+        "search_replace" | "str_replace" | "StrReplace" | "Edit" | "ApplyPatch"
+        | "replace_in_file" | "multi_edit" => "edit",
         // bash
-        "shell" | "Bash" | "Shell" | "run_terminal_cmd" | "run_command" | "execute" | "terminal" => {
-            "bash"
-        }
+        "shell" | "Bash" | "Shell" | "run_terminal_cmd" | "run_command" | "execute"
+        | "terminal" => "bash",
         // find / glob
         "Glob" | "glob" | "glob_file_search" | "find_files" | "list_files_glob" => "find",
         // grep

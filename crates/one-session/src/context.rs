@@ -33,7 +33,11 @@ fn entry_produces_message(entry: &SessionEntry) -> bool {
 ///
 /// Used when writing a compaction: `first_kept_entry_id` must point at the oldest
 /// message that remains after the summary, not the current leaf.
-pub fn first_kept_entry_id(entries: &[SessionEntry], leaf_id: &str, kept_count: usize) -> Option<String> {
+pub fn first_kept_entry_id(
+    entries: &[SessionEntry],
+    leaf_id: &str,
+    kept_count: usize,
+) -> Option<String> {
     if leaf_id.is_empty() || kept_count == 0 {
         return None;
     }

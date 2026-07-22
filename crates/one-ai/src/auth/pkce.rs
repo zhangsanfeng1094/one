@@ -46,9 +46,7 @@ fn fill_random(buf: &mut [u8]) {
         .unwrap_or(0);
     let mut x = seed as u64 ^ std::process::id() as u64;
     for b in buf.iter_mut() {
-        x = x
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1);
+        x = x.wrapping_mul(6364136223846793005).wrapping_add(1);
         *b = (x >> 33) as u8;
     }
 }

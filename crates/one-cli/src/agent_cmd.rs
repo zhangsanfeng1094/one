@@ -21,9 +21,7 @@ pub enum AgentCommands {
         name: String,
     },
     /// Summarize tools + prompt for a preset.
-    Inspect {
-        name: String,
-    },
+    Inspect { name: String },
 }
 
 #[derive(Debug, Clone, Args)]
@@ -76,7 +74,10 @@ pub async fn run_agent_command(
     cmd: AgentCommands,
     global: &Cli,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let cwd = global.cwd.canonicalize().unwrap_or_else(|_| global.cwd.clone());
+    let cwd = global
+        .cwd
+        .canonicalize()
+        .unwrap_or_else(|_| global.cwd.clone());
     match cmd {
         AgentCommands::Dump { name } => {
             let json = presets::dump_preset(&name, &cwd)?;
@@ -135,7 +136,10 @@ pub async fn run_run_cli(
     run: RunCli,
     global: &Cli,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
-    let cwd = global.cwd.canonicalize().unwrap_or_else(|_| global.cwd.clone());
+    let cwd = global
+        .cwd
+        .canonicalize()
+        .unwrap_or_else(|_| global.cwd.clone());
     let prompt = run
         .prompt
         .or_else(|| global.print.clone())
@@ -182,10 +186,7 @@ async fn execute_run(
     if let Some(iso) = crate::protocol::IsolationMode::parse(isolation) {
         spec.isolation = iso;
     } else if !isolation.is_empty() && isolation != "none" {
-        return Err(format!(
-            "unknown --isolation `{isolation}` (use none|worktree)"
-        )
-        .into());
+        return Err(format!("unknown --isolation `{isolation}` (use none|worktree)").into());
     }
     let mut req = RunRequest::new(spec, prompt);
     req.session.mode = SessionMode::Ephemeral;

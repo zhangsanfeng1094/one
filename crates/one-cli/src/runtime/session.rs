@@ -82,10 +82,7 @@ impl AppRuntime {
         Ok(SessionManager::list(&self.cwd).await?)
     }
 
-    pub async fn set_session_name(
-        &mut self,
-        name: &str,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    pub async fn set_session_name(&mut self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(session) = &mut self.session {
             session.append_session_info(name).await?;
         }
@@ -101,9 +98,7 @@ impl AppRuntime {
             agent.config.thinking_level = level;
         }
         if let Some(session) = &mut self.session {
-            session
-                .append_thinking_level_change(level.as_str())
-                .await?;
+            session.append_thinking_level_change(level.as_str()).await?;
         }
         Ok(())
     }

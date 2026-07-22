@@ -36,7 +36,9 @@ fn branch_switches_context_path() {
     manager.branch(&branch_b.id).expect("branch b");
     let ctx = manager.build_session_context();
     assert_eq!(ctx.messages.len(), 2);
-    assert!(matches!(ctx.messages.last(), Some(AgentMessage::Assistant(a)) if a.content.iter().any(|b| matches!(b, one_core::message::ContentBlock::Text { text } if text == "b"))));
+    assert!(
+        matches!(ctx.messages.last(), Some(AgentMessage::Assistant(a)) if a.content.iter().any(|b| matches!(b, one_core::message::ContentBlock::Text { text } if text == "b")))
+    );
 }
 
 #[test]

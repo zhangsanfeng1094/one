@@ -5,9 +5,7 @@ use one_core::error::Result;
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
-use crate::tasks::{
-    format_task_list, format_task_output, BackgroundTaskRegistry, TaskState,
-};
+use crate::tasks::{format_task_list, format_task_output, BackgroundTaskRegistry, TaskState};
 
 const DEFAULT_MAX_CHARS: usize = 50_000;
 
@@ -61,10 +59,7 @@ before returning a snapshot (0 or omit = return immediately)."
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
 
-        let timeout_secs = call
-            .arguments
-            .get("timeout_secs")
-            .and_then(|v| v.as_u64());
+        let timeout_secs = call.arguments.get("timeout_secs").and_then(|v| v.as_u64());
 
         let max_chars = call
             .arguments

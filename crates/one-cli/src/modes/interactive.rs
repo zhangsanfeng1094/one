@@ -167,13 +167,7 @@ fn refresh_agents_rows(app: &mut App, runtime: &AppRuntime) {
                 .map(|t| format!(" · turns={t}"))
                 .unwrap_or_default();
             let label = format!("{} [{}]{turns}", e.name, e.source.as_str());
-            (
-                e.name,
-                label,
-                detail,
-                path,
-                e.source.as_str().to_string(),
-            )
+            (e.name, label, detail, path, e.source.as_str().to_string())
         })
         .collect();
     app.set_agents_rows(rows, project_s, user_s);
@@ -219,22 +213,22 @@ fn refresh_mcp_rows(app: &mut App, runtime: &AppRuntime) {
 }
 
 fn refresh_mcp_import_rows(app: &mut App, runtime: &AppRuntime) {
-    let rows: Vec<(String, String, String, bool)> = match runtime.mcp.list_import_candidates(&runtime.cwd)
-    {
-        Ok(cands) => cands
-            .into_iter()
-            .map(|c| {
-                let transport = if c.server.is_http() { "http" } else { "stdio" };
-                let detail = format!("{} · {transport}", c.source.as_str());
-                let label = c.name.clone();
-                (c.name, label, detail, c.already_owned)
-            })
-            .collect(),
-        Err(e) => {
-            app.set_notice(format!("mcp scan: {e}"));
-            Vec::new()
-        }
-    };
+    let rows: Vec<(String, String, String, bool)> =
+        match runtime.mcp.list_import_candidates(&runtime.cwd) {
+            Ok(cands) => cands
+                .into_iter()
+                .map(|c| {
+                    let transport = if c.server.is_http() { "http" } else { "stdio" };
+                    let detail = format!("{} · {transport}", c.source.as_str());
+                    let label = c.name.clone();
+                    (c.name, label, detail, c.already_owned)
+                })
+                .collect(),
+            Err(e) => {
+                app.set_notice(format!("mcp scan: {e}"));
+                Vec::new()
+            }
+        };
     app.set_mcp_import_rows(rows);
 }
 
@@ -520,10 +514,7 @@ async fn apply_config_op(
             }
         }
         ConfigOp::McpImport { names, force } => {
-            match runtime
-                .import_mcp_from_agents(&names, None, force)
-                .await
-            {
+            match runtime.import_mcp_from_agents(&names, None, force).await {
                 Ok(report) => {
                     refresh_mcp_rows(app, runtime);
                     let mut parts = Vec::new();
@@ -721,14 +712,8 @@ pub async fn run_interactive(
                     }
                     SlashAction::LoginLogout { is_login, args } => {
                         if is_login {
-                            handle_login_slash(
-                                runtime,
-                                providers,
-                                &mut app,
-                                &mut terminal,
-                                &args,
-                            )
-                            .await?;
+                            handle_login_slash(runtime, providers, &mut app, &mut terminal, &args)
+                                .await?;
                         } else {
                             handle_logout_slash(providers, &mut app, &args).await?;
                         }
@@ -851,11 +836,7 @@ async fn refresh_usage(app: &mut App, runtime: &AppRuntime) {
     app.set_usage_io(usage.input_tokens, usage.output_tokens);
     app.set_usage_cache(usage.cache_read_tokens, usage.cache_write_tokens);
     // Rough blended cost (USD / 1M tokens) — cache read/write discounted when known.
-    let cost = estimate_cost_usd(
-        &app.current_provider,
-        &app.current_model,
-        &usage,
-    );
+    let cost = estimate_cost_usd(&app.current_provider, &app.current_model, &usage);
     app.set_usage_cost_usd(cost);
 }
 
@@ -904,8 +885,7 @@ fn estimate_cost_usd(provider: &str, model: &str, usage: &one_core::TokenUsage) 
     // OpenRouter Claude (we inject cache_control so creation tokens appear).
     let anthropic_style = provider == "anthropic"
         || usage.cache_write_tokens > 0
-        || (provider == "openrouter"
-            && (model.contains("anthropic/") || model.contains("claude")));
+        || (provider == "openrouter" && (model.contains("anthropic/") || model.contains("claude")));
 
     let in_cost = if anthropic_style {
         let write_rate = in_rate * 1.25;
@@ -973,9 +953,7 @@ async fn run_turn_streaming(
     runtime.maybe_compact(provider.as_ref(), false).await?;
     let _ = runtime
         .extensions
-        .emit(&one_ext::ExtensionEvent::UserPromptSubmit {
-            text: text.clone(),
-        })
+        .emit(&one_ext::ExtensionEvent::UserPromptSubmit { text: text.clone() })
         .await;
 
     let mut before = agent.lock().await.messages.len();
@@ -1435,10 +1413,7 @@ async fn handle_slash(
                                 .as_ref()
                                 .map(|p| p.display().to_string())
                                 .unwrap_or_else(|| "builtin".into());
-                            (
-                                format!("{} [{}]", e.name, e.source.as_str()),
-                                path,
-                            )
+                            (format!("{} [{}]", e.name, e.source.as_str()), path)
                         })
                         .collect();
                     if rows.is_empty() {
@@ -1780,7 +1755,9 @@ async fn handle_slash(
                 return Ok(SlashAction::Consumed);
             }
             // /settings feature <id> <on|off|toggle>
-            if parts.get(1).is_some_and(|p| p.eq_ignore_ascii_case("feature"))
+            if parts
+                .get(1)
+                .is_some_and(|p| p.eq_ignore_ascii_case("feature"))
                 && parts.len() >= 4
             {
                 let id = parts[2];
@@ -1821,8 +1798,7 @@ async fn handle_slash(
                         .map(|(_, rest)| rest.trim())
                         .unwrap_or("");
                     let s = crate::settings::load();
-                    let current =
-                        crate::runtime::FeatureState::from_settings(&s).is_enabled(id);
+                    let current = crate::runtime::FeatureState::from_settings(&s).is_enabled(id);
                     match crate::runtime::features::parse_bool_token(&value, current) {
                         Ok(enabled) => match runtime.set_feature_enabled(id, enabled).await {
                             Ok((on, applied)) => {
@@ -2053,10 +2029,7 @@ fn login_provider_rows() -> Vec<(String, String, String, bool)> {
     one_ai::oauth_provider_catalog()
         .iter()
         .map(|p| {
-            let logged_in = storage
-                .as_ref()
-                .map(|s| s.has_auth(p.id))
-                .unwrap_or(false);
+            let logged_in = storage.as_ref().map(|s| s.has_auth(p.id)).unwrap_or(false);
             (
                 p.id.to_string(),
                 p.name.to_string(),

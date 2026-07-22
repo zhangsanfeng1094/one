@@ -77,10 +77,8 @@ mod tests {
 
     #[tokio::test]
     async fn materialize_and_load() {
-        let tmp = std::env::temp_dir().join(format!(
-            "one-builtin-skills-test-{}",
-            std::process::id()
-        ));
+        let tmp =
+            std::env::temp_dir().join(format!("one-builtin-skills-test-{}", std::process::id()));
         let _ = fs::remove_dir_all(&tmp).await;
         fs::create_dir_all(&tmp).await.unwrap();
 

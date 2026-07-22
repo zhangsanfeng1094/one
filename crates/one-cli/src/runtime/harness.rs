@@ -65,11 +65,7 @@ pub struct RunControl {
 }
 
 /// Run one agent (root or sub) according to [`RunRequest`].
-pub async fn run(
-    req: RunRequest,
-    provider: &dyn LlmProvider,
-    opts: &HarnessOptions,
-) -> RunResult {
+pub async fn run(req: RunRequest, provider: &dyn LlmProvider, opts: &HarnessOptions) -> RunResult {
     run_with_control(req, provider, opts, RunControl::default()).await
 }
 
@@ -90,12 +86,13 @@ pub async fn run_with_control(
     let wt_handle = match apply_isolation(&mut req, &mut effective_opts) {
         Ok(h) => h,
         Err(e) => {
-            return RunResult::failure(e, t0.elapsed().as_millis() as u64)
-                .with_agent_echo(AgentRunEcho {
+            return RunResult::failure(e, t0.elapsed().as_millis() as u64).with_agent_echo(
+                AgentRunEcho {
                     name: Some(agent_name),
                     depth: Some(depth),
                     ..Default::default()
-                });
+                },
+            );
         }
     };
 
@@ -105,24 +102,24 @@ pub async fn run_with_control(
             if let Some(ref h) = wt_handle {
                 let _ = super::worktree::WorktreeManager::remove(h, true);
             }
-            return RunResult::failure(e, t0.elapsed().as_millis() as u64)
-                .with_agent_echo(AgentRunEcho {
+            return RunResult::failure(e, t0.elapsed().as_millis() as u64).with_agent_echo(
+                AgentRunEcho {
                     name: Some(agent_name),
                     depth: Some(depth),
                     ..Default::default()
-                });
+                },
+            );
         }
     };
     let tool_names: Vec<String> = tools.iter().map(|t| t.definition().name).collect();
 
     // Shared-cwd mutators serialize; worktree runs may write in parallel.
-    let _write_permit = if wt_handle.is_none()
-        && super::provider_limit::tools_need_write_lock(&tool_names)
-    {
-        Some(super::provider_limit::acquire_write_permit().await)
-    } else {
-        None
-    };
+    let _write_permit =
+        if wt_handle.is_none() && super::provider_limit::tools_need_write_lock(&tool_names) {
+            Some(super::provider_limit::acquire_write_permit().await)
+        } else {
+            None
+        };
 
     let system_prompt = resolve_system_prompt(&req.agent);
     let max_turns = req.agent.max_turns.unwrap_or(16);
@@ -387,10 +384,8 @@ fn build_tools(
     // Named explore (or builtin research face): force Explore catalog when tools
     // look like default read_only — keeps hard whitelist even if deny list varies.
     let prefer_explore = spec.display_name() == "explore"
-        || (matches!(
-            spec.tools.profile,
-            crate::protocol::ToolProfile::ReadOnly
-        ) && spec.tools.allow.is_empty());
+        || (matches!(spec.tools.profile, crate::protocol::ToolProfile::ReadOnly)
+            && spec.tools.allow.is_empty());
 
     let ctx = harness_build_context(policy, opts.auto_approve);
     materialize_tools(&spec.tools, &registry, &ctx, prefer_explore)
@@ -447,10 +442,8 @@ pub fn child_request(
 /// Resolved tool names for inspect/dump without constructing tools.
 pub fn preview_tool_names(spec: &AgentSpec) -> Vec<String> {
     let prefer_explore = spec.display_name() == "explore"
-        || (matches!(
-            spec.tools.profile,
-            crate::protocol::ToolProfile::ReadOnly
-        ) && spec.tools.allow.is_empty());
+        || (matches!(spec.tools.profile, crate::protocol::ToolProfile::ReadOnly)
+            && spec.tools.allow.is_empty());
     resolve_names(&spec.tools, prefer_explore)
 }
 

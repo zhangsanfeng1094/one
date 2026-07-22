@@ -27,7 +27,10 @@ pub fn explore_tools(policy: PathPolicy) -> Vec<Arc<dyn Tool>> {
 
 /// Names actually registered (order may match construction).
 pub fn explore_tool_names() -> Vec<String> {
-    EXPLORE_TOOL_NAMES.iter().map(|s| (*s).to_string()).collect()
+    EXPLORE_TOOL_NAMES
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect()
 }
 
 #[cfg(test)]
@@ -39,7 +42,15 @@ mod tests {
     fn explore_has_no_write_or_bash() {
         let tools = explore_tools(PathPolicy::workspace(PathBuf::from("/tmp")));
         let names: Vec<_> = tools.iter().map(|t| t.definition().name).collect();
-        for forbidden in ["write", "edit", "bash", "bash_output", "bash_kill", "ask_user", "task"] {
+        for forbidden in [
+            "write",
+            "edit",
+            "bash",
+            "bash_output",
+            "bash_kill",
+            "ask_user",
+            "task",
+        ] {
             assert!(
                 !names.iter().any(|n| n == forbidden),
                 "explore must not include {forbidden}, got {names:?}"

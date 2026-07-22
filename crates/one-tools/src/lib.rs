@@ -18,11 +18,11 @@ pub mod sandbox_permissions;
 pub mod tasks;
 pub mod tool_args;
 pub mod truncate;
-pub mod write;
 #[cfg(feature = "network")]
 pub mod web_fetch;
 #[cfg(feature = "network")]
 pub mod web_search;
+pub mod write;
 
 use std::sync::Arc;
 
@@ -43,33 +43,33 @@ pub use permissions::{
     evaluate as evaluate_permissions, suggested_command_prefix, suggested_command_prefix_from_cmd,
     PermissionRule, PermissionRules, PermissionVerdict, RuleAction,
 };
-pub use sandbox_permissions::{
-    justification_of, looks_like_sandbox_denial, requires_escalation, sandbox_permissions_of,
-    SandboxPermissions,
-};
 pub use plan::{
     plan_mode_system_overlay, plan_mode_tools, plan_mode_tools_with_policy, ExitPlanModeTool,
     PlanEditTool, PlanExitState, PlanWriteTool,
 };
 pub use read::ReadTool;
-pub use tasks::BackgroundTaskRegistry;
-pub use truncate::{
-    apply_head_default, apply_tail_default, cleanup_tool_outputs, cleanup_tool_outputs_before,
-    format_size, present_file_read, present_tool_output, present_tool_output_with,
-    set_tool_output_limits, spill_full_output, tool_output_limits, tool_outputs_root, truncate_head,
-    truncate_line, truncate_tail, CleanupReport, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES,
-    GREP_MAX_LINE_LENGTH, TOOL_OUTPUT_RETENTION_DAYS, PreviewStyle, PresentedOutput,
-    ToolOutputLimits,
-};
-pub use write::WriteTool;
-#[cfg(feature = "network")]
-pub use web_fetch::WebFetchTool;
-#[cfg(feature = "network")]
-pub use web_search::WebSearchTool;
 pub use registry::{
     materialize_coding, materialize_explore, materialize_read_only, resolve_tool_names,
     BuiltinToolProfile, ToolBuildContext, ToolRegistry, UnknownToolError,
 };
+pub use sandbox_permissions::{
+    justification_of, looks_like_sandbox_denial, requires_escalation, sandbox_permissions_of,
+    SandboxPermissions,
+};
+pub use tasks::BackgroundTaskRegistry;
+pub use truncate::{
+    apply_head_default, apply_tail_default, cleanup_tool_outputs, cleanup_tool_outputs_before,
+    format_size, present_file_read, present_tool_output, present_tool_output_with,
+    set_tool_output_limits, spill_full_output, tool_output_limits, tool_outputs_root,
+    truncate_head, truncate_line, truncate_tail, CleanupReport, PresentedOutput, PreviewStyle,
+    ToolOutputLimits, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH,
+    TOOL_OUTPUT_RETENTION_DAYS,
+};
+#[cfg(feature = "network")]
+pub use web_fetch::WebFetchTool;
+#[cfg(feature = "network")]
+pub use web_search::WebSearchTool;
+pub use write::WriteTool;
 
 /// Options for building the default coding tool set.
 #[derive(Clone)]
@@ -128,7 +128,10 @@ pub fn coding_tools(cwd: std::path::PathBuf) -> Vec<Arc<dyn Tool>> {
     coding_tools_with_approve(cwd, true)
 }
 
-pub fn coding_tools_with_approve(cwd: std::path::PathBuf, auto_approve: bool) -> Vec<Arc<dyn Tool>> {
+pub fn coding_tools_with_approve(
+    cwd: std::path::PathBuf,
+    auto_approve: bool,
+) -> Vec<Arc<dyn Tool>> {
     let registry = Arc::new(BackgroundTaskRegistry::new());
     coding_tools_with_registry(cwd, auto_approve, registry)
 }

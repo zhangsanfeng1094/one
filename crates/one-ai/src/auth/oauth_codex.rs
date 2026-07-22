@@ -77,7 +77,9 @@ async fn login_inner(interaction: &mut dyn AuthInteraction) -> Result<OAuthCrede
 }
 
 /// Browser-only login (skips method select) — useful for CLI flags.
-pub async fn login_browser(interaction: &mut dyn AuthInteraction) -> Result<OAuthCredential, String> {
+pub async fn login_browser(
+    interaction: &mut dyn AuthInteraction,
+) -> Result<OAuthCredential, String> {
     #[cfg(not(feature = "http-providers"))]
     {
         let _ = interaction;
@@ -205,9 +207,7 @@ async fn login_browser_inner(
 }
 
 #[cfg(feature = "http-providers")]
-async fn wait_callback(
-    rx: mpsc::Receiver<Result<String, String>>,
-) -> Result<String, String> {
+async fn wait_callback(rx: mpsc::Receiver<Result<String, String>>) -> Result<String, String> {
     loop {
         match rx.try_recv() {
             Ok(result) => return result,
@@ -332,17 +332,15 @@ async fn login_device_code_inner(
             continue;
         }
 
-        let error_code = serde_json::from_str::<Value>(&body)
-            .ok()
-            .and_then(|j| {
-                let err = j.get("error")?;
-                if let Some(s) = err.as_str() {
-                    return Some(s.to_string());
-                }
-                err.get("code")
-                    .and_then(|c| c.as_str())
-                    .map(|s| s.to_string())
-            });
+        let error_code = serde_json::from_str::<Value>(&body).ok().and_then(|j| {
+            let err = j.get("error")?;
+            if let Some(s) = err.as_str() {
+                return Some(s.to_string());
+            }
+            err.get("code")
+                .and_then(|c| c.as_str())
+                .map(|s| s.to_string())
+        });
 
         match error_code.as_deref() {
             Some("deviceauth_authorization_pending") | None if status == 400 => {
@@ -634,9 +632,7 @@ fn start_callback_server(
         )));
         e.to_string()
     })?;
-    listener
-        .set_nonblocking(true)
-        .map_err(|e| e.to_string())?;
+    listener.set_nonblocking(true).map_err(|e| e.to_string())?;
 
     let deadline = SystemTime::now() + Duration::from_secs(DEVICE_CODE_TIMEOUT_SECS);
     loop {
@@ -706,8 +702,7 @@ fn handle_callback_stream(
         let _ = tx.send(Err("Missing authorization code".into()));
         return Ok(());
     };
-    let body =
-        oauth_success_html("OpenAI authentication completed. You can close this window.");
+    let body = oauth_success_html("OpenAI authentication completed. You can close this window.");
     let _ = write_html(&mut stream, 200, &body);
     let _ = tx.send(Ok(code));
     Ok(())
@@ -783,5 +778,3 @@ fn html_escape(s: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
 }
-
-

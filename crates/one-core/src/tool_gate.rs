@@ -26,13 +26,7 @@ pub trait ToolGate: Send + Sync {
     async fn check(&self, call: &ToolCall) -> ToolGateDecision;
 
     /// Post-tool observe hook (audit, metrics, extension after_tool). Default no-op.
-    async fn after_tool(
-        &self,
-        _call: &ToolCall,
-        _output: &ToolOutput,
-        _is_error: bool,
-    ) {
-    }
+    async fn after_tool(&self, _call: &ToolCall, _output: &ToolOutput, _is_error: bool) {}
 }
 
 /// Always-allow gate (tests / full automation with other sandboxes).

@@ -10,8 +10,8 @@ pub mod prompt_history;
 pub mod share;
 
 pub use context::{
-    SessionContext, build_context_entries, build_session_context, context_message_entries,
-    first_kept_entry_id,
+    build_context_entries, build_session_context, context_message_entries, first_kept_entry_id,
+    SessionContext,
 };
 pub use entries::*;
 pub use error::{Result, SessionError};

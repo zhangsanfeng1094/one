@@ -157,12 +157,9 @@ impl AppRuntime {
 
     /// Short notice for UI when feature changes need `/new`.
     pub fn features_pending_notice(&self) -> Option<String> {
-        self.pending_features.as_ref().map(|p| {
-            format!(
-                "features pending ({}) · /new to apply",
-                p.fingerprint()
-            )
-        })
+        self.pending_features
+            .as_ref()
+            .map(|p| format!("features pending ({}) · /new to apply", p.fingerprint()))
     }
 
     fn can_spawn_policy(&self) -> bool {

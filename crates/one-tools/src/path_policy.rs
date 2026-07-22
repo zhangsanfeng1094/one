@@ -381,9 +381,7 @@ mod tests {
     fn denies_absolute_outside_workspace() {
         let dir = temp_dir();
         let policy = PathPolicy::workspace(dir.clone());
-        let err = policy
-            .resolve("/etc/passwd", AccessKind::Read)
-            .unwrap_err();
+        let err = policy.resolve("/etc/passwd", AccessKind::Read).unwrap_err();
         assert!(err.contains("outside workspace"), "{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -426,10 +424,7 @@ mod tests {
     #[test]
     fn allowed_file_outside_workspace() {
         let dir = temp_dir();
-        let plan = std::env::temp_dir().join(format!(
-            "one-plan-allow-{}.md",
-            std::process::id()
-        ));
+        let plan = std::env::temp_dir().join(format!("one-plan-allow-{}.md", std::process::id()));
         std::fs::write(&plan, "# plan").unwrap();
         let policy = PathPolicy::workspace(dir.clone()).with_allowed_file(plan.clone());
         let resolved = policy

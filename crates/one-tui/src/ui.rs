@@ -591,9 +591,7 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         FloatKind::SettingsModelAdd => " ↑/↓ Fields  ·  Enter Edit/Save  ·  Esc Back ",
         FloatKind::Skills => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Close ",
         FloatKind::Agents => " ↑/↓ Navigate  ·  Enter details/path  ·  Esc Close ",
-        FloatKind::Features => {
-            " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Back  ·  ctx needs /new "
-        }
+        FloatKind::Features => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Back  ·  ctx needs /new ",
         FloatKind::Mcp => " ↑/↓  ·  Enter  ·  Import  ·  Esc ",
         FloatKind::McpImport => " ↑/↓  ·  Enter import  ·  Esc back ",
         FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
@@ -910,11 +908,7 @@ fn highlight_line_range(line: &Line<'static>, char_lo: usize, char_hi: usize) ->
     if char_lo == 0 && char_hi == usize::MAX {
         return highlight_line_full(line);
     }
-    let plain: String = line
-        .spans
-        .iter()
-        .map(|s| s.content.as_ref())
-        .collect();
+    let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
     let n = plain.chars().count();
     let lo = char_lo.min(n);
     let hi = if char_hi == usize::MAX {
@@ -1164,7 +1158,10 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
     ]));
     lines.push(tip_line("Shift+Tab", "Plan ↔ Build"));
     lines.push(tip_line("Ctrl+J", "newline"));
-    lines.push(tip_line("Ctrl+V", "paste clipboard image (Ctrl+Alt+V on WSL)"));
+    lines.push(tip_line(
+        "Ctrl+V",
+        "paste clipboard image (Ctrl+Alt+V on WSL)",
+    ));
     lines.push(tip_line("Esc Esc", "rewind last turn"));
     lines.push(tip_line("/resume", "past sessions"));
     lines.push(blank());
@@ -1961,10 +1958,10 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn mcp_chip_style(kind: u8) -> Style {
     match kind {
-        1 => Theme::status().fg(Theme::INFO),            // loading
-        2 => Theme::status_faint(),                      // all ok — quiet
-        3 => Theme::status().fg(Theme::WARNING),         // partial
-        4 => Theme::status().fg(Theme::ERROR),           // error
+        1 => Theme::status().fg(Theme::INFO),    // loading
+        2 => Theme::status_faint(),              // all ok — quiet
+        3 => Theme::status().fg(Theme::WARNING), // partial
+        4 => Theme::status().fg(Theme::ERROR),   // error
         _ => Theme::status_faint(),
     }
 }
@@ -2456,11 +2453,7 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         let approx = if app.usage_tokens_estimated { "~" } else { "" };
         let usage = if app.context_window > 0 {
             let pct = (app.usage_tokens * 100) / app.context_window.max(1);
-            format!(
-                "{approx}{} tok {}%  ",
-                format_tokens(app.usage_tokens),
-                pct
-            )
+            format!("{approx}{} tok {}%  ", format_tokens(app.usage_tokens), pct)
         } else {
             format!("{approx}{} tok  ", format_tokens(app.usage_tokens))
         };

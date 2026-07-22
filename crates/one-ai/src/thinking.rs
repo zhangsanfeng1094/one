@@ -37,19 +37,13 @@ pub fn apply_chat_thinking(body: &mut Value, level: ThinkingLevel, wire: Thinkin
             obj.insert("reasoning_effort".into(), json!(effort));
         }
         ThinkingWire::OpenRouter => {
-            obj.insert(
-                "reasoning".into(),
-                json!({ "effort": effort }),
-            );
+            obj.insert("reasoning".into(), json!({ "effort": effort }));
             // Ask OpenRouter to surface reasoning when the model supports it.
             obj.insert("include_reasoning".into(), json!(true));
         }
         ThinkingWire::Auto => {
             obj.insert("reasoning_effort".into(), json!(effort));
-            obj.insert(
-                "reasoning".into(),
-                json!({ "effort": effort }),
-            );
+            obj.insert("reasoning".into(), json!({ "effort": effort }));
         }
     }
 }
@@ -100,9 +94,9 @@ pub fn thinking_text(content: &[ContentBlock]) -> String {
     content
         .iter()
         .filter_map(|b| match b {
-            ContentBlock::Thinking { thinking, redacted, .. } if !redacted => {
-                Some(thinking.as_str())
-            }
+            ContentBlock::Thinking {
+                thinking, redacted, ..
+            } if !redacted => Some(thinking.as_str()),
             _ => None,
         })
         .collect::<Vec<_>>()
@@ -113,8 +107,7 @@ pub fn thinking_text(content: &[ContentBlock]) -> String {
 pub fn first_thinking_signature(content: &[ContentBlock]) -> Option<&str> {
     content.iter().find_map(|b| match b {
         ContentBlock::Thinking {
-            signature: Some(s),
-            ..
+            signature: Some(s), ..
         } if !s.is_empty() => Some(s.as_str()),
         _ => None,
     })
@@ -128,7 +121,11 @@ mod tests {
     #[test]
     fn chat_openai_wire() {
         let mut body = json!({ "model": "x" });
-        apply_chat_thinking(&mut body, ThinkingLevel::High, ThinkingWire::ReasoningEffort);
+        apply_chat_thinking(
+            &mut body,
+            ThinkingLevel::High,
+            ThinkingWire::ReasoningEffort,
+        );
         assert_eq!(body["reasoning_effort"], "high");
         assert!(body.get("reasoning").is_none());
     }

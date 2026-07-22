@@ -28,8 +28,11 @@ impl AppRuntime {
         {
             let mut agent = self.agent.lock().await;
             agent.set_tools(tools);
-            agent.config.system_prompt =
-                format!("{}{}", self.base_system_prompt, plan_mode_system_overlay(path));
+            agent.config.system_prompt = format!(
+                "{}{}",
+                self.base_system_prompt,
+                plan_mode_system_overlay(path)
+            );
         }
         Ok(())
     }
@@ -51,11 +54,7 @@ impl AppRuntime {
         }
         // Seed empty plan file so path is stable and readable.
         if !path.exists() {
-            tokio::fs::write(
-                &path,
-                "# Plan\n\n_Write the implementation plan here._\n",
-            )
-            .await?;
+            tokio::fs::write(&path, "# Plan\n\n_Write the implementation plan here._\n").await?;
         }
 
         {

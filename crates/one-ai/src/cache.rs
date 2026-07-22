@@ -59,10 +59,7 @@ pub fn normalize_content_to_blocks(content: &mut Value) {
 /// string for Chat Completions (and most OpenAI-compat proxies).
 pub fn stabilize_messages_for_cache(messages: &mut [Value]) {
     for message in messages.iter_mut() {
-        let role = message
-            .get("role")
-            .and_then(|r| r.as_str())
-            .unwrap_or("");
+        let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
         if role == "tool" {
             continue;
         }
@@ -106,10 +103,7 @@ pub fn attach_cache_control_to_content(content: &mut Value, cache: &Value) -> bo
 
 /// Attach `cache_control` to a message object's `content` field.
 pub fn attach_cache_control_to_message(message: &mut Value, cache: &Value) -> bool {
-    let role = message
-        .get("role")
-        .and_then(|r| r.as_str())
-        .unwrap_or("");
+    let role = message.get("role").and_then(|r| r.as_str()).unwrap_or("");
     // OpenAI tool results are string-only; converting them to blocks breaks the API
     // and is not a valid Anthropic `tool_result` block either (wrong envelope).
     if role == "tool" {

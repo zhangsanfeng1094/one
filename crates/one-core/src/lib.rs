@@ -14,7 +14,6 @@ pub use agent::{
     Agent, AgentConfig, CompletionRequest, CompletionResponse, LlmProvider, ThinkingLevel,
     TokenUsage, TraceRunMeta,
 };
-pub use streaming::{race_abort, wait_until_aborted, StreamEvent, ABORT_POLL_INTERVAL};
 pub use compaction::{
     compact_messages, estimate_tokens, extractive_summary, is_context_overflow_error,
     prune_old_tool_outputs, should_compact, should_compact_tokens, split_for_compaction,
@@ -27,6 +26,7 @@ pub use error::{OneError, Result};
 pub use events::AgentEvent;
 pub use hooks::{AgentHooks, NoopHooks};
 pub use message::{AgentMessage, AssistantMessage, StopReason, ToolResultMessage, UserMessage};
+pub use streaming::{race_abort, wait_until_aborted, StreamEvent, ABORT_POLL_INTERVAL};
 pub use tool::{resolve_tool_name, Tool, ToolCall, ToolDefinition, ToolOutput};
 pub use tool_gate::{AllowAllGate, ToolGate, ToolGateDecision};
 pub use trace::{

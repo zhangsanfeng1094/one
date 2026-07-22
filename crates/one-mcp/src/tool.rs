@@ -7,9 +7,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use one_core::tool::{tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use one_core::Result as CoreResult;
-use one_tools::{
-    present_tool_output_with, tool_output_limits, PreviewStyle, ToolOutputLimits,
-};
+use one_tools::{present_tool_output_with, tool_output_limits, PreviewStyle, ToolOutputLimits};
 use rmcp::model::{CallToolRequestParams, ContentBlock};
 use rmcp::service::ServerSink;
 use serde_json::{json, Value};
@@ -111,10 +109,7 @@ impl Tool for McpTool {
             Err(_) => {
                 return Err(tool_error(
                     &self.public_name,
-                    format!(
-                        "MCP call timed out after {}s",
-                        timeout.as_secs()
-                    ),
+                    format!("MCP call timed out after {}s", timeout.as_secs()),
                 ));
             }
         };

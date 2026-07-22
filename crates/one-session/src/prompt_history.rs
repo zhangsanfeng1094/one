@@ -12,9 +12,9 @@ use std::path::{Path, PathBuf};
 
 use one_core::message::AgentMessage;
 
+use crate::entries::SessionEntry;
 use crate::manager::SessionManager;
 use crate::paths::session_dir_for_cwd;
-use crate::entries::SessionEntry;
 
 const HISTORY_FILE: &str = "prompt_history.jsonl";
 const MAX_ENTRIES: usize = 500;
@@ -42,8 +42,7 @@ fn load_from_path(path: &Path) -> Vec<String> {
             continue;
         }
         // Prefer JSON string; fall back to raw line for hand-edited files.
-        let text = serde_json::from_str::<String>(line)
-            .unwrap_or_else(|_| line.to_string());
+        let text = serde_json::from_str::<String>(line).unwrap_or_else(|_| line.to_string());
         let text = text.trim();
         if text.is_empty() {
             continue;
@@ -209,7 +208,10 @@ mod tests {
         writeln!(file, "\"a\"").unwrap();
         writeln!(file, "\"b\"").unwrap();
         drop(file);
-        assert_eq!(load_from_path(&path), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            load_from_path(&path),
+            vec!["a".to_string(), "b".to_string()]
+        );
         let _ = fs::remove_file(&path);
     }
 }

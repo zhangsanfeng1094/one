@@ -3,7 +3,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub enum ContentBlock {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// Extended reasoning / chain-of-thought (provider-agnostic).
     ///
     /// `signature` is an opaque multi-turn handoff blob (Anthropic thinking
@@ -87,7 +89,9 @@ pub enum UserContent {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum TextOrImage {
-    Text { text: String },
+    Text {
+        text: String,
+    },
     /// Local image file. Session stores path only; providers read → base64 at request time.
     Image {
         mime_type: String,
@@ -217,9 +221,9 @@ impl UserContent {
     pub fn has_images(&self) -> bool {
         match self {
             UserContent::Text(_) => false,
-            UserContent::Blocks(blocks) => {
-                blocks.iter().any(|b| matches!(b, TextOrImage::Image { .. }))
-            }
+            UserContent::Blocks(blocks) => blocks
+                .iter()
+                .any(|b| matches!(b, TextOrImage::Image { .. })),
         }
     }
 

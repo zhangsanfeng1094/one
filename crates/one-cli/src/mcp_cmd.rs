@@ -47,9 +47,7 @@ pub enum McpAction {
         command: Vec<String>,
     },
     /// Remove a server from user config
-    Remove {
-        name: String,
-    },
+    Remove { name: String },
     /// Diagnose connectivity for configured servers
     Doctor {
         /// Optional single server name
@@ -134,10 +132,7 @@ async fn cmd_import(
             println!("No foreign MCP servers found (Claude / Codex / Cursor / .mcp.json).");
             return Ok(());
         }
-        println!(
-            "{:<20} {:<10} {:<8} {}",
-            "NAME", "SOURCE", "OWNED", "PATH"
-        );
+        println!("{:<20} {:<10} {:<8} {}", "NAME", "SOURCE", "OWNED", "PATH");
         for c in candidates {
             let owned = if c.already_owned { "yes" } else { "no" };
             println!(
@@ -159,10 +154,7 @@ async fn cmd_import(
             report.skipped_existing.len()
         );
         if !report.skipped_existing.is_empty() {
-            println!(
-                "  skipped: {}",
-                report.skipped_existing.join(", ")
-            );
+            println!("  skipped: {}", report.skipped_existing.join(", "));
             println!("  use --force to replace existing One entries");
         }
         println!("  list candidates: one mcp import --list");
@@ -215,10 +207,7 @@ async fn cmd_list(cwd: &std::path::Path, as_json: bool) -> Result<(), Box<dyn st
     if cfg.mcp_servers.is_empty() {
         println!("No MCP servers in One config (user + project only).");
         println!("  one user:  {}", user_mcp_path().display());
-        println!(
-            "  project:   {}",
-            one_mcp::project_mcp_path(cwd).display()
-        );
+        println!("  project:   {}", one_mcp::project_mcp_path(cwd).display());
         println!("  import:    one mcp import --list   # Claude / Codex / Cursor");
         println!(
             "  add:       one mcp add filesystem -- npx -y @modelcontextprotocol/server-filesystem /path"
@@ -442,9 +431,7 @@ fn validate_name(name: &str) -> Result<(), Box<dyn std::error::Error>> {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
     {
-        return Err(
-            "server name must be non-empty and only [A-Za-z0-9_-]".into(),
-        );
+        return Err("server name must be non-empty and only [A-Za-z0-9_-]".into());
     }
     Ok(())
 }
@@ -458,4 +445,3 @@ fn split_kv(pair: &str) -> Result<(String, String), Box<dyn std::error::Error>> 
     }
     Ok((k.to_string(), v.to_string()))
 }
-

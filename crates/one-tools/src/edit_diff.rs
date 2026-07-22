@@ -70,7 +70,9 @@ pub enum EditApplyError {
     EmptyOldString,
     NoChange,
     NotFound,
-    Multiple { count: usize },
+    Multiple {
+        count: usize,
+    },
     /// Matched span is far larger than old_string (OpenCode safety guard).
     Disproportionate,
 }
@@ -472,7 +474,11 @@ fn collapse_whitespace(s: &str) -> String {
 }
 
 fn dedent_lines(lines: &[&str]) -> String {
-    let non_empty: Vec<&str> = lines.iter().copied().filter(|l| !l.trim().is_empty()).collect();
+    let non_empty: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|l| !l.trim().is_empty())
+        .collect();
     let min_indent = non_empty
         .iter()
         .map(|l| l.chars().take_while(|c| *c == ' ' || *c == '\t').count())
@@ -508,9 +514,7 @@ fn levenshtein(a: &str, b: &str) -> usize {
         cur[0] = i;
         for j in 1..=m {
             let cost = if a[i - 1] == b[j - 1] { 0 } else { 1 };
-            cur[j] = (prev[j] + 1)
-                .min(cur[j - 1] + 1)
-                .min(prev[j - 1] + cost);
+            cur[j] = (prev[j] + 1).min(cur[j - 1] + 1).min(prev[j - 1] + cost);
         }
         std::mem::swap(&mut prev, &mut cur);
     }
@@ -639,10 +643,7 @@ pub fn apply_edit_lf(
         return Err(EditApplyError::NoChange);
     }
 
-    let strategies: &[(
-        MatchStrategy,
-        fn(&str, &str) -> Vec<MatchSpan>,
-    )] = &[
+    let strategies: &[(MatchStrategy, fn(&str, &str) -> Vec<MatchSpan>)] = &[
         (MatchStrategy::Exact, find_exact_matches),
         (MatchStrategy::Fuzzy, find_fuzzy_matches),
         (MatchStrategy::LineTrimmed, find_line_trimmed_matches),
@@ -690,9 +691,7 @@ pub fn apply_edit_lf(
     }
 
     if multi_count > 1 {
-        return Err(EditApplyError::Multiple {
-            count: multi_count,
-        });
+        return Err(EditApplyError::Multiple { count: multi_count });
     }
     if saw_disproportionate {
         return Err(EditApplyError::Disproportionate);
@@ -708,11 +707,7 @@ fn apply_spans(
     strategy: MatchStrategy,
 ) -> Result<AppliedEdit, EditApplyError> {
     let replacements = if replace_all { matches.len() } else { 1 };
-    let use_matches: &[MatchSpan] = if replace_all {
-        matches
-    } else {
-        &matches[..1]
-    };
+    let use_matches: &[MatchSpan] = if replace_all { matches } else { &matches[..1] };
 
     let mut content = content_lf.to_string();
     for m in use_matches.iter().rev() {
@@ -938,12 +933,7 @@ struct Hunk {
     lines: Vec<String>,
 }
 
-fn group_hunks(
-    edits: &[DiffEdit],
-    _old_len: usize,
-    _new_len: usize,
-    context: usize,
-) -> Vec<Hunk> {
+fn group_hunks(edits: &[DiffEdit], _old_len: usize, _new_len: usize, context: usize) -> Vec<Hunk> {
     // Collect indices of non-equal ops
     let change_idxs: Vec<usize> = edits
         .iter()
@@ -1127,7 +1117,9 @@ mod tests {
         assert!(
             matches!(
                 r.strategy,
-                MatchStrategy::WhitespaceNormalized | MatchStrategy::LineTrimmed | MatchStrategy::Fuzzy
+                MatchStrategy::WhitespaceNormalized
+                    | MatchStrategy::LineTrimmed
+                    | MatchStrategy::Fuzzy
             ),
             "{:?}",
             r.strategy

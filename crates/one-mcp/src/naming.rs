@@ -26,11 +26,17 @@ mod tests {
 
     #[test]
     fn public_name_basic() {
-        assert_eq!(public_tool_name("github", "create_issue"), "github__create_issue");
+        assert_eq!(
+            public_tool_name("github", "create_issue"),
+            "github__create_issue"
+        );
     }
 
     #[test]
     fn sanitize_special() {
-        assert_eq!(public_tool_name("my server", "list/prs"), "my_server__list_prs");
+        assert_eq!(
+            public_tool_name("my server", "list/prs"),
+            "my_server__list_prs"
+        );
     }
 }

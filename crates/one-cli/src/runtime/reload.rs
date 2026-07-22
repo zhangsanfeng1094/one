@@ -61,8 +61,7 @@ impl AppRuntime {
         {
             let mut agent = self.agent.lock().await;
             agent.set_tool_gate(Some(
-                self.extensions
-                    .tool_gate(self.permission_gate.clone()),
+                self.extensions.tool_gate(self.permission_gate.clone()),
             ));
             agent.set_hooks(Some(self.extensions.agent_hooks()));
         }
