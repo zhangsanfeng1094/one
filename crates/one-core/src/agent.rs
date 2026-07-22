@@ -1472,6 +1472,7 @@ fn tool_output_indicates_error(tool_name: &str, output: &ToolOutput) -> bool {
                 }
             }
             let text = output.as_text();
+            // Foreground bash titles: "exit N" (ok) or "command failed (exit N|signal)".
             if let Some(rest) = text.strip_prefix("exit ") {
                 let code = rest
                     .split(|c: char| c.is_whitespace())
@@ -1483,6 +1484,9 @@ fn tool_output_indicates_error(tool_name: &str, output: &ToolOutput) -> bool {
                 if let Ok(n) = code.parse::<i64>() {
                     return n != 0;
                 }
+            }
+            if text.starts_with("command failed (") {
+                return true;
             }
             false
         }
@@ -1793,6 +1797,18 @@ mod tests {
             serde_json::json!({ "running": true, "ok": true, "status": "running" }),
         );
         assert!(!tool_output_indicates_error("bash_output", &output));
+    }
+
+    #[test]
+    fn bash_command_failed_title_is_error_without_details() {
+        // Fallback when details are missing: new failure title must still count.
+        let failed = ToolOutput::text(
+            "command failed (exit 1)\nsandbox: bwrap · mode=workspace-write\nTraceback...",
+        );
+        assert!(tool_output_indicates_error("bash", &failed));
+
+        let ok = ToolOutput::text("exit 0\nsandbox: bwrap · mode=workspace-write\nok\n");
+        assert!(!tool_output_indicates_error("bash", &ok));
     }
 
     #[tokio::test]

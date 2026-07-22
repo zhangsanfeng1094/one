@@ -199,12 +199,21 @@ impl BashTool {
             body.push_str(&stderr_buf);
         }
 
-        let code_label = match exit_code {
-            Some(c) => c.to_string(),
-            None => "signal".into(),
-        };
         let (sandboxed, sandbox_line) = self.sandbox_banner(sandbox, escalated);
-        let mut output = format!("exit {code_label}\n{sandbox_line}");
+        // Keep the sandbox line on success and failure, but lead failures with a
+        // command-centric title so a non-zero exit is not read as "sandbox crashed".
+        let status_line = if status.success() {
+            match exit_code {
+                Some(c) => format!("exit {c}"),
+                None => "exit 0".into(),
+            }
+        } else {
+            match exit_code {
+                Some(c) => format!("command failed (exit {c})"),
+                None => "command failed (signal)".into(),
+            }
+        };
+        let mut output = format!("{status_line}\n{sandbox_line}");
         if escalated_on_failure {
             output.push_str("\nnote: re-ran outside sandbox after sandboxed attempt failed (user approved escalate)");
         }
@@ -582,6 +591,10 @@ mod tests {
             .expect("bash ok");
         let text = out.as_text();
         assert!(
+            text.starts_with("exit 0\n"),
+            "success should lead with exit code, got:\n{text}"
+        );
+        assert!(
             text.contains("sandbox: bwrap"),
             "expected visible sandbox banner, got:\n{text}"
         );
@@ -592,6 +605,58 @@ mod tests {
             .and_then(|d| d.get("sandboxed"))
             .and_then(|v| v.as_bool());
         assert_eq!(sandboxed, Some(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn bash_failure_leads_with_command_failed_not_sandbox() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-bash-fail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = BashTool::with_policy(
+            PathPolicy::workspace(dir.clone()),
+            true,
+            Arc::new(BackgroundTaskRegistry::new()),
+        );
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "python3 -c 'raise SystemExit(7)'" }),
+            })
+            .await
+            .expect("bash should return ToolOutput even on non-zero exit");
+        let text = out.as_text();
+        assert!(
+            text.starts_with("command failed (exit 7)\n"),
+            "failure title must be command-centric, got:\n{text}"
+        );
+        assert!(
+            text.contains("sandbox:"),
+            "sandbox banner should still appear on failure:\n{text}"
+        );
+        assert!(
+            !text.starts_with("exit 7"),
+            "must not look like a bare exit header that reads as sandbox noise:\n{text}"
+        );
+        let ok = out
+            .details
+            .as_ref()
+            .and_then(|d| d.get("ok"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(ok, Some(false));
+        let code = out
+            .details
+            .as_ref()
+            .and_then(|d| d.get("exitCode"))
+            .and_then(|v| v.as_i64());
+        assert_eq!(code, Some(7));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
