@@ -23,15 +23,18 @@ pub mod float;
 pub mod markdown;
 pub mod message;
 pub mod select;
+pub mod settings;
 pub mod slash;
+pub mod state;
 pub mod terminal;
 pub mod theme;
 pub mod tool_view;
 pub mod ui;
 
-pub use app::{
-    expand_at_files, App, ApprovalAnswer, ApprovalPrompt, ConfigOp, InteractiveApp, PendingImage,
-    PendingText, RunOutcome, SelectKind, SelectPos, Toast,
+pub use app::{expand_at_files, App, InteractiveApp};
+pub use crate::state::{
+    ApprovalAnswer, ApprovalPrompt, ConfigOp, ModelDraft, PendingImage, PendingText, RunOutcome,
+    SelectKind, SelectPos, Toast,
 };
 pub use error::Result;
 pub use float::{FloatItem, FloatKind, FloatMenu, FloatSection};

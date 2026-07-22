@@ -1179,7 +1179,7 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
         ),
         Span::styled("  ·  press 1–3", Theme::meta()),
     ]));
-    for (i, example) in crate::app::WELCOME_TRY_PROMPTS.iter().enumerate() {
+    for (i, example) in crate::state::WELCOME_TRY_PROMPTS.iter().enumerate() {
         // Muted [n] — readable index without a "clickable chip" false affordance;
         // keys 1–3 actually run these when the session is empty.
         lines.push(Line::from(vec![
@@ -1970,6 +1970,7 @@ fn mcp_chip_style(kind: u8) -> Style {
 }
 
 /// Terminal columns occupied by `s` (fullwidth / CJK = 2) as u16 for layout.
+#[cfg(test)]
 fn display_cols(s: &str) -> u16 {
     display_width(s).min(u16::MAX as usize) as u16
 }

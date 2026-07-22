@@ -1423,7 +1423,7 @@ impl FloatMenu {
     /// In-float add-model form. Connection (`base_url` / `api`) is provider-level only.
     pub fn settings_model_add(
         provider: &str,
-        draft: &crate::app::ModelDraft,
+        draft: &crate::state::ModelDraft,
         editing: Option<&str>,
     ) -> Self {
         let mark = |key: &str, label: &str, value: &str, hint: &str| -> FloatItem {

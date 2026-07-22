@@ -29,7 +29,8 @@ use crossterm::ExecutableCommand;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
-use crate::app::{App, RunOutcome};
+use crate::app::App;
+use crate::state::RunOutcome;
 use crate::clipboard;
 use crate::error::Result;
 use crate::ui;

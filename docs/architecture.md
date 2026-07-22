@@ -390,7 +390,7 @@ DEFAULT_SYSTEM_PROMPT          # core role + tool policy（无 feature 包）
 | `one-ai` | 各 provider + `auth/*`（OAuth）+ `registry` + `thinking` + `compat` + `models_file` |
 | `one-session` | `manager` + `entries` + export/migrate/share + `prompt_history` |
 | `one-resources` | `loader` + skills/prompts/agents + builtin-skills |
-| `one-tui` | `app` / `ui` / `slash` / float 选择器 / theme |
+| `one-tui` | `app` / `state` / `settings` / `ui` / `slash` / float 选择器 / theme |
 
 ---
 
