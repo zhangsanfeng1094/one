@@ -1,0 +1,13 @@
+{
+  "id": "tb-polyglot-rust-c",
+  "title": "TB2 hard: single-file Rust/C++ polyglot Fibonacci",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "polyglot-rust-c",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/polyglot-rust-c",
+    "difficulty": "hard",
+    "expert_time_estimate_min": 180,
+    "author": "Nicholas Carlini"
+  }
+}

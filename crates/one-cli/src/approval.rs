@@ -11,7 +11,8 @@ use async_trait::async_trait;
 use one_core::tool::ToolCall;
 use one_core::tool_gate::{ToolGate, ToolGateDecision};
 use one_tools::{
-    call_fingerprint, call_summary, evaluate_permissions, PermissionRule, PermissionRules,
+    bash_command, call_fingerprint, call_summary, command_matches_prefix, evaluate_permissions,
+    requires_escalation, suggested_command_prefix, PermissionRule, PermissionRules,
     PermissionVerdict,
 };
 use tokio::sync::oneshot;
@@ -37,6 +38,8 @@ pub struct ApprovalRequest {
     pub summary: String,
     pub reason: String,
     pub fingerprint: String,
+    /// Codex-style command-family prefix when the tool is bash/shell.
+    pub suggested_prefix: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,12 +50,29 @@ pub enum ApprovalChoice {
     Once,
     /// Allow matching fingerprint for the rest of the process.
     Session,
+    /// Allow bash/shell commands sharing [`ApprovalRequest::suggested_prefix`].
+    ///
+    /// Escalation scope is taken from the pending request (sandbox escalate stays
+    /// separate from in-sandbox high-risk allows).
+    Prefix,
     /// Deny this call; optional feedback is returned to the model.
     Deny { feedback: Option<String> },
 }
 
+/// Session allow for a command *family* (Codex "starts with …").
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PrefixAllow {
+    /// Lowercase tool name (`bash` / `shell` normalized to `bash`).
+    tool: String,
+    /// When true, only matches `require_escalated` calls.
+    escalate_only: bool,
+    prefix: String,
+}
+
 struct Pending {
     request: ApprovalRequest,
+    /// Whether the pending call requested sandbox escalation.
+    escalate: bool,
     tx: oneshot::Sender<ApprovalChoice>,
 }
 
@@ -63,6 +83,7 @@ pub struct PermissionGate {
     /// Set by ApprovalChoice::Always for the rest of the process.
     session_auto: AtomicBool,
     session_allows: Mutex<HashSet<String>>,
+    session_prefixes: Mutex<Vec<PrefixAllow>>,
     pending: Mutex<Option<Pending>>,
 }
 
@@ -73,6 +94,7 @@ impl PermissionGate {
             mode: Mutex::new(mode),
             session_auto: AtomicBool::new(matches!(mode, ApprovalMode::Auto)),
             session_allows: Mutex::new(HashSet::new()),
+            session_prefixes: Mutex::new(Vec::new()),
             pending: Mutex::new(None),
         })
     }
@@ -97,7 +119,7 @@ impl PermissionGate {
         self.session_auto.load(Ordering::Relaxed)
     }
 
-    /// Enable process-wide auto-approve (permission option 1 / Ctrl+O).
+    /// Enable process-wide auto-approve (permission option / Ctrl+O).
     pub fn enable_session_auto(&self) {
         self.session_auto.store(true, Ordering::Relaxed);
         *self.mode.lock().expect("mode lock") = ApprovalMode::Auto;
@@ -112,6 +134,24 @@ impl PermissionGate {
             .map(|p| p.request.clone())
     }
 
+    fn matches_session_prefix(&self, call: &ToolCall) -> bool {
+        let Some(cmd) = bash_command(call) else {
+            return false;
+        };
+        let tool_lc = call.name.to_ascii_lowercase();
+        let tool = match tool_lc.as_str() {
+            "bash" | "shell" => "bash",
+            other => other,
+        };
+        let escalate = requires_escalation(call);
+        let prefixes = self.session_prefixes.lock().expect("session prefixes");
+        prefixes.iter().any(|pa| {
+            pa.tool == tool
+                && pa.escalate_only == escalate
+                && command_matches_prefix(cmd, &pa.prefix)
+        })
+    }
+
     /// Resolve the current pending request (TUI / tests).
     pub fn respond(&self, choice: ApprovalChoice) -> bool {
         let mut g = self.pending.lock().expect("pending lock");
@@ -122,6 +162,30 @@ impl PermissionGate {
                         .lock()
                         .expect("session allows")
                         .insert(pending.request.fingerprint.clone());
+                }
+                ApprovalChoice::Prefix => {
+                    if let Some(prefix) = pending.request.suggested_prefix.clone() {
+                        let tool_lc = pending.request.tool.to_ascii_lowercase();
+                        let tool = match tool_lc.as_str() {
+                            "bash" | "shell" => "bash".to_string(),
+                            other => other.to_string(),
+                        };
+                        let mut list = self.session_prefixes.lock().expect("session prefixes");
+                        let entry = PrefixAllow {
+                            tool,
+                            escalate_only: pending.escalate,
+                            prefix,
+                        };
+                        if !list.contains(&entry) {
+                            list.push(entry);
+                        }
+                    } else {
+                        // No prefix available — fall back to exact fingerprint.
+                        self.session_allows
+                            .lock()
+                            .expect("session allows")
+                            .insert(pending.request.fingerprint.clone());
+                    }
                 }
                 ApprovalChoice::Always => {
                     self.enable_session_auto();
@@ -161,6 +225,10 @@ impl ToolGate for PermissionGate {
             return ToolGateDecision::Allow;
         }
 
+        if self.matches_session_prefix(call) {
+            return ToolGateDecision::Allow;
+        }
+
         // Env override always wins for automation.
         let env_auto = std::env::var("ONE_AUTO_APPROVE")
             .or_else(|_| std::env::var("PI_AUTO_APPROVE"))
@@ -187,12 +255,14 @@ impl ToolGate for PermissionGate {
                     },
                     ApprovalMode::Interactive => {
                         let id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+                        let escalate = requires_escalation(call);
                         let request = ApprovalRequest {
                             id,
                             tool: call.name.clone(),
                             summary: call_summary(call),
                             reason: reason.clone(),
                             fingerprint: fp.clone(),
+                            suggested_prefix: suggested_command_prefix(call),
                         };
                         let (tx, rx) = oneshot::channel();
                         {
@@ -205,12 +275,14 @@ impl ToolGate for PermissionGate {
                             }
                             *g = Some(Pending {
                                 request: request.clone(),
+                                escalate,
                                 tx,
                             });
                         }
                         match rx.await {
                             Ok(ApprovalChoice::Once)
                             | Ok(ApprovalChoice::Session)
+                            | Ok(ApprovalChoice::Prefix)
                             | Ok(ApprovalChoice::Always) => ToolGateDecision::Allow,
                             Ok(ApprovalChoice::Deny { feedback }) => {
                                 let msg = match feedback {
@@ -367,6 +439,127 @@ mod tests {
             })
             .await;
         assert_eq!(d2, ToolGateDecision::Allow);
+        assert!(gate.poll_request().is_none());
+    }
+
+    #[tokio::test]
+    async fn prefix_allows_command_family_not_unrelated() {
+        let gate = PermissionGate::with_auto_approve(PermissionRules::default(), false, true);
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "git push origin main" }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if let Some(req) = gate.poll_request() {
+                assert_eq!(req.suggested_prefix.as_deref(), Some("git push"));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.respond(ApprovalChoice::Prefix));
+        assert_eq!(handle.await.unwrap(), ToolGateDecision::Allow);
+
+        // Same family — auto allow.
+        let d2 = gate
+            .check(&ToolCall {
+                id: "2".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "git push --force-with-lease origin main" }),
+            })
+            .await;
+        assert_eq!(d2, ToolGateDecision::Allow);
+        assert!(gate.poll_request().is_none());
+
+        // Different family — still asks (high-risk sudo).
+        let g2 = gate.clone();
+        let handle2 = tokio::spawn(async move {
+            g2.check(&ToolCall {
+                id: "3".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "sudo id" }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.poll_request().is_some());
+        assert!(gate.respond(ApprovalChoice::Deny { feedback: None }));
+        assert!(matches!(handle2.await.unwrap(), ToolGateDecision::Deny { .. }));
+    }
+
+    #[tokio::test]
+    async fn prefix_escalate_does_not_cover_sandboxed() {
+        let gate = PermissionGate::with_auto_approve(PermissionRules::default(), false, true);
+        let g = gate.clone();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({
+                    "command": "sudo id",
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "need host root"
+                }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let req = gate.poll_request().expect("pending");
+        // "sudo id" → wrapper+next → "sudo id"
+        assert_eq!(req.suggested_prefix.as_deref(), Some("sudo id"));
+        assert!(gate.respond(ApprovalChoice::Prefix));
+        assert_eq!(handle.await.unwrap(), ToolGateDecision::Allow);
+
+        // Same command family but NOT escalated: still high-risk Ask.
+        let g2 = gate.clone();
+        let handle2 = tokio::spawn(async move {
+            g2.check(&ToolCall {
+                id: "2".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "sudo id -u" }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            gate.poll_request().is_some(),
+            "sandboxed sudo must not inherit escalate-only prefix allow"
+        );
+        assert!(gate.respond(ApprovalChoice::Once));
+        assert_eq!(handle2.await.unwrap(), ToolGateDecision::Allow);
+
+        // Escalated family still auto-allows.
+        let d3 = gate
+            .check(&ToolCall {
+                id: "3".into(),
+                name: "bash".into(),
+                arguments: json!({
+                    "command": "sudo id -a",
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "again"
+                }),
+            })
+            .await;
+        assert_eq!(d3, ToolGateDecision::Allow);
         assert!(gate.poll_request().is_none());
     }
 

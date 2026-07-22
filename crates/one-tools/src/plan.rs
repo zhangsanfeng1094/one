@@ -141,7 +141,7 @@ impl Tool for PlanWriteTool {
     }
 }
 
-/// Edit only the plan file (exact string replace).
+/// Edit only the plan file (same multi-strategy replace as coding `edit`).
 pub struct PlanEditTool {
     cwd: PathBuf,
     plan_path: PathBuf,
@@ -159,37 +159,48 @@ impl Tool for PlanEditTool {
         ToolDefinition {
             name: "edit".to_string(),
             description: format!(
-                "Replace an exact string in the plan file only. Allowed path: {}.",
+                "Replace a string in the plan file only (exact then relaxed matching). \
+                 Allowed path: {}.",
                 self.plan_path.display()
             ),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
+                    "file_path": { "type": "string" },
+                    "filePath": { "type": "string" },
                     "old_string": { "type": "string" },
-                    "new_string": { "type": "string" }
+                    "oldString": { "type": "string" },
+                    "new_string": { "type": "string" },
+                    "newString": { "type": "string" },
+                    "replace_all": { "type": "boolean" },
+                    "replaceAll": { "type": "boolean" }
                 },
-                "required": ["path", "old_string", "new_string"]
+                "required": ["old_string", "new_string"]
             }),
         }
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = call
-            .arguments
-            .get("path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| invalid_args("edit", "missing `path`"))?;
-        let old_string = call
-            .arguments
-            .get("old_string")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| invalid_args("edit", "missing `old_string`"))?;
-        let new_string = call
-            .arguments
-            .get("new_string")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| invalid_args("edit", "missing `new_string`"))?;
+        use crate::edit_diff::{
+            apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success,
+            normalize_to_lf,
+        };
+        use crate::tool_args::{
+            bool_arg_names, new_string_arg, old_string_arg, path_arg,
+        };
+
+        let path = path_arg(&call.arguments).ok_or_else(|| {
+            invalid_args("edit", "missing `path` / `file_path` / `filePath`")
+        })?;
+        let old_string = old_string_arg(&call.arguments).ok_or_else(|| {
+            invalid_args("edit", "missing `old_string` / `oldString` / `oldText`")
+        })?;
+        let new_string = new_string_arg(&call.arguments).ok_or_else(|| {
+            invalid_args("edit", "missing `new_string` / `newString` / `newText`")
+        })?;
+        let replace_all =
+            bool_arg_names(&call.arguments, &["replace_all", "replaceAll"]).unwrap_or(false);
 
         if !is_allowed_plan_path(&self.cwd, &self.plan_path, path) {
             return Err(tool_error(
@@ -201,31 +212,38 @@ impl Tool for PlanEditTool {
             ));
         }
 
-        let content = tokio::fs::read_to_string(&self.plan_path)
+        let raw = tokio::fs::read_to_string(&self.plan_path)
+            .await
+            .map_err(|err| tool_error("edit", err.to_string()))?;
+        let ending = detect_line_ending(&raw);
+        let content_lf = normalize_to_lf(&raw);
+        let applied = apply_edit_lf(
+            &content_lf,
+            &normalize_to_lf(old_string),
+            &normalize_to_lf(new_string),
+            replace_all,
+        )
+        .map_err(|e| tool_error("edit", e.user_message()))?;
+
+        let to_write = apply_line_ending(&applied.content_lf, ending);
+        tokio::fs::write(&self.plan_path, to_write)
             .await
             .map_err(|err| tool_error("edit", err.to_string()))?;
 
-        let count = content.matches(old_string).count();
-        if count == 0 {
-            return Err(tool_error("edit", "old_string not found"));
-        }
-        if count > 1 {
-            return Err(tool_error(
-                "edit",
-                format!("old_string matched {count} times; must be unique"),
-            ));
-        }
-
-        let updated = content.replacen(old_string, new_string, 1);
-        tokio::fs::write(&self.plan_path, &updated)
-            .await
-            .map_err(|err| tool_error("edit", err.to_string()))?;
-
+        let text = format_edit_success(
+            &self.plan_path.to_string_lossy(),
+            &content_lf,
+            &applied.content_lf,
+            applied.replacements,
+            applied.strategy,
+        );
         Ok(ToolOutput::text_with_details(
-            format!("Edited plan file {}", self.plan_path.display()),
+            text,
             json!({
                 "path": self.plan_path.to_string_lossy(),
                 "plan": true,
+                "replacements": applied.replacements,
+                "strategy": applied.strategy.as_str(),
             }),
         ))
     }

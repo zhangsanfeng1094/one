@@ -77,12 +77,21 @@ one bench --suite all --out ./benches/out/manual
 - **有** `LANGFUSE_*` keys：每个 task 的事件与 harness score 写入 Langfuse  
 - **无** keys：仅内存打分（不联网），适合离线 CI  
 
-`suite=full` 的任务（如 `edit-marker`）需要真实模型才能过；当前 bench runner 默认仍走 **MockProvider**。对 full 任务请用：
+`suite=full` 的任务（如 `edit-marker`、`edit-resilient`）需要真实模型才能过；当前 `one bench` 默认仍走 **MockProvider**。对 full 任务请用 shell harness：
 
 ```bash
-one --trace --provider <real> -y -p "$(cat benches/tasks/edit-marker/prompt.md)" \
-  --cwd /tmp/edit-ws
+# 推荐：TUI 监督（首条消息=prompt，/quit 后自动打分）
+./benches/run.sh full edit-resilient
+./benches/run.sh full edit-resilient --provider <real>
+./benches/run.sh full edit-resilient --headless   # CI print 模式
+
+# 手动等价：
+one --tui -y --no-mcp --no-skills --cwd /path/to/ws \
+  -p "$(cat benches/tasks/edit-resilient/prompt.md)"
 ```
+
+**`edit-resilient`**：两处 `+`→`*`，fixture 带 trailing WS / Tab / CRLF / smart quotes，压 edit 匹配容错；rubric 含 `trace_has_tool:edit` 与 `max_tool_errors`。  
+写后 format/LSP：**OpenCode 有**，**Pi / One 目前无**（见 `benches/tasks/edit-resilient/SOLUTIONS.md`）。
 
 ## 架构
 

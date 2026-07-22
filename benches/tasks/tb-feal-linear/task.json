@@ -1,0 +1,12 @@
+{
+  "id": "tb-feal-linear",
+  "title": "TB2 hard: FEAL linear cryptanalysis — recover key, decrypt 100 ciphertexts",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "feal-linear-cryptanalysis",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/feal-linear-cryptanalysis",
+    "difficulty": "hard",
+    "expert_time_estimate_min": 960
+  }
+}

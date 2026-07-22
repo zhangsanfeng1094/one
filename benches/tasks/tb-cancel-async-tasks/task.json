@@ -1,0 +1,14 @@
+{
+  "id": "tb-cancel-async-tasks",
+  "title": "TB2 hard: implement async run_tasks with SIGINT cleanup (queued semaphore edge case)",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "cancel-async-tasks",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/cancel-async-tasks",
+    "difficulty": "hard",
+    "category": "software-engineering",
+    "author": "Alex Shaw",
+    "expert_time_estimate_min": 120
+  }
+}

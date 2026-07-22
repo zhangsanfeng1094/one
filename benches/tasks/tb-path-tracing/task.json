@@ -1,0 +1,12 @@
+{
+  "id": "tb-path-tracing",
+  "title": "TB2 hard: reverse-engineer path tracer, emit image.c (<2KB gzip) matching reference PPM",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "path-tracing",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/path-tracing",
+    "difficulty": "hard",
+    "expert_time_estimate_min": 360
+  }
+}

@@ -13,7 +13,8 @@ mod provider;
 mod runtime;
 mod settings;
 
-use clap::Parser;
+use clap::parser::ValueSource;
+use clap::{CommandFactory, FromArgMatches};
 use one_session::export_html;
 use tracing_subscriber::EnvFilter;
 
@@ -23,6 +24,30 @@ use crate::protocol::{RunResult, UsageSnapshot};
 use crate::runtime::AppRuntime;
 use std::process::ExitCode;
 use std::time::Instant;
+
+/// Resolve run mode.
+///
+/// | invocation | mode |
+/// |------------|------|
+/// | `one` | Interactive |
+/// | `one -p "…"` | Print (compat) |
+/// | `one --mode interactive -p "…"` | Interactive, first turn = prompt |
+/// | `one --tui -p "…"` | Interactive, first turn = prompt |
+/// | `one --mode print -p "…"` | Print |
+fn resolve_run_mode(cli: &Cli, matches: &clap::ArgMatches) -> RunMode {
+    if cli.tui {
+        return RunMode::Interactive;
+    }
+    let mode_explicit = matches.value_source("mode") == Some(ValueSource::CommandLine);
+    if mode_explicit {
+        return cli.mode.clone();
+    }
+    // Default mode is Interactive; bare `-p` historically means print/scripts.
+    if cli.print.is_some() {
+        return RunMode::Print;
+    }
+    cli.mode.clone()
+}
 
 fn init_tracing(interactive_tui: bool) {
     let filter = EnvFilter::from_default_env();
@@ -114,12 +139,13 @@ fn load_env_from_exe_ancestors() {
 #[tokio::main]
 async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     load_env_files();
-    let mut cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
+    let run_mode = resolve_run_mode(&cli, &matches);
 
     // Interactive TUI owns the terminal — never print tracing to stderr
     // (MCP background connect would otherwise corrupt the alternate screen).
-    let interactive_tui = matches!(cli.mode, RunMode::Interactive)
-        && cli.print.is_none()
+    let interactive_tui = matches!(run_mode, RunMode::Interactive)
         && cli.command.is_none()
         && !cli.list_models
         && !cli.list_providers;
@@ -228,21 +254,18 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let mode = if cli.print.is_some() {
-        RunMode::Print
-    } else {
-        cli.mode.clone()
-    };
-
     let want_json_envelope = cli
         .output_format
         .as_deref()
         .map(|s| s.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
 
-    let exit = match mode {
+    let exit = match run_mode {
         RunMode::Print => {
-            let prompt = cli.print.expect("print prompt");
+            let prompt = cli
+                .print
+                .clone()
+                .ok_or("--mode print requires -p / --print <prompt>")?;
             if want_json_envelope {
                 run_print_envelope(&mut runtime, providers.as_llm(), &prompt).await?
             } else {
@@ -251,7 +274,10 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
         }
         RunMode::Json => {
-            let prompt = cli.print.unwrap_or_else(|| "Say hello.".to_string());
+            let prompt = cli
+                .print
+                .clone()
+                .unwrap_or_else(|| "Say hello.".to_string());
             if want_json_envelope {
                 run_print_envelope(&mut runtime, providers.as_llm(), &prompt).await?
             } else {
@@ -264,7 +290,8 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             ExitCode::SUCCESS
         }
         RunMode::Interactive => {
-            modes::run_interactive(&mut runtime, &mut providers, cli.print).await?;
+            // `-p` / `--tui -p` seeds the first user turn inside the TUI.
+            modes::run_interactive(&mut runtime, &mut providers, cli.print.clone()).await?;
             ExitCode::SUCCESS
         }
     };

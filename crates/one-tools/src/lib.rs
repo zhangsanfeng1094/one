@@ -3,6 +3,7 @@ pub mod bash;
 pub mod bash_kill;
 pub mod bash_output;
 pub mod edit;
+pub mod edit_diff;
 pub mod find;
 pub mod grep;
 pub mod ls;
@@ -38,8 +39,9 @@ pub use ls::LsTool;
 pub use os_sandbox::OsSandbox;
 pub use path_policy::{AccessKind, PathPolicy, SandboxMode};
 pub use permissions::{
-    call_fingerprint, call_summary, evaluate as evaluate_permissions, PermissionRules,
-    PermissionRule, PermissionVerdict, RuleAction,
+    bash_command, call_fingerprint, call_summary, command_matches_prefix,
+    evaluate as evaluate_permissions, suggested_command_prefix, suggested_command_prefix_from_cmd,
+    PermissionRule, PermissionRules, PermissionVerdict, RuleAction,
 };
 pub use sandbox_permissions::{
     justification_of, looks_like_sandbox_denial, requires_escalation, sandbox_permissions_of,

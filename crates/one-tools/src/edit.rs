@@ -1,12 +1,24 @@
-use std::path::PathBuf;
+//! Surgical file edit tool (Claude / OpenCode / Pi compatible).
+//!
+//! Matching and diff logic live in [`crate::edit_diff`] (exact → fuzzy, CRLF, unified diff).
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use async_trait::async_trait;
 use one_core::error::Result;
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
+use tokio::sync::Mutex as AsyncMutex;
 
+use crate::edit_diff::{
+    apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success, normalize_to_lf,
+};
 use crate::path_policy::{AccessKind, PathPolicy};
-use crate::tool_args::{bool_arg, path_arg, path_properties};
+use crate::tool_args::{
+    bool_arg_names, new_string_arg, old_string_arg, path_arg, path_properties,
+};
 
 pub struct EditTool {
     policy: PathPolicy,
@@ -22,6 +34,18 @@ impl EditTool {
     }
 }
 
+/// Per-path mutation lock shared by all edit tool instances (Pi-style queue).
+fn file_lock(path: &Path) -> Arc<AsyncMutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
+    let key = path.to_string_lossy().into_owned();
+    let map = LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut guard = map.lock().expect("edit file lock map");
+    guard
+        .entry(key)
+        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+        .clone()
+}
+
 #[async_trait]
 impl Tool for EditTool {
     fn definition(&self) -> ToolDefinition {
@@ -34,40 +58,41 @@ impl Tool for EditTool {
             )
         };
         let mut properties = path_properties(
-            "Existing file path (Claude Code alias: `file_path`)",
+            "Existing file path (aliases: `file_path`, `filePath`)",
         );
         if let Some(obj) = properties.as_object_mut() {
             obj.insert(
                 "old_string".into(),
                 json!({
                     "type": "string",
-                    "description": "Exact text to find. Must match uniquely unless replace_all is true."
+                    "description": "Text to find (aliases: oldString, oldText). Prefer exact match; trailing whitespace / smart quotes are tolerated via fuzzy fallback. Must match uniquely unless replace_all is true. Do not include read-tool line-number prefixes."
                 }),
             );
             obj.insert(
                 "new_string".into(),
                 json!({
                     "type": "string",
-                    "description": "Replacement text (must differ from old_string)"
+                    "description": "Replacement text (aliases: newString, newText). Must differ from old_string."
                 }),
             );
             obj.insert(
                 "replace_all".into(),
                 json!({
                     "type": "boolean",
-                    "description": "If true, replace every occurrence of old_string (Claude Code). Default false — then old_string must match exactly once."
+                    "description": "If true, replace every occurrence (alias: replaceAll). Default false — then the match must be unique."
                 }),
             );
         }
         ToolDefinition {
             name: "edit".to_string(),
             description: format!(
-                "Surgical in-place edit (Claude Code Edit-compatible): replace `old_string` with \
-                 `new_string` in an existing file. Prefer this over `write` for bugfixes and \
-                 localized changes. By default `old_string` must match uniquely (fails if 0 or \
-                 >1 matches); set `replace_all=true` to change every occurrence (e.g. rename an \
-                 identifier). Include enough surrounding context when not using replace_all. \
-                 Allowed: {scope}."
+                "Surgical in-place edit (Claude / OpenCode / Pi compatible): replace `old_string` \
+                 with `new_string` in an existing file. Prefer this over `write` for bugfixes and \
+                 localized changes. Matching: exact first, then fuzzy (trailing whitespace, smart \
+                 quotes/dashes). By default the match must be unique (fails if 0 or >1); set \
+                 `replace_all=true` to change every occurrence (e.g. rename). Include enough \
+                 surrounding context when not using replace_all. Read the file before editing when \
+                 you need current contents. Allowed: {scope}."
             ),
             parameters: json!({
                 "type": "object",
@@ -79,121 +104,72 @@ impl Tool for EditTool {
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
         let path = path_arg(&call.arguments).ok_or_else(|| {
-            invalid_args("edit", "missing `path` or `file_path`")
-        })?;
-        let old_string = call
-            .arguments
-            .get("old_string")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| invalid_args("edit", "missing `old_string`"))?;
-        let new_string = call
-            .arguments
-            .get("new_string")
-            .and_then(|value| value.as_str())
-            .ok_or_else(|| invalid_args("edit", "missing `new_string`"))?;
-        let replace_all = bool_arg(&call.arguments, "replace_all", None).unwrap_or(false);
-
-        if old_string == new_string {
-            return Err(tool_error(
+            invalid_args(
                 "edit",
-                "old_string and new_string must be different",
-            ));
-        }
+                "missing `path` / `file_path` / `filePath`",
+            )
+        })?;
+        let old_string = old_string_arg(&call.arguments).ok_or_else(|| {
+            invalid_args(
+                "edit",
+                "missing `old_string` / `oldString` / `oldText`",
+            )
+        })?;
+        let new_string = new_string_arg(&call.arguments).ok_or_else(|| {
+            invalid_args(
+                "edit",
+                "missing `new_string` / `newString` / `newText`",
+            )
+        })?;
+        let replace_all =
+            bool_arg_names(&call.arguments, &["replace_all", "replaceAll"]).unwrap_or(false);
 
         let resolved = self
             .policy
             .resolve(path, AccessKind::Write)
             .map_err(|err| tool_error("edit", err))?;
-        let content = tokio::fs::read_to_string(&resolved)
+
+        let lock = file_lock(&resolved);
+        let _guard = lock.lock().await;
+
+        let raw = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|err| tool_error("edit", err.to_string()))?;
 
-        let count = content.matches(old_string).count();
-        if count == 0 {
-            return Err(tool_error("edit", "old_string not found"));
-        }
-        if !replace_all && count > 1 {
-            return Err(tool_error(
-                "edit",
-                format!(
-                    "old_string matched {count} times; must be unique, or set replace_all=true"
-                ),
-            ));
-        }
+        let ending = detect_line_ending(&raw);
+        let content_lf = normalize_to_lf(&raw);
+        let old_lf = normalize_to_lf(old_string);
+        let new_lf = normalize_to_lf(new_string);
 
-        let replacements = if replace_all { count } else { 1 };
-        let updated = if replace_all {
-            content.replace(old_string, new_string)
-        } else {
-            content.replacen(old_string, new_string, 1)
-        };
-        tokio::fs::write(&resolved, updated)
+        let applied = apply_edit_lf(&content_lf, &old_lf, &new_lf, replace_all)
+            .map_err(|e| tool_error("edit", e.user_message()))?;
+
+        let to_write = apply_line_ending(&applied.content_lf, ending);
+        tokio::fs::write(&resolved, to_write)
             .await
             .map_err(|err| tool_error("edit", err.to_string()))?;
 
-        let diff = unified_edit_diff(path, old_string, new_string, replacements);
-        let old_lines = old_string.lines().count().max(1);
-        let new_lines = new_string.lines().count().max(1);
+        let text = format_edit_success(
+            path,
+            &content_lf,
+            &applied.content_lf,
+            applied.replacements,
+            applied.strategy,
+        );
+        let old_lines = old_lf.lines().count().max(1);
+        let new_lines = new_lf.lines().count().max(1);
         Ok(ToolOutput::text_with_details(
-            diff,
+            text,
             json!({
                 "path": path,
-                "replacements": replacements,
+                "replacements": applied.replacements,
                 "replace_all": replace_all,
                 "old_lines": old_lines,
                 "new_lines": new_lines,
+                "strategy": applied.strategy.as_str(),
             }),
         ))
     }
-}
-
-/// Compact unified-style preview for the TUI and the model.
-fn unified_edit_diff(path: &str, old: &str, new: &str, replacements: usize) -> String {
-    let mut out = String::new();
-    if replacements > 1 {
-        out.push_str(&format!(
-            "Updated {path} ({replacements} replacements)\n"
-        ));
-    } else {
-        out.push_str(&format!("Updated {path}\n"));
-    }
-    out.push_str("--- a/");
-    out.push_str(path);
-    out.push('\n');
-    out.push_str("+++ b/");
-    out.push_str(path);
-    out.push('\n');
-    // Line-oriented hunk (not a real LCS diff — good enough for unique replace).
-    let old_lines: Vec<&str> = if old.is_empty() {
-        Vec::new()
-    } else {
-        old.lines().collect()
-    };
-    let new_lines: Vec<&str> = if new.is_empty() {
-        Vec::new()
-    } else {
-        new.lines().collect()
-    };
-    out.push_str(&format!(
-        "@@ -{} +{} @@\n",
-        old_lines.len().max(1),
-        new_lines.len().max(1)
-    ));
-    for line in &old_lines {
-        out.push('-');
-        out.push_str(line);
-        out.push('\n');
-    }
-    for line in &new_lines {
-        out.push('+');
-        out.push_str(line);
-        out.push('\n');
-    }
-    // Trim trailing newline for cleaner tool_result storage.
-    while out.ends_with('\n') {
-        out.pop();
-    }
-    out
 }
 
 #[cfg(test)]
@@ -213,16 +189,6 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn diff_marks_old_and_new() {
-        let d = unified_edit_diff("src/a.rs", "fn a() {}", "fn a() {\n    ok\n}", 1);
-        assert!(d.contains("--- a/src/a.rs"));
-        assert!(d.contains("+++ b/src/a.rs"));
-        assert!(d.contains("-fn a() {}"));
-        assert!(d.contains("+fn a() {"));
-        assert!(d.contains("+    ok"));
     }
 
     #[tokio::test]
@@ -277,7 +243,10 @@ mod tests {
             .await
             .unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("matched 2 times") || msg.contains("replace_all"), "{msg}");
+        assert!(
+            msg.contains("matched 2 times") || msg.contains("replace_all"),
+            "{msg}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -301,6 +270,136 @@ mod tests {
         .unwrap();
 
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "hello one\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn accepts_opencode_camel_case_args() {
+        let dir = temp_dir();
+        let file = dir.join("b.txt");
+        std::fs::write(&file, "alpha beta\n").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "filePath": "b.txt",
+                    "oldString": "beta",
+                    "newString": "gamma",
+                    "replaceAll": false
+                }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "alpha gamma\n");
+        assert_eq!(out.details.as_ref().unwrap()["strategy"], "exact");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn fuzzy_trailing_whitespace() {
+        let dir = temp_dir();
+        let file = dir.join("main.rs");
+        // trailing spaces on first line
+        std::fs::write(&file, "fn main() {  \n    let x = 1;\n}\n").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "path": "main.rs",
+                    "old_string": "fn main() {\n    let x = 1;\n}",
+                    "new_string": "fn main() {\n    let x = 2;\n}"
+                }),
+            })
+            .await
+            .unwrap();
+
+        let text = std::fs::read_to_string(&file).unwrap();
+        assert!(text.contains("let x = 2"), "{text}");
+        assert_eq!(out.details.as_ref().unwrap()["strategy"], "fuzzy");
+        assert!(out.as_text().contains("fuzzy") || out.as_text().contains("Updated"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn preserves_crlf() {
+        let dir = temp_dir();
+        let file = dir.join("win.txt");
+        std::fs::write(&file, "line1\r\nline2\r\n").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        tool.execute(&ToolCall {
+            id: "1".into(),
+            name: "edit".into(),
+            arguments: json!({
+                "path": "win.txt",
+                "old_string": "line2",
+                "new_string": "LINE2"
+            }),
+        })
+        .await
+        .unwrap();
+
+        let bytes = std::fs::read(&file).unwrap();
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.contains("\r\n"), "expected CRLF preserved: {text:?}");
+        assert!(text.contains("LINE2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn not_found_is_actionable() {
+        let dir = temp_dir();
+        let file = dir.join("a.txt");
+        std::fs::write(&file, "only this\n").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let err = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "path": "a.txt",
+                    "old_string": "missing block",
+                    "new_string": "x"
+                }),
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("re-read") || msg.contains("not find"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn result_contains_unified_diff_markers() {
+        let dir = temp_dir();
+        let file = dir.join("d.txt");
+        std::fs::write(&file, "a\nb\nc\n").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "path": "d.txt",
+                    "old_string": "b",
+                    "new_string": "B"
+                }),
+            })
+            .await
+            .unwrap();
+        let t = out.as_text();
+        assert!(t.contains("--- a/d.txt"), "{t}");
+        assert!(t.contains("+++ b/d.txt"), "{t}");
+        assert!(t.contains("-b") || t.contains("- b"), "{t}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

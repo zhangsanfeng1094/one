@@ -12,7 +12,7 @@ use crate::hooks::AgentHooks;
 use crate::message::{
     AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage, now_ms,
 };
-use crate::tool::{Tool, ToolCall, ToolOutput};
+use crate::tool::{resolve_tool_name, Tool, ToolCall, ToolOutput};
 use crate::tool_gate::{ToolGate, ToolGateDecision};
 use crate::trace::{
     args_preview, new_run_id, SharedTrace, TraceEvent, TraceGateDecision, TraceRunStatus,
@@ -33,7 +33,8 @@ Tool choice (prefer specialized tools over bash — Claude Code style):
 - Never use bash echo (or similar) to talk to the user; reply in normal assistant text.
 - Do not assume host extras exist (`rg`, `tree`, `eza`, `fd`, …). The `grep` tool is built in (in-process, no host `rg` required) — prefer it over shell `rg`/`grep`.
 - You may request multiple independent tool calls in one turn; read-only tools (read/grep/find/ls/…) may run concurrently, while write/edit/bash and similar run serially.
-- Path args accept `path` or Claude-style `file_path`.
+- Path args accept `path` or Claude-style `file_path` (also OpenCode `filePath`).
+- Prefer built-in tool names (`read`/`edit`/`write`/`bash`/`grep`/`find`/`ls`); common aliases like `read_file`/`search_replace` are mapped automatically.
 
 File changes:
 - Prefer `edit` for localized fixes. By default `old_string` must uniquely match once; set `replace_all=true` to replace every occurrence (e.g. renames).
@@ -44,7 +45,7 @@ Search:
 - Prefer `grep` with `glob` / `type` / `output_mode` / `head_limit` / context (`-A`/`-B`/`-C`) over any shell search.
 
 Bash / sandbox:
-- Default bash runs under an OS sandbox (workspace-write): workspace is writable; home and system paths are mostly read-only. Prefer the dedicated file tools so path policy and truncation stay consistent.
+- Default bash runs under a Codex-style OS sandbox (workspace-write): full filesystem is readable; only the workspace and /tmp are writable. Prefer dedicated file tools so path policy and truncation stay consistent.
 - Keep commands focused; avoid huge recursive dumps. If output is truncated or spilled to a file, read the spill instead of re-running wider.
 
 When requirements are ambiguous, use the `ask_user` tool instead of guessing. Be concise and precise. Do not load unrelated skills or docs unless they clearly help the task.";
@@ -1217,6 +1218,11 @@ impl Agent {
 
     async fn gate_tool(&self, call: &ToolCall, run_id: &str, turn: usize) -> GateOutcome {
         let mut effective = call.clone();
+        // Map cross-agent / hallucinated names before gate + dispatch.
+        let canonical = resolve_tool_name(&effective.name);
+        if canonical != effective.name {
+            effective.name = canonical.to_string();
+        }
         let mut gate_decision = None;
         if let Some(gate) = &self.tool_gate {
             match gate.check(&effective).await {
@@ -1404,7 +1410,7 @@ enum GateOutcome {
 /// Everything else (writes, shell, MCP, ask_user, plan tools, unknown names) runs serially.
 pub fn is_parallel_safe_tool(name: &str) -> bool {
     matches!(
-        name,
+        resolve_tool_name(name),
         // `task` is explore-only (read-only research) in MVP → concurrent-safe.
         // When general/write subagents land, keep them serial via a different
         // name or gate classification on mode.

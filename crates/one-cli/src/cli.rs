@@ -68,13 +68,26 @@ pub enum RunMode {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "one", about = "One coding agent", version)]
 pub struct Cli {
-    /// Prompt for print/json mode, or initial message for interactive.
+    /// Prompt text.
+    ///
+    /// - Bare `-p "…"` (no `--mode`) → **print** mode (scripts / CI).
+    /// - `--mode interactive -p "…"` or `--tui -p "…"` → **TUI**, first user turn.
     #[arg(short = 'p', long = "print")]
     pub print: Option<String>,
 
     /// Run mode.
+    ///
+    /// With an explicit `--mode interactive` plus `-p`, the prompt is the first
+    /// TUI turn (not print mode). Bare `-p` without `--mode` still selects print
+    /// for backward compatibility.
     #[arg(long, value_enum, default_value_t = RunMode::Interactive)]
     pub mode: RunMode,
+
+    /// Force interactive TUI even when `-p` is set (seed the first user message).
+    ///
+    /// Equivalent to `--mode interactive -p "…"` for the common supervise/eval path.
+    #[arg(long = "tui")]
+    pub tui: bool,
 
     /// Continue the most recent session for this cwd.
     #[arg(short = 'c', long = "continue")]

@@ -1,0 +1,12 @@
+{
+  "id": "tb-write-compressor",
+  "title": "TB2 hard: reverse-engineer custom decompressor, emit ≤2500B data.comp",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "write-compressor",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/write-compressor",
+    "difficulty": "hard",
+    "expert_time_estimate_min": 1440
+  }
+}

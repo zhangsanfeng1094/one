@@ -4,7 +4,9 @@
 
 ```bash
 one                          # 交互模式（自动创建 session）
-one -p "explain this repo"   # print 模式
+one -p "explain this repo"   # print 模式（裸 -p；脚本/CI）
+one --tui -p "fix the bug"  # TUI + 首条消息自动发出（监督/评测）
+one --mode interactive -p "…"  # 同上（显式 mode）
 one --continue / -c          # 继续最近 session
 one --resume / -r            # 交互：打开 session 选择器；非交互：最近 session
 one --session PATH           # 打开指定 session 文件

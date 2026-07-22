@@ -1,0 +1,12 @@
+{
+  "id": "tb-circuit-fibsqrt",
+  "title": "TB2 hard: gates.txt circuit computing fib(isqrt(N)) mod 2^32",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "circuit-fibsqrt",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/circuit-fibsqrt",
+    "difficulty": "hard",
+    "expert_time_estimate_min": 960
+  }
+}

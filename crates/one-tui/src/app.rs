@@ -348,8 +348,12 @@ impl App {
         if self.approval.as_ref().map(|p| p.id) == Some(prompt.id) {
             return;
         }
-        let select =
-            crate::select::SelectPrompt::permission(&prompt.tool, &prompt.summary, &prompt.reason);
+        let select = crate::select::SelectPrompt::permission_with_prefix(
+            &prompt.tool,
+            &prompt.summary,
+            &prompt.reason,
+            prompt.suggested_prefix.as_deref(),
+        );
         let id = prompt.id;
         self.approval = Some(prompt);
         self.approval_answer = None;
@@ -428,6 +432,7 @@ impl App {
                             Some("always") => ApprovalAnswer::Always,
                             Some("once") => ApprovalAnswer::Once,
                             Some("session") => ApprovalAnswer::Session,
+                            Some("prefix") => ApprovalAnswer::Prefix,
                             Some("deny") => ApprovalAnswer::Deny { feedback: other },
                             _ => ApprovalAnswer::Deny { feedback: other },
                         }
@@ -437,6 +442,7 @@ impl App {
                     ApprovalAnswer::Always => "always-approve mode",
                     ApprovalAnswer::Once => "approved once",
                     ApprovalAnswer::Session => "approved for session",
+                    ApprovalAnswer::Prefix => "approved command prefix for session",
                     ApprovalAnswer::Deny { feedback } => {
                         if feedback.as_ref().map(|s| !s.is_empty()).unwrap_or(false) {
                             "denied (with feedback)"

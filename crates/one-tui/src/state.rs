@@ -290,6 +290,8 @@ pub struct ApprovalPrompt {
     pub tool: String,
     pub summary: String,
     pub reason: String,
+    /// Codex-style bash command-family prefix (`git push`, `cargo test`, …).
+    pub suggested_prefix: Option<String>,
 }
 
 /// Why a [`crate::select::SelectPrompt`] is open.
@@ -312,6 +314,8 @@ pub enum ApprovalAnswer {
     Once,
     /// Allow matching fingerprint for the rest of the process.
     Session,
+    /// Allow bash/shell commands sharing the suggested command prefix.
+    Prefix,
     /// Deny; optional free-text feedback is sent back to the model.
     Deny { feedback: Option<String> },
 }

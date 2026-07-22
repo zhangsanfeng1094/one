@@ -1,0 +1,5 @@
+{
+  "id": "edit-resilient",
+  "title": "Fix two multiply bugs under edit-match traps (trailing WS / tabs / CRLF / smart quotes)",
+  "suite": "full"
+}

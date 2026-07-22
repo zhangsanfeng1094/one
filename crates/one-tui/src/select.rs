@@ -116,13 +116,25 @@ impl SelectPrompt {
         p
     }
 
-    /// Permission dialog matching Codex-style list (4 options).
+    /// Permission dialog matching Codex-style list.
     ///
     /// When `reason` starts with `sandbox escalation:` (from PermissionGate),
     /// labels switch to Codex-style outside-sandbox approval copy, the body is
     /// restructured (why first, short command), and focus defaults to **once**
     /// instead of always-approve.
+    ///
+    /// When `command_prefix` is set (bash/shell), an extra option allows the
+    /// whole command family for this process (Codex "starts with …").
     pub fn permission(tool: &str, summary: &str, reason: &str) -> Self {
+        Self::permission_with_prefix(tool, summary, reason, None)
+    }
+
+    pub fn permission_with_prefix(
+        tool: &str,
+        summary: &str,
+        reason: &str,
+        command_prefix: Option<&str>,
+    ) -> Self {
         let escalate = reason.starts_with("sandbox escalation:");
         let body = if escalate {
             format_escalate_body(tool, summary, reason)
@@ -131,9 +143,14 @@ impl SelectPrompt {
         } else {
             format!("{tool}\n{summary}\n{reason}")
         };
-        let options = if escalate {
+
+        let prefix = command_prefix
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        let mut options = if escalate {
             // Safer default first (Codex "Yes, proceed" is the primary action).
-            // always-approve is available but not pre-focused.
             vec![
                 SelectOption::new(
                     "once",
@@ -143,54 +160,74 @@ impl SelectPrompt {
                 SelectOption::new(
                     "session",
                     "Yes, and don't ask again for this command",
-                    "Remember escalate for this command until one exits",
-                ),
-                SelectOption::new(
-                    "always",
-                    "Yes, and don't ask again for anything",
-                    "Auto-approve all tool asks (including escalations) for the rest of this process",
-                ),
-                SelectOption::new(
-                    "deny",
-                    "No, keep sandboxed",
-                    "Do not escalate; optional message is sent to the model",
+                    "Remember escalate for this exact command until one exits",
                 ),
             ]
         } else {
+            // Safer default first — demote process-wide always-approve.
             vec![
-                SelectOption::new(
-                    "always",
-                    "Yes, and don't ask again for anything (always-approve mode)",
-                    "Auto-approve all tool asks for the rest of this process",
-                ),
                 SelectOption::new("once", "Yes, proceed", "Allow this single tool call"),
                 SelectOption::new(
                     "session",
                     "Yes, and don't ask again for this",
-                    "Allow matching calls for the rest of this process",
-                ),
-                SelectOption::new(
-                    "deny",
-                    "No, reject (type to add feedback)",
-                    "Block this call; optional message is sent to the model",
+                    "Allow matching calls (exact fingerprint) for the rest of this process",
                 ),
             ]
         };
+
+        if let Some(ref pfx) = prefix {
+            let label = if escalate {
+                format!("Yes, and don't ask again for escalated commands starting with `{pfx}`")
+            } else {
+                format!("Yes, and don't ask again for commands starting with `{pfx}`")
+            };
+            let desc: &str = if escalate {
+                "Session allow for this command family outside the sandbox only"
+            } else {
+                "Session allow for this command family (word-boundary prefix match)"
+            };
+            options.push(SelectOption::new("prefix", label, desc));
+        }
+
+        if escalate {
+            options.push(SelectOption::new(
+                "always",
+                "Yes, and don't ask again for anything",
+                "Auto-approve all tool asks (including escalations) for the rest of this process",
+            ));
+            options.push(SelectOption::new(
+                "deny",
+                "No, keep sandboxed",
+                "Do not escalate; optional message is sent to the model",
+            ));
+        } else {
+            options.push(SelectOption::new(
+                "always",
+                "Yes, and don't ask again for anything (always-approve mode)",
+                "Auto-approve all tool asks for the rest of this process",
+            ));
+            options.push(SelectOption::new(
+                "deny",
+                "No, reject (type to add feedback)",
+                "Block this call; optional message is sent to the model",
+            ));
+        }
+
         let title = if escalate {
             "Run outside sandbox?"
         } else {
             "Permission required"
         };
+        let n = options.len();
         let mut p = Self::single(title, body, options);
-        // Escalate: focus "once" (index 0 after reorder). High-risk: keep always at 0.
+        // Safer defaults: focus "once".
         p.selected = 0;
         p.type_on_ids.insert("deny".into());
         p.ctrl_o_id = Some("always".into());
-        p.footer_hint = if escalate {
-            "↑↓/1-4:select  Enter:confirm  Ctrl+o:always-approve  Esc:deny".into()
-        } else {
-            "↑↓/1-4:select  Enter:confirm  Ctrl+o:always-approve  Esc:cancel".into()
-        };
+        let esc_hint = if escalate { "Esc:deny" } else { "Esc:cancel" };
+        p.footer_hint = format!(
+            "↑↓/1-{n}:select  Enter:confirm  Ctrl+o:always-approve  {esc_hint}"
+        );
         p.other_label = "Feedback for the model (Enter empty to skip)".into();
         p
     }
@@ -547,6 +584,18 @@ impl SelectPrompt {
                 }
                 None
             }
+            // Prefix-family allow (Codex-style command starts-with).
+            KeyCode::Char('p') | KeyCode::Char('P')
+                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                if self.options.iter().any(|o| o.id == "prefix") {
+                    return Some(SelectResult::Confirmed {
+                        ids: vec!["prefix".into()],
+                        other: None,
+                    });
+                }
+                None
+            }
             KeyCode::Char('n') | KeyCode::Char('N') => {
                 if self.options.iter().any(|o| o.id == "deny") {
                     // Jump to deny and enter feedback typing.
@@ -736,6 +785,54 @@ mod tests {
                 other: None,
             })
         );
+    }
+
+    #[test]
+    fn permission_prefix_option_when_suggested() {
+        let p = SelectPrompt::permission_with_prefix(
+            "bash",
+            "git push origin main",
+            "high-risk bash pattern",
+            Some("git push"),
+        );
+        assert_eq!(p.options[0].id, "once");
+        assert_eq!(p.selected, 0);
+        assert!(
+            p.options.iter().any(|o| o.id == "prefix"),
+            "missing prefix option: {:?}",
+            p.options.iter().map(|o| &o.id).collect::<Vec<_>>()
+        );
+        let prefix = p.options.iter().find(|o| o.id == "prefix").unwrap();
+        assert!(
+            prefix.label.contains("git push"),
+            "{}",
+            prefix.label
+        );
+        // once, session, prefix, always, deny
+        assert_eq!(p.options.len(), 5);
+        assert!(p.footer_hint.contains("1-5"));
+    }
+
+    #[test]
+    fn permission_no_prefix_has_four_options() {
+        let p = SelectPrompt::permission("edit", "src/a.rs", "outside workspace");
+        assert!(!p.options.iter().any(|o| o.id == "prefix"));
+        assert_eq!(p.options.len(), 4);
+        assert_eq!(p.options[0].id, "once");
+    }
+
+    #[test]
+    fn escalate_prefix_option() {
+        let p = SelectPrompt::permission_with_prefix(
+            "bash",
+            "[outside sandbox] kill 1",
+            "sandbox escalation: cleanup",
+            Some("kill"),
+        );
+        assert_eq!(p.options[0].id, "once");
+        let prefix = p.options.iter().find(|o| o.id == "prefix").unwrap();
+        assert!(prefix.label.contains("escalated"), "{}", prefix.label);
+        assert!(prefix.label.contains("`kill`"), "{}", prefix.label);
     }
 
     #[test]

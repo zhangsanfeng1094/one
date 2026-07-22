@@ -1,0 +1,21 @@
+{
+  "checks": [
+    {
+      "type": "file_exists",
+      "path": "run.py"
+    },
+    {
+      "type": "command",
+      "cmd": "python3 verify.py",
+      "exit_code": 0
+    },
+    {
+      "type": "max_turns",
+      "n": 48
+    },
+    {
+      "type": "max_tool_errors",
+      "n": 16
+    }
+  ]
+}

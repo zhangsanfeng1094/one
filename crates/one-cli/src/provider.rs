@@ -117,6 +117,7 @@ impl ProviderSet {
         let cli = Cli {
             print: None,
             mode: crate::cli::RunMode::Interactive,
+            tui: false,
             r#continue: false,
             resume: false,
             session: None,

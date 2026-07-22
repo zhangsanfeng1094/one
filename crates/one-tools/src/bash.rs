@@ -316,12 +316,12 @@ impl Tool for BashTool {
         let boundary = match self.sandbox_mode {
             SandboxMode::WorkspaceWrite => {
                 if self.os_sandbox.enabled && OsSandbox::bwrap_available() {
-                    " File tools are workspace-scoped. Bash runs in a bubblewrap sandbox \
-(workspace RW, $HOME RO). High-risk commands prompt for approval unless --yes. \
-When a command needs host access (kill host processes, write outside the workspace, \
-system packages), set sandbox_permissions to \"require_escalated\" and provide \
-justification — the user will be asked to approve running outside the sandbox \
-(Codex-aligned). If a sandboxed command fails with a sandbox-like denial, one may \
+                    " File tools are workspace-scoped. Bash runs in a Codex-style bubblewrap \
+sandbox: full FS read-only, workspace + /tmp writable (home/system not writable). \
+High-risk commands prompt for approval unless --yes. \
+When a command needs host writes outside that boundary (or full unsandboxed access), \
+set sandbox_permissions to \"require_escalated\" with justification — the user will \
+be asked to approve. If a sandboxed command fails with a sandbox-like denial, one may \
 prompt to re-run escalated (escalate_on_failure)."
                 } else {
                     " File tools are workspace-scoped. High-risk bash commands need approval \

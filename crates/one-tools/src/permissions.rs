@@ -185,11 +185,114 @@ fn wildcard_match_inner(pat: &[u8], text: &[u8]) -> bool {
     pi == pat.len()
 }
 
-/// Fingerprint for session-level "always allow".
+/// Command string from a bash/shell tool call, if present.
+pub fn bash_command(call: &ToolCall) -> Option<&str> {
+    match call.name.as_str() {
+        "bash" | "shell" => call.arguments.get("command").and_then(|v| v.as_str()),
+        _ => None,
+    }
+}
+
+/// Codex-style session prefix for "don't ask again for commands starting with …".
+///
+/// Heuristic (keeps approval narrower than full Always):
+/// - wrappers (`sudo`, `doas`, …) + next non-flag token when present
+/// - multi-word CLIs (`git`, `cargo`, `npm`, …) → first two tokens when 2nd is not a flag
+/// - otherwise first token only
+///
+/// Returns `None` for non-bash tools or empty commands.
+pub fn suggested_command_prefix(call: &ToolCall) -> Option<String> {
+    let cmd = bash_command(call)?.trim();
+    if cmd.is_empty() {
+        return None;
+    }
+    suggested_command_prefix_from_cmd(cmd)
+}
+
+/// Same as [`suggested_command_prefix`] but from a raw command string (tests / UI).
+pub fn suggested_command_prefix_from_cmd(command: &str) -> Option<String> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    const WRAPPERS: &[&str] = &[
+        "sudo", "doas", "nice", "nohup", "time", "command", "builtin", "exec",
+    ];
+    const MULTI: &[&str] = &[
+        "git", "cargo", "npm", "pnpm", "yarn", "bun", "pip", "pip3", "docker", "kubectl", "gh",
+        "systemctl", "apt", "apt-get", "brew", "podman", "terraform", "aws", "gcloud", "go",
+        "make", "cmake", "mvn", "gradle", "poetry", "uv", "rustup", "npx", "deno",
+    ];
+
+    let mut i = 0usize;
+    // Skip leading ENV=value assignments: `FOO=1 cargo test`
+    while i < tokens.len()
+        && tokens[i].contains('=')
+        && !tokens[i].starts_with('-')
+        && !tokens[i].starts_with('/')
+    {
+        i += 1;
+    }
+    if i >= tokens.len() {
+        return None;
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    let head = tokens[i];
+    parts.push(head);
+    i += 1;
+
+    if WRAPPERS.iter().any(|w| head.eq_ignore_ascii_case(w)) {
+        // sudo apt install … → "sudo apt"
+        while i < tokens.len() && tokens[i].starts_with('-') {
+            // keep flags out of the prefix (sudo -u root … is too variable)
+            break;
+        }
+        if i < tokens.len() && !tokens[i].starts_with('-') {
+            parts.push(tokens[i]);
+        }
+    } else if MULTI.iter().any(|m| head.eq_ignore_ascii_case(m))
+        && i < tokens.len()
+        && !tokens[i].starts_with('-')
+    {
+        parts.push(tokens[i]);
+    }
+
+    let prefix = parts.join(" ");
+    if prefix.is_empty() {
+        None
+    } else {
+        Some(prefix)
+    }
+}
+
+/// True when `command` is exactly `prefix` or continues after a word boundary.
+///
+/// `cargo test` matches `cargo test` and `cargo test --quiet`, not `cargo testing`.
+pub fn command_matches_prefix(command: &str, prefix: &str) -> bool {
+    let cmd = command.trim_start();
+    let p = prefix.trim();
+    if p.is_empty() {
+        return false;
+    }
+    if cmd == p {
+        return true;
+    }
+    let mut bound = String::with_capacity(p.len() + 1);
+    bound.push_str(p);
+    bound.push(' ');
+    cmd.starts_with(&bound)
+}
+
+/// Fingerprint for session-level "always allow this exact call".
 ///
 /// Escalated bash calls use a separate key (`bash::escalate::{cmd}`) so that
 /// approving a high-risk command under the sandbox does not auto-approve
 /// unsandboxed re-runs (Codex session escalate is scoped to the escalate path).
+///
+/// For prefix-family allows, see [`suggested_command_prefix`] + session prefix list
+/// on the permission gate (not this fingerprint).
 pub fn call_fingerprint(call: &ToolCall) -> String {
     let subject = match call.name.as_str() {
         "bash" | "shell" => call
@@ -212,7 +315,6 @@ pub fn call_fingerprint(call: &ToolCall) -> String {
     {
         format!("{name}::escalate::{subject}")
     } else {
-        // For bash, allow by command *prefix* for "always" is too broad; use exact command.
         format!("{name}::{subject}")
     }
 }
@@ -457,5 +559,53 @@ mod tests {
         };
         assert_ne!(call_fingerprint(&normal), call_fingerprint(&escalated));
         assert!(call_fingerprint(&escalated).contains("escalate"));
+    }
+
+    #[test]
+    fn suggested_prefix_git_and_cargo() {
+        assert_eq!(
+            suggested_command_prefix_from_cmd("git push origin main").as_deref(),
+            Some("git push")
+        );
+        assert_eq!(
+            suggested_command_prefix_from_cmd("cargo test --quiet").as_deref(),
+            Some("cargo test")
+        );
+        assert_eq!(
+            suggested_command_prefix_from_cmd("sudo apt install foo").as_deref(),
+            Some("sudo apt")
+        );
+        assert_eq!(
+            suggested_command_prefix_from_cmd("rm -rf /tmp/x").as_deref(),
+            Some("rm")
+        );
+        assert_eq!(
+            suggested_command_prefix_from_cmd("FOO=1 cargo build").as_deref(),
+            Some("cargo build")
+        );
+    }
+
+    #[test]
+    fn command_prefix_word_boundary() {
+        assert!(command_matches_prefix("cargo test --quiet", "cargo test"));
+        assert!(command_matches_prefix("cargo test", "cargo test"));
+        assert!(!command_matches_prefix("cargo testing", "cargo test"));
+        assert!(!command_matches_prefix("cargotest", "cargo"));
+        assert!(command_matches_prefix("cargo", "cargo"));
+    }
+
+    #[test]
+    fn suggested_prefix_from_call() {
+        let call = bash("npm install lodash");
+        assert_eq!(
+            suggested_command_prefix(&call).as_deref(),
+            Some("npm install")
+        );
+        let edit = ToolCall {
+            id: "1".into(),
+            name: "edit".into(),
+            arguments: json!({ "path": "a.rs", "old_string": "a", "new_string": "b" }),
+        };
+        assert_eq!(suggested_command_prefix(&edit), None);
     }
 }

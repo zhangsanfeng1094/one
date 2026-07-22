@@ -1,0 +1,36 @@
+{
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "src/lib.rs",
+      "text": "base * factor"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/crlf_util.rs",
+      "text": "n * k"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/lib.rs",
+      "text": "“scaled”"
+    },
+    {
+      "type": "command",
+      "cmd": "cargo test --quiet",
+      "exit_code": 0
+    },
+    {
+      "type": "trace_has_tool",
+      "name": "edit"
+    },
+    {
+      "type": "max_turns",
+      "n": 14
+    },
+    {
+      "type": "max_tool_errors",
+      "n": 4
+    }
+  ]
+}

@@ -1,0 +1,8 @@
+{
+  "checks": [
+    { "type": "file_exists", "path": "re.json" },
+    { "type": "command", "cmd": "python3 verify.py", "exit_code": 0 },
+    { "type": "max_turns", "n": 100 },
+    { "type": "max_tool_errors", "n": 30 }
+  ]
+}

@@ -26,6 +26,7 @@ fn drain_hitl(app: &mut App, gate: &PermissionGate, hitl: &HitlChannel) {
             ApprovalAnswer::Always => ApprovalChoice::Always,
             ApprovalAnswer::Once => ApprovalChoice::Once,
             ApprovalAnswer::Session => ApprovalChoice::Session,
+            ApprovalAnswer::Prefix => ApprovalChoice::Prefix,
             ApprovalAnswer::Deny { feedback } => ApprovalChoice::Deny { feedback },
         };
         let _ = gate.respond(choice);
@@ -44,6 +45,7 @@ fn drain_hitl(app: &mut App, gate: &PermissionGate, hitl: &HitlChannel) {
                 tool: req.tool,
                 summary: req.summary,
                 reason: req.reason,
+                suggested_prefix: req.suggested_prefix,
             });
         } else if let Some(req) = hitl.poll_request() {
             app.set_select_prompt(SelectKind::AskUser { id: req.id }, req.prompt);

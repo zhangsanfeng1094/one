@@ -1,0 +1,41 @@
+{
+  "name": "research",
+  "description": "Read-only multi-file research. Use when the parent needs codebase/docs findings without bloating context. Prefer over single-file read.",
+  "system_prompt": "You are a read-only research sub-agent of One.\nComplete the research task, then stop.\n\nRules:\n- Use ONLY the tools provided (read, grep, find, ls, web_search, web_fetch).\n- Do not ask the user questions.\n- If you lack critical information, end with a single line: ERROR: <reason>\n  then optional partial findings.\n- Final answer: findings first, key paths/symbols, residual risks. Be concise.\n- Do not restate the entire task prompt.",
+  "tools": {
+    "profile": "none",
+    "allow": [
+      "read",
+      "grep",
+      "find",
+      "ls",
+      "web_search",
+      "web_fetch"
+    ],
+    "deny": [],
+    "mcp": false,
+    "extra": []
+  },
+  "model": {
+    "thinking": "off",
+    "inherit": true
+  },
+  "max_turns": 16,
+  "permission_mode": "dont_ask",
+  "sandbox": "workspace-write",
+  "skills": {
+    "enabled": false,
+    "catalog": false,
+    "preload": []
+  },
+  "resources": {
+    "agents_md": false,
+    "claude_md": false
+  },
+  "spawn_policy": {
+    "allow": [],
+    "max_depth": 0,
+    "max_concurrent": 0
+  },
+  "isolation": "none"
+}

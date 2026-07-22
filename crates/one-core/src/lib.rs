@@ -27,7 +27,7 @@ pub use error::{OneError, Result};
 pub use events::AgentEvent;
 pub use hooks::{AgentHooks, NoopHooks};
 pub use message::{AgentMessage, AssistantMessage, StopReason, ToolResultMessage, UserMessage};
-pub use tool::{Tool, ToolCall, ToolDefinition, ToolOutput};
+pub use tool::{resolve_tool_name, Tool, ToolCall, ToolDefinition, ToolOutput};
 pub use tool_gate::{AllowAllGate, ToolGate, ToolGateDecision};
 pub use trace::{
     args_preview, last_user_preview, llm_input_preview, llm_output_preview, load_trace_file,

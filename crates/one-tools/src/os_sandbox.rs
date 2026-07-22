@@ -1,15 +1,24 @@
 //! OS-level bash sandbox via bubblewrap (`bwrap`).
 //!
-//! When enabled (default for `workspace-write`), shell commands run inside a
-//! minimal filesystem namespace:
-//! - system paths (`/usr`, `/bin`, …) read-only
-//! - `$HOME` read-only (cargo/npm caches, rustup)
-//! - workspace + `--add-dir` roots **read-write**
-//! - skill roots (`~/.one/agent`, `~/.agents/skills`, compat `~/.codex/skills`, …) RO
-//! - network shared (no `--unshare-net`) so package managers work
+//! Aligned with OpenAI Codex Linux `workspace-write` layout
+//! (`codex-rs/linux-sandbox` bwrap filesystem args):
 //!
-//! `full-access` disables wrapping. If `bwrap` is missing, commands run unsandboxed
-//! with a one-time warning via stderr (best-effort).
+//! 1. **Entire host FS read-only** — `--ro-bind / /`  
+//!    (so `/etc/alternatives`, toolchains, ssl, etc. all resolve)
+//! 2. Minimal `--dev` / `--proc`
+//! 3. **Writable roots** rebound on top:
+//!    - policy workspace roots + cwd
+//!    - `/tmp` and `$TMPDIR` (Codex workspace-write defaults)
+//! 4. Network shared (no `--unshare-net`) so package managers work
+//!
+//! Sensitive agent config dirs under a writable root are re-masked RO when
+//! present (`.codex`, `.one`, `.agents`) — not project `.git`, so `git commit`
+//! inside a workspace still works.
+//!
+//! `full-access` disables wrapping. If `bwrap` is missing, commands run
+//! unsandboxed with a one-time warning (best-effort).
+//!
+//! Override: `ONE_BASH_SANDBOX=0` disables the OS sandbox only.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,6 +26,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use crate::path_policy::{PathPolicy, SandboxMode};
 
 static WARNED_NO_BWRAP: AtomicBool = AtomicBool::new(false);
+
+/// Dir names re-applied as RO when they sit under a writable root.
+///
+/// Matches Codex-style protection of agent metadata; **excludes** `.git` so
+/// normal VCS writes in a project workspace keep working.
+const PROTECTED_UNDER_WRITABLE: &[&str] = &[".codex", ".one", ".agents"];
 
 /// How to launch a bash command under the host OS.
 #[derive(Debug, Clone)]
@@ -91,58 +106,67 @@ impl OsSandbox {
 
         let mut args = Vec::new();
 
-        // Base system (RO).
-        for p in [
-            "/usr", "/bin", "/sbin", "/lib", "/lib64", "/lib32", "/opt",
-        ] {
-            push_ro_try(&mut args, p);
-        }
-        // DNS / TLS / user identity (RO).
-        for p in [
-            "/etc/resolv.conf",
-            "/etc/hosts",
-            "/etc/nsswitch.conf",
-            "/etc/ssl",
-            "/etc/ca-certificates",
-            "/etc/pki",
-            "/etc/passwd",
-            "/etc/group",
-            "/etc/localtime",
-            "/etc/timezone",
-            "/etc/gitconfig",
-        ] {
-            push_ro_try(&mut args, p);
-        }
-        // Devices & proc for normal tooling.
+        // --- Codex-style base: whole filesystem RO, then carve RW roots ---
+        // `--ro-bind / /` keeps /etc/alternatives, ld.so paths, etc. intact
+        // (the old selective-mount list broke `cc` → /etc/alternatives/cc).
+        args.push("--ro-bind".into());
+        args.push("/".into());
+        args.push("/".into());
+
+        // Minimal device tree + proc (after RO root, before writable binds).
         args.push("--dev".into());
         args.push("/dev".into());
         args.push("--proc".into());
         args.push("/proc".into());
-        // Private temp — do NOT bind host /tmp (that would allow write-escape via /tmp).
-        args.push("--tmpfs".into());
-        args.push("/tmp".into());
-        args.push("--tmpfs".into());
-        args.push("/var/tmp".into());
 
-        // Home RO so cargo/rustup/npm work; writable roots rebound RW below.
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            if home.exists() {
-                push_ro_try_path(&mut args, &home);
+        // Collect writable roots (dedupe by canonical-ish display string).
+        let mut writables: Vec<PathBuf> = Vec::new();
+        let mut push_w = |p: PathBuf| {
+            if !p.as_os_str().is_empty() && !writables.iter().any(|e| e == &p) {
+                writables.push(p);
+            }
+        };
+
+        for w in &self.writable_roots {
+            push_w(w.clone());
+        }
+        push_w(self.cwd.clone());
+
+        // Codex workspace-write: /tmp + $TMPDIR are writable by default.
+        push_w(PathBuf::from("/tmp"));
+        if let Some(td) = std::env::var_os("TMPDIR") {
+            let td = PathBuf::from(td);
+            if td.as_os_str() != "/tmp" && (td.is_dir() || td.parent().is_some()) {
+                push_w(td);
+            }
+        }
+        // Common secondary temp root (cargo / some tools).
+        if Path::new("/var/tmp").is_dir() {
+            push_w(PathBuf::from("/var/tmp"));
+        }
+
+        for w in &writables {
+            push_bind_try_path(&mut args, w);
+        }
+
+        // Extra readable roots are already covered by RO `/` — no-op unless
+        // we later switch to a minimal (non full-disk-read) profile. Keep the
+        // field for API compatibility; explicit RO re-bind is harmless.
+        for r in &self.readable_roots {
+            if !writables.iter().any(|w| w == r) {
+                push_ro_try_path(&mut args, r);
             }
         }
 
-        // Extra readable roots (agent dir, etc.).
-        for r in &self.readable_roots {
-            push_ro_try_path(&mut args, r);
+        // Re-mask agent metadata dirs under writable roots (not project .git).
+        for w in &writables {
+            for name in PROTECTED_UNDER_WRITABLE {
+                let p = w.join(name);
+                if p.exists() {
+                    push_ro_try_path(&mut args, &p);
+                }
+            }
         }
-
-        // Writable workspace roots (override any RO home bind).
-        for w in &self.writable_roots {
-            push_bind_try_path(&mut args, w);
-        }
-        // Always ensure cwd is writable when sandboxed.
-        push_bind_try_path(&mut args, &self.cwd);
 
         args.push("--chdir".into());
         args.push(self.cwd.display().to_string());
@@ -176,12 +200,6 @@ fn which_bwrap() -> Option<String> {
     None
 }
 
-fn push_ro_try(args: &mut Vec<String>, path: &str) {
-    args.push("--ro-bind-try".into());
-    args.push(path.into());
-    args.push(path.into());
-}
-
 fn push_ro_try_path(args: &mut Vec<String>, path: &Path) {
     let s = path.display().to_string();
     args.push("--ro-bind-try".into());
@@ -201,6 +219,19 @@ mod tests {
     use super::*;
     use crate::path_policy::PathPolicy;
 
+    fn unique_dir(prefix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn full_access_disables() {
         let policy = PathPolicy::full_access(std::env::temp_dir());
@@ -216,15 +247,18 @@ mod tests {
         if !OsSandbox::bwrap_available() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!("one-os-sb-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = unique_dir("one-os-sb");
         let policy = PathPolicy::workspace(dir.clone());
-        // Force-enable even if env disables.
         let mut sb = OsSandbox::from_policy(&policy);
         sb.enabled = true;
         let (prog, args) = sb.command_line("echo hi");
         assert!(prog.contains("bwrap"), "{prog}");
         assert!(args.iter().any(|a| a == "--die-with-parent"));
+        // Codex-style full-disk RO root.
+        assert!(
+            args.windows(3).any(|w| w[0] == "--ro-bind" && w[1] == "/" && w[2] == "/"),
+            "expected --ro-bind / / in {args:?}"
+        );
         assert!(args.iter().any(|a| a == "echo hi"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -234,40 +268,90 @@ mod tests {
         if !OsSandbox::bwrap_available() {
             return;
         }
-        let dir = std::env::temp_dir().join(format!(
-            "one-os-sb-block-{}-{}",
+        // Workspace under /tmp (writable). Leak target under $HOME (RO via /).
+        let dir = unique_dir("one-os-sb-block");
+        let home = std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/tmp"));
+        let outside = home.join(format!(
+            ".one-os-sb-outside-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
                 .as_nanos()
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let outside = std::env::temp_dir().join(format!(
-            "one-os-sb-outside-{}",
-            std::process::id()
-        ));
         let _ = std::fs::remove_file(&outside);
 
         let mut sb = OsSandbox::from_policy(&PathPolicy::workspace(dir.clone()));
         sb.enabled = true;
-        let (prog, args) = sb.command_line(&format!(
-            "echo leaked > {}",
-            outside.display()
-        ));
+        let (prog, args) = sb.command_line(&format!("echo leaked > '{}'", outside.display()));
         let out = std::process::Command::new(&prog)
             .args(&args)
             .current_dir(&dir)
             .output()
             .expect("spawn bwrap");
-        // Either command fails or file was not created outside.
         let leaked = outside.exists();
         if leaked {
             let _ = std::fs::remove_file(&outside);
         }
         assert!(
             !leaked,
-            "sandbox allowed write outside workspace; status={:?} stderr={}",
+            "sandbox allowed write outside workspace into $HOME; status={:?} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bwrap_resolves_cc_via_etc_alternatives() {
+        if !OsSandbox::bwrap_available() {
+            return;
+        }
+        // Host must have the Debian/Ubuntu alternatives layout.
+        if !Path::new("/etc/alternatives/cc").exists() && !Path::new("/usr/bin/cc").exists() {
+            return;
+        }
+        let dir = unique_dir("one-os-sb-cc");
+        let mut sb = OsSandbox::from_policy(&PathPolicy::workspace(dir.clone()));
+        sb.enabled = true;
+        // Prove alternatives + compiler are visible (the old selective /etc mount failed here).
+        let (prog, args) = sb.command_line(
+            "test -e /usr/bin/cc && command -v cc >/dev/null && cc -dumpversion >/dev/null",
+        );
+        let out = std::process::Command::new(&prog)
+            .args(&args)
+            .current_dir(&dir)
+            .output()
+            .expect("spawn bwrap");
+        assert!(
+            out.status.success(),
+            "cc must work inside sandbox (Codex-style / mount); status={:?} stdout={} stderr={}",
+            out.status,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn bwrap_allows_write_in_workspace() {
+        if !OsSandbox::bwrap_available() {
+            return;
+        }
+        let dir = unique_dir("one-os-sb-rw");
+        let target = dir.join("ok.txt");
+        let mut sb = OsSandbox::from_policy(&PathPolicy::workspace(dir.clone()));
+        sb.enabled = true;
+        let (prog, args) =
+            sb.command_line(&format!("echo hi > '{}'", target.display()));
+        let out = std::process::Command::new(&prog)
+            .args(&args)
+            .current_dir(&dir)
+            .output()
+            .expect("spawn bwrap");
+        assert!(
+            out.status.success() && target.is_file(),
+            "workspace write failed; status={:?} stderr={}",
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );

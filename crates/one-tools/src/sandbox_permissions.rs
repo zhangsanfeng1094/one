@@ -99,6 +99,11 @@ pub fn looks_like_sandbox_denial(exit_code: Option<i32>, combined_output: &str) 
         "erofs",
         "sandbox",
         "bwrap:",
+        // Toolchain resolution failures that historically meant incomplete mounts
+        // (Codex-style full-disk RO root usually avoids these).
+        "linker `cc` not found",
+        "linker 'cc' not found",
+        "linker cc not found",
     ];
     MARKERS.iter().any(|m| lower.contains(m))
 }

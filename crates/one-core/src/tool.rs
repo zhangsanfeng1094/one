@@ -142,3 +142,56 @@ pub fn invalid_args(tool: &str, message: impl Into<String>) -> OneError {
         message: message.into(),
     }
 }
+
+/// Map common model-hallucinated / cross-agent tool names to One builtins.
+///
+/// Keeps the agent loop resilient when models trained on Claude Code, Cursor,
+/// Codex, or OpenCode emit alternate names (`read_file`, `search_replace`, …).
+pub fn resolve_tool_name(name: &str) -> &str {
+    match name {
+        // read
+        "read_file" | "Read" | "ReadFile" | "readFile" | "view" | "View" | "open_file" => "read",
+        // write
+        "write_file" | "Write" | "WriteFile" | "writeFile" | "create_file" => "write",
+        // edit
+        "search_replace"
+        | "str_replace"
+        | "StrReplace"
+        | "Edit"
+        | "ApplyPatch"
+        | "replace_in_file"
+        | "multi_edit" => "edit",
+        // bash
+        "shell" | "Bash" | "Shell" | "run_terminal_cmd" | "run_command" | "execute" | "terminal" => {
+            "bash"
+        }
+        // find / glob
+        "Glob" | "glob" | "glob_file_search" | "find_files" | "list_files_glob" => "find",
+        // grep
+        "Grep" | "rg" | "search_codebase" | "codebase_search" => "grep",
+        // ls
+        "LS" | "list_dir" | "list_files" | "list_directory" => "ls",
+        // web
+        "WebFetch" | "webfetch" | "fetch_url" | "fetch" => "web_fetch",
+        "WebSearch" | "websearch" | "search_web" => "web_search",
+        // ask user
+        "AskUserQuestion" | "ask" | "question" | "ask_user_question" => "ask_user",
+        other => other,
+    }
+}
+
+#[cfg(test)]
+mod tool_name_tests {
+    use super::resolve_tool_name;
+
+    #[test]
+    fn aliases_common_hallucinations() {
+        assert_eq!(resolve_tool_name("read_file"), "read");
+        assert_eq!(resolve_tool_name("search_replace"), "edit");
+        assert_eq!(resolve_tool_name("str_replace"), "edit");
+        assert_eq!(resolve_tool_name("shell"), "bash");
+        assert_eq!(resolve_tool_name("Glob"), "find");
+        assert_eq!(resolve_tool_name("read"), "read");
+        assert_eq!(resolve_tool_name("mcp__x"), "mcp__x");
+    }
+}

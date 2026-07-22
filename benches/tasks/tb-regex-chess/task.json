@@ -1,0 +1,12 @@
+{
+  "id": "tb-regex-chess",
+  "title": "TB2 hard: full chess move generator as ordered regex substitutions on FEN",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "regex-chess",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/regex-chess",
+    "difficulty": "hard",
+    "expert_time_estimate_min": 1440
+  }
+}
