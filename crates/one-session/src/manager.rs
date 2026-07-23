@@ -1,3 +1,4 @@
+use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
@@ -98,50 +99,48 @@ impl SessionManager {
         let sessions = Self::list(cwd.as_ref()).await?;
         let latest = sessions
             .into_iter()
-            .max_by_key(|session| session.modified)
+            .next() // `list` returns newest-first
             .ok_or(SessionError::NoSessions)?;
         Self::open(latest.path).await
     }
 
+    /// List sessions for a project cwd (newest first).
+    ///
+    /// **Performance:** does **not** fully open each JSONL. A prior implementation
+    /// called [`Self::open`] (read + migrate + deserialize every entry) for every
+    /// file — with ~180 multi-MB sessions that made `/resume` freeze the TUI for
+    /// hundreds of ms to seconds. Listing only needs id / name / first-user
+    /// preview / mtime, so we read a small prefix per file off the async runtime.
     pub async fn list(cwd: impl AsRef<Path>) -> Result<Vec<SessionInfo>> {
-        let dir = session_dir_for_cwd(cwd.as_ref());
-        if !dir.exists() {
-            return Ok(Vec::new());
+        let cwd = cwd.as_ref().to_path_buf();
+        // Sync I/O in a blocking thread: many small prefix reads are faster as
+        // plain `std::fs` than hundreds of async `read_line` syscalls, and keeps
+        // the TUI event loop free while `/resume` loads.
+        match tokio::task::spawn_blocking(move || list_sessions_sync(&cwd)).await {
+            Ok(sessions) => Ok(sessions),
+            Err(err) => Err(SessionError::Io(std::io::Error::other(format!(
+                "list sessions join: {err}"
+            )))),
         }
+    }
 
-        let mut sessions = Vec::new();
-        let mut entries = fs::read_dir(&dir).await?;
-        while let Some(entry) = entries.next_entry().await? {
-            let path = entry.path();
-            if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
-                continue;
-            }
-            if let Ok(manager) = Self::open(&path).await {
-                sessions.push(SessionInfo {
-                    path,
-                    id: manager.header.id.clone(),
-                    cwd: manager.header.cwd.clone(),
-                    name: manager.session_name(),
-                    preview: manager.first_user_preview(),
-                    modified: manager
-                        .entries
-                        .last()
-                        .map(|entry| match entry {
-                            SessionEntry::Message { base, .. }
-                            | SessionEntry::Compaction { base, .. }
-                            | SessionEntry::BranchSummary { base, .. }
-                            | SessionEntry::Custom { base, .. }
-                            | SessionEntry::CustomMessage { base, .. }
-                            | SessionEntry::Label { base, .. }
-                            | SessionEntry::ModelChange { base, .. }
-                            | SessionEntry::ThinkingLevelChange { base, .. }
-                            | SessionEntry::SessionInfo { base, .. } => base.timestamp,
-                        })
-                        .unwrap_or(manager.header.timestamp),
-                });
-            }
-        }
-        Ok(sessions)
+    /// Lightweight metadata for a single session file (same fields as [`list`]).
+    pub async fn list_info(path: impl AsRef<Path>) -> Option<SessionInfo> {
+        let path = path.as_ref().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            let modified = std::fs::metadata(&path)
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .map(|t| {
+                    let dt: chrono::DateTime<Utc> = t.into();
+                    dt
+                })
+                .unwrap_or_else(Utc::now);
+            scan_session_list_info(&path, modified)
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     pub fn from_jsonl(content: &str) -> Result<Self> {
@@ -487,6 +486,180 @@ fn first_line_preview(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Max bytes to read from a session file when building the `/resume` list.
+/// First user turns (and almost all `/name` renames) sit near the head; tool
+/// dumps of multi-MB live later and must not be fully deserialized.
+const LIST_SCAN_MAX_BYTES: u64 = 256 * 1024;
+
+fn list_sessions_sync(cwd: &Path) -> Vec<SessionInfo> {
+    let dir = session_dir_for_cwd(cwd);
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+
+    let mut candidates: Vec<(PathBuf, chrono::DateTime<Utc>)> = Vec::new();
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+            continue;
+        }
+        // prompt_history.jsonl lives in the same dir — not a session.
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "prompt_history.jsonl")
+        {
+            continue;
+        }
+        let modified = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .map(|t| {
+                let dt: chrono::DateTime<Utc> = t.into();
+                dt
+            })
+            .unwrap_or_else(Utc::now);
+        candidates.push((path, modified));
+    }
+
+    // Newest first so `/resume` / `continue_recent` don't reverse readdir order.
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+
+    candidates
+        .into_iter()
+        .filter_map(|(path, fs_modified)| scan_session_list_info(&path, fs_modified))
+        .collect()
+}
+
+/// Prefix-scan a session JSONL for list metadata only — never materializes full
+/// `SessionEntry` trees or multi-MB tool payloads into the agent message model.
+fn scan_session_list_info(
+    path: &Path,
+    fs_modified: chrono::DateTime<Utc>,
+) -> Option<SessionInfo> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut limited = file.take(LIST_SCAN_MAX_BYTES);
+    let mut content = String::new();
+    limited.read_to_string(&mut content).ok()?;
+
+    let mut id = String::new();
+    let mut cwd = String::new();
+    let mut name: Option<String> = None;
+    let mut preview: Option<String> = None;
+    let mut saw_header = false;
+    let mut lines_read: usize = 0;
+
+    // After we have a preview, skip heavy JSON parse unless the line might be
+    // a rename (`session_info`). Cap how long we hunt for a late name.
+    const NAME_HUNT_LINES: usize = 64;
+
+    for raw in content.lines() {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        lines_read += 1;
+
+        // Cheap reject after preview: only `session_info` can still change label.
+        if preview.is_some() && !trimmed.contains("session_info") {
+            if lines_read > NAME_HUNT_LINES {
+                break;
+            }
+            continue;
+        }
+
+        let value: serde_json::Value = match serde_json::from_str(trimmed) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let ty = value.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+        match ty {
+            "session" => {
+                if let Ok(header) = serde_json::from_value::<SessionHeader>(value) {
+                    id = header.id;
+                    cwd = header.cwd;
+                    saw_header = true;
+                }
+            }
+            "session_info" => {
+                if let Some(n) = value.get("name").and_then(|v| v.as_str()) {
+                    let n = n.trim();
+                    if !n.is_empty() {
+                        name = Some(n.to_string());
+                    }
+                }
+            }
+            "message" if preview.is_none() => {
+                if let Some(p) = preview_from_message_value(&value) {
+                    preview = Some(p);
+                }
+            }
+            _ => {}
+        }
+
+        // Fast path: identity + label material is enough for the picker.
+        if saw_header && preview.is_some() && (name.is_some() || lines_read >= NAME_HUNT_LINES) {
+            break;
+        }
+        // Empty / tool-only sessions: keep scanning a bit for any user turn.
+        if saw_header && preview.is_none() && lines_read >= 256 {
+            break;
+        }
+    }
+
+    if !saw_header || id.is_empty() {
+        return None;
+    }
+
+    Some(SessionInfo {
+        path: path.to_path_buf(),
+        id,
+        cwd,
+        name,
+        preview,
+        modified: fs_modified,
+    })
+}
+
+/// Pull a short user-text preview from a raw message line without deserializing
+/// the full `AgentMessage` (avoids allocating tool/assistant payloads).
+fn preview_from_message_value(value: &serde_json::Value) -> Option<String> {
+    let message = value.get("message")?;
+    let role = message.get("role").and_then(|v| v.as_str())?;
+    if role != "user" {
+        return None;
+    }
+    let content = message.get("content")?;
+    let text = match content {
+        serde_json::Value::String(s) => s.clone(),
+        serde_json::Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for b in blocks {
+                let ty = b.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                match ty {
+                    "text" => {
+                        if let Some(t) = b.get("text").and_then(|v| v.as_str()) {
+                            parts.push(t.to_string());
+                        }
+                    }
+                    "image" => parts.push("[image]".into()),
+                    _ => {}
+                }
+            }
+            parts.join("\n")
+        }
+        _ => return None,
+    };
+    let preview = first_line_preview(&text, 72);
+    if preview.is_empty() {
+        None
+    } else {
+        Some(preview)
+    }
+}
+
 /// Replace plain-text user turns that are only `as_display_text` snapshots of a
 /// real multimodal turn with the original `UserContent::Blocks` (images included).
 ///
@@ -650,5 +823,60 @@ mod tests {
         sm.leaf_id = Some(base.id);
 
         assert_eq!(sm.first_user_preview().as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn list_is_lightweight_and_newest_first() {
+        use std::time::Duration;
+        use tokio::time::sleep;
+
+        let dir = std::env::temp_dir().join(format!(
+            "one-session-list-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Point session root at a temp tree via a fake cwd encoding.
+        // `session_dir_for_cwd` uses ~/.one/agent/sessions — use real create API
+        // under an isolated cwd path that won't collide.
+        let cwd = dir.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        let mut a = SessionManager::create(&cwd).await.unwrap();
+        a.append_message(AgentMessage::user_text("older prompt"))
+            .await
+            .unwrap();
+        sleep(Duration::from_millis(20)).await;
+        let mut b = SessionManager::create(&cwd).await.unwrap();
+        b.append_message(AgentMessage::user_text("newer prompt"))
+            .await
+            .unwrap();
+        b.append_session_info("named-new").await.unwrap();
+
+        let list = SessionManager::list(&cwd).await.unwrap();
+        assert!(list.len() >= 2, "expected both sessions, got {list:?}");
+        // Newest first.
+        assert!(
+            list[0].modified >= list[1].modified,
+            "list must be newest-first: {:?}",
+            list.iter().map(|s| s.modified).collect::<Vec<_>>()
+        );
+        // Labels come from lightweight scan.
+        let labels: Vec<_> = list.iter().map(|s| s.display_label()).collect();
+        assert!(
+            labels.iter().any(|l| l.contains("named-new") || l.contains("newer")),
+            "expected newer label, got {labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.contains("older")),
+            "expected older preview, got {labels:?}"
+        );
+
+        // Direct path metadata matches list entry.
+        let info = SessionManager::list_info(&list[0].path).await.unwrap();
+        assert_eq!(info.id, list[0].id);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

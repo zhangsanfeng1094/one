@@ -461,6 +461,44 @@ fn refresh_background_list_if_open(app: &mut App, runtime: &AppRuntime) {
     refresh_bg_chip(app, runtime);
 }
 
+/// Live-refresh an already-open `/ps` task detail (status + log tail).
+///
+/// Follows the tail when the user was already on the last line; otherwise keeps
+/// their scroll index so ↑/↓ browsing is not yanked away by new output.
+fn refresh_background_detail_if_open(app: &mut App, runtime: &AppRuntime) {
+    let kind = app.float.as_ref().map(|f| f.kind);
+    if kind != Some(FloatKind::BackgroundDetail) {
+        return;
+    }
+    let Some(id) = app.bg_ps_detail_id.clone() else {
+        return;
+    };
+    let (follow_tail, sel) = app
+        .float
+        .as_ref()
+        .map(|f| {
+            let n = f.filtered_entries().len();
+            let sel = f.selected;
+            (n == 0 || sel + 1 >= n, sel)
+        })
+        .unwrap_or((true, 0));
+
+    // Keep list cache warm for Esc-back.
+    app.bg_ps_list = background_ps_list_rows(runtime);
+    let (title, section, rows) = background_ps_detail(runtime, &id);
+    app.open_background_detail_float(id, title, &section, &rows);
+    // `open_background_detail_float` pins to the last line; restore if scrolled up.
+    if !follow_tail {
+        if let Some(f) = app.float.as_mut() {
+            let n = f.filtered_entries().len();
+            if n > 0 {
+                f.selected = sel.min(n - 1);
+            }
+        }
+    }
+    refresh_bg_chip(app, runtime);
+}
+
 /// Apply UI outcomes queued mid-turn (Enter on `/ps`, kill from `/ps` panel, …).
 ///
 /// Avoids anything that needs `agent.lock()` — the streaming task already holds it.
@@ -1085,9 +1123,9 @@ pub async fn run_interactive(
             runtime.new_session().await?;
             app.set_notice("no past sessions · started new");
         } else {
+            // `list` is already newest-first — do not reverse.
             let rows: Vec<(String, String, String, String)> = sessions
                 .into_iter()
-                .rev()
                 .take(40)
                 .map(|s| {
                     let id = s.path.to_string_lossy().to_string();
@@ -1137,8 +1175,9 @@ pub async fn run_interactive(
                 refresh_mcp_chip(app, runtime);
                 // Live bg:N chip for background bash / agent jobs (/ps for detail).
                 refresh_bg_chip(app, runtime);
-                // Keep open `/ps` list elapsed/status current.
+                // Keep open `/ps` list / detail elapsed + log tail current.
                 refresh_background_list_if_open(app, runtime);
+                refresh_background_detail_if_open(app, runtime);
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?
@@ -1462,6 +1501,7 @@ async fn run_turn_streaming(
                 refresh_mcp_chip(app, runtime);
                 refresh_bg_chip(app, runtime);
                 refresh_background_list_if_open(app, runtime);
+                refresh_background_detail_if_open(app, runtime);
                 // UI slash / `/ps` while streaming — open floats without waiting for turn end.
                 while let Some(outcome) = app.take_busy_ui() {
                     apply_busy_ui_outcome(app, runtime, outcome);
@@ -1754,33 +1794,29 @@ async fn handle_slash(
             Ok(SlashAction::Consumed)
         }
         Some("/resume") => {
-            let sessions = runtime.list_sessions().await?;
-            if sessions.is_empty() {
-                app.set_notice("no sessions for this project");
-                return Ok(SlashAction::Consumed);
-            }
-            // Optional path/id argument → open directly.
-            if let Some(spec) = parts.get(1) {
-                let target = sessions.iter().find(|s| {
-                    s.path.to_string_lossy().contains(spec)
-                        || s.id.starts_with(spec)
-                        || s.name.as_deref().is_some_and(|n| n == *spec)
-                        || s.preview
-                            .as_deref()
-                            .is_some_and(|p| p == *spec || p.contains(spec))
-                });
-                if let Some(info) = target {
-                    load_session_into_app(runtime, app, info).await?;
+            // Optional path/id argument → open directly (picker selection re-enters
+            // here with the full session path — never re-list all files for that).
+            if parts.len() > 1 {
+                let spec = parts[1..].join(" ");
+                if let Some(info) = resolve_resume_target(runtime, &spec).await? {
+                    load_session_into_app(runtime, app, &info).await?;
                 } else {
                     app.set_notice(format!("session not found: {spec}"));
                 }
                 return Ok(SlashAction::Consumed);
             }
 
-            // Secondary float picker (newest first).
-            let mut rows: Vec<(String, String, String, String)> = sessions
+            // Secondary float picker (newest first). Lightweight list — no full
+            // open of every JSONL (that used to freeze the TUI for seconds).
+            app.set_notice("loading sessions…");
+            let sessions = runtime.list_sessions().await?;
+            if sessions.is_empty() {
+                app.set_notice("no sessions for this project");
+                return Ok(SlashAction::Consumed);
+            }
+
+            let rows: Vec<(String, String, String, String)> = sessions
                 .into_iter()
-                .rev()
                 .take(40)
                 .map(|s| {
                     let id = s.path.to_string_lossy().to_string();
@@ -1801,8 +1837,8 @@ async fn handle_slash(
                 app.set_notice("no sessions");
             } else {
                 app.open_sessions_float(&rows);
+                app.set_notice(format!("{} recent · enter to resume", rows.len()));
             }
-            let _ = &mut rows;
             Ok(SlashAction::Consumed)
         }
         Some("/plan") => {
@@ -2399,12 +2435,56 @@ async fn notify_plan_ready(app: &mut App, runtime: &AppRuntime) {
     app.set_notice(format!("plan ready · /act to implement · {path}"));
 }
 
+/// Resolve `/resume <spec>` without listing every session when `spec` is a path.
+async fn resolve_resume_target(
+    runtime: &AppRuntime,
+    spec: &str,
+) -> Result<Option<one_session::SessionInfo>, Box<dyn std::error::Error>> {
+    let spec = spec.trim();
+    if spec.is_empty() {
+        return Ok(None);
+    }
+
+    // Picker selection passes the absolute JSONL path as the item id.
+    let as_path = std::path::Path::new(spec);
+    if as_path.is_file() {
+        if let Some(info) = one_session::SessionManager::list_info(as_path).await {
+            return Ok(Some(info));
+        }
+        // File exists but header unreadable — still try open via synthetic info.
+        return Ok(Some(one_session::SessionInfo {
+            path: as_path.to_path_buf(),
+            id: as_path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(spec)
+                .to_string(),
+            cwd: runtime.cwd.display().to_string(),
+            name: None,
+            preview: None,
+            modified: chrono::Utc::now(),
+        }));
+    }
+
+    // Fuzzy match against project sessions (id prefix / name / preview / path).
+    let sessions = runtime.list_sessions().await?;
+    Ok(sessions.into_iter().find(|s| {
+        s.path.to_string_lossy().contains(spec)
+            || s.id.starts_with(spec)
+            || s.name.as_deref().is_some_and(|n| n == spec)
+            || s.preview
+                .as_deref()
+                .is_some_and(|p| p == spec || p.contains(spec))
+    }))
+}
+
 /// Open a past session and mirror messages into the TUI transcript.
 async fn load_session_into_app(
     runtime: &mut AppRuntime,
     app: &mut App,
     info: &one_session::SessionInfo,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    app.set_notice(format!("resuming {}…", info.display_label()));
     runtime.open_session_path(&info.path).await?;
     let msgs = runtime.agent.lock().await.messages.clone();
     rebuild_tui_from_agent(app, &msgs);

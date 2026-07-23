@@ -499,7 +499,9 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
         );
     }
 
-    // List with scroll around selected
+    // List with scroll around selected. BackgroundDetail is a read-only log:
+    // `selected` is only a scroll anchor — never a focus cursor.
+    let readonly_log = menu.kind == FloatKind::BackgroundDetail;
     let max_rows = list_area.height as usize;
     let selected_row = render_rows
         .iter()
@@ -508,6 +510,7 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
             _ => false,
         })
         .unwrap_or(0);
+    // Keep the scroll anchor visible (tail when selected is last line).
     let start = selected_row.saturating_sub(max_rows.saturating_sub(1));
     let end = (start + max_rows).min(render_rows.len());
 
@@ -526,10 +529,14 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
                 hint,
                 style,
             } => {
-                let active = !editing && *entry_index == menu.selected;
-                lines.push(float_item_line(
-                    label, detail, hint, col_w, active, editing, *style,
-                ));
+                if readonly_log {
+                    lines.push(float_log_line(label, detail, col_w));
+                } else {
+                    let active = !editing && *entry_index == menu.selected;
+                    lines.push(float_item_line(
+                        label, detail, hint, col_w, active, editing, *style,
+                    ));
+                }
             }
         }
     }
@@ -595,10 +602,27 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         FloatKind::Mcp => " ↑/↓  ·  Enter  ·  Import  ·  Esc ",
         FloatKind::McpImport => " ↑/↓  ·  Enter import  ·  Esc back ",
         FloatKind::Background => " ↑/↓  ·  Enter log  ·  x kill  ·  Esc ",
-        FloatKind::BackgroundDetail => " ↑/↓  ·  Enter refresh  ·  x kill  ·  Esc list ",
+        FloatKind::BackgroundDetail => " ↑/↓ scroll  ·  auto  ·  x kill  ·  Esc list ",
         FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
     };
     base.into()
+}
+
+/// Read-only log row for `/ps` task detail — full width, no selection cursor.
+fn float_log_line(label: &str, detail: &str, col_w: usize) -> Line<'static> {
+    let text = if label.is_empty() {
+        detail.to_string()
+    } else {
+        // stderr / error marker stays as a one-char prefix.
+        format!("{label} {detail}")
+    };
+    let padded = pad_or_truncate(&text, col_w.max(1));
+    let style = if label.is_empty() {
+        Theme::slash_desc()
+    } else {
+        Theme::slash_item()
+    };
+    Line::from(Span::styled(padded, style))
 }
 
 fn float_filter_line(menu: &FloatMenu) -> Line<'static> {
@@ -1779,8 +1803,15 @@ fn char_width(ch: char) -> usize {
 /// │              ← top padding (not input)
 /// │  hello ▌     ← indent + text + blinking software caret
 /// │              ← bottom padding
-///   Build  deepseek-v4-flash  opencode
+///   Build  deepseek-v4-flash  sensenova          MCP 3/3  bg:1
+///   Ctrl+G settings │ Ctrl+L model │ Alt+H help   think:medium  181k
 /// ```
+///
+/// **Layout contract (each fact once):**
+/// - Meta left  → session identity (agent / model / provider)
+/// - Meta right → live ops chips only (MCP / bg / running)
+/// - Status left → contextual keybindings
+/// - Status right → session stats (think level / token usage)
 ///
 /// Caret sits on a **dedicated 1-column slot** after the text (or before the
 /// placeholder when empty). Hardware cursor stays hidden.
@@ -1895,7 +1926,15 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(paragraph, box_area);
     // Hardware cursor stays hidden — software ▌ above is the typewriter caret.
 
-    // Prompt meta: agent (accent)  model  provider — no api/host noise.
+    // Prompt meta — identity left, live ops chips right. Stats live on status.
+    draw_prompt_meta(frame, meta_area, app);
+}
+
+/// Prompt meta strip under the input box.
+///
+/// Left:  `Build  deepseek-v4-flash  sensenova`
+/// Right: `MCP 3/3  bg:1 · top…  running`  (ops only — never think/tokens)
+fn draw_prompt_meta(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let agent = if app.agent_label.is_empty() {
         "Build".to_string()
     } else {
@@ -1910,59 +1949,84 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let provider = app.current_provider.clone();
 
-    let mut meta_spans = vec![
+    // —— left: session identity ——
+    let mut left = vec![
         Span::styled("  ", Theme::bg()),
         // Copper identity tag — PRIMARY reserved for caret / list selection.
         Span::styled(agent, Theme::mode_label()),
     ];
     if !model.is_empty() {
-        meta_spans.push(Span::styled("  ", Theme::bg()));
-        meta_spans.push(Span::styled(model, Theme::meta()));
+        left.push(Span::styled("  ", Theme::bg()));
+        left.push(Span::styled(model, Theme::meta()));
     }
     if !provider.is_empty() {
-        meta_spans.push(Span::styled("  ", Theme::bg()));
-        meta_spans.push(Span::styled(provider, Theme::status_faint()));
+        left.push(Span::styled("  ", Theme::bg()));
+        left.push(Span::styled(provider, Theme::status_faint()));
     }
-    if app.thinking_level != "off" {
-        meta_spans.push(Span::styled("  ", Theme::bg()));
-        meta_spans.push(Span::styled(
-            format!("think:{}", app.thinking_level),
-            Theme::status_faint(),
-        ));
-    }
-    if app.usage_tokens > 0 {
-        meta_spans.push(Span::styled("  ", Theme::bg()));
-        let tok = format_tokens(app.usage_tokens);
-        let label = if app.usage_tokens_estimated {
-            format!("~{tok}")
-        } else {
-            tok
-        };
-        meta_spans.push(Span::styled(label, Theme::status_faint()));
-    }
-    // Live MCP progress chip (e.g. MCP 4/5…) — coarse, no connection noise.
+
+    // —— right: live ops chips only ——
+    let mut right: Vec<Span<'static>> = Vec::new();
+    // MCP progress (e.g. MCP 3/3) — coarse, no connection noise. Status does NOT mirror.
     if !app.mcp_chip_text.is_empty() {
-        meta_spans.push(Span::styled("  ", Theme::bg()));
-        meta_spans.push(Span::styled(
+        right.push(Span::styled(
             app.mcp_chip_text.clone(),
             mcp_chip_style(app.mcp_chip_kind),
         ));
     }
-    // Live background bash/jobs chip (e.g. bg:1 · cargo…) — open /ps for detail.
+    // Background bash/jobs (e.g. bg:1 · cargo…) — open /ps for detail.
     if !app.bg_chip_text.is_empty() {
-        meta_spans.push(Span::styled("  ", Theme::bg()));
-        meta_spans.push(Span::styled(
+        if !right.is_empty() {
+            right.push(Span::styled("  ", Theme::bg()));
+        }
+        right.push(Span::styled(
             app.bg_chip_text.clone(),
             bg_chip_style(app.bg_chip_kind),
         ));
     }
     if app.busy {
-        meta_spans.push(Span::styled("  running", Theme::status_faint()));
+        if !right.is_empty() {
+            right.push(Span::styled("  ", Theme::bg()));
+        }
+        right.push(Span::styled("running", Theme::status_faint()));
+    }
+    if !right.is_empty() {
+        right.push(Span::raw("  ")); // trailing pad so right edge breathes
     }
 
+    render_split_row(frame, area, left, right);
+}
+
+/// Paint a single-row strip with left content + right-aligned trailing content.
+/// Right width is measured from content (not a fixed column count) so chips
+/// never collide with identity/key labels.
+fn render_split_row(
+    frame: &mut Frame<'_>,
+    area: Rect,
+    left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
+) {
+    if right.is_empty() {
+        frame.render_widget(Paragraph::new(Line::from(left)).style(Theme::bg()), area);
+        return;
+    }
+
+    let right_text: String = right.iter().map(|s| s.content.as_ref()).collect();
+    let right_cols = display_width(&right_text) as u16;
+    // Leave at least ~12 cols for left identity/keys; clamp right if terminal is tight.
+    let max_right = area.width.saturating_sub(12);
+    let right_w = right_cols.min(max_right).max(1);
+
+    let row = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(8), Constraint::Length(right_w)])
+        .split(area);
+
+    frame.render_widget(Paragraph::new(Line::from(left)).style(Theme::bg()), row[0]);
     frame.render_widget(
-        Paragraph::new(Line::from(meta_spans)).style(Theme::bg()),
-        meta_area,
+        Paragraph::new(Line::from(right))
+            .alignment(Alignment::Right)
+            .style(Theme::bg()),
+        row[1],
     );
 }
 
@@ -2303,7 +2367,7 @@ mod tests {
         let meta_row: String = cells[(h - 2) * w..(h - 1) * w].concat();
         let status_row: String = cells[(h - 1) * w..h * w].concat();
 
-        // Meta: agent + model + provider only.
+        // Meta: agent + model + provider (identity).
         assert!(meta_row.contains("Build"), "agent on meta: {meta_row}");
         assert!(
             meta_row.contains("deepseek-v4-flash"),
@@ -2339,28 +2403,95 @@ mod tests {
             "idle status should stay sparse: {status_row}"
         );
     }
+
+    #[test]
+    fn meta_and_status_do_not_duplicate_chips() {
+        // Regression: MCP / think / tokens used to appear on BOTH strips and
+        // jammed into `MCP3/3…MCP 3/3think:medium181k` on narrow terminals.
+        let backend = TestBackend::new(100, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.set_agent_label("Build");
+        app.set_current_model("sensenova", "deepseek-v4-flash");
+        app.thinking_level = "medium".into();
+        app.set_usage_tokens(37_000);
+        app.set_usage_tokens_estimated(false);
+        app.set_mcp_chip("MCP 3/3", 2);
+        app.set_bg_chip("bg:1 · top", 1);
+        app.push_assistant("hello");
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let buf = terminal.backend().buffer();
+        let w = buf.area.width as usize;
+        let h = buf.area.height as usize;
+        let cells: Vec<String> = buf
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        let meta_row: String = cells[(h - 2) * w..(h - 1) * w].concat();
+        let status_row: String = cells[(h - 1) * w..h * w].concat();
+
+        // Meta: identity + live ops only.
+        assert!(meta_row.contains("Build"), "agent: {meta_row}");
+        assert!(meta_row.contains("deepseek-v4-flash"), "model: {meta_row}");
+        assert!(meta_row.contains("sensenova"), "provider: {meta_row}");
+        assert!(meta_row.contains("MCP 3/3"), "MCP chip on meta: {meta_row}");
+        assert!(meta_row.contains("bg:1"), "bg chip on meta: {meta_row}");
+        assert!(
+            !meta_row.contains("think:"),
+            "think belongs on status, not meta: {meta_row}"
+        );
+        assert!(
+            !meta_row.contains("37k") && !meta_row.contains("tok"),
+            "tokens belong on status, not meta: {meta_row}"
+        );
+
+        // Status: keys + session stats only — never mirror MCP/bg.
+        assert!(
+            status_row.contains("Ctrl+G") || status_row.contains("settings"),
+            "keys: {status_row}"
+        );
+        assert!(
+            status_row.contains("think:medium"),
+            "think on status: {status_row}"
+        );
+        assert!(
+            status_row.contains("37k") || status_row.contains("tok"),
+            "tokens on status: {status_row}"
+        );
+        assert!(
+            !status_row.contains("MCP"),
+            "MCP must not duplicate on status: {status_row}"
+        );
+        assert!(
+            !status_row.contains("bg:"),
+            "bg must not duplicate on status: {status_row}"
+        );
+
+        // Exactly one MCP occurrence across both chrome rows.
+        let chrome = format!("{meta_row}{status_row}");
+        assert_eq!(
+            chrome.matches("MCP").count(),
+            1,
+            "MCP chip must appear exactly once: meta={meta_row} status={status_row}"
+        );
+    }
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let (left, right) = status_spans(app);
-
-    // Left is sparse core keys; give the right side enough room for usage / ctx %.
-    let row = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(8), Constraint::Length(28)])
-        .split(area);
-
-    frame.render_widget(Paragraph::new(Line::from(left)).style(Theme::bg()), row[0]);
-    frame.render_widget(
-        Paragraph::new(Line::from(right))
-            .alignment(Alignment::Right)
-            .style(Theme::bg()),
-        row[1],
-    );
+    // Content-measured right width — fixed 28 was too tight for think+usage and
+    // too loose when empty, and collided with left keys on narrow terminals.
+    render_split_row(frame, area, left, right);
 }
 
 /// Sparse, context-aware status strip.
-/// Keys slightly brighter than labels; only show what matters in the current mode.
+///
+/// Left:  keybindings only (mode-aware).
+/// Right: session stats only (think level / token usage).
+/// Never MCP or bg — those live exclusively on the prompt meta strip.
 fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     // Key + label pairs, joined with double-space (no middle-dot soup).
     fn pair(key: &'static str, label: &'static str) -> [Span<'static>; 2] {
@@ -2386,7 +2517,10 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         let pct = ((app.chat_scroll as f64 / max as f64) * 100.0).round() as u16;
         let mut left = vec![Span::raw("  ")];
         left.extend(pair("end", " latest"));
-        let right = vec![Span::styled(format!("↑{pct}%  "), Theme::status_faint())];
+        let right = vec![
+            Span::styled(format!("↑{pct}%"), Theme::status_faint()),
+            Span::raw("  "),
+        ];
         return (left, right);
     }
 
@@ -2396,15 +2530,12 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         left.extend(pair("esc", " stop  "));
         left.extend(pair("Ctrl+C", "×2 quit  "));
         left.extend(pair("Ctrl+S", " steer"));
-        let mut right = Vec::new();
-        if !app.mcp_chip_text.is_empty() {
-            right.push(Span::styled(
-                format!("{}  ", app.mcp_chip_text),
-                mcp_chip_style(app.mcp_chip_kind),
-            ));
+        // Ops chips (MCP/bg) stay on meta; status only shows activity + stats.
+        let mut right = status_stats_spans(app);
+        if right.is_empty() {
+            right.push(Span::styled("working", Theme::status_faint()));
+            right.push(Span::raw("  "));
         }
-        // bg chip lives only on the prompt meta row (avoid status-bar duplicate).
-        right.push(Span::styled("working  ", Theme::status_faint()));
         return (left, right);
     }
 
@@ -2417,23 +2548,21 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     left.push(Span::styled("  │  ", Theme::status_faint()));
     left.extend(pair("Alt+H", " help"));
 
+    (left, status_stats_spans(app))
+}
+
+/// Right-side session stats for the status strip: think level + token usage.
+/// Kept separate so busy/idle modes share one formatter (no MCP/bg).
+fn status_stats_spans(app: &App) -> Vec<Span<'static>> {
     let mut right = Vec::new();
-    // MCP progress on the right (mirrors prompt meta) — always visible when configured.
-    if !app.mcp_chip_text.is_empty() {
-        right.push(Span::styled(
-            format!("{}  ", app.mcp_chip_text),
-            mcp_chip_style(app.mcp_chip_kind),
-        ));
-    }
-    // bg chip: prompt meta only (not mirrored here).
+    let mut parts: Vec<String> = Vec::new();
+
     if app.thinking_level != "off" {
         // Default is collapsed; only badge when the user opted into full bodies.
         let vis = if app.show_thinking { "·full" } else { "" };
-        right.push(Span::styled(
-            format!("think:{}{vis}  ", app.thinking_level),
-            Theme::status_faint(),
-        ));
+        parts.push(format!("think:{}{vis}", app.thinking_level));
     }
+
     // Prefer precise provider I/O tokens when available.
     if app.usage_input > 0
         || app.usage_output > 0
@@ -2441,47 +2570,51 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         || app.usage_cache_write > 0
     {
         let mut usage = format!(
-            "↑{} ↓{}  ",
+            "↑{} ↓{}",
             format_tokens(app.usage_input as usize),
             format_tokens(app.usage_output as usize)
         );
         // Cache R = read hits, W = creation/write (Anthropic).
         if app.usage_cache_read > 0 || app.usage_cache_write > 0 {
             usage.push_str(&format!(
-                "cR{} cW{}  ",
+                " cR{} cW{}",
                 format_tokens(app.usage_cache_read as usize),
                 format_tokens(app.usage_cache_write as usize)
             ));
         }
         if app.usage_cost_usd > 0.0 {
             if app.usage_cost_usd < 0.01 {
-                usage.push_str(&format!("${:.4}  ", app.usage_cost_usd));
+                usage.push_str(&format!(" ${:.4}", app.usage_cost_usd));
             } else {
-                usage.push_str(&format!("${:.3}  ", app.usage_cost_usd));
+                usage.push_str(&format!(" ${:.3}", app.usage_cost_usd));
             }
         }
         if app.context_window > 0 && app.usage_tokens > 0 {
             let pct = (app.usage_tokens * 100) / app.context_window.max(1);
-            // ctx uses last provider prompt size when known (no ~).
             let approx = if app.usage_tokens_estimated { "~" } else { "" };
             usage.push_str(&format!(
-                "ctx {approx}{} {}%  ",
+                " ctx {approx}{} {}%",
                 format_tokens(app.usage_tokens),
                 pct
             ));
         }
-        right.push(Span::styled(usage, Theme::status_faint()));
+        parts.push(usage);
     } else if app.usage_tokens > 0 {
         let approx = if app.usage_tokens_estimated { "~" } else { "" };
         let usage = if app.context_window > 0 {
             let pct = (app.usage_tokens * 100) / app.context_window.max(1);
-            format!("{approx}{} tok {}%  ", format_tokens(app.usage_tokens), pct)
+            format!("{approx}{} tok {}%", format_tokens(app.usage_tokens), pct)
         } else {
-            format!("{approx}{} tok  ", format_tokens(app.usage_tokens))
+            format!("{approx}{} tok", format_tokens(app.usage_tokens))
         };
-        right.push(Span::styled(usage, Theme::status_faint()));
+        parts.push(usage);
     }
-    (left, right)
+
+    if !parts.is_empty() {
+        right.push(Span::styled(parts.join("  "), Theme::status_faint()));
+        right.push(Span::raw("  ")); // trailing pad
+    }
+    right
 }
 
 fn format_tokens(n: usize) -> String {

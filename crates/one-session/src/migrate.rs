@@ -15,14 +15,10 @@ pub fn migrate_jsonl(content: &str) -> Result<String> {
     let version = first.get("version").and_then(|v| v.as_u64()).unwrap_or(1);
 
     if version >= 3 {
-        if lines.iter().skip(1).all(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
-                .and_then(|v| v.get("id").cloned())
-                .is_some()
-        }) {
-            return Ok(content.to_string());
-        }
+        // Trust current-format sessions. The previous "every line has an id"
+        // check re-parsed the entire file as `Value` (including multi-MB tool
+        // payloads) on every open — a pure tax for the common path.
+        return Ok(content.to_string());
     }
 
     let mut header: SessionHeader = if first.get("type").and_then(|t| t.as_str()) == Some("session")

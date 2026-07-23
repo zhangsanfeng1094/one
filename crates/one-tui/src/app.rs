@@ -2885,9 +2885,14 @@ impl App {
             {
                 self.background_kill_selection()
             }
+            // BackgroundDetail is a read-only log viewer — no type-to-filter.
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !self
+                        .float
+                        .as_ref()
+                        .is_some_and(|f| f.kind == FloatKind::BackgroundDetail) =>
             {
                 if let Some(f) = self.float.as_mut() {
                     f.push_search(ch);

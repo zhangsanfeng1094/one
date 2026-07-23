@@ -422,7 +422,8 @@ impl FloatMenu {
         }
     }
 
-    /// Log viewer: title = command, `section` = status line, `rows` = log lines
+    /// Read-only log viewer: title = command, `section` = status line,
+    /// `rows` = log lines. Selection is a scroll anchor only (no focus cursor).
     /// (`label` usually empty so the line uses the full detail column).
     pub fn background_detail(
         title: impl Into<String>,
