@@ -135,6 +135,16 @@ impl AppRuntime {
         self.mode
     }
 
+    /// Background bash task registry (shared with `bash` / `bash_output` / `bash_kill`).
+    pub fn bg_registry(&self) -> Arc<BackgroundTaskRegistry> {
+        self.bg_registry.clone()
+    }
+
+    /// Background agent jobs registry (`task(background=true)`), if spawn is enabled.
+    pub fn agent_jobs(&self) -> Option<Arc<jobs::AgentJobRegistry>> {
+        self.task_host.as_ref().map(|h| h.jobs())
+    }
+
     /// Whether the `task` tool is registered for this runtime.
     pub fn task_enabled(&self) -> bool {
         self.applied_features.subagent_enabled()

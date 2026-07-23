@@ -159,6 +159,61 @@ impl App {
         self.mcp_chip_kind = 0;
     }
 
+    /// Background tasks chip (`bg:1 · cargo…`). Empty text hides it.
+    /// `kind`: 1 running · 2 idle/recent done · 3 mixed fail · 4 error-only
+    pub fn set_bg_chip(&mut self, text: impl Into<String>, kind: u8) {
+        self.bg_chip_text = text.into();
+        self.bg_chip_kind = if self.bg_chip_text.is_empty() {
+            0
+        } else {
+            kind
+        };
+    }
+
+    pub fn clear_bg_chip(&mut self) {
+        self.bg_chip_text.clear();
+        self.bg_chip_kind = 0;
+    }
+
+    /// Open `/ps` list panel. `rows`: `(id, label, detail, hint)`.
+    pub fn open_background_float(&mut self, rows: &[(String, String, String, String)]) {
+        self.bg_ps_list = rows.to_vec();
+        self.bg_ps_detail_id = None;
+        self.close_float();
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::background_picker(rows));
+        self.clear_notice();
+    }
+
+    /// Open one background task log panel (fresh rows from CLI).
+    pub fn open_background_detail_float(
+        &mut self,
+        id: impl Into<String>,
+        title: impl Into<String>,
+        section: impl Into<String>,
+        rows: &[(String, String)],
+    ) {
+        self.bg_ps_detail_id = Some(id.into());
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::background_detail(title, section, rows));
+        // Jump selection to the last log line so the tail is visible.
+        if let Some(f) = self.float.as_mut() {
+            let n = f.filtered_entries().len();
+            if n > 0 {
+                f.selected = n - 1;
+            }
+        }
+        self.clear_notice();
+    }
+
+    /// Re-open last `/ps` list (Esc from detail).
+    pub fn reopen_background_list_float(&mut self) {
+        self.bg_ps_detail_id = None;
+        let rows = self.bg_ps_list.clone();
+        self.float = Some(FloatMenu::background_picker(&rows));
+        self.clear_notice();
+    }
+
     /// Open skills enable/disable panel (`/skills`).
     pub fn open_skills_float(&mut self) {
         self.close_float();
@@ -497,6 +552,15 @@ impl App {
                 // Back to MCP manager (caller may refresh rows).
                 self.open_mcp_float();
                 true
+            }
+            FloatKind::BackgroundDetail => {
+                // Esc is handled in `handle_float_key` → OpenBackgroundList
+                // so the CLI reloads a fresh snapshot (not this cache).
+                false
+            }
+            FloatKind::Background => {
+                // Esc closes the panel entirely.
+                false
             }
             FloatKind::Thinking => {
                 // Opened from Settings — return to root rather than blank.

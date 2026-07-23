@@ -5,8 +5,8 @@ use one_core::error::OneError;
 use one_core::events::AgentEvent;
 use one_core::message::AgentMessage;
 use one_tui::{
-    App, ApprovalAnswer, ApprovalPrompt, ConfigOp, ForceQuit, ModelChoice, RunOutcome, SelectKind,
-    TerminalSession,
+    App, ApprovalAnswer, ApprovalPrompt, ConfigOp, FloatKind, FloatMenu, ForceQuit, ModelChoice,
+    RunOutcome, SelectKind, TerminalSession,
 };
 
 use crate::approval::{ApprovalChoice, PermissionGate};
@@ -210,6 +210,7 @@ fn refresh_mcp_rows(app: &mut App, runtime: &AppRuntime) {
         .collect();
     app.set_mcp_rows(rows, runtime.mcp.settings_summary());
     refresh_mcp_chip(app, runtime);
+    refresh_bg_chip(app, runtime);
 }
 
 fn refresh_mcp_import_rows(app: &mut App, runtime: &AppRuntime) {
@@ -246,6 +247,459 @@ fn refresh_mcp_chip(app: &mut App, runtime: &AppRuntime) {
         }
         None => app.clear_mcp_chip(),
     }
+}
+
+/// Live chip for background bash + agent jobs (`bg:1 · cargo…`). Open `/ps` for detail.
+fn refresh_bg_chip(app: &mut App, runtime: &AppRuntime) {
+    // Lightweight meta — no stdout/stderr clone on every tick.
+    let bash = runtime.bg_registry().list_meta();
+    let jobs = runtime
+        .agent_jobs()
+        .map(|j| j.list())
+        .unwrap_or_default();
+
+    let bash_running = bash
+        .iter()
+        .filter(|t| t.state == one_tools::TaskState::Running)
+        .count();
+    let jobs_running = jobs
+        .iter()
+        .filter(|j| j.state == crate::runtime::jobs::JobState::Running)
+        .count();
+    let running = bash_running + jobs_running;
+
+    // Fail signal: real failures only — not intentional kill.
+    let bash_failed = bash.iter().any(|t| {
+        matches!(
+            t.state,
+            one_tools::TaskState::Failed | one_tools::TaskState::TimedOut
+        ) || (t.state == one_tools::TaskState::Completed && t.exit_code.unwrap_or(0) != 0)
+    });
+    let jobs_failed = jobs.iter().any(|j| {
+        matches!(j.state, crate::runtime::jobs::JobState::Failed)
+            || (matches!(j.state, crate::runtime::jobs::JobState::Completed) && !j.ok)
+    });
+
+    if running == 0 && bash.is_empty() && jobs.is_empty() {
+        app.clear_bg_chip();
+        return;
+    }
+
+    if running == 0 {
+        // No active work: hide chip unless something failed recently still listed.
+        if bash_failed || jobs_failed {
+            let n_fail = bash
+                .iter()
+                .filter(|t| {
+                    matches!(
+                        t.state,
+                        one_tools::TaskState::Failed | one_tools::TaskState::TimedOut
+                    ) || (t.state == one_tools::TaskState::Completed
+                        && t.exit_code.unwrap_or(0) != 0)
+                })
+                .count()
+                + jobs
+                    .iter()
+                    .filter(|j| {
+                        matches!(j.state, crate::runtime::jobs::JobState::Failed)
+                            || (matches!(j.state, crate::runtime::jobs::JobState::Completed)
+                                && !j.ok)
+                    })
+                    .count();
+            app.set_bg_chip(format!("bg:{n_fail} · fail · /ps"), 4);
+        } else {
+            // Completed / killed successfully — clear so chrome stays quiet.
+            app.clear_bg_chip();
+        }
+        return;
+    }
+
+    // Prefer the newest running bash command as the label.
+    let label = bash
+        .iter()
+        .filter(|t| t.state == one_tools::TaskState::Running)
+        .max_by_key(|t| t.seq)
+        .map(|t| {
+            let cmd = t.command.trim();
+            if cmd.chars().count() > 18 {
+                format!("{}…", cmd.chars().take(17).collect::<String>())
+            } else {
+                cmd.to_string()
+            }
+        })
+        .or_else(|| {
+            jobs.iter()
+                .filter(|j| j.state == crate::runtime::jobs::JobState::Running)
+                .map(|j| {
+                    j.description
+                        .clone()
+                        .unwrap_or_else(|| format!("task·{}", j.agent))
+                })
+                .next()
+        })
+        .unwrap_or_else(|| "running".into());
+
+    let kind = if bash_failed || jobs_failed { 3 } else { 1 };
+    app.set_bg_chip(format!("bg:{running} · {label}"), kind);
+}
+
+/// Selectable `/ps` list rows: `(id, label, detail, hint)`.
+///
+/// Columns: **status · command · time · short id** (id helps with `bash_output`).
+fn background_ps_list_rows(runtime: &AppRuntime) -> Vec<(String, String, String, String)> {
+    let bash = runtime.bg_registry().list_meta();
+    let jobs = runtime
+        .agent_jobs()
+        .map(|j| j.list())
+        .unwrap_or_default();
+
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
+    for t in &bash {
+        rows.push((
+            t.id.clone(),
+            bash_meta_status_label(t),
+            truncate_cmd(&t.command, 48),
+            format!("{} · {}", human_elapsed(t.elapsed_ms), short_task_id(&t.id)),
+        ));
+    }
+    for j in &jobs {
+        let what = j
+            .description
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(j.agent.as_str());
+        let progress = match (j.turns, j.max_turns) {
+            (Some(t), Some(m)) => format!("{t}/{m}"),
+            (Some(t), None) => format!("t{t}"),
+            _ => String::new(),
+        };
+        let time = if progress.is_empty() {
+            human_elapsed(j.duration_ms)
+        } else {
+            format!("{} · {}", human_elapsed(j.duration_ms), progress)
+        };
+        rows.push((
+            j.id.clone(),
+            job_status_label(j),
+            truncate_cmd(what, 48),
+            format!("{} · {}", time, short_task_id(&j.id)),
+        ));
+    }
+    rows
+}
+
+/// Detail: title = command, section = status line, body = log lines (one float row each).
+fn background_ps_detail(
+    runtime: &AppRuntime,
+    id: &str,
+) -> (String, String, Vec<(String, String)>) {
+    if let Some(t) = runtime.bg_registry().get(id) {
+        let title = truncate_cmd(&t.command, 56);
+        let section = format!("{} · {}", bash_status_line(&t), short_task_id(&t.id));
+        let rows = log_lines_as_rows(&t.stdout, &t.stderr, 40);
+        return (title, section, rows);
+    }
+    if let Some(jobs) = runtime.agent_jobs() {
+        if let Some(j) = jobs.get(id) {
+            let title = j
+                .description
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("{} · {}", j.kind, j.agent));
+            let section = format!("{} · {}", job_status_line(&j), short_task_id(&j.id));
+            let mut rows = Vec::new();
+            if let Some(err) = &j.error {
+                if !err.is_empty() {
+                    rows.push(("!".into(), truncate_cmd(err, 80)));
+                }
+            }
+            if !j.summary.is_empty() {
+                rows.extend(text_lines_as_rows(&j.summary, 40));
+            }
+            if rows.is_empty() {
+                rows.push((String::new(), "(no summary yet)".into()));
+            }
+            return (truncate_cmd(&title, 56), section, rows);
+        }
+    }
+    (
+        id.to_string(),
+        "not found".into(),
+        vec![(String::new(), format!("unknown task `{id}`"))],
+    )
+}
+
+fn open_background_list_panel(app: &mut App, runtime: &AppRuntime) {
+    refresh_bg_chip(app, runtime);
+    let rows = background_ps_list_rows(runtime);
+    app.open_background_float(&rows);
+}
+
+/// Live-refresh an already-open `/ps` list (preserve selection by id).
+fn refresh_background_list_if_open(app: &mut App, runtime: &AppRuntime) {
+    let kind = app.float.as_ref().map(|f| f.kind);
+    if kind != Some(FloatKind::Background) {
+        return;
+    }
+    let sel_id = app
+        .float
+        .as_ref()
+        .and_then(|f| f.selected_entry())
+        .map(|e| e.item.id);
+    let rows = background_ps_list_rows(runtime);
+    app.bg_ps_list = rows.clone();
+    app.float = Some(FloatMenu::background_picker(&rows));
+    if let (Some(id), Some(f)) = (sel_id, app.float.as_mut()) {
+        if let Some(idx) = f
+            .filtered_entries()
+            .iter()
+            .position(|e| e.item.id == id)
+        {
+            f.selected = idx;
+        }
+    }
+    refresh_bg_chip(app, runtime);
+}
+
+/// Apply UI outcomes queued mid-turn (Enter on `/ps`, kill from `/ps` panel, …).
+///
+/// Avoids anything that needs `agent.lock()` — the streaming task already holds it.
+fn apply_busy_ui_outcome(app: &mut App, runtime: &AppRuntime, outcome: RunOutcome) {
+    match outcome {
+        RunOutcome::OpenBackgroundList => {
+            open_background_list_panel(app, runtime);
+        }
+        RunOutcome::OpenBackgroundDetail { id } => {
+            open_background_detail_panel(app, runtime, &id);
+        }
+        RunOutcome::KillBackground { id } => {
+            // Sync kill so list refresh sees Killed immediately (no spawn race).
+            kill_background_task_sync(app, runtime, &id);
+        }
+        RunOutcome::OpenMcpPanel => {
+            refresh_mcp_rows(app, runtime);
+            app.open_mcp_float();
+        }
+        RunOutcome::OpenMcpImportPanel => {
+            refresh_mcp_import_rows(app, runtime);
+            app.open_mcp_import_float();
+        }
+        RunOutcome::Prompt(text) => {
+            // Safe mid-turn subset — no agent.lock / no nested prompt turn.
+            let cmd = text.split_whitespace().next().unwrap_or(text.as_str());
+            match cmd {
+                "/ps" | "/jobs" => {
+                    let id = text.split_whitespace().nth(1);
+                    if let Some(id) = id {
+                        open_background_detail_panel(app, runtime, id);
+                    } else {
+                        open_background_list_panel(app, runtime);
+                    }
+                }
+                "/login" => {
+                    app.open_login_float(&login_provider_rows());
+                }
+                "/logout" => {
+                    app.open_logout_float(&logout_provider_rows());
+                }
+                "/mcp" => {
+                    refresh_mcp_rows(app, runtime);
+                    app.open_mcp_float();
+                }
+                _ => {
+                    app.set_notice(format!("busy · `{cmd}` after this turn"));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn open_background_detail_panel(app: &mut App, runtime: &AppRuntime, id: &str) {
+    refresh_bg_chip(app, runtime);
+    // Always refresh list cache so Esc-back (if any) is not completely stale.
+    app.bg_ps_list = background_ps_list_rows(runtime);
+    let (title, section, rows) = background_ps_detail(runtime, id);
+    app.open_background_detail_float(id, title, &section, &rows);
+}
+
+/// Kill bash task or agent job by id, then refresh `/ps` list (async path).
+async fn kill_background_task(app: &mut App, runtime: &AppRuntime, id: &str) {
+    kill_background_task_sync(app, runtime, id);
+    // Yield so process-group reapers can settle.
+    tokio::task::yield_now().await;
+}
+
+/// Sync kill + list refresh (safe from busy TUI tick).
+fn kill_background_task_sync(app: &mut App, runtime: &AppRuntime, id: &str) {
+    let bash = runtime.bg_registry();
+    if bash.get(id).is_some() {
+        match bash.kill_sync(id) {
+            Ok(snap) => {
+                app.set_notice(format!("killed {} · {}", snap.id, snap.state.as_str()));
+            }
+            Err(e) => {
+                app.set_notice(format!("kill failed: {e}"));
+            }
+        }
+        open_background_list_panel(app, runtime);
+        return;
+    }
+    if let Some(jobs) = runtime.agent_jobs() {
+        match jobs.kill(id) {
+            Ok(snap) => {
+                app.set_notice(format!("killed {} · {}", snap.id, snap.state.as_str()));
+            }
+            Err(e) => {
+                app.set_notice(format!("kill failed: {e}"));
+            }
+        }
+        open_background_list_panel(app, runtime);
+        return;
+    }
+    app.set_notice(format!("unknown task `{id}`"));
+    open_background_list_panel(app, runtime);
+}
+
+fn bash_meta_status_label(t: &one_tools::TaskMeta) -> String {
+    match t.state {
+        one_tools::TaskState::Running => "● run".into(),
+        one_tools::TaskState::Completed => match t.exit_code {
+            Some(0) => "✓ ok".into(),
+            Some(c) => format!("✗ {c}"),
+            None => "✓ done".into(),
+        },
+        one_tools::TaskState::TimedOut => "⏱ out".into(),
+        one_tools::TaskState::Killed => "■ kill".into(),
+        one_tools::TaskState::Failed => "✗ fail".into(),
+    }
+}
+
+fn bash_status_line(t: &one_tools::TaskSnapshot) -> String {
+    let time = human_elapsed(t.elapsed_ms);
+    match t.state {
+        one_tools::TaskState::Running => format!("running · {time}"),
+        one_tools::TaskState::Completed => match t.exit_code {
+            Some(0) => format!("ok · {time}"),
+            Some(c) => format!("exit {c} · {time}"),
+            None => format!("done · {time}"),
+        },
+        one_tools::TaskState::TimedOut => format!("timed out · {time}"),
+        one_tools::TaskState::Killed => format!("killed · {time}"),
+        one_tools::TaskState::Failed => {
+            if let Some(err) = &t.error {
+                format!("failed · {time} · {}", truncate_cmd(err, 40))
+            } else {
+                format!("failed · {time}")
+            }
+        }
+    }
+}
+
+/// Short id for list hint / detail (strip `bg_` / `job_` prefix when present).
+fn short_task_id(id: &str) -> String {
+    let bare = id
+        .strip_prefix("bg_")
+        .or_else(|| id.strip_prefix("job_"))
+        .unwrap_or(id);
+    if bare.chars().count() > 12 {
+        format!("{}…", bare.chars().take(11).collect::<String>())
+    } else {
+        bare.to_string()
+    }
+}
+
+fn job_status_label(j: &crate::runtime::jobs::JobSnapshot) -> String {
+    match j.state {
+        crate::runtime::jobs::JobState::Running => "● job".into(),
+        crate::runtime::jobs::JobState::Completed if j.ok => "✓ job".into(),
+        crate::runtime::jobs::JobState::Completed => "✗ job".into(),
+        crate::runtime::jobs::JobState::Aborted => "■ job".into(),
+        crate::runtime::jobs::JobState::Failed => "✗ job".into(),
+    }
+}
+
+fn job_status_line(j: &crate::runtime::jobs::JobSnapshot) -> String {
+    let time = human_elapsed(j.duration_ms);
+    let progress = match (j.turns, j.max_turns) {
+        (Some(t), Some(m)) => format!(" · turn {t}/{m}"),
+        (Some(t), None) => format!(" · turn {t}"),
+        _ => String::new(),
+    };
+    match j.state {
+        crate::runtime::jobs::JobState::Running => format!("running{progress} · {time}"),
+        crate::runtime::jobs::JobState::Completed if j.ok => format!("ok{progress} · {time}"),
+        crate::runtime::jobs::JobState::Completed => format!("failed{progress} · {time}"),
+        crate::runtime::jobs::JobState::Aborted => format!("aborted · {time}"),
+        crate::runtime::jobs::JobState::Failed => format!("failed · {time}"),
+    }
+}
+
+/// One float row per log line (float UI is single-line; multi-line blobs are useless).
+///
+/// Stderr lines get a `!` label so errors stay visible when mixed with stdout.
+fn log_lines_as_rows(
+    stdout: &str,
+    stderr: &str,
+    max_lines: usize,
+) -> Vec<(String, String)> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for line in stdout.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
+        rows.push((String::new(), truncate_cmd(line, 96)));
+    }
+    for line in stderr.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
+        rows.push(("!".into(), truncate_cmd(line, 94)));
+    }
+    if rows.is_empty() {
+        return vec![(String::new(), "(no output yet)".into())];
+    }
+    let start = rows.len().saturating_sub(max_lines);
+    rows[start..].to_vec()
+}
+
+fn text_lines_as_rows(text: &str, max_lines: usize) -> Vec<(String, String)> {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return vec![(String::new(), "(no output yet)".into())];
+    }
+    let start = lines.len().saturating_sub(max_lines);
+    lines[start..]
+        .iter()
+        .map(|line| {
+            // Empty label → full width for the log line in the detail column.
+            (String::new(), truncate_cmd(line, 96))
+        })
+        .collect()
+}
+
+fn human_elapsed(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        let s = ms as f64 / 1000.0;
+        if s < 10.0 {
+            format!("{s:.1}s")
+        } else {
+            format!("{}s", ms / 1000)
+        }
+    } else {
+        let m = ms / 60_000;
+        let s = (ms / 1000) % 60;
+        format!("{m}m{s:02}s")
+    }
+}
+
+fn truncate_cmd(s: &str, max_chars: usize) -> String {
+    let s = s.trim();
+    if s.chars().count() <= max_chars {
+        return s.to_string();
+    }
+    let head: String = s.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{head}…")
 }
 
 async fn apply_config_op(
@@ -681,6 +1135,10 @@ pub async fn run_interactive(
             .wait_action_with(&mut app, |app| {
                 // Live MCP 4/5 chip while servers connect in the background.
                 refresh_mcp_chip(app, runtime);
+                // Live bg:N chip for background bash / agent jobs (/ps for detail).
+                refresh_bg_chip(app, runtime);
+                // Keep open `/ps` list elapsed/status current.
+                refresh_background_list_if_open(app, runtime);
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?
@@ -799,6 +1257,24 @@ pub async fn run_interactive(
             RunOutcome::OpenMcpImportPanel => {
                 refresh_mcp_import_rows(&mut app, runtime);
                 app.open_mcp_import_float();
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            RunOutcome::OpenBackgroundList => {
+                open_background_list_panel(&mut app, runtime);
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            RunOutcome::OpenBackgroundDetail { id } => {
+                open_background_detail_panel(&mut app, runtime, &id);
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            RunOutcome::KillBackground { id } => {
+                kill_background_task(&mut app, runtime, &id).await;
                 terminal
                     .draw(&mut app)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -934,12 +1410,14 @@ async fn run_turn_streaming(
             && tokio::time::Instant::now() < deadline
         {
             refresh_mcp_chip(app, runtime);
+            refresh_bg_chip(app, runtime);
             let _ = terminal.draw(app);
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
     }
     runtime.sync_mcp_tools().await?;
     refresh_mcp_chip(app, runtime);
+    refresh_bg_chip(app, runtime);
 
     let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
     runtime.subscribe_collector(events.clone()).await;
@@ -982,6 +1460,12 @@ async fn run_turn_streaming(
                 drain_events(app, &events);
                 drain_hitl(app, &gate, &hitl);
                 refresh_mcp_chip(app, runtime);
+                refresh_bg_chip(app, runtime);
+                refresh_background_list_if_open(app, runtime);
+                // UI slash / `/ps` while streaming — open floats without waiting for turn end.
+                while let Some(outcome) = app.take_busy_ui() {
+                    apply_busy_ui_outcome(app, runtime, outcome);
+                }
                 if app.take_abort() {
                     cancel_hitl(app, &gate, &hitl);
                     runtime.abort();
@@ -1220,6 +1704,15 @@ async fn handle_slash(
                 let _ = session;
             }
             app.open_info_float("Session", &rows);
+            Ok(SlashAction::Consumed)
+        }
+        // Codex-style process list: selectable panel → Enter detail.
+        Some("/ps") | Some("/jobs") => {
+            if let Some(id) = parts.get(1).copied() {
+                open_background_detail_panel(app, runtime, id);
+            } else {
+                open_background_list_panel(app, runtime);
+            }
             Ok(SlashAction::Consumed)
         }
         Some("/name") => {

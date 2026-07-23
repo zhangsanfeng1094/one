@@ -128,6 +128,12 @@ pub enum RunOutcome {
     OpenMcpPanel,
     /// Open MCP import picker; CLI scans foreign agents first.
     OpenMcpImportPanel,
+    /// Open / refresh background tasks list (`/ps`).
+    OpenBackgroundList,
+    /// Open one background task detail (fresh snapshot from runtime).
+    OpenBackgroundDetail { id: String },
+    /// Kill a background bash task or agent job (`/ps` → `x`).
+    KillBackground { id: String },
     Quit,
     Noop,
 }
@@ -143,6 +149,9 @@ impl RunOutcome {
             | RunOutcome::OpenRewind
             | RunOutcome::OpenMcpPanel
             | RunOutcome::OpenMcpImportPanel
+            | RunOutcome::OpenBackgroundList
+            | RunOutcome::OpenBackgroundDetail { .. }
+            | RunOutcome::KillBackground { .. }
             | RunOutcome::SwitchModel { .. }
             | RunOutcome::ConfigOp(_)
             | RunOutcome::Quit => true,

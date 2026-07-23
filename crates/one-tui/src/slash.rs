@@ -96,6 +96,16 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "MCP servers · status · enable/disable (bare = panel)",
     },
     SlashCommand {
+        name: "/ps",
+        usage: "/ps [task_id]",
+        description: "background bash/jobs · status · output tail (Codex-style)",
+    },
+    SlashCommand {
+        name: "/jobs",
+        usage: "/jobs [task_id]",
+        description: "alias for /ps",
+    },
+    SlashCommand {
         name: "/skill",
         usage: "/skill:name [args]",
         description: "force-load skill (else agent auto-reads when relevant)",

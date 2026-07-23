@@ -594,6 +594,8 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         FloatKind::Features => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Back  ·  ctx needs /new ",
         FloatKind::Mcp => " ↑/↓  ·  Enter  ·  Import  ·  Esc ",
         FloatKind::McpImport => " ↑/↓  ·  Enter import  ·  Esc back ",
+        FloatKind::Background => " ↑/↓  ·  Enter log  ·  x kill  ·  Esc ",
+        FloatKind::BackgroundDetail => " ↑/↓  ·  Enter refresh  ·  x kill  ·  Esc list ",
         FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
     };
     base.into()
@@ -1946,6 +1948,14 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
             mcp_chip_style(app.mcp_chip_kind),
         ));
     }
+    // Live background bash/jobs chip (e.g. bg:1 · cargo…) — open /ps for detail.
+    if !app.bg_chip_text.is_empty() {
+        meta_spans.push(Span::styled("  ", Theme::bg()));
+        meta_spans.push(Span::styled(
+            app.bg_chip_text.clone(),
+            bg_chip_style(app.bg_chip_kind),
+        ));
+    }
     if app.busy {
         meta_spans.push(Span::styled("  running", Theme::status_faint()));
     }
@@ -1962,6 +1972,16 @@ fn mcp_chip_style(kind: u8) -> Style {
         2 => Theme::status_faint(),              // all ok — quiet
         3 => Theme::status().fg(Theme::WARNING), // partial
         4 => Theme::status().fg(Theme::ERROR),   // error
+        _ => Theme::status_faint(),
+    }
+}
+
+fn bg_chip_style(kind: u8) -> Style {
+    match kind {
+        1 => Theme::status().fg(Theme::INFO),    // running
+        2 => Theme::status_faint(),              // recent done
+        3 => Theme::status().fg(Theme::WARNING), // mixed
+        4 => Theme::status().fg(Theme::ERROR),   // failed
         _ => Theme::status_faint(),
     }
 }
@@ -2383,6 +2403,7 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
                 mcp_chip_style(app.mcp_chip_kind),
             ));
         }
+        // bg chip lives only on the prompt meta row (avoid status-bar duplicate).
         right.push(Span::styled("working  ", Theme::status_faint()));
         return (left, right);
     }
@@ -2404,6 +2425,7 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
             mcp_chip_style(app.mcp_chip_kind),
         ));
     }
+    // bg chip: prompt meta only (not mirrored here).
     if app.thinking_level != "off" {
         // Default is collapsed; only badge when the user opted into full bodies.
         let vis = if app.show_thinking { "·full" } else { "" };

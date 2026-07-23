@@ -351,16 +351,32 @@ pub fn summarize_tool_special(
                 .unwrap_or("?");
             let running = status == "running";
             let failed = is_error || matches!(status, "timed_out" | "killed" | "failed");
+            let last_log = output
+                .lines()
+                .map(str::trim)
+                .filter(|l| {
+                    !l.is_empty()
+                        && !l.starts_with("task_id:")
+                        && !l.starts_with("command:")
+                        && !l.starts_with("status:")
+                        && !l.starts_with("exit:")
+                        && !l.starts_with("elapsed")
+                        && !l.starts_with("--- ")
+                        && *l != "(no output yet)"
+                })
+                .last();
             let summary =
                 if output.starts_with("Background tasks:") || output.starts_with("No background") {
                     format!(
                         "list · {}",
                         truncate(output.lines().next().unwrap_or("ps"), 40)
                     )
+                } else if let Some(line) = last_log {
+                    format!("{status} · {}", truncate(line, 42))
                 } else {
                     format!("{status} · {task_id}")
                 };
-            // Expand finished snapshots so bg results are visible without an extra click.
+            // Expand finished / failed; keep running compact but show last log line.
             Some((summary, !running || failed, None))
         }
         "bash_kill" => {

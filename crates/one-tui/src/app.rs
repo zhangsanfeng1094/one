@@ -3,6 +3,7 @@
 //! Public types live in [`crate::state`]; Settings / MCP / skills float
 //! navigation lives in [`crate::settings`] (`impl App` continues there).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -139,6 +140,14 @@ pub struct App {
     pub mcp_chip_text: String,
     /// 0=hide 1=loading 2=ok 3=partial 4=error
     pub mcp_chip_kind: u8,
+    /// Status-bar / prompt-meta chip for background bash/jobs, e.g. `bg:1`. Empty = hidden.
+    pub bg_chip_text: String,
+    /// 0=hide 1=running 2=idle/done 3=failed mixed 4=error
+    pub bg_chip_kind: u8,
+    /// Cached `/ps` list rows: `(id, label, detail, hint)` for Esc-back from detail.
+    pub bg_ps_list: Vec<(String, String, String, String)>,
+    /// Task id currently shown in BackgroundDetail (for Enter refresh).
+    pub bg_ps_detail_id: Option<String>,
     /// Ephemeral toast (top-right). **Not** chat context, **not** agent messages.
     pub toast: Option<Toast>,
     /// Centered floating secondary menu (Settings, commands, sessions, …).
@@ -183,6 +192,8 @@ pub struct App {
     followup_pending: Option<String>,
     steer_pending: Option<String>,
     abort_pending: bool,
+    /// UI outcomes queued while streaming (e.g. `/ps`) for the CLI busy tick.
+    busy_ui_queue: VecDeque<RunOutcome>,
     /// Ctrl+C force-quit: leave interactive immediately (not soft cancel).
     force_quit_pending: bool,
     /// Images still referenced by tokens in `input`.
@@ -294,6 +305,10 @@ impl App {
             compaction_prune_max_chars: 2_000,
             mcp_chip_text: String::new(),
             mcp_chip_kind: 0,
+            bg_chip_text: String::new(),
+            bg_chip_kind: 0,
+            bg_ps_list: Vec::new(),
+            bg_ps_detail_id: None,
             toast: None,
             float: None,
             current_provider: String::new(),
@@ -317,6 +332,7 @@ impl App {
             followup_pending: None,
             steer_pending: None,
             abort_pending: false,
+            busy_ui_queue: VecDeque::new(),
             force_quit_pending: false,
             pending_images: Vec::new(),
             image_jobs: Vec::new(),
@@ -2077,6 +2093,19 @@ impl App {
         self.steer_pending.take()
     }
 
+    /// Queue a UI action while the agent is streaming (CLI drains via [`take_busy_ui`]).
+    pub fn queue_busy_ui(&mut self, outcome: RunOutcome) {
+        if matches!(outcome, RunOutcome::Noop) {
+            return;
+        }
+        self.busy_ui_queue.push_back(outcome);
+    }
+
+    /// Pop the next busy-time UI action (oldest first).
+    pub fn take_busy_ui(&mut self) -> Option<RunOutcome> {
+        self.busy_ui_queue.pop_front()
+    }
+
     pub fn request_abort(&mut self) {
         self.abort_pending = true;
     }
@@ -2775,13 +2804,28 @@ impl App {
                 RunOutcome::Noop
             }
             // Esc / ← (nav only): cancel field edit, else one level up.
+            // `/ps` detail → ask CLI to reopen list with a fresh snapshot (not cache).
             KeyCode::Esc => {
+                if self
+                    .float
+                    .as_ref()
+                    .is_some_and(|f| f.kind == FloatKind::BackgroundDetail)
+                {
+                    return RunOutcome::OpenBackgroundList;
+                }
                 if !self.settings_go_back() {
                     self.close_float();
                 }
                 RunOutcome::Noop
             }
             KeyCode::Left if !text_focus => {
+                if self
+                    .float
+                    .as_ref()
+                    .is_some_and(|f| f.kind == FloatKind::BackgroundDetail)
+                {
+                    return RunOutcome::OpenBackgroundList;
+                }
                 if !self.settings_go_back() {
                     self.close_float();
                 }
@@ -2806,6 +2850,13 @@ impl App {
                     .map(|f| f.search.is_empty())
                     .unwrap_or(true);
                 if empty && !editing {
+                    if self
+                        .float
+                        .as_ref()
+                        .is_some_and(|f| f.kind == FloatKind::BackgroundDetail)
+                    {
+                        return RunOutcome::OpenBackgroundList;
+                    }
                     if !self.settings_go_back() {
                         self.close_float();
                     }
@@ -2819,6 +2870,20 @@ impl App {
                     f.delete_search_forward();
                 }
                 RunOutcome::Noop
+            }
+            // `/ps`: `x` kills selected task (list or open detail) when not filtering.
+            KeyCode::Char('x') | KeyCode::Char('X')
+                if !editing
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && self.float.as_ref().is_some_and(|f| {
+                        matches!(
+                            f.kind,
+                            FloatKind::Background | FloatKind::BackgroundDetail
+                        ) && f.search.is_empty()
+                    }) =>
+            {
+                self.background_kill_selection()
             }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2839,6 +2904,28 @@ impl App {
                 }
             }
             _ => RunOutcome::Noop,
+        }
+    }
+
+    /// `/ps` list or detail: kill the focused background task (`x`).
+    fn background_kill_selection(&mut self) -> RunOutcome {
+        let kind = self.float.as_ref().map(|f| f.kind);
+        let id = match kind {
+            Some(FloatKind::BackgroundDetail) => self.bg_ps_detail_id.clone(),
+            Some(FloatKind::Background) => self
+                .float
+                .as_ref()
+                .and_then(|f| f.selected_entry())
+                .map(|e| e.item.id)
+                .filter(|id| id != "_empty" && !id.is_empty()),
+            _ => None,
+        };
+        match id {
+            Some(id) => RunOutcome::KillBackground { id },
+            None => {
+                self.set_notice("nothing to kill");
+                RunOutcome::Noop
+            }
         }
     }
 
@@ -2910,6 +2997,23 @@ impl App {
             FloatKind::Info => {
                 self.close_float();
                 RunOutcome::Noop
+            }
+            FloatKind::Background => {
+                if entry.item.id == "_empty" || entry.item.id.is_empty() {
+                    return RunOutcome::Noop;
+                }
+                // CLI re-fetches a fresh snapshot (live output tail).
+                RunOutcome::OpenBackgroundDetail {
+                    id: entry.item.id.clone(),
+                }
+            }
+            FloatKind::BackgroundDetail => {
+                // Enter refreshes the open task (live output tail).
+                if let Some(id) = self.bg_ps_detail_id.clone() {
+                    return RunOutcome::OpenBackgroundDetail { id };
+                }
+                // No id (edge case) → CLI reopens fresh list.
+                RunOutcome::OpenBackgroundList
             }
             FloatKind::Settings => self.confirm_settings_root(&entry.item.id),
             FloatKind::SettingsToolOutput => self.confirm_settings_tool_output(&entry.item.id),
@@ -2995,6 +3099,10 @@ impl App {
                 self.close_float();
                 RunOutcome::OpenMcpPanel
             }
+            "ps" | "jobs" => {
+                self.close_float();
+                RunOutcome::OpenBackgroundList
+            }
             // These need runtime data → emit slash so CLI opens the right float.
             "resume" | "session" | "tree" | "rewind" | "new" | "name" | "export" | "compact"
             | "reload" | "skill" | "plan" | "act" | "build" => {
@@ -3064,15 +3172,25 @@ impl App {
             return;
         }
 
+        // Float panels (including `/ps`) must queue CLI-facing outcomes while busy —
+        // `run_busy` discards return values, so we stash them for the tick drain.
         if self.float_open() {
-            let _ = self.handle_float_key(key);
+            let outcome = self.handle_float_key(key);
+            self.route_busy_outcome(outcome);
             return;
         }
 
         match key.code {
             KeyCode::Esc => {
-                self.request_abort();
-                self.set_notice("interrupting…");
+                if self.slash_menu_visible() {
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.slash_selected = 0;
+                    self.clear_notice();
+                } else {
+                    self.request_abort();
+                    self.set_notice("interrupting…");
+                }
             }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 let _ = self.submit_steer();
@@ -3080,11 +3198,41 @@ impl App {
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
                 let _ = self.submit_followup();
             }
+            // Enter while busy: UI slash commands (esp. `/ps`) and slash-menu confirm.
+            // Plain text still uses Alt+Enter for follow-up (unchanged).
+            KeyCode::Enter => {
+                if self.slash_menu_visible() {
+                    let outcome = self.confirm_slash_menu();
+                    self.route_busy_outcome(outcome);
+                    return;
+                }
+                let text = self.input.trim().to_string();
+                if text.is_empty() {
+                    return;
+                }
+                if is_ui_slash(&text) {
+                    self.input.clear();
+                    self.input_cursor = 0;
+                    self.queue_busy_ui_from_slash(&text);
+                    return;
+                }
+            }
+            KeyCode::Tab => {
+                if self.slash_menu_visible() {
+                    self.apply_slash_completion();
+                }
+            }
             KeyCode::Backspace => {
                 self.pop_input();
+                if self.input.starts_with('/') {
+                    self.clamp_slash_selection();
+                }
             }
             KeyCode::Delete => {
                 self.delete_input_forward();
+                if self.input.starts_with('/') {
+                    self.clamp_slash_selection();
+                }
             }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -3092,6 +3240,9 @@ impl App {
                     && !ch.is_control() =>
             {
                 self.insert_input_char(ch);
+                if self.input.starts_with('/') {
+                    self.clamp_slash_selection();
+                }
             }
             KeyCode::Left => self.move_input_cursor(-1),
             KeyCode::Right => self.move_input_cursor(1),
@@ -3099,9 +3250,97 @@ impl App {
             KeyCode::PageDown => self.scroll_down(self.page_lines()),
             KeyCode::Home => self.scroll_to_top(),
             KeyCode::End => self.scroll_to_bottom(),
-            KeyCode::Up => self.scroll_up(3),
-            KeyCode::Down => self.scroll_down(3),
+            // Slash menu owns ↑/↓ when open; otherwise scroll transcript.
+            KeyCode::Up => {
+                if self.slash_menu_visible() {
+                    self.move_slash_selection(-1);
+                } else {
+                    self.scroll_up(3);
+                }
+            }
+            KeyCode::Down => {
+                if self.slash_menu_visible() {
+                    self.move_slash_selection(1);
+                } else {
+                    self.scroll_down(3);
+                }
+            }
             _ => {}
+        }
+    }
+
+    /// Map a key outcome into busy-time UI work (no nested agent turns).
+    fn route_busy_outcome(&mut self, outcome: RunOutcome) {
+        match outcome {
+            RunOutcome::Noop => {}
+            RunOutcome::Prompt(text) if is_ui_slash(&text) => {
+                self.queue_busy_ui_from_slash(&text);
+            }
+            // Mid-turn user text is follow-up, not a new Prompt turn.
+            RunOutcome::Prompt(text) => {
+                if !text.is_empty() {
+                    self.followup_pending = Some(text);
+                }
+            }
+            RunOutcome::FollowUp(text) => {
+                if !text.is_empty() {
+                    self.followup_pending = Some(text);
+                }
+            }
+            RunOutcome::Steer(text) => {
+                if !text.is_empty() {
+                    self.steer_pending = Some(text);
+                }
+            }
+            other if other.is_actionable() => self.queue_busy_ui(other),
+            _ => {}
+        }
+    }
+
+    /// Expand a UI slash into a local float or a CLI-facing busy action.
+    fn queue_busy_ui_from_slash(&mut self, text: &str) {
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        match parts.first().copied() {
+            Some("/ps") | Some("/jobs") => {
+                if let Some(id) = parts.get(1).copied() {
+                    self.queue_busy_ui(RunOutcome::OpenBackgroundDetail {
+                        id: id.to_string(),
+                    });
+                } else {
+                    self.queue_busy_ui(RunOutcome::OpenBackgroundList);
+                }
+                self.set_notice("background tasks…");
+            }
+            Some("/settings") if parts.len() == 1 => {
+                self.open_settings_float();
+            }
+            Some("/help") => {
+                self.open_help_float();
+            }
+            Some("/model") if parts.len() == 1 => {
+                self.open_model_select();
+            }
+            Some("/thinking") if parts.len() == 1 => {
+                self.open_thinking_float();
+            }
+            Some("/skills") if parts.len() == 1 => {
+                self.open_skills_float();
+            }
+            Some("/mcp") if parts.len() == 1 => {
+                self.queue_busy_ui(RunOutcome::OpenMcpPanel);
+            }
+            Some("/login") if parts.len() == 1 => {
+                // CLI attaches provider rows; queue slash so interactive fills them.
+                self.queue_busy_ui(RunOutcome::Prompt(text.to_string()));
+            }
+            Some("/logout") if parts.len() == 1 => {
+                self.queue_busy_ui(RunOutcome::Prompt(text.to_string()));
+            }
+            // Other UI slashes: hand to CLI (may open floats / notice). Avoids starting
+            // a nested agent turn while the current one is still streaming.
+            _ => {
+                self.queue_busy_ui(RunOutcome::Prompt(text.to_string()));
+            }
         }
     }
 
@@ -3179,8 +3418,8 @@ impl App {
             return RunOutcome::Noop;
         }
         // UI slash commands — handled by one-cli without adding a chat turn.
+        // Also skip ↑ prompt history: recalling `/model` / `/session` is noise.
         if is_ui_slash(&text) {
-            self.push_prompt_history(&text);
             self.input.clear();
             return RunOutcome::Prompt(text);
         }
@@ -3440,6 +3679,10 @@ fn split_tool_text(content: &str) -> (String, String) {
 pub type InteractiveApp = App;
 
 /// Slash commands handled by the CLI as UI ops (not agent user turns).
+///
+/// Keep in sync with `SLASH_COMMANDS` / `handle_slash` — anything here skips
+/// chat transcript **and** ↑ prompt history. `/skill…` is intentionally excluded
+/// (those are real user turns for the agent).
 fn is_ui_slash(text: &str) -> bool {
     let cmd = text
         .split_whitespace()
@@ -3455,11 +3698,16 @@ fn is_ui_slash(text: &str) -> bool {
             | "/new"
             | "/name"
             | "/model"
+            | "/login"
+            | "/logout"
             | "/thinking"
             | "/compact"
             | "/settings"
             | "/skills"
+            | "/agents"
             | "/mcp"
+            | "/ps"
+            | "/jobs"
             | "/tree"
             | "/rewind"
             | "/export"
@@ -3775,6 +4023,78 @@ mod tests {
         assert_eq!(app.input, "second");
         app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
         assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn ui_slash_commands_skip_prompt_history_and_chat() {
+        let mut app = App::new("test");
+        app.push_prompt_history("real prompt");
+
+        // Use args so the `/` completion popup is closed (space ⇒ no menu),
+        // and Enter hits `submit_prompt` → `is_ui_slash` path.
+        for cmd in [
+            "/session detail",
+            "/new",
+            "/name my-session",
+            "/model gpt-4",
+            "/login",
+            "/login openai-codex",
+            "/logout",
+            "/ps",
+            "/agents",
+            "/plan",
+            "/compact",
+        ] {
+            app.input = cmd.into();
+            // Bare `/new` / `/plan` still open the slash menu; complete+submit
+            // via confirm_slash_menu → submit_prompt.
+            if app.slash_menu_visible() {
+                // Snap selection to the exact command row when possible.
+                let rows = app.popup_rows();
+                let want = cmd.split_whitespace().next().unwrap();
+                if let Some(i) = rows
+                    .iter()
+                    .position(|r| matches!(r, PopupRow::Command(c) if c.name == want))
+                {
+                    app.slash_selected = i;
+                }
+            }
+            match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+                RunOutcome::Prompt(t) => {
+                    // Menu confirm may expand bare name; with args it stays as typed.
+                    assert!(
+                        t == cmd || t == cmd.split_whitespace().next().unwrap(),
+                        "unexpected prompt text for {cmd}: {t}"
+                    );
+                }
+                other => panic!("expected Prompt for {cmd}, got {other:?}"),
+            }
+            assert!(
+                app.input.is_empty(),
+                "input should clear after submitting {cmd}"
+            );
+            assert!(
+                app.messages.is_empty(),
+                "UI slash {cmd} must not appear in chat transcript"
+            );
+            assert_eq!(
+                app.prompt_history,
+                vec!["real prompt".to_string()],
+                "UI slash {cmd} must not pollute ↑ history"
+            );
+        }
+
+        // Real user text still records both history and transcript.
+        app.input = "hello".into();
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            RunOutcome::Prompt(_)
+        ));
+        assert_eq!(
+            app.prompt_history,
+            vec!["real prompt".to_string(), "hello".to_string()]
+        );
+        assert_eq!(app.messages.last().unwrap().content, "hello");
     }
 
     #[test]
@@ -4360,6 +4680,41 @@ mod tests {
         assert!(app.take_force_quit());
         // request_force_quit also trips abort so in-flight work stops.
         assert!(app.take_abort());
+    }
+
+    #[test]
+    fn busy_enter_queues_ps_ui_action() {
+        let mut app = App::new("test");
+        app.begin_busy();
+
+        // Type `/ps` (no slash menu once a space is present; bare needs menu confirm).
+        // Use `/ps detail` shape without menu, then bare via direct input clear.
+        app.input = "/ps".into();
+        // When slash menu is open, Enter confirms selection → same Prompt path.
+        if app.slash_menu_visible() {
+            let rows = app.popup_rows();
+            if let Some(i) = rows
+                .iter()
+                .position(|r| matches!(r, PopupRow::Command(c) if c.name == "/ps"))
+            {
+                app.slash_selected = i;
+            }
+        }
+        app.handle_busy_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(app.input.is_empty(), "input cleared after busy /ps");
+        match app.take_busy_ui() {
+            Some(RunOutcome::OpenBackgroundList) => {}
+            other => panic!("expected OpenBackgroundList, got {other:?}"),
+        }
+        assert!(app.take_busy_ui().is_none());
+
+        // Detail form with args (no menu).
+        app.input = "/ps task-9".into();
+        app.handle_busy_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        match app.take_busy_ui() {
+            Some(RunOutcome::OpenBackgroundDetail { id }) => assert_eq!(id, "task-9"),
+            other => panic!("expected OpenBackgroundDetail, got {other:?}"),
+        }
     }
 
     #[test]

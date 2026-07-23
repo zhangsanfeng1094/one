@@ -11,6 +11,7 @@ pub mod os_sandbox;
 pub mod path_policy;
 pub mod permissions;
 pub mod plan;
+pub(crate) mod process_io;
 pub mod read;
 pub mod registry;
 pub mod sandbox;
@@ -56,7 +57,7 @@ pub use sandbox_permissions::{
     justification_of, looks_like_sandbox_denial, requires_escalation, sandbox_permissions_of,
     SandboxPermissions,
 };
-pub use tasks::BackgroundTaskRegistry;
+pub use tasks::{BackgroundTaskRegistry, TaskMeta, TaskSnapshot, TaskState};
 pub use truncate::{
     apply_head_default, apply_tail_default, cleanup_tool_outputs, cleanup_tool_outputs_before,
     format_size, present_file_read, present_tool_output, present_tool_output_with,

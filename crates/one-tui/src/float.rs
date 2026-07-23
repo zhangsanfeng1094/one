@@ -88,6 +88,10 @@ pub enum FloatKind {
     Mcp,
     /// Import MCP servers from Claude / Codex / Cursor.
     McpImport,
+    /// Background bash + agent jobs list (`/ps`).
+    Background,
+    /// One background task detail (status + output tail). Esc → list.
+    BackgroundDetail,
     /// Subscription / OAuth login provider picker (`/login`).
     Login,
     /// Logout provider picker (`/logout`).
@@ -369,6 +373,79 @@ impl FloatMenu {
             search: String::new(),
             sections: vec![FloatSection {
                 title: "Details".into(),
+                items,
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// `/ps` list. `rows`: `(id, status_label, command, elapsed)`.
+    pub fn background_picker(rows: &[(String, String, String, String)]) -> Self {
+        let items: Vec<FloatItem> = if rows.is_empty() {
+            vec![FloatItem {
+                id: "_empty".into(),
+                label: "—".into(),
+                detail: "nothing running".into(),
+                hint: String::new(),
+                style: FloatItemStyle::Normal,
+            }]
+        } else {
+            rows.iter()
+                .map(|(id, label, detail, hint)| FloatItem {
+                    id: id.clone(),
+                    label: label.clone(),
+                    detail: detail.clone(),
+                    hint: hint.clone(),
+                    style: FloatItemStyle::Normal,
+                })
+                .collect()
+        };
+        Self {
+            kind: FloatKind::Background,
+            title: "Background".into(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: if rows.is_empty() {
+                    "idle".into()
+                } else {
+                    format!("{} · enter log", rows.len())
+                },
+                items,
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Log viewer: title = command, `section` = status line, `rows` = log lines
+    /// (`label` usually empty so the line uses the full detail column).
+    pub fn background_detail(
+        title: impl Into<String>,
+        section: impl Into<String>,
+        rows: &[(String, String)],
+    ) -> Self {
+        let items: Vec<FloatItem> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| FloatItem {
+                id: format!("L{i}"),
+                label: k.clone(),
+                detail: v.clone(),
+                hint: String::new(),
+                style: FloatItemStyle::Normal,
+            })
+            .collect();
+        Self {
+            kind: FloatKind::BackgroundDetail,
+            title: title.into(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: section.into(),
                 items,
             }],
             selected: 0,
@@ -1802,6 +1879,12 @@ fn default_command_sections() -> Vec<FloatSection> {
                     "/agents",
                 ),
                 item("mcp", "MCP Servers", "status · enable · disable", "/mcp"),
+                item(
+                    "ps",
+                    "Background Tasks",
+                    "bash · agent jobs · live status · /ps",
+                    "/ps",
+                ),
                 item(
                     "skill",
                     "Force-load Skill",

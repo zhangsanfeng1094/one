@@ -1,19 +1,19 @@
 use std::path::PathBuf;
 use std::process::ExitStatus;
 use std::sync::Arc;
-use std::time::Duration;
 
 use async_trait::async_trait;
 use one_core::error::Result;
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use one_core::tool_gate::{ToolGate, ToolGateDecision};
 use serde_json::json;
-use tokio::io::AsyncReadExt;
 use tokio::process::Command;
-use tokio::time::timeout;
 
 use crate::os_sandbox::OsSandbox;
 use crate::path_policy::{PathPolicy, SandboxMode};
+use crate::process_io::{
+    configure_shell_stdio, consume_child, CapturedOutput, EXEC_OUTPUT_MAX_BYTES,
+};
 use crate::sandbox_permissions::{
     looks_like_sandbox_denial, sandbox_permissions_of, SandboxPermissions,
 };
@@ -131,49 +131,23 @@ impl BashTool {
         command: &str,
         sandbox: &OsSandbox,
         timeout_secs: u64,
-    ) -> Result<(ExitStatus, String, String)> {
+    ) -> Result<CapturedOutput> {
         let (prog, args) = sandbox.command_line(command);
-        let mut child = Command::new(&prog)
-            .args(&args)
+        let mut cmd = Command::new(&prog);
+        cmd.args(&args)
             .current_dir(&self.cwd)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true)
+            .kill_on_drop(true);
+        // Codex-aligned: piped stdio + process group for kill-on-timeout.
+        configure_shell_stdio(&mut cmd);
+        let child = cmd
             .spawn()
             .map_err(|err| tool_error("bash", err.to_string()))?;
 
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-
-        let wait_result = timeout(Duration::from_secs(timeout_secs), child.wait()).await;
-
-        let status = match wait_result {
-            Ok(Ok(status)) => status,
-            Ok(Err(err)) => return Err(tool_error("bash", err.to_string())),
-            Err(_) => {
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                return Err(tool_error("bash", "command timed out"));
-            }
-        };
-
-        let mut stdout_buf = String::new();
-        let mut stderr_buf = String::new();
-
-        if let Some(mut stdout) = stdout {
-            stdout
-                .read_to_string(&mut stdout_buf)
-                .await
-                .map_err(|err| tool_error("bash", err.to_string()))?;
-        }
-        if let Some(mut stderr) = stderr {
-            stderr
-                .read_to_string(&mut stderr_buf)
-                .await
-                .map_err(|err| tool_error("bash", err.to_string()))?;
-        }
-
-        Ok((status, stdout_buf, stderr_buf))
+        // Concurrent drain + cap + process-group kill + IO drain timeout.
+        // See `crate::process_io` (mirrors Codex `consume_output`).
+        consume_child(child, Some(timeout_secs), Some(EXEC_OUTPUT_MAX_BYTES))
+            .await
+            .map_err(|err| tool_error("bash", err.to_string()))
     }
 
     fn present_result(
@@ -240,6 +214,7 @@ impl BashTool {
             "command": command,
             "ok": status.success(),
             "background": false,
+            "timedOut": false,
             "sandboxed": sandboxed,
             "sandboxMode": self.sandbox_mode.as_str(),
             "sandboxPermissions": if escalated {
@@ -249,6 +224,78 @@ impl BashTool {
             },
             "escalated": escalated,
             "escalatedOnFailure": escalated_on_failure,
+            "truncated": truncated,
+            "fullOutputPath": spill_path,
+        });
+        if let Some(d) = description {
+            details
+                .as_object_mut()
+                .unwrap()
+                .insert("description".into(), json!(d));
+        }
+        ToolOutput::text_with_details(output, details)
+    }
+
+    /// Codex-style timeout result: partial stdout/stderr still returned to the model.
+    fn present_timeout(
+        &self,
+        command: &str,
+        description: Option<String>,
+        timeout_secs: u64,
+        stdout_buf: String,
+        stderr_buf: String,
+        sandbox: &OsSandbox,
+        escalated: bool,
+    ) -> ToolOutput {
+        let mut body = String::new();
+        if !stdout_buf.is_empty() {
+            body.push_str(&stdout_buf);
+        }
+        if !stderr_buf.is_empty() {
+            if !body.is_empty() {
+                body.push('\n');
+            }
+            body.push_str(&stderr_buf);
+        }
+
+        let (sandboxed, sandbox_line) = self.sandbox_banner(sandbox, escalated);
+        let mut output = format!(
+            "command timed out after {timeout_secs}s\n{sandbox_line}"
+        );
+        let mut truncated = false;
+        let mut spill_path: Option<String> = None;
+        if !body.is_empty() {
+            let presented = crate::truncate::present_tool_output(
+                body.trim_end(),
+                "bash",
+                &self.cwd,
+                crate::truncate::PreviewStyle::Head,
+            );
+            truncated = presented.truncated;
+            spill_path = presented
+                .spill_path
+                .as_ref()
+                .map(|p| p.display().to_string());
+            output.push('\n');
+            output.push_str(&presented.text);
+        }
+
+        let mut details = json!({
+            "exitCode": null,
+            "command": command,
+            "ok": false,
+            "background": false,
+            "timedOut": true,
+            "timeoutSecs": timeout_secs,
+            "sandboxed": sandboxed,
+            "sandboxMode": self.sandbox_mode.as_str(),
+            "sandboxPermissions": if escalated {
+                SandboxPermissions::RequireEscalated.as_str()
+            } else {
+                SandboxPermissions::UseDefault.as_str()
+            },
+            "escalated": escalated,
+            "escalatedOnFailure": false,
             "truncated": truncated,
             "fullOutputPath": spill_path,
         });
@@ -307,8 +354,10 @@ impl BashTool {
                 let timeout_secs =
                     resolve_timeout_secs(&call.arguments).unwrap_or(DEFAULT_TIMEOUT_SECS);
                 match self.run_command(command, &sandbox, timeout_secs).await {
-                    Ok((status, out, err)) => Some((status, out, err, sandbox)),
-                    Err(_) => None,
+                    Ok(cap) if !cap.timed_out => {
+                        Some((cap.status, cap.stdout, cap.stderr, sandbox))
+                    }
+                    _ => None,
                 }
             }
             ToolGateDecision::Deny { .. } => None,
@@ -442,7 +491,8 @@ over limit → full spill under ~/.one/agent/tool-outputs/ + preview + path for 
                  task_id: {id}\n\
                  command: {command}\n\
                  {sb_note}\n\
-                 Use bash_output with this task_id to poll or wait; bash_kill to stop.\n\
+                 TUI: /ps · Enter log · x kill.\n\
+                 Agent: bash_output to poll; bash_kill to stop.\n\
                  A [Background task completed] notice will appear when it finishes."
             );
             let mut details = json!({
@@ -465,9 +515,24 @@ over limit → full spill under ~/.one/agent/tool-outputs/ + preview + path for 
         // —— Foreground (blocking) ——
         let timeout_secs = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
 
-        let (status, stdout_buf, stderr_buf) =
-            self.run_command(command, &sandbox, timeout_secs).await?;
+        let cap = self.run_command(command, &sandbox, timeout_secs).await?;
 
+        // Codex returns partial output on timeout; surface it instead of a bare error.
+        if cap.timed_out {
+            return Ok(self.present_timeout(
+                command,
+                description,
+                timeout_secs,
+                cap.stdout,
+                cap.stderr,
+                &sandbox,
+                escalated,
+            ));
+        }
+
+        let status = cap.status;
+        let stdout_buf = cap.stdout;
+        let stderr_buf = cap.stderr;
         let exit_code = status.code();
         let mut body = String::new();
         if !stdout_buf.is_empty() {
@@ -796,6 +861,102 @@ mod tests {
             .and_then(|v| v.as_bool());
         assert_eq!(escalated, Some(true));
         let _ = std::fs::remove_file(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Regression: wait-then-read deadlocks once stdout exceeds the OS pipe
+    /// buffer (~64 KiB). Concurrent drain must let a multi-hundred-KiB writer
+    /// exit promptly.
+    #[tokio::test]
+    async fn large_stdout_does_not_deadlock() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-bash-pipe-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = BashTool::with_policy(
+            PathPolicy::workspace(dir.clone()),
+            true,
+            Arc::new(BackgroundTaskRegistry::new()),
+        );
+        // ~512 KiB of 'x' — well above typical pipe capacity.
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({
+                    "command": "python3 -c 'print(\"x\" * (512 * 1024), end=\"\")'",
+                    "timeout_secs": 30,
+                }),
+            })
+            .await
+            .expect("large stdout must complete without pipe deadlock");
+        let text = out.as_text();
+        assert!(
+            text.starts_with("exit 0\n"),
+            "expected success, got:\n{text}"
+        );
+        assert!(
+            text.contains('x'),
+            "stdout should include captured payload:\n{text}"
+        );
+        let timed_out = out
+            .details
+            .as_ref()
+            .and_then(|d| d.get("timedOut"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(timed_out, Some(false));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_tool_output_not_hard_error() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-bash-to-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = BashTool::with_policy(
+            PathPolicy::workspace(dir.clone()),
+            true,
+            Arc::new(BackgroundTaskRegistry::new()),
+        );
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({
+                    "command": "sleep 60",
+                    "timeout_secs": 1,
+                }),
+            })
+            .await
+            .expect("timeout should be ToolOutput, not Err");
+        let text = out.as_text();
+        assert!(
+            text.starts_with("command timed out after 1s\n"),
+            "got:\n{text}"
+        );
+        let timed_out = out
+            .details
+            .as_ref()
+            .and_then(|d| d.get("timedOut"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(timed_out, Some(true));
+        let ok = out
+            .details
+            .as_ref()
+            .and_then(|d| d.get("ok"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(ok, Some(false));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

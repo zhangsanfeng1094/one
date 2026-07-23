@@ -26,9 +26,13 @@ impl Tool for BashOutputTool {
         ToolDefinition {
             name: "bash_output".to_string(),
             description: "Get status and output of a background bash task. \
+Stdout/stderr are streamed while the task runs — a snapshot includes output \
+captured so far (not only after exit). \
 Omit task_id to list all background tasks (like Codex /ps). \
 Set timeout_secs > 0 to wait up to that many seconds for the task to finish \
-before returning a snapshot (0 or omit = return immediately)."
+before returning a snapshot (0 or omit = return immediately). \
+For long-running servers (npm run dev), poll with timeout_secs=0 or a short wait \
+to read progress logs; use bash_kill when done."
                 .to_string(),
             parameters: json!({
                 "type": "object",
