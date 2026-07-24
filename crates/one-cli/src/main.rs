@@ -296,6 +296,8 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     };
 
+    // Session-owned background bash / agent jobs die with the process.
+    runtime.shutdown_owned_tasks();
     // Ensure Langfuse HTTP worker drains before process exit.
     runtime.flush_trace();
 

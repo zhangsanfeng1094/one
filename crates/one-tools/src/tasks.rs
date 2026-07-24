@@ -456,7 +456,37 @@ impl BackgroundTaskRegistry {
     /// Safe to call from a non-async TUI tick: state becomes [`TaskState::Killed`]
     /// before this returns so `/ps` refresh sees the new status immediately.
     pub fn kill_sync(&self, id: &str) -> Result<TaskSnapshot, String> {
-        let (child, done, notify) = {
+        self.kill_sync_inner(id, "killed by bash_kill", true)
+    }
+
+    /// Kill every still-running task (process exit / session switch).
+    ///
+    /// Uses process-group kill like [`Self::kill_sync`], but does **not** enqueue
+    /// completion notifications — teardown must not pollute the next session turn.
+    /// Returns how many running tasks were signalled.
+    pub fn kill_all_running(&self) -> usize {
+        let ids: Vec<String> = {
+            let tasks = self.tasks.lock().expect("tasks lock");
+            tasks
+                .iter()
+                .filter(|(_, t)| !t.state.is_terminal())
+                .map(|(id, _)| id.clone())
+                .collect()
+        };
+        let n = ids.len();
+        for id in &ids {
+            let _ = self.kill_sync_inner(id, "killed on session end", false);
+        }
+        n
+    }
+
+    fn kill_sync_inner(
+        &self,
+        id: &str,
+        reason: &str,
+        notify: bool,
+    ) -> Result<TaskSnapshot, String> {
+        let (child, done, note) = {
             let mut tasks = self.tasks.lock().expect("tasks lock");
             let task = tasks
                 .get_mut(id)
@@ -470,11 +500,15 @@ impl BackgroundTaskRegistry {
             // Mark killed immediately so wait path won't overwrite.
             task.state = TaskState::Killed;
             task.finished = Some(Instant::now());
-            task.error = Some("killed by bash_kill".into());
-            let notify = if !task.notified {
+            task.error = Some(reason.into());
+            let note = if notify && !task.notified {
                 task.notified = true;
                 Some(task.snapshot())
             } else {
+                // Teardown path: mark notified so a late wait finalize won't notify.
+                if !notify {
+                    task.notified = true;
+                }
                 None
             };
             prune_terminal_tasks(&mut tasks);
@@ -484,18 +518,26 @@ impl BackgroundTaskRegistry {
                     kill_process_group(pid);
                 }
             }
-            (child, done, notify)
+            (child, done, note)
         };
-        if let Some(snap) = notify {
+        if let Some(snap) = note {
             self.push_notification(format_completion_notification(&snap));
         }
 
         if let Some(mut child) = child {
             force_kill(&mut child);
-            tokio::spawn(async move {
-                let _ = child.wait().await;
+            // Reap in the background when a runtime is available; on process exit
+            // the OS reparents/reaps either way after process-group SIGKILL.
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = child.wait().await;
+                    done.notify_waiters();
+                });
+            } else {
+                // Best-effort synchronous reap outside async context.
+                let _ = child.start_kill();
                 done.notify_waiters();
-            });
+            }
         } else {
             done.notify_waiters();
         }
@@ -723,6 +765,44 @@ mod tests {
         // wait should resolve quickly now
         let snap2 = reg.wait(&id, Some(5)).await.unwrap();
         assert_eq!(snap2.state, TaskState::Killed);
+    }
+
+    #[tokio::test]
+    async fn kill_all_running_stops_tasks_without_notify() {
+        let reg = Arc::new(BackgroundTaskRegistry::new());
+        let id1 = reg
+            .spawn("sleep 60".into(), std::env::temp_dir(), Some(120))
+            .await
+            .unwrap();
+        let id2 = reg
+            .spawn("sleep 60".into(), std::env::temp_dir(), Some(120))
+            .await
+            .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert_eq!(reg.kill_all_running(), 2);
+        // Idempotent.
+        assert_eq!(reg.kill_all_running(), 0);
+
+        let s1 = reg.get(&id1).unwrap();
+        let s2 = reg.get(&id2).unwrap();
+        assert_eq!(s1.state, TaskState::Killed);
+        assert_eq!(s2.state, TaskState::Killed);
+        assert!(
+            s1.error.as_deref() == Some("killed on session end"),
+            "err={:?}",
+            s1.error
+        );
+
+        let notes = reg.notification_queue().lock().unwrap().clone();
+        assert!(
+            notes.is_empty(),
+            "teardown kills must not enqueue notices: {notes:?}"
+        );
+
+        // wait should resolve quickly (already terminal).
+        let snap = reg.wait(&id1, Some(5)).await.unwrap();
+        assert_eq!(snap.state, TaskState::Killed);
     }
 
     #[tokio::test]

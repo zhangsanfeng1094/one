@@ -301,6 +301,23 @@ impl AppRuntime {
         }
     }
 
+    /// Kill session-owned background work (bash tasks + agent jobs).
+    ///
+    /// Call on process exit and when switching sessions (`/new`, `/resume`).
+    /// Does **not** run on Esc turn-abort (long-lived bash servers like
+    /// `npm run dev` should survive soft cancel).
+    pub fn shutdown_owned_tasks(&self) {
+        self.bg_registry.kill_all_running();
+        if let Some(host) = &self.task_host {
+            host.jobs().kill_all();
+        }
+        // Drop any completion notices produced by job kill so the next session
+        // turn does not see teardown noise.
+        if let Ok(mut q) = self.bg_registry.notification_queue().lock() {
+            q.clear();
+        }
+    }
+
     /// Optional notice for TUI when MCP is still loading / just became ready.
     pub fn mcp_status_line(&self) -> Option<String> {
         self.mcp.status_line()
@@ -356,8 +373,16 @@ impl AppRuntime {
     pub fn abort(&self) {
         self.abort_flag.store(true, Ordering::Relaxed);
         // Cancel background subagent jobs (signals child abort_flag + notifies).
+        // Background bash is intentionally left running (dev servers, watches).
         if let Some(host) = &self.task_host {
             host.jobs().kill_all();
         }
+    }
+}
+
+impl Drop for AppRuntime {
+    fn drop(&mut self) {
+        // Best-effort: process exit / early return paths that skip explicit cleanup.
+        self.shutdown_owned_tasks();
     }
 }

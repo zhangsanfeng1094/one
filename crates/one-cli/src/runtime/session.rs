@@ -12,6 +12,8 @@ impl AppRuntime {
         // Cold start already emitted SessionStart from extension load_all.
         let switching = self.session.is_some();
         if switching {
+            // Background bash/jobs are session-owned — do not leak across /new.
+            self.shutdown_owned_tasks();
             self.extensions.notify_session_end().await;
         }
         // New conversation only — MCP connection pool is process-scoped (Grok-style).
@@ -39,6 +41,8 @@ impl AppRuntime {
     ) -> Result<(), Box<dyn std::error::Error>> {
         let switching = self.session.is_some();
         if switching {
+            // Background bash/jobs are session-owned — do not leak across /resume.
+            self.shutdown_owned_tasks();
             self.extensions.notify_session_end().await;
         }
         let session = SessionManager::open(path).await?;

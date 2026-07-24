@@ -398,6 +398,7 @@ For long-running work (tests, builds, dev servers) set run_in_background=true: \
 returns a task_id immediately so you can continue other tools. \
 When the task finishes, a [Background task completed] notice is injected into the conversation. \
 Use bash_output to poll/wait for output, bash_kill to stop a task. \
+Background tasks are session-owned: quitting one or /new/resume kills them (Esc abort does not). \
 Omit run_in_background (or false) for short commands whose result you need before acting. \
 Stdout/stderr returned to the model are capped (~2000 lines / 50KB by default; \
 over limit → full spill under ~/.one/agent/tool-outputs/ + preview + path for read/grep)."
