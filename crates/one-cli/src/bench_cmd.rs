@@ -323,6 +323,7 @@ async fn run_one_task(
             system_prompt: one_core::agent::DEFAULT_SYSTEM_PROMPT.into(),
             max_turns,
             thinking_level: one_core::ThinkingLevel::Off,
+            server_search: false,
         },
         tools,
     );

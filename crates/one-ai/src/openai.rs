@@ -45,6 +45,22 @@ pub enum ProviderApi {
 /// Backward-compatible alias used across the crate.
 pub type OpenaiWireApi = ProviderApi;
 
+/// Auto-select provider-native search tools for Responses models.
+pub fn server_tools_for(wire_api: ProviderApi, model: &str) -> Vec<one_core::agent::ServerTool> {
+    use one_core::agent::ServerTool;
+    if wire_api != ProviderApi::OpenaiResponses {
+        return Vec::new();
+    }
+    let model = model.to_ascii_lowercase();
+    if model.starts_with("grok-") {
+        vec![ServerTool::WebSearch, ServerTool::XSearch]
+    } else if model.starts_with("gpt-") {
+        vec![ServerTool::WebSearch]
+    } else {
+        Vec::new()
+    }
+}
+
 impl ProviderApi {
     pub const ALL: &'static [Self] = &[
         Self::OpenaiCompletions,
@@ -110,7 +126,8 @@ impl ProviderApi {
 
 #[cfg(test)]
 mod wire_api_tests {
-    use super::ProviderApi;
+    use super::{server_tools_for, ProviderApi};
+    use one_core::agent::ServerTool;
 
     #[test]
     fn parse_aliases() {
@@ -148,6 +165,21 @@ mod wire_api_tests {
         );
         assert_eq!(ProviderApi::parse("nope"), None);
     }
+
+    #[test]
+    fn server_search_auto_matrix_only_enables_responses_gpt_and_grok() {
+        assert_eq!(
+            server_tools_for(ProviderApi::Responses, "gpt-5.2"),
+            vec![ServerTool::WebSearch]
+        );
+        assert_eq!(
+            server_tools_for(ProviderApi::Responses, "grok-4"),
+            vec![ServerTool::WebSearch, ServerTool::XSearch]
+        );
+        assert!(server_tools_for(ProviderApi::Responses, "claude-sonnet").is_empty());
+        assert!(server_tools_for(ProviderApi::Completions, "gpt-5.2").is_empty());
+        assert!(server_tools_for(ProviderApi::Completions, "grok-4").is_empty());
+    }
 }
 
 #[cfg(feature = "http-providers")]
@@ -157,10 +189,12 @@ mod inner {
     use std::sync::atomic::AtomicBool;
 
     use async_trait::async_trait;
-    use one_core::agent::{CompletionRequest, CompletionResponse, LlmProvider, TokenUsage};
+    use one_core::agent::{
+        Citation, CompletionRequest, CompletionResponse, LlmProvider, ServerTool, TokenUsage,
+    };
     use one_core::error::{OneError, Result};
     use one_core::message::{ContentBlock, StopReason};
-    use one_core::streaming::StreamEvent;
+    use one_core::streaming::{ServerToolStatus, StreamEvent};
     use reqwest::Client;
     use serde_json::{json, Value};
 
@@ -350,11 +384,15 @@ mod inner {
     #[async_trait]
     impl LlmProvider for OpenAiProvider {
         fn name(&self) -> &str {
-            "openai"
+            &self.provider_id
         }
 
         fn model(&self) -> &str {
             &self.model
+        }
+
+        fn server_tools(&self) -> Vec<one_core::agent::ServerTool> {
+            super::server_tools_for(self.wire_api, &self.model)
         }
 
         async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
@@ -586,27 +624,48 @@ mod inner {
     impl OpenAiProvider {
         async fn complete_responses(
             &self,
-            request: CompletionRequest,
+            mut request: CompletionRequest,
             stream: bool,
             on_event: &mut (dyn FnMut(StreamEvent) + Send),
             abort: Option<&AtomicBool>,
         ) -> Result<CompletionResponse> {
-            let body = build_responses_body(&request, &self.model, stream);
             let url = format!("{}/responses", self.base_url.trim_end_matches('/'));
-            let response = crate::sse::send_with_abort(
-                self.apply_request_headers(self.client.post(&url))
-                    .json(&body),
-                abort,
-            )
-            .await?;
-
-            if !response.status().is_success() {
+            let mut attempt = 0usize;
+            let response = loop {
+                let body = build_responses_body(
+                    &request,
+                    &self.model,
+                    stream,
+                    !self.model.starts_with("grok-"),
+                );
+                let response = crate::sse::send_with_abort(
+                    self.apply_request_headers(self.client.post(&url))
+                        .json(&body),
+                    abort,
+                )
+                .await?;
+                if response.status().is_success() {
+                    break response;
+                }
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
+                if attempt == 0
+                    && !request.server_tools.is_empty()
+                    && should_fallback_server_tools(
+                        status.as_u16(),
+                        &text,
+                        false,
+                        abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)),
+                    )
+                {
+                    request.server_tools.clear();
+                    attempt += 1;
+                    continue;
+                }
                 return Err(OneError::Provider(format!(
                     "openai responses {status}: {text}"
                 )));
-            }
+            };
 
             if !stream {
                 let value: Value = response
@@ -622,6 +681,7 @@ mod inner {
             let mut tool_acc: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
             let mut status: Option<String> = None;
             let mut usage = TokenUsage::default();
+            let mut citations = Vec::new();
 
             let aborted = matches!(
                 crate::sse::read_sse_response(
@@ -635,6 +695,7 @@ mod inner {
                         if !chunk_usage.is_zero() {
                             usage = chunk_usage;
                         }
+                        append_top_level_citations(&value, &mut citations);
 
                         match etype {
                             "response.output_text.delta" | "response.refusal.delta" => {
@@ -667,6 +728,11 @@ mod inner {
                                     .unwrap_or(0)
                                     as usize;
                                 let item = value.get("item");
+                                if let Some((tool, status)) =
+                                    item.and_then(|item| server_tool_update(item, false))
+                                {
+                                    on_event(StreamEvent::ServerTool { tool, status });
+                                }
                                 if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
                                     == Some("function_call")
                                 {
@@ -721,6 +787,11 @@ mod inner {
                                     .unwrap_or(0)
                                     as usize;
                                 let item = value.get("item");
+                                if let Some((tool, status)) =
+                                    item.and_then(|item| server_tool_update(item, true))
+                                {
+                                    on_event(StreamEvent::ServerTool { tool, status });
+                                }
                                 if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
                                     == Some("function_call")
                                 {
@@ -774,29 +845,12 @@ mod inner {
                                 } else if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
                                     == Some("message")
                                 {
-                                    // Finalize text from completed message if stream deltas were empty.
-                                    if full_text.is_empty() {
-                                        if let Some(parts) = item
-                                            .and_then(|i| i.get("content"))
-                                            .and_then(|c| c.as_array())
-                                        {
-                                            for p in parts {
-                                                let t = p.get("type").and_then(|x| x.as_str());
-                                                if t == Some("output_text") || t == Some("refusal")
-                                                {
-                                                    if let Some(text) =
-                                                        p.get("text").and_then(|x| x.as_str())
-                                                    {
-                                                        full_text.push_str(text);
-                                                    }
-                                                    if let Some(text) =
-                                                        p.get("refusal").and_then(|x| x.as_str())
-                                                    {
-                                                        full_text.push_str(text);
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    if let Some(item) = item {
+                                        collect_completed_message(
+                                            item,
+                                            &mut full_text,
+                                            &mut citations,
+                                        );
                                     }
                                 }
                             }
@@ -848,6 +902,7 @@ mod inner {
             if aborted {
                 response.stop_reason = StopReason::Aborted;
             }
+            response.citations = citations;
             Ok(response)
         }
     }
@@ -1000,6 +1055,7 @@ mod inner {
             content,
             stop_reason,
             usage,
+            citations: Vec::new(),
         }
     }
 
@@ -1065,6 +1121,7 @@ mod inner {
         let mut text = String::new();
         let mut thinking = String::new();
         let mut tools = Vec::new();
+        let mut citations = Vec::new();
 
         if let Some(output) = value.get("output").and_then(|v| v.as_array()) {
             for item in output {
@@ -1072,6 +1129,7 @@ mod inner {
                     Some("message") => {
                         if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
                             for p in parts {
+                                append_citations(p, &mut citations);
                                 if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
                                     text.push_str(t);
                                 }
@@ -1113,6 +1171,7 @@ mod inner {
                 }
             }
         }
+        append_top_level_citations(value, &mut citations);
 
         let status = value.get("status").and_then(|v| v.as_str());
         let finish = match status {
@@ -1123,7 +1182,7 @@ mod inner {
             _ => Some("stop"),
         };
 
-        Ok(assemble_response_with_usage(
+        let mut response = assemble_response_with_usage(
             provider,
             model,
             text,
@@ -1131,7 +1190,9 @@ mod inner {
             tools,
             finish,
             parse_openai_usage(value),
-        ))
+        );
+        response.citations = citations;
+        Ok(response)
     }
 
     fn build_chat_body(
@@ -1255,7 +1316,12 @@ mod inner {
         body
     }
 
-    fn build_responses_body(request: &CompletionRequest, model: &str, stream: bool) -> Value {
+    fn build_responses_body(
+        request: &CompletionRequest,
+        model: &str,
+        stream: bool,
+        include_search_sources: bool,
+    ) -> Value {
         // system prompt goes in `instructions` (Responses style)
         let input = map_responses_input(&request.messages);
 
@@ -1267,27 +1333,168 @@ mod inner {
             "store": false,
         });
 
-        if !request.tools.is_empty() {
-            // Flattened tool schema (not nested under function)
-            let tools: Vec<Value> = request
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    })
+        let native_web_search = request
+            .server_tools
+            .contains(&one_core::agent::ServerTool::WebSearch);
+        let mut tools: Vec<Value> = request
+            .tools
+            .iter()
+            .filter(|tool| !(native_web_search && tool.name == "web_search"))
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
                 })
-                .collect();
+            })
+            .collect();
+        for tool in &request.server_tools {
+            tools.push(match tool {
+                one_core::agent::ServerTool::WebSearch => json!({ "type": "web_search" }),
+                one_core::agent::ServerTool::XSearch => json!({ "type": "x_search" }),
+            });
+        }
+        if !tools.is_empty() {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
+        }
+        if native_web_search && include_search_sources {
+            body["include"] = json!(["web_search_call.action.sources"]);
         }
 
         crate::thinking::apply_responses_thinking(&mut body, request.thinking_level);
 
         body
+    }
+
+    fn should_fallback_server_tools(
+        status: u16,
+        body: &str,
+        emitted_content: bool,
+        cancelled: bool,
+    ) -> bool {
+        if emitted_content || cancelled || !matches!(status, 400 | 404 | 422) {
+            return false;
+        }
+        let body = body.to_ascii_lowercase();
+        let unsupported = body.contains("unsupported")
+            || body.contains("not supported")
+            || body.contains("unknown")
+            || body.contains("unrecognized")
+            || body.contains("invalid tool");
+        let search_tool =
+            body.contains("tool") || body.contains("web_search") || body.contains("x_search");
+        unsupported && search_tool
+    }
+
+    fn server_tool_update(
+        item: &Value,
+        done_event: bool,
+    ) -> Option<(ServerTool, ServerToolStatus)> {
+        let tool = match item.get("type").and_then(Value::as_str)? {
+            "web_search_call" => ServerTool::WebSearch,
+            "x_search_call" => ServerTool::XSearch,
+            _ => return None,
+        };
+        let status = match item.get("status").and_then(Value::as_str) {
+            Some("failed") | Some("error") => ServerToolStatus::Failed,
+            Some("completed") | Some("done") => ServerToolStatus::Completed,
+            _ if done_event => ServerToolStatus::Completed,
+            _ => ServerToolStatus::Started,
+        };
+        Some((tool, status))
+    }
+
+    fn append_citations(part: &Value, citations: &mut Vec<Citation>) {
+        let Some(annotations) = part.get("annotations").and_then(Value::as_array) else {
+            return;
+        };
+        for annotation in annotations {
+            if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+                continue;
+            }
+            let source = annotation.get("url_citation").unwrap_or(annotation);
+            let Some(url) = source.get("url").and_then(Value::as_str) else {
+                continue;
+            };
+            let citation = Citation {
+                url: url.to_string(),
+                title: source
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(url)
+                    .to_string(),
+                start_index: source
+                    .get("start_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+                end_index: source.get("end_index").and_then(Value::as_u64).unwrap_or(0) as usize,
+            };
+            if !citations.contains(&citation) {
+                citations.push(citation);
+            }
+        }
+    }
+
+    fn append_top_level_citations(value: &Value, citations: &mut Vec<Citation>) {
+        let sources = value
+            .get("citations")
+            .or_else(|| value.pointer("/response/citations"))
+            .and_then(Value::as_array);
+        let Some(sources) = sources else {
+            return;
+        };
+        for source in sources {
+            let (url, title) = match source {
+                Value::String(url) => (url.as_str(), url.as_str()),
+                Value::Object(source) => {
+                    let Some(url) = source.get("url").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    (
+                        url,
+                        source.get("title").and_then(Value::as_str).unwrap_or(url),
+                    )
+                }
+                _ => continue,
+            };
+            if citations.iter().any(|citation| citation.url == url) {
+                continue;
+            }
+            citations.push(Citation {
+                url: url.to_string(),
+                title: title.to_string(),
+                start_index: 0,
+                end_index: 0,
+            });
+        }
+    }
+
+    fn collect_completed_message(
+        item: &Value,
+        full_text: &mut String,
+        citations: &mut Vec<Citation>,
+    ) {
+        let collect_text = full_text.is_empty();
+        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+            return;
+        };
+        for part in parts {
+            append_citations(part, citations);
+            if !collect_text {
+                continue;
+            }
+            let part_type = part.get("type").and_then(Value::as_str);
+            if part_type == Some("output_text") || part_type == Some("refusal") {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    full_text.push_str(text);
+                }
+                if let Some(text) = part.get("refusal").and_then(Value::as_str) {
+                    full_text.push_str(text);
+                }
+            }
+        }
     }
 
     /// May emit 1–2 chat messages (tool result with images → tool + synthetic user).
@@ -1545,6 +1752,316 @@ mod inner {
             }
         }
         input
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use one_core::agent::{ServerTool, ThinkingLevel};
+        use one_core::tool::ToolDefinition;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
+
+        async fn read_json_body(socket: &mut TcpStream) -> Value {
+            let mut bytes = Vec::new();
+            let mut chunk = [0_u8; 4096];
+            loop {
+                let n = socket.read(&mut chunk).await.unwrap();
+                assert!(n > 0, "connection closed before request completed");
+                bytes.extend_from_slice(&chunk[..n]);
+                let Some(header_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&bytes[..header_end]);
+                let content_length = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.split_once(':').and_then(|(name, value)| {
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().unwrap())
+                        })
+                    })
+                    .unwrap_or(0);
+                let body_start = header_end + 4;
+                if bytes.len() >= body_start + content_length {
+                    return serde_json::from_slice(&bytes[body_start..body_start + content_length])
+                        .unwrap();
+                }
+            }
+        }
+
+        fn request(server_tools: Vec<ServerTool>) -> CompletionRequest {
+            CompletionRequest {
+                system_prompt: "sys".into(),
+                messages: vec![one_core::AgentMessage::user_text("search")],
+                tools: vec![
+                    ToolDefinition {
+                        name: "web_search".into(),
+                        description: "local search".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                    ToolDefinition {
+                        name: "web_fetch".into(),
+                        description: "fetch".into(),
+                        parameters: json!({"type": "object"}),
+                    },
+                ],
+                server_tools,
+                thinking_level: ThinkingLevel::Off,
+            }
+        }
+
+        #[test]
+        fn responses_body_prefers_native_search_and_keeps_fetch() {
+            let body = build_responses_body(
+                &request(vec![ServerTool::WebSearch, ServerTool::XSearch]),
+                "grok-4",
+                true,
+                false,
+            );
+            let tools = body["tools"].as_array().unwrap();
+            assert!(tools.iter().any(|t| t["type"] == "web_search"));
+            assert!(tools.iter().any(|t| t["type"] == "x_search"));
+            assert!(tools
+                .iter()
+                .any(|t| t["type"] == "function" && t["name"] == "web_fetch"));
+            assert!(!tools
+                .iter()
+                .any(|t| t["type"] == "function" && t["name"] == "web_search"));
+            assert!(body.get("include").is_none());
+        }
+
+        #[test]
+        fn openai_responses_requests_search_sources() {
+            let body =
+                build_responses_body(&request(vec![ServerTool::WebSearch]), "gpt-5", true, true);
+            assert!(body["include"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "web_search_call.action.sources"));
+        }
+
+        #[test]
+        fn fallback_body_restores_local_web_search() {
+            let body = build_responses_body(&request(Vec::new()), "gpt-5", true, true);
+            let tools = body["tools"].as_array().unwrap();
+            assert!(tools
+                .iter()
+                .any(|t| t["type"] == "function" && t["name"] == "web_search"));
+            assert!(body.get("include").is_none());
+        }
+
+        #[test]
+        fn fallback_only_for_unsupported_before_any_stream_content() {
+            assert!(should_fallback_server_tools(
+                400,
+                "Unknown tool type: web_search",
+                false,
+                false,
+            ));
+            assert!(should_fallback_server_tools(
+                422,
+                "unsupported x_search",
+                false,
+                false,
+            ));
+            assert!(!should_fallback_server_tools(
+                429,
+                "rate limited",
+                false,
+                false,
+            ));
+            assert!(!should_fallback_server_tools(
+                401,
+                "unknown tool",
+                false,
+                false,
+            ));
+            assert!(!should_fallback_server_tools(
+                400,
+                "unknown tool",
+                true,
+                false,
+            ));
+            assert!(!should_fallback_server_tools(
+                400,
+                "unknown tool",
+                false,
+                true,
+            ));
+        }
+
+        #[test]
+        fn provider_name_keeps_custom_provider_id() {
+            let provider = OpenAiProvider::with_base("key", "gpt-5", "http://localhost")
+                .with_wire_api(OpenaiWireApi::Responses)
+                .with_provider_id("xai");
+            assert_eq!(provider.name(), "xai");
+        }
+
+        #[test]
+        fn parses_and_deduplicates_response_url_citations() {
+            let value = json!({
+                "status": "completed",
+                "output": [{
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Rust 1.90",
+                        "annotations": [
+                            {
+                                "type": "url_citation",
+                                "url": "https://example.com/rust",
+                                "title": "Rust release",
+                                "start_index": 0,
+                                "end_index": 9
+                            },
+                            {
+                                "type": "url_citation",
+                                "url_citation": {
+                                    "url": "https://example.com/rust",
+                                    "title": "Rust release",
+                                    "start_index": 0,
+                                    "end_index": 9
+                                }
+                            }
+                        ]
+                    }]
+                }]
+            });
+            let response = parse_responses_non_stream(&value, "xai", "grok-4").unwrap();
+            assert_eq!(response.provider, "xai");
+            assert_eq!(response.citations.len(), 1);
+            assert_eq!(response.citations[0].url, "https://example.com/rust");
+            assert_eq!(response.citations[0].start_index, 0);
+            assert_eq!(response.citations[0].end_index, 9);
+        }
+
+        #[test]
+        fn parses_xai_top_level_citations() {
+            let response = parse_responses_non_stream(
+                &json!({
+                    "status": "completed",
+                    "citations": ["https://example.com/source"],
+                    "output": [{
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "answer"}]
+                    }]
+                }),
+                "xai",
+                "grok-4",
+            )
+            .unwrap();
+            assert_eq!(
+                response.citations,
+                vec![Citation {
+                    url: "https://example.com/source".into(),
+                    title: "https://example.com/source".into(),
+                    start_index: 0,
+                    end_index: 0,
+                }]
+            );
+        }
+
+        #[test]
+        fn completed_message_collects_annotations_after_text_deltas() {
+            let mut text = "answer".to_string();
+            let mut citations = Vec::new();
+            collect_completed_message(
+                &json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "answer",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://example.com/stream",
+                            "title": "Stream source",
+                            "start_index": 0,
+                            "end_index": 6
+                        }]
+                    }]
+                }),
+                &mut text,
+                &mut citations,
+            );
+            assert_eq!(text, "answer");
+            assert_eq!(citations.len(), 1);
+        }
+
+        #[test]
+        fn recognizes_web_and_x_search_output_items() {
+            assert_eq!(
+                server_tool_update(&json!({"type":"web_search_call"}), false),
+                Some((ServerTool::WebSearch, ServerToolStatus::Started))
+            );
+            assert_eq!(
+                server_tool_update(&json!({"type":"x_search_call","status":"completed"}), true),
+                Some((ServerTool::XSearch, ServerToolStatus::Completed))
+            );
+            assert_eq!(
+                server_tool_update(&json!({"type":"web_search_call","status":"failed"}), true),
+                Some((ServerTool::WebSearch, ServerToolStatus::Failed))
+            );
+        }
+
+        #[tokio::test]
+        async fn retries_once_without_server_tools_after_unsupported_response() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let mut bodies = Vec::new();
+                for attempt in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    bodies.push(read_json_body(&mut socket).await);
+                    let (status, body) = if attempt == 0 {
+                        (
+                            "400 Bad Request",
+                            r#"{"error":{"message":"Unknown tool type: web_search"}}"#,
+                        )
+                    } else {
+                        (
+                            "200 OK",
+                            r#"{"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":"fallback ok"}]}]}"#,
+                        )
+                    };
+                    let response = format!(
+                        "HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    socket.write_all(response.as_bytes()).await.unwrap();
+                }
+                bodies
+            });
+            let provider = OpenAiProvider::with_base("key", "gpt-5", format!("http://{addr}/v1"))
+                .with_wire_api(OpenaiWireApi::Responses);
+
+            let response = provider
+                .complete(request(vec![ServerTool::WebSearch]))
+                .await
+                .unwrap();
+            assert_eq!(
+                one_core::agent::extract_text(&response.content),
+                "fallback ok"
+            );
+            let bodies = server.await.unwrap();
+            assert!(bodies[0]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["type"] == "web_search"));
+            assert!(bodies[1]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["type"] == "function" && tool["name"] == "web_search"));
+            assert!(!bodies[1]["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|tool| tool["type"] == "web_search"));
+        }
     }
 }
 

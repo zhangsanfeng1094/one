@@ -99,3 +99,33 @@ fn rewind_before_drops_selected_prompt_and_later() {
     assert!(manager.build_session_context().messages.is_empty());
     assert!(manager.get_leaf_id().is_none());
 }
+
+#[test]
+fn assistant_citations_round_trip_through_session_jsonl() {
+    let base = new_entry_base(None);
+    let mut message = AgentMessage::assistant_text("xai", "grok-4", "answer");
+    let AgentMessage::Assistant(assistant) = &mut message else {
+        unreachable!()
+    };
+    assistant.citations.push(one_core::Citation {
+        url: "https://example.com/source".into(),
+        title: "Source".into(),
+        start_index: 0,
+        end_index: 6,
+    });
+    let header = new_session_header("/tmp");
+    let entry = SessionEntry::Message { base, message };
+    let jsonl = format!(
+        "{}\n{}\n",
+        serde_json::to_string(&header).unwrap(),
+        serde_json::to_string(&entry).unwrap()
+    );
+
+    let manager = SessionManager::from_jsonl(&jsonl).unwrap();
+    let messages = manager.build_session_context().messages;
+    let AgentMessage::Assistant(assistant) = &messages[0] else {
+        panic!("assistant")
+    };
+    assert_eq!(assistant.citations.len(), 1);
+    assert_eq!(assistant.citations[0].url, "https://example.com/source");
+}

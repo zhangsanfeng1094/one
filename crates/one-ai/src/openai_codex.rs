@@ -14,10 +14,12 @@ mod inner {
     use std::sync::atomic::AtomicBool;
 
     use async_trait::async_trait;
-    use one_core::agent::{CompletionRequest, CompletionResponse, LlmProvider, TokenUsage};
+    use one_core::agent::{
+        Citation, CompletionRequest, CompletionResponse, LlmProvider, ServerTool, TokenUsage,
+    };
     use one_core::error::{OneError, Result};
     use one_core::message::{ContentBlock, StopReason};
-    use one_core::streaming::StreamEvent;
+    use one_core::streaming::{ServerToolStatus, StreamEvent};
     use reqwest::Client;
     use serde_json::{json, Value};
 
@@ -123,6 +125,13 @@ mod inner {
             &self.model
         }
 
+        fn server_tools(&self) -> Vec<one_core::agent::ServerTool> {
+            crate::openai::server_tools_for(
+                crate::openai::ProviderApi::OpenaiResponses,
+                &self.model,
+            )
+        }
+
         async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
             self.complete_codex(request, false, &mut |_| {}, None).await
         }
@@ -140,7 +149,7 @@ mod inner {
     impl OpenAiCodexProvider {
         async fn complete_codex(
             &self,
-            request: CompletionRequest,
+            mut request: CompletionRequest,
             stream: bool,
             on_event: &mut (dyn FnMut(StreamEvent) + Send),
             abort: Option<&AtomicBool>,
@@ -151,33 +160,46 @@ mod inner {
                 ));
             }
 
-            let body = build_codex_body(&request, &self.model, stream, &self.session_id);
             let url = self.codex_url();
-
-            crate::cache::record_cache_debug(
-                PROVIDER_OPENAI_CODEX,
-                "request",
-                Some(&body),
-                None,
-                Some(json!({
-                    "model": self.model,
-                    "base_url": self.base_url,
-                    "wire": "openai-codex-responses",
-                    "stream": stream,
-                })),
-            );
-
-            let response = crate::sse::send_with_abort(
-                self.apply_headers(self.client.post(&url)).json(&body),
-                abort,
-            )
-            .await?;
-
-            if !response.status().is_success() {
+            let mut attempt = 0usize;
+            let response = loop {
+                let body = build_codex_body(&request, &self.model, stream, &self.session_id);
+                crate::cache::record_cache_debug(
+                    PROVIDER_OPENAI_CODEX,
+                    "request",
+                    Some(&body),
+                    None,
+                    Some(json!({
+                        "model": self.model,
+                        "base_url": self.base_url,
+                        "wire": "openai-codex-responses",
+                        "stream": stream,
+                    })),
+                );
+                let response = crate::sse::send_with_abort(
+                    self.apply_headers(self.client.post(&url)).json(&body),
+                    abort,
+                )
+                .await?;
+                if response.status().is_success() {
+                    break response;
+                }
                 let status = response.status();
                 let text = response.text().await.unwrap_or_default();
+                if attempt == 0
+                    && !request.server_tools.is_empty()
+                    && should_fallback_server_tools(
+                        status.as_u16(),
+                        &text,
+                        abort.is_some_and(|flag| flag.load(std::sync::atomic::Ordering::Relaxed)),
+                    )
+                {
+                    request.server_tools.clear();
+                    attempt += 1;
+                    continue;
+                }
                 return Err(OneError::Provider(format!("openai-codex {status}: {text}")));
-            }
+            };
 
             // Non-stream: parse final JSON (rare for Codex which prefers stream).
             if !stream {
@@ -194,6 +216,7 @@ mod inner {
             let mut tool_acc: BTreeMap<usize, PartialToolCall> = BTreeMap::new();
             let mut status: Option<String> = None;
             let mut usage = TokenUsage::default();
+            let mut citations = Vec::new();
 
             let aborted = matches!(
                 crate::sse::read_sse_response(
@@ -238,6 +261,11 @@ mod inner {
                                     .unwrap_or(0)
                                     as usize;
                                 let item = value.get("item");
+                                if let Some((tool, status)) =
+                                    item.and_then(|item| server_tool_update(item, false))
+                                {
+                                    on_event(StreamEvent::ServerTool { tool, status });
+                                }
                                 if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
                                     == Some("function_call")
                                 {
@@ -291,6 +319,11 @@ mod inner {
                                     .unwrap_or(0)
                                     as usize;
                                 let item = value.get("item");
+                                if let Some((tool, status)) =
+                                    item.and_then(|item| server_tool_update(item, true))
+                                {
+                                    on_event(StreamEvent::ServerTool { tool, status });
+                                }
                                 if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
                                     == Some("function_call")
                                 {
@@ -337,23 +370,12 @@ mod inner {
                                 } else if item.and_then(|i| i.get("type")).and_then(|t| t.as_str())
                                     == Some("message")
                                 {
-                                    if full_text.is_empty() {
-                                        if let Some(parts) = item
-                                            .and_then(|i| i.get("content"))
-                                            .and_then(|c| c.as_array())
-                                        {
-                                            for p in parts {
-                                                let t = p.get("type").and_then(|x| x.as_str());
-                                                if t == Some("output_text") || t == Some("refusal")
-                                                {
-                                                    if let Some(text) =
-                                                        p.get("text").and_then(|x| x.as_str())
-                                                    {
-                                                        full_text.push_str(text);
-                                                    }
-                                                }
-                                            }
-                                        }
+                                    if let Some(item) = item {
+                                        collect_completed_message(
+                                            item,
+                                            &mut full_text,
+                                            &mut citations,
+                                        );
                                     }
                                 }
                             }
@@ -417,6 +439,7 @@ mod inner {
             if aborted {
                 response.stop_reason = StopReason::Aborted;
             }
+            response.citations = citations;
 
             // Silence unused field warning for inner (kept for future shared helpers).
             let _ = self.inner.model();
@@ -476,20 +499,34 @@ mod inner {
             "parallel_tool_calls": true,
         });
 
-        if !request.tools.is_empty() {
-            let tools: Vec<Value> = request
-                .tools
-                .iter()
-                .map(|tool| {
-                    json!({
-                        "type": "function",
-                        "name": tool.name,
-                        "description": tool.description,
-                        "parameters": tool.parameters,
-                    })
+        let native_web_search = request.server_tools.contains(&ServerTool::WebSearch);
+        let mut tools: Vec<Value> = request
+            .tools
+            .iter()
+            .filter(|tool| !(native_web_search && tool.name == "web_search"))
+            .map(|tool| {
+                json!({
+                    "type": "function",
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
                 })
-                .collect();
+            })
+            .collect();
+        for tool in &request.server_tools {
+            tools.push(match tool {
+                ServerTool::WebSearch => json!({"type":"web_search"}),
+                ServerTool::XSearch => json!({"type":"x_search"}),
+            });
+        }
+        if !tools.is_empty() {
             body["tools"] = json!(tools);
+        }
+        if native_web_search {
+            body["include"]
+                .as_array_mut()
+                .expect("include array")
+                .push(json!("web_search_call.action.sources"));
         }
 
         crate::thinking::apply_responses_thinking(&mut body, request.thinking_level);
@@ -615,6 +652,7 @@ mod inner {
         let mut text = String::new();
         let mut thinking = String::new();
         let mut tools = Vec::new();
+        let mut citations = Vec::new();
 
         if let Some(output) = value.get("output").and_then(|v| v.as_array()) {
             for item in output {
@@ -622,6 +660,7 @@ mod inner {
                     Some("message") => {
                         if let Some(parts) = item.get("content").and_then(|c| c.as_array()) {
                             for p in parts {
+                                append_citations(p, &mut citations);
                                 if let Some(t) = p.get("text").and_then(|x| x.as_str()) {
                                     text.push_str(t);
                                 }
@@ -670,7 +709,7 @@ mod inner {
             _ => Some("stop"),
         };
 
-        Ok(assemble(
+        let mut response = assemble(
             provider,
             model,
             text,
@@ -678,7 +717,9 @@ mod inner {
             tools,
             finish,
             parse_usage(value),
-        ))
+        );
+        response.citations = citations;
+        Ok(response)
     }
 
     fn parse_usage(value: &Value) -> TokenUsage {
@@ -763,6 +804,7 @@ mod inner {
             content,
             stop_reason,
             usage,
+            citations: Vec::new(),
         }
     }
 
@@ -775,9 +817,101 @@ mod inner {
         format!("{n:x}")
     }
 
+    fn should_fallback_server_tools(status: u16, body: &str, cancelled: bool) -> bool {
+        if cancelled || !matches!(status, 400 | 404 | 422) {
+            return false;
+        }
+        let body = body.to_ascii_lowercase();
+        let unsupported = body.contains("unsupported")
+            || body.contains("not supported")
+            || body.contains("unknown")
+            || body.contains("unrecognized")
+            || body.contains("invalid tool");
+        let search_tool =
+            body.contains("tool") || body.contains("web_search") || body.contains("x_search");
+        unsupported && search_tool
+    }
+
+    fn server_tool_update(
+        item: &Value,
+        done_event: bool,
+    ) -> Option<(ServerTool, ServerToolStatus)> {
+        let tool = match item.get("type").and_then(Value::as_str)? {
+            "web_search_call" => ServerTool::WebSearch,
+            "x_search_call" => ServerTool::XSearch,
+            _ => return None,
+        };
+        let status = match item.get("status").and_then(Value::as_str) {
+            Some("failed") | Some("error") => ServerToolStatus::Failed,
+            Some("completed") | Some("done") => ServerToolStatus::Completed,
+            _ if done_event => ServerToolStatus::Completed,
+            _ => ServerToolStatus::Started,
+        };
+        Some((tool, status))
+    }
+
+    fn append_citations(part: &Value, citations: &mut Vec<Citation>) {
+        let Some(annotations) = part.get("annotations").and_then(Value::as_array) else {
+            return;
+        };
+        for annotation in annotations {
+            if annotation.get("type").and_then(Value::as_str) != Some("url_citation") {
+                continue;
+            }
+            let source = annotation.get("url_citation").unwrap_or(annotation);
+            let Some(url) = source.get("url").and_then(Value::as_str) else {
+                continue;
+            };
+            let citation = Citation {
+                url: url.to_string(),
+                title: source
+                    .get("title")
+                    .and_then(Value::as_str)
+                    .unwrap_or(url)
+                    .to_string(),
+                start_index: source
+                    .get("start_index")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0) as usize,
+                end_index: source.get("end_index").and_then(Value::as_u64).unwrap_or(0) as usize,
+            };
+            if !citations.contains(&citation) {
+                citations.push(citation);
+            }
+        }
+    }
+
+    fn collect_completed_message(
+        item: &Value,
+        full_text: &mut String,
+        citations: &mut Vec<Citation>,
+    ) {
+        let collect_text = full_text.is_empty();
+        let Some(parts) = item.get("content").and_then(Value::as_array) else {
+            return;
+        };
+        for part in parts {
+            append_citations(part, citations);
+            if !collect_text {
+                continue;
+            }
+            let part_type = part.get("type").and_then(Value::as_str);
+            if part_type == Some("output_text") || part_type == Some("refusal") {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    full_text.push_str(text);
+                }
+                if let Some(text) = part.get("refusal").and_then(Value::as_str) {
+                    full_text.push_str(text);
+                }
+            }
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
+        use one_core::agent::{ServerTool, ThinkingLevel};
+        use one_core::tool::ToolDefinition;
 
         #[test]
         fn resolve_url_variants() {
@@ -793,6 +927,96 @@ mod inner {
                 resolve_codex_url("https://chatgpt.com/backend-api/codex/responses"),
                 "https://chatgpt.com/backend-api/codex/responses"
             );
+        }
+
+        #[test]
+        fn codex_body_injects_native_search_and_filters_local_search() {
+            let request = CompletionRequest {
+                system_prompt: "sys".into(),
+                messages: vec![one_core::AgentMessage::user_text("search")],
+                tools: vec![
+                    ToolDefinition {
+                        name: "web_search".into(),
+                        description: "local".into(),
+                        parameters: json!({"type":"object"}),
+                    },
+                    ToolDefinition {
+                        name: "web_fetch".into(),
+                        description: "fetch".into(),
+                        parameters: json!({"type":"object"}),
+                    },
+                ],
+                server_tools: vec![ServerTool::WebSearch],
+                thinking_level: ThinkingLevel::Off,
+            };
+            let body = build_codex_body(&request, "gpt-5", true, "session");
+            let tools = body["tools"].as_array().unwrap();
+            assert!(tools.iter().any(|tool| tool["type"] == "web_search"));
+            assert!(tools
+                .iter()
+                .any(|tool| tool["type"] == "function" && tool["name"] == "web_fetch"));
+            assert!(!tools
+                .iter()
+                .any(|tool| tool["type"] == "function" && tool["name"] == "web_search"));
+            assert!(body["include"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "web_search_call.action.sources"));
+        }
+
+        #[test]
+        fn codex_non_stream_parses_citations() {
+            let response = parse_codex_non_stream(
+                &json!({
+                    "status":"completed",
+                    "output":[{
+                        "type":"message",
+                        "content":[{
+                            "type":"output_text",
+                            "text":"answer",
+                            "annotations":[{
+                                "type":"url_citation",
+                                "url":"https://example.com",
+                                "title":"Example",
+                                "start_index":0,
+                                "end_index":6
+                            }]
+                        }]
+                    }]
+                }),
+                "openai-codex",
+                "gpt-5",
+            )
+            .unwrap();
+            assert_eq!(response.citations.len(), 1);
+            assert_eq!(response.citations[0].url, "https://example.com");
+        }
+
+        #[test]
+        fn codex_completed_message_collects_annotations_after_text_deltas() {
+            let mut text = "answer".to_string();
+            let mut citations = Vec::new();
+            collect_completed_message(
+                &json!({
+                    "type": "message",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "answer",
+                        "annotations": [{
+                            "type": "url_citation",
+                            "url": "https://example.com/stream",
+                            "title": "Stream source",
+                            "start_index": 0,
+                            "end_index": 6
+                        }]
+                    }]
+                }),
+                &mut text,
+                &mut citations,
+            );
+            assert_eq!(text, "answer");
+            assert_eq!(citations.len(), 1);
         }
     }
 }

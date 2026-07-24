@@ -706,6 +706,8 @@ pub struct RunResult {
     pub status: Option<TaskExitStatus>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<UsageSnapshot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<one_core::Citation>,
     /// What harness actually used (prompt/tools face).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentRunEcho>,
@@ -737,6 +739,7 @@ impl Default for RunResult {
             stop_reason: None,
             status: None,
             usage: None,
+            citations: Vec::new(),
             agent: None,
             parent: None,
             children: vec![],
@@ -788,6 +791,11 @@ impl RunResult {
 
     pub fn with_usage(mut self, usage: UsageSnapshot) -> Self {
         self.usage = Some(usage);
+        self
+    }
+
+    pub fn with_citations(mut self, citations: Vec<one_core::Citation>) -> Self {
+        self.citations = citations;
         self
     }
 
@@ -927,6 +935,20 @@ mod tests {
         assert_eq!(v["agent"]["name"], "explore");
         assert_eq!(v["agent"]["tools"][0], "read");
         assert_eq!(v["agent"]["depth"], 1);
+    }
+
+    #[test]
+    fn run_result_serializes_citations_when_present() {
+        let rr = RunResult::success("answer", 10).with_citations(vec![one_core::Citation {
+            url: "https://example.com".into(),
+            title: "Example".into(),
+            start_index: 0,
+            end_index: 6,
+        }]);
+        let value: Value = serde_json::from_str(&rr.to_json_line()).unwrap();
+        assert_eq!(value["citations"][0]["url"], "https://example.com");
+        assert_eq!(value["citations"][0]["startIndex"], 0);
+        assert_eq!(value["citations"][0]["endIndex"], 6);
     }
 
     #[test]

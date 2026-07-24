@@ -226,6 +226,7 @@ impl AppRuntime {
                 .into(),
             messages: vec![AgentMessage::user_text(prompt)],
             tools: Vec::new(),
+            server_tools: Vec::new(),
             thinking_level: ThinkingLevel::Off,
         };
         match provider.complete(request).await {

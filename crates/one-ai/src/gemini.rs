@@ -203,6 +203,7 @@ mod inner {
                 content: ordered,
                 stop_reason,
                 usage,
+                citations: Vec::new(),
             })
         }
     }
@@ -530,6 +531,7 @@ mod inner {
                         "$schema": "http://json-schema.org/draft-07/schema#"
                     }),
                 }],
+                server_tools: Vec::new(),
                 thinking_level: ThinkingLevel::Off,
             };
             let body = build_request_body(&req);
@@ -573,6 +575,7 @@ mod inner {
                     provider: "gemini".into(),
                     model: "m".into(),
                     stop_reason: StopReason::ToolUse,
+                    citations: Vec::new(),
                     timestamp: 0,
                 }),
                 one_core::AgentMessage::ToolResult(ToolResultMessage {

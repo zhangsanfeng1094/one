@@ -9,6 +9,17 @@ pub const ABORT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub enum StreamEvent {
     TextDelta(String),
     ThinkingDelta(String),
+    ServerTool {
+        tool: crate::agent::ServerTool,
+        status: ServerToolStatus,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerToolStatus {
+    Started,
+    Completed,
+    Failed,
 }
 
 /// Completes when `abort` is set. If `abort` is `None`, waits forever so it can

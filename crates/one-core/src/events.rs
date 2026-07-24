@@ -21,6 +21,11 @@ pub enum AgentEvent {
     ThinkingDelta {
         delta: String,
     },
+    ServerTool {
+        provider: String,
+        tool: crate::agent::ServerTool,
+        status: crate::streaming::ServerToolStatus,
+    },
     ToolExecutionStart {
         tool_call: ToolCall,
     },

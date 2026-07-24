@@ -234,6 +234,7 @@ impl AppRuntime {
                 system_prompt,
                 max_turns,
                 thinking_level: ThinkingLevel::Off,
+                server_search: applied_features.server_search_enabled(),
             },
             tools,
         );

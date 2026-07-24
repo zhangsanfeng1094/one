@@ -107,6 +107,8 @@ pub struct AssistantMessage {
     pub provider: String,
     pub model: String,
     pub stop_reason: StopReason,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub citations: Vec<crate::agent::Citation>,
     #[serde(default = "default_timestamp")]
     pub timestamp: u64,
 }
@@ -184,6 +186,7 @@ impl AgentMessage {
             provider: provider.to_string(),
             model: model.to_string(),
             stop_reason: StopReason::Stop,
+            citations: Vec::new(),
             timestamp: now_ms(),
         })
     }
