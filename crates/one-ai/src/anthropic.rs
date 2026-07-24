@@ -366,6 +366,7 @@ mod inner {
                 content,
                 stop_reason,
                 usage,
+                citations: Vec::new(),
             })
         }
     }
@@ -687,6 +688,7 @@ mod inner {
                         parameters: json!({"type": "object"}),
                     },
                 ],
+                server_tools: Vec::new(),
                 thinking_level: one_core::agent::ThinkingLevel::Off,
             };
             let body = build_request_body(
@@ -722,6 +724,7 @@ mod inner {
                     timestamp: 0,
                 })],
                 tools: vec![],
+                server_tools: Vec::new(),
                 thinking_level: one_core::agent::ThinkingLevel::Off,
             };
             let body1 = build_request_body(&turn1, "m", false, &compat);
@@ -738,10 +741,12 @@ mod inner {
                         provider: "anthropic".into(),
                         model: "m".into(),
                         stop_reason: StopReason::Stop,
+                        citations: Vec::new(),
                         timestamp: 0,
                     }),
                 ],
                 tools: vec![],
+                server_tools: Vec::new(),
                 thinking_level: one_core::agent::ThinkingLevel::Off,
             };
             let body2 = build_request_body(&turn2, "m", false, &compat);
@@ -763,6 +768,7 @@ mod inner {
                 system_prompt: "sys".into(),
                 messages: vec![],
                 tools: vec![],
+                server_tools: Vec::new(),
                 thinking_level: one_core::agent::ThinkingLevel::Off,
             };
             let body = build_request_body(&req, "m", false, &compat);

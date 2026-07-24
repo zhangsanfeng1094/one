@@ -1613,11 +1613,31 @@ async fn run_turn_streaming(
         tracing::warn!(error = %e, "failed to persist extension state after turn");
     }
 
+    let sources = {
+        let guard = agent.lock().await;
+        let citations = guard
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                AgentMessage::Assistant(message) => Some(message.citations.as_slice()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        format_sources(citations)
+    };
+
     match prompt_result {
         Ok(reply) => {
-            if app.stream_buffer.is_empty() && !reply.is_empty() {
-                app.push_assistant(reply);
+            if app.stream_buffer.is_empty() {
+                let reply = format!("{reply}{sources}");
+                if !reply.is_empty() {
+                    app.push_assistant(reply);
+                }
             } else {
+                if !sources.is_empty() {
+                    app.append_stream(&sources);
+                }
                 app.finish_stream();
             }
 
@@ -1681,6 +1701,21 @@ fn drain_events(app: &mut App, events: &Arc<Mutex<Vec<AgentEvent>>>) {
         match event {
             AgentEvent::TextDelta { delta } => app.append_stream(&delta),
             AgentEvent::ThinkingDelta { delta } => app.append_thinking_stream(&delta),
+            AgentEvent::ServerTool {
+                provider,
+                tool,
+                status,
+            } => match status {
+                one_core::ServerToolStatus::Started => {
+                    app.push_tool_call(tool.as_str(), format!("server · {provider}"));
+                }
+                one_core::ServerToolStatus::Completed => {
+                    app.finish_tool_with_output(tool.as_str(), false, None);
+                }
+                one_core::ServerToolStatus::Failed => {
+                    app.finish_tool_with_output(tool.as_str(), true, None);
+                }
+            },
             AgentEvent::ToolExecutionStart { tool_call } => {
                 let args = match &tool_call.arguments {
                     serde_json::Value::String(s) => s.clone(),
@@ -2611,10 +2646,39 @@ fn rebuild_tui_from_agent(app: &mut App, messages: &[AgentMessage]) {
                         }
                     }
                 }
+                let sources = format_sources(&a.citations);
+                if !sources.is_empty() {
+                    if let Some(message) = app.messages.iter_mut().rev().find(|message| {
+                        message.role == one_tui::message::MessageRole::Assistant
+                    }) {
+                        message.content.push_str(&sources);
+                    } else {
+                        app.push_assistant(sources.trim_start());
+                    }
+                }
             }
             _ => {}
         }
     }
+}
+
+fn format_sources(citations: &[one_core::Citation]) -> String {
+    if citations.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\n\nSources:\n");
+    let mut seen_urls = std::collections::HashSet::new();
+    for citation in citations {
+        if !seen_urls.insert(citation.url.as_str()) {
+            continue;
+        }
+        if citation.title.trim().is_empty() || citation.title == citation.url {
+            out.push_str(&format!("- {}\n", citation.url));
+        } else {
+            out.push_str(&format!("- {} — {}\n", citation.title, citation.url));
+        }
+    }
+    out
 }
 
 /// Rows for TUI login float: `(id, label, detail, logged_in)`.
@@ -2786,4 +2850,98 @@ async fn handle_logout_slash(
         app.set_notice(format!("no credential for `{provider}`"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod server_search_tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::{drain_events, format_sources, rebuild_tui_from_agent};
+    use one_core::{AgentEvent, AgentMessage, ServerTool, ServerToolStatus};
+    use one_tui::{App, MessageRole, ToolStatus};
+
+    #[test]
+    fn sources_list_keeps_titles_and_full_urls() {
+        let text = format_sources(&[
+            one_core::Citation {
+                url: "https://example.com/a/really/long/path?x=1".into(),
+                title: "Example source".into(),
+                start_index: 0,
+                end_index: 4,
+            },
+            one_core::Citation {
+                url: "https://rust-lang.org".into(),
+                title: String::new(),
+                start_index: 5,
+                end_index: 9,
+            },
+            one_core::Citation {
+                url: "https://example.com/a/really/long/path?x=1".into(),
+                title: "Repeated annotation".into(),
+                start_index: 10,
+                end_index: 14,
+            },
+        ]);
+        assert!(text.starts_with("\n\nSources:\n"));
+        assert!(text.contains(
+            "- Example source — https://example.com/a/really/long/path?x=1"
+        ));
+        assert!(text.contains("- https://rust-lang.org"));
+        assert_eq!(
+            text.matches("https://example.com/a/really/long/path?x=1")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn restored_assistant_keeps_sources_at_answer_end() {
+        let mut message = AgentMessage::assistant_text("xai", "grok-4", "answer");
+        let AgentMessage::Assistant(assistant) = &mut message else {
+            unreachable!()
+        };
+        assistant.citations.push(one_core::Citation {
+            url: "https://example.com".into(),
+            title: "Example".into(),
+            start_index: 0,
+            end_index: 6,
+        });
+        let mut app = App::new("test");
+        rebuild_tui_from_agent(&mut app, &[message]);
+        let assistant = app
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Assistant)
+            .unwrap();
+        assert_eq!(
+            assistant.content,
+            "answer\n\nSources:\n- Example — https://example.com\n"
+        );
+    }
+
+    #[test]
+    fn server_search_events_render_as_completed_tool_row() {
+        let events = Arc::new(Mutex::new(vec![
+            AgentEvent::ServerTool {
+                provider: "xai".into(),
+                tool: ServerTool::WebSearch,
+                status: ServerToolStatus::Started,
+            },
+            AgentEvent::ServerTool {
+                provider: "xai".into(),
+                tool: ServerTool::WebSearch,
+                status: ServerToolStatus::Completed,
+            },
+        ]));
+        let mut app = App::new("test");
+        drain_events(&mut app, &events);
+        let tool = app
+            .messages
+            .iter()
+            .find(|message| message.role == MessageRole::Tool)
+            .unwrap();
+        assert_eq!(tool.tool_name.as_deref(), Some("web_search"));
+        assert_eq!(tool.tool_status, Some(ToolStatus::Done));
+        assert!(tool.content.contains("xai"));
+    }
 }

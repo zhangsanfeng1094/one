@@ -129,6 +129,7 @@ pub async fn run_with_control(
         system_prompt,
         max_turns,
         thinking_level: thinking,
+        server_search: false,
     };
 
     let mut agent = Agent::new(config, tools);
@@ -231,6 +232,7 @@ pub async fn run_with_control(
 
     result = result.with_agent_echo(echo);
     result.usage = Some(usage);
+    result.citations = last_assistant_citations(&agent);
     result.parent = req.parent.clone();
 
     if let Some(ref h) = wt_handle {
@@ -326,6 +328,20 @@ fn last_assistant_text(agent: &Agent) -> Option<String> {
         }
     }
     None
+}
+
+fn last_assistant_citations(agent: &Agent) -> Vec<one_core::Citation> {
+    agent
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            one_core::message::AgentMessage::Assistant(message) => {
+                Some(message.citations.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_default()
 }
 
 fn resolve_system_prompt(spec: &AgentSpec) -> String {

@@ -124,6 +124,7 @@ impl MockProvider {
                     output_tokens: 24,
                     ..Default::default()
                 },
+                citations: Vec::new(),
             });
         }
 
@@ -142,6 +143,7 @@ impl MockProvider {
                     output_tokens: 12,
                     ..Default::default()
                 },
+                citations: Vec::new(),
             });
         }
 
@@ -166,6 +168,7 @@ impl MockProvider {
                 output_tokens: 16,
                 ..Default::default()
             },
+            citations: Vec::new(),
         })
     }
 }

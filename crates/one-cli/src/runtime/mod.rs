@@ -274,6 +274,8 @@ impl AppRuntime {
                 self.apply_act_tools_and_prompt().await?;
             }
         }
+        self.agent.lock().await.config.server_search =
+            self.applied_features.server_search_enabled();
         Ok(())
     }
 

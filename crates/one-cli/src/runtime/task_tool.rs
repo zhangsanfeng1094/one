@@ -1028,6 +1028,7 @@ mod tests {
                         }],
                         stop_reason: StopReason::Stop,
                         usage: TokenUsage::default(),
+                        citations: Vec::new(),
                     });
                 }
                 Ok(CompletionResponse {
@@ -1044,6 +1045,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::ToolUse,
                     usage: TokenUsage::default(),
+                    citations: Vec::new(),
                 })
             }
         }
@@ -1058,6 +1060,7 @@ mod tests {
                 system_prompt: "You are the parent.".into(),
                 max_turns: 8,
                 thinking_level: one_core::agent::ThinkingLevel::Off,
+                server_search: false,
             },
             vec![task],
         );

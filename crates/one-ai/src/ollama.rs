@@ -137,6 +137,7 @@ impl LlmProvider for OllamaProvider {
                 StopReason::Stop
             },
             usage,
+            citations: Vec::new(),
         })
     }
 }

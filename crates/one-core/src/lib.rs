@@ -11,8 +11,8 @@ pub mod tool_gate;
 pub mod trace;
 
 pub use agent::{
-    Agent, AgentConfig, CompletionRequest, CompletionResponse, LlmProvider, ThinkingLevel,
-    TokenUsage, TraceRunMeta,
+    Agent, AgentConfig, Citation, CompletionRequest, CompletionResponse, LlmProvider, ServerTool,
+    ThinkingLevel, TokenUsage, TraceRunMeta,
 };
 pub use compaction::{
     compact_messages, estimate_tokens, extractive_summary, is_context_overflow_error,
@@ -26,7 +26,9 @@ pub use error::{OneError, Result};
 pub use events::AgentEvent;
 pub use hooks::{AgentHooks, NoopHooks};
 pub use message::{AgentMessage, AssistantMessage, StopReason, ToolResultMessage, UserMessage};
-pub use streaming::{race_abort, wait_until_aborted, StreamEvent, ABORT_POLL_INTERVAL};
+pub use streaming::{
+    race_abort, wait_until_aborted, ServerToolStatus, StreamEvent, ABORT_POLL_INTERVAL,
+};
 pub use tool::{resolve_tool_name, Tool, ToolCall, ToolDefinition, ToolOutput};
 pub use tool_gate::{AllowAllGate, ToolGate, ToolGateDecision};
 pub use trace::{

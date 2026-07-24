@@ -23,6 +23,31 @@ impl AppRuntime {
                 let line = serde_json::json!({"type":"text_delta","delta":delta});
                 println!("{line}");
             }
+            AgentEvent::ServerTool {
+                provider,
+                tool,
+                status,
+            } if !json => {
+                eprintln!(
+                    "\n[server tool] {} · {} · {:?}",
+                    provider,
+                    tool.as_str(),
+                    status
+                );
+            }
+            AgentEvent::ServerTool {
+                provider,
+                tool,
+                status,
+            } if json => {
+                let line = serde_json::json!({
+                    "type":"server_tool",
+                    "provider":provider,
+                    "name":tool.as_str(),
+                    "status":format!("{status:?}").to_ascii_lowercase(),
+                });
+                println!("{line}");
+            }
             AgentEvent::ToolExecutionStart { tool_call } if !json => {
                 eprintln!("\n[tool] {}({})", tool_call.name, tool_call.arguments);
             }

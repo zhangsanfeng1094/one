@@ -121,6 +121,8 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub max_turns: usize,
     pub thinking_level: ThinkingLevel,
+    /// Enable provider-native search when the active provider/model supports it.
+    pub server_search: bool,
 }
 
 impl Default for AgentConfig {
@@ -129,6 +131,7 @@ impl Default for AgentConfig {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
             max_turns: 32,
             thinking_level: ThinkingLevel::Off,
+            server_search: false,
         }
     }
 }
@@ -138,7 +141,33 @@ pub struct CompletionRequest {
     pub system_prompt: String,
     pub messages: Vec<AgentMessage>,
     pub tools: Vec<crate::tool::ToolDefinition>,
+    /// Provider-native tools, kept separate from locally executed functions.
+    pub server_tools: Vec<ServerTool>,
     pub thinking_level: ThinkingLevel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerTool {
+    WebSearch,
+    XSearch,
+}
+
+impl ServerTool {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::WebSearch => "web_search",
+            Self::XSearch => "x_search",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Citation {
+    pub url: String,
+    pub title: String,
+    pub start_index: usize,
+    pub end_index: usize,
 }
 
 /// Token accounting returned by providers (when available).
@@ -229,12 +258,18 @@ pub struct CompletionResponse {
     pub stop_reason: StopReason,
     /// Provider-reported usage for this completion (may be zero if unknown).
     pub usage: TokenUsage,
+    /// URL annotations attached to generated output text.
+    pub citations: Vec<Citation>,
 }
 
 #[async_trait]
 pub trait LlmProvider: Send + Sync {
     fn name(&self) -> &str;
     fn model(&self) -> &str;
+
+    fn server_tools(&self) -> Vec<ServerTool> {
+        Vec::new()
+    }
 
     async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse>;
 
@@ -569,6 +604,11 @@ impl Agent {
                 system_prompt: self.config.system_prompt.clone(),
                 messages: self.messages.clone(),
                 tools: self.tool_definitions(),
+                server_tools: if self.config.server_search {
+                    provider.server_tools()
+                } else {
+                    Vec::new()
+                },
                 thinking_level: self.config.thinking_level,
             };
 
@@ -619,6 +659,16 @@ impl Agent {
                                 crate::streaming::StreamEvent::ThinkingDelta(delta) => {
                                     let agent_event = AgentEvent::ThinkingDelta {
                                         delta: delta.clone(),
+                                    };
+                                    for listener in &listeners {
+                                        listener(&agent_event);
+                                    }
+                                }
+                                crate::streaming::StreamEvent::ServerTool { tool, status } => {
+                                    let agent_event = AgentEvent::ServerTool {
+                                        provider: provider.name().to_string(),
+                                        tool,
+                                        status,
                                     };
                                     for listener in &listeners {
                                         listener(&agent_event);
@@ -699,6 +749,7 @@ impl Agent {
                     model: response.model.clone(),
                     stop_reason: StopReason::Aborted,
                     timestamp: crate::message::now_ms(),
+                    citations: response.citations.clone(),
                 });
                 self.messages.push(assistant);
                 return self
@@ -712,6 +763,7 @@ impl Agent {
                 model: response.model.clone(),
                 stop_reason: response.stop_reason,
                 timestamp: crate::message::now_ms(),
+                citations: response.citations.clone(),
             });
             self.messages.push(assistant.clone());
 
@@ -1688,6 +1740,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::Aborted,
                     usage: TokenUsage::default(),
+                    citations: Vec::new(),
                 })
             }
         }
@@ -1758,6 +1811,7 @@ mod tests {
                         }],
                         stop_reason: StopReason::ToolUse,
                         usage: TokenUsage::default(),
+                        citations: Vec::new(),
                     })
                 } else {
                     Ok(CompletionResponse {
@@ -1768,6 +1822,7 @@ mod tests {
                         }],
                         stop_reason: StopReason::Stop,
                         usage: TokenUsage::default(),
+                        citations: Vec::new(),
                     })
                 }
             }
@@ -1878,6 +1933,7 @@ mod tests {
                     }],
                     stop_reason: StopReason::Stop,
                     usage: TokenUsage::default(),
+                    citations: Vec::new(),
                 })
             }
         }

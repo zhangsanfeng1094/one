@@ -9,6 +9,8 @@ use crate::settings::Settings;
 
 /// Feature id for the subagent / `task` tool package.
 pub const FEATURE_SUBAGENT: &str = "subagent";
+/// Feature id for provider-native Web/X search.
+pub const FEATURE_SERVER_SEARCH: &str = "server_search";
 
 /// Static definition of a product feature.
 #[derive(Debug, Clone, Copy)]
@@ -23,15 +25,24 @@ pub struct FeatureDef {
     pub tool_names: &'static [&'static str],
 }
 
-/// Built-in feature registry (V1: subagent only; extend here later).
-pub const FEATURE_REGISTRY: &[FeatureDef] = &[FeatureDef {
-    id: FEATURE_SUBAGENT,
-    label: "Subagent (task)",
-    description: "task / job_output / wait_tasks / job_kill + prompt policy",
-    default_enabled: true,
-    affects_context: true,
-    tool_names: &["task", "job_output", "wait_tasks", "job_kill"],
-}];
+pub const FEATURE_REGISTRY: &[FeatureDef] = &[
+    FeatureDef {
+        id: FEATURE_SUBAGENT,
+        label: "Subagent (task)",
+        description: "task / job_output / wait_tasks / job_kill + prompt policy",
+        default_enabled: true,
+        affects_context: true,
+        tool_names: &["task", "job_output", "wait_tasks", "job_kill"],
+    },
+    FeatureDef {
+        id: FEATURE_SERVER_SEARCH,
+        label: "Server search",
+        description: "provider-native web/X search when supported",
+        default_enabled: false,
+        affects_context: true,
+        tool_names: &[],
+    },
+];
 
 /// Effective feature enable map (defaults filled in for known ids).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +126,10 @@ impl FeatureState {
     pub fn subagent_enabled(&self) -> bool {
         self.is_enabled(FEATURE_SUBAGENT)
     }
+
+    pub fn server_search_enabled(&self) -> bool {
+        self.is_enabled(FEATURE_SERVER_SEARCH)
+    }
 }
 
 /// Look up a registry definition.
@@ -153,7 +168,8 @@ mod tests {
     fn default_subagent_on() {
         let s = FeatureState::default();
         assert!(s.subagent_enabled());
-        assert_eq!(s.fingerprint(), "subagent=1");
+        assert!(!s.server_search_enabled());
+        assert_eq!(s.fingerprint(), "server_search=0,subagent=1");
     }
 
     #[test]
@@ -164,7 +180,7 @@ mod tests {
         settings.features = Some(m);
         let s = FeatureState::from_settings(&settings);
         assert!(!s.subagent_enabled());
-        assert_eq!(s.fingerprint(), "subagent=0");
+        assert_eq!(s.fingerprint(), "server_search=0,subagent=0");
     }
 
     #[test]
@@ -178,5 +194,17 @@ mod tests {
         assert_eq!(parse_bool_token("toggle", true).unwrap(), false);
         assert_eq!(parse_bool_token("on", false).unwrap(), true);
         assert!(parse_bool_token("maybe", true).is_err());
+    }
+
+    #[test]
+    fn server_search_is_context_affecting_and_can_be_enabled() {
+        let def = feature_def(FEATURE_SERVER_SEARCH).expect("server_search registered");
+        assert!(!def.default_enabled);
+        assert!(def.affects_context);
+
+        let mut settings = Settings::default();
+        settings.set_feature(FEATURE_SERVER_SEARCH, true);
+        let state = FeatureState::from_settings(&settings);
+        assert!(state.server_search_enabled());
     }
 }
