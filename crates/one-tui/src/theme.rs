@@ -445,44 +445,112 @@ impl Theme {
         Style::default().fg(Self::MUTED).bg(Self::PANEL)
     }
 
-    /// IDE-style insert line (Cursor / VS Code dark).
+    // Diff palette — soft VS Code / Cursor dark (not neon full-row blocks).
+    const DIFF_ADD_BG: Color = Color::Rgb(0x14, 0x2a, 0x1c);
+    const DIFF_ADD_BG_HI: Color = Color::Rgb(0x1f, 0x4a, 0x2c);
+    const DIFF_ADD_FG: Color = Color::Rgb(0xc8, 0xea, 0xd0);
+    const DIFF_ADD_MARK: Color = Color::Rgb(0x4e, 0xc9, 0x7a);
+    const DIFF_DEL_BG: Color = Color::Rgb(0x2a, 0x14, 0x16);
+    const DIFF_DEL_BG_HI: Color = Color::Rgb(0x4a, 0x1f, 0x24);
+    const DIFF_DEL_FG: Color = Color::Rgb(0xf0, 0xc8, 0xcc);
+    const DIFF_DEL_MARK: Color = Color::Rgb(0xe0, 0x6c, 0x75);
+    const DIFF_GUTTER_BG: Color = Color::Rgb(0x0e, 0x0e, 0x0e);
+
+    /// IDE-style insert line body.
     pub fn diff_add() -> Style {
-        Style::default()
-            .fg(Color::Rgb(0xd6, 0xf5, 0xdc))
-            .bg(Color::Rgb(0x1b, 0x3a, 0x24))
+        Style::default().fg(Self::DIFF_ADD_FG).bg(Self::DIFF_ADD_BG)
     }
 
-    /// IDE-style delete line.
-    pub fn diff_del() -> Style {
+    /// Word-level highlight on an insert line (brighter green wash).
+    pub fn diff_add_word() -> Style {
         Style::default()
-            .fg(Color::Rgb(0xff, 0xcd, 0xd2))
-            .bg(Color::Rgb(0x4a, 0x18, 0x1c))
+            .fg(Color::Rgb(0xe8, 0xff, 0xee))
+            .bg(Self::DIFF_ADD_BG_HI)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// IDE-style delete line body.
+    pub fn diff_del() -> Style {
+        Style::default().fg(Self::DIFF_DEL_FG).bg(Self::DIFF_DEL_BG)
+    }
+
+    /// Word-level highlight on a delete line.
+    pub fn diff_del_word() -> Style {
+        Style::default()
+            .fg(Color::Rgb(0xff, 0xe0, 0xe4))
+            .bg(Self::DIFF_DEL_BG_HI)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn diff_meta() -> Style {
         Style::default().fg(Self::MUTED)
     }
 
+    /// 1-col left accent rail (add).
+    pub fn diff_mark_add() -> Style {
+        Style::default().fg(Self::DIFF_ADD_MARK).bg(Self::DIFF_ADD_BG)
+    }
+
+    /// 1-col left accent rail (delete).
+    pub fn diff_mark_del() -> Style {
+        Style::default().fg(Self::DIFF_DEL_MARK).bg(Self::DIFF_DEL_BG)
+    }
+
+    pub fn diff_mark_ctx() -> Style {
+        Style::default().fg(Self::BORDER).bg(Self::DIFF_GUTTER_BG)
+    }
+
     /// Gutter line number on context rows.
     pub fn diff_ln() -> Style {
-        Style::default().fg(Self::MUTED).bg(Self::BG)
+        Style::default()
+            .fg(Color::Rgb(0x5a, 0x5a, 0x5a))
+            .bg(Self::DIFF_GUTTER_BG)
     }
 
     pub fn diff_ln_add() -> Style {
         Style::default()
-            .fg(Color::Rgb(0x7f, 0xd8, 0x8f))
-            .bg(Color::Rgb(0x1b, 0x3a, 0x24))
+            .fg(Self::DIFF_ADD_MARK)
+            .bg(Self::DIFF_ADD_BG)
     }
 
     pub fn diff_ln_del() -> Style {
         Style::default()
-            .fg(Color::Rgb(0xe0, 0x6c, 0x75))
-            .bg(Color::Rgb(0x4a, 0x18, 0x1c))
+            .fg(Self::DIFF_DEL_MARK)
+            .bg(Self::DIFF_DEL_BG)
+    }
+
+    /// Thin gutter / body separator.
+    pub fn diff_gutter_sep() -> Style {
+        Style::default()
+            .fg(Color::Rgb(0x2a, 0x2a, 0x2a))
+            .bg(Self::DIFF_GUTTER_BG)
+    }
+
+    pub fn diff_gutter_sep_add() -> Style {
+        Style::default()
+            .fg(Color::Rgb(0x1f, 0x3a, 0x28))
+            .bg(Self::DIFF_ADD_BG)
+    }
+
+    pub fn diff_gutter_sep_del() -> Style {
+        Style::default()
+            .fg(Color::Rgb(0x3a, 0x1f, 0x22))
+            .bg(Self::DIFF_DEL_BG)
     }
 
     /// Unchanged context code in an expanded edit diff.
     pub fn diff_context() -> Style {
-        Style::default().fg(Self::FG).bg(Self::BG)
+        Style::default()
+            .fg(Color::Rgb(0xb0, 0xb0, 0xb0))
+            .bg(Self::BG)
+    }
+
+    /// Ellipsis / skipped-lines meta inside a diff block.
+    pub fn diff_skip() -> Style {
+        Style::default()
+            .fg(Self::MUTED)
+            .bg(Self::DIFF_GUTTER_BG)
+            .add_modifier(Modifier::ITALIC)
     }
 
     pub fn tool_group() -> Style {

@@ -357,6 +357,106 @@ fn split_hunk_token(s: &str) -> Option<(&str, &str)> {
     Some((tok, rest))
 }
 
+/// Tokenize for word-level inline diff (words + single separators).
+pub fn diff_tokens(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while !rest.is_empty() {
+        let mut chars = rest.char_indices();
+        let Some((_, c0)) = chars.next() else {
+            break;
+        };
+        if c0.is_alphanumeric() || c0 == '_' {
+            let end = chars
+                .find(|(_, c)| !(c.is_alphanumeric() || *c == '_'))
+                .map(|(i, _)| i)
+                .unwrap_or(rest.len());
+            out.push(&rest[..end]);
+            rest = &rest[end..];
+        } else {
+            let end = c0.len_utf8();
+            out.push(&rest[..end]);
+            rest = &rest[end..];
+        }
+    }
+    out
+}
+
+/// Word-level highlight ranges for a del/add pair.
+///
+/// Returns parallel segment lists `(text, emphasized)` for old and new lines.
+/// When lines are identical or too large, returns a single non-emphasized segment each.
+pub fn inline_diff_segments(old: &str, new: &str) -> (Vec<(String, bool)>, Vec<(String, bool)>) {
+    const MAX: usize = 400;
+    if old == new || old.len() > MAX || new.len() > MAX {
+        return (vec![(old.to_string(), false)], vec![(new.to_string(), false)]);
+    }
+    let a = diff_tokens(old);
+    let b = diff_tokens(new);
+    if a.is_empty() && b.is_empty() {
+        return (vec![(String::new(), false)], vec![(String::new(), false)]);
+    }
+    // Cap token count for O(n*m) LCS.
+    if a.len() > 120 || b.len() > 120 {
+        return (vec![(old.to_string(), false)], vec![(new.to_string(), false)]);
+    }
+
+    let n = a.len();
+    let m = b.len();
+    let mut dp = vec![vec![0u16; m + 1]; n + 1];
+    for i in 0..n {
+        for j in 0..m {
+            dp[i + 1][j + 1] = if a[i] == b[j] {
+                dp[i][j].saturating_add(1)
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+
+    // Backtrack → common-token mask
+    let mut common_a = vec![false; n];
+    let mut common_b = vec![false; m];
+    let mut i = n;
+    let mut j = m;
+    while i > 0 && j > 0 {
+        if a[i - 1] == b[j - 1] {
+            common_a[i - 1] = true;
+            common_b[j - 1] = true;
+            i -= 1;
+            j -= 1;
+        } else if dp[i - 1][j] >= dp[i][j - 1] {
+            i -= 1;
+        } else {
+            j -= 1;
+        }
+    }
+
+    let merge = |toks: &[&str], common: &[bool]| -> Vec<(String, bool)> {
+        let mut segs: Vec<(String, bool)> = Vec::new();
+        for (t, &is_common) in toks.iter().zip(common.iter()) {
+            let emp = !is_common;
+            if let Some(last) = segs.last_mut() {
+                if last.1 == emp {
+                    last.0.push_str(t);
+                    continue;
+                }
+            }
+            segs.push(((*t).to_string(), emp));
+        }
+        if segs.is_empty() {
+            segs.push((String::new(), false));
+        }
+        // If everything is emphasized, drop word-level paint (whole line already colored).
+        if segs.iter().all(|(_, e)| *e) {
+            return vec![(toks.concat(), false)];
+        }
+        segs
+    };
+
+    (merge(&a, &common_a), merge(&b, &common_b))
+}
+
 /// Parse `exit N` / `exit signal` prefix from bash tool output.
 pub fn parse_bash_exit(output: &str) -> (Option<i64>, &str) {
     let trimmed = output.trim_start();
@@ -707,5 +807,43 @@ Updated src/a.rs
         assert!(add.text.contains("Prefer always"));
         assert_eq!(del.line_no, Some(52));
         assert_eq!(add.line_no, Some(52));
+    }
+
+    #[test]
+    fn inline_diff_highlights_changed_words() {
+        let (old, new) =
+            inline_diff_segments("let text = tool_output_for_ui(output);", "let text = tool_output_for_ui(&output);");
+        let emp_old: String = old
+            .iter()
+            .filter(|(_, e)| *e)
+            .map(|(s, _)| s.as_str())
+            .collect();
+        let emp_new: String = new
+            .iter()
+            .filter(|(_, e)| *e)
+            .map(|(s, _)| s.as_str())
+            .collect();
+        // Only the `&` insertion should be emphasized on the new side; old may be empty emp.
+        assert!(
+            emp_new.contains('&') || new.iter().any(|(s, e)| *e && s.contains('&')),
+            "expected & highlighted in new, segs={new:?}"
+        );
+        assert!(
+            !emp_old.contains("tool_output_for_ui"),
+            "shared identifier should not be fully emphasized: {old:?}"
+        );
+    }
+
+    #[test]
+    fn inline_diff_identical_is_plain() {
+        let (old, new) = inline_diff_segments("same line", "same line");
+        assert_eq!(old, vec![("same line".into(), false)]);
+        assert_eq!(new, vec![("same line".into(), false)]);
+    }
+
+    #[test]
+    fn diff_tokens_keeps_separators() {
+        let t = diff_tokens("a.b(c)");
+        assert_eq!(t, vec!["a", ".", "b", "(", "c", ")"]);
     }
 }

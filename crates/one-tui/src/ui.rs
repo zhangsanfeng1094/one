@@ -1655,7 +1655,7 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
     lines
 }
 
-/// Cursor / VS Code style edit diff: `  52  code…` with red/green full-row paint.
+/// Cursor / VS Code style edit diff: accent rail + gutter + word-level paint.
 fn render_ide_diff(output: &str, wrap_width: usize) -> Vec<Line<'static>> {
     const MAX_ROWS: usize = 48;
     let rows = tool_view::parse_ide_diff_rows(output);
@@ -1680,66 +1680,209 @@ fn render_ide_diff(output: &str, wrap_width: usize) -> Vec<Line<'static>> {
         return out;
     }
 
+    // Pair consecutive del→add (same line_no preferred) for word-level highlights.
+    let word_hi = compute_word_highlights(&rows);
+
     let max_ln = rows.iter().filter_map(|r| r.line_no).max().unwrap_or(1);
     let ln_w = max_ln.to_string().len().max(2).min(5);
-    // `  ` + ln_w + `  ` + code
-    let gutter = 2 + ln_w + 2;
+    // mark(1) + space(1) + ln + sep(1) + space(1) + code
+    let gutter = 1 + 1 + ln_w + 1 + 1;
     let body_budget = wrap_width.saturating_sub(gutter).max(8);
 
     let mut out = Vec::new();
     let total = rows.len();
-    for row in rows.iter().take(MAX_ROWS) {
-        let (ln_style, code_style) = match row.kind {
-            DiffLineKind::Add => (Theme::diff_ln_add(), Theme::diff_add()),
-            DiffLineKind::Del => (Theme::diff_ln_del(), Theme::diff_del()),
-            _ => (Theme::diff_ln(), Theme::diff_context()),
+    for (idx, row) in rows.iter().enumerate().take(MAX_ROWS) {
+        let (mark_ch, mark_style, ln_style, code_style, word_style, sep_style) = match row.kind {
+            DiffLineKind::Add => (
+                "┃",
+                Theme::diff_mark_add(),
+                Theme::diff_ln_add(),
+                Theme::diff_add(),
+                Theme::diff_add_word(),
+                Theme::diff_gutter_sep_add(),
+            ),
+            DiffLineKind::Del => (
+                "┃",
+                Theme::diff_mark_del(),
+                Theme::diff_ln_del(),
+                Theme::diff_del(),
+                Theme::diff_del_word(),
+                Theme::diff_gutter_sep_del(),
+            ),
+            _ => (
+                " ",
+                Theme::diff_mark_ctx(),
+                Theme::diff_ln(),
+                Theme::diff_context(),
+                Theme::diff_context(),
+                Theme::diff_gutter_sep(),
+            ),
         };
         let ln_label = match row.line_no {
             Some(n) => format!("{n:>ln_w$}"),
             None => " ".repeat(ln_w),
         };
-        let wrapped = wrap_str(&row.text, body_budget);
-        if wrapped.is_empty() {
+
+        let segments: Vec<(String, bool)> = word_hi
+            .get(&idx)
+            .cloned()
+            .unwrap_or_else(|| vec![(row.text.clone(), false)]);
+
+        let visual_rows = wrap_styled_segments(&segments, body_budget);
+        if visual_rows.is_empty() {
             out.push(Line::from(vec![
-                Span::raw("  "),
+                Span::styled(mark_ch, mark_style),
+                Span::styled(" ", ln_style),
                 Span::styled(ln_label, ln_style),
-                Span::styled("  ", code_style),
+                Span::styled("│", sep_style),
+                Span::styled(" ", code_style),
             ]));
             continue;
         }
-        for (wi, piece) in wrapped.into_iter().enumerate() {
-            // Only first visual row of a logical line shows the gutter number.
-            let gutter_spans = if wi == 0 {
+
+        for (wi, pieces) in visual_rows.into_iter().enumerate() {
+            let mut spans = if wi == 0 {
                 vec![
-                    Span::raw("  "),
+                    Span::styled(mark_ch, mark_style),
+                    Span::styled(" ", ln_style),
                     Span::styled(ln_label.clone(), ln_style),
-                    Span::styled("  ", code_style),
+                    Span::styled("│", sep_style),
+                    Span::styled(" ", code_style),
                 ]
             } else {
+                // Continuation: keep rail + blank gutter so wrap stays aligned.
                 vec![
-                    Span::raw("  "),
+                    Span::styled(mark_ch, mark_style),
+                    Span::styled(" ", ln_style),
                     Span::styled(" ".repeat(ln_w), ln_style),
-                    Span::styled("  ", code_style),
+                    Span::styled("│", sep_style),
+                    Span::styled(" ", code_style),
                 ]
             };
-            let mut spans = gutter_spans;
-            // Pad code to remaining width so the red/green bg fills the row.
-            let pad = body_budget.saturating_sub(display_width(&piece));
-            let mut body = piece;
-            if pad > 0 {
-                body.push_str(&" ".repeat(pad));
+            let mut used = 0usize;
+            for (piece, emp) in pieces {
+                let st = if emp { word_style } else { code_style };
+                used = used.saturating_add(display_width(&piece));
+                spans.push(Span::styled(piece, st));
             }
-            spans.push(Span::styled(body, code_style));
+            // Pad so the red/green wash fills the remaining columns.
+            let pad = body_budget.saturating_sub(used);
+            if pad > 0 {
+                spans.push(Span::styled(" ".repeat(pad), code_style));
+            }
             out.push(Line::from(spans));
         }
     }
     if total > MAX_ROWS {
         out.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("… +{} lines", total - MAX_ROWS), Theme::meta()),
+            Span::styled(" ", Theme::diff_mark_ctx()),
+            Span::styled(
+                format!("  … +{} lines", total - MAX_ROWS),
+                Theme::diff_skip(),
+            ),
         ]));
     }
     out
+}
+
+/// For each consecutive Del→Add pair, compute word-level emphasize masks.
+fn compute_word_highlights(
+    rows: &[tool_view::IdeDiffRow],
+) -> std::collections::HashMap<usize, Vec<(String, bool)>> {
+    use std::collections::HashMap;
+    let mut map = HashMap::new();
+    let mut i = 0;
+    while i + 1 < rows.len() {
+        let a = &rows[i];
+        let b = &rows[i + 1];
+        // Pair adjacent del→add when line numbers are equal or off-by-one (replace).
+        let same_or_adj = match (a.line_no, b.line_no) {
+            (Some(x), Some(y)) => x.abs_diff(y) <= 1,
+            _ => true,
+        };
+        if a.kind == DiffLineKind::Del && b.kind == DiffLineKind::Add && same_or_adj {
+            let (old_segs, new_segs) = tool_view::inline_diff_segments(&a.text, &b.text);
+            // Only keep if there is at least one emphasized span (real word change).
+            if old_segs.iter().any(|(_, e)| *e) || new_segs.iter().any(|(_, e)| *e) {
+                map.insert(i, old_segs);
+                map.insert(i + 1, new_segs);
+            }
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    map
+}
+
+/// Wrap a sequence of (text, emphasize) segments to `width` display columns.
+fn wrap_styled_segments(segments: &[(String, bool)], width: usize) -> Vec<Vec<(String, bool)>> {
+    if width == 0 {
+        return vec![segments.to_vec()];
+    }
+    let mut rows: Vec<Vec<(String, bool)>> = Vec::new();
+    let mut cur: Vec<(String, bool)> = Vec::new();
+    let mut col = 0usize;
+
+    let push_chunk = |cur: &mut Vec<(String, bool)>, text: String, emp: bool| {
+        if text.is_empty() {
+            return;
+        }
+        if let Some(last) = cur.last_mut() {
+            if last.1 == emp {
+                last.0.push_str(&text);
+                return;
+            }
+        }
+        cur.push((text, emp));
+    };
+
+    for (text, emp) in segments {
+        let mut rest = text.as_str();
+        while !rest.is_empty() {
+            if col >= width {
+                rows.push(std::mem::take(&mut cur));
+                col = 0;
+            }
+            let room = width.saturating_sub(col).max(1);
+            let (take, advance) = take_prefix_cols(rest, room);
+            if take.is_empty() {
+                // Can't fit even one char — force break.
+                rows.push(std::mem::take(&mut cur));
+                col = 0;
+                continue;
+            }
+            push_chunk(&mut cur, take.to_string(), *emp);
+            col = col.saturating_add(advance);
+            rest = &rest[take.len()..];
+            if col >= width && !rest.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+                col = 0;
+            }
+        }
+    }
+    if !cur.is_empty() || rows.is_empty() {
+        rows.push(cur);
+    }
+    rows
+}
+
+/// Take a prefix of `s` whose display width is ≤ `max_cols`. Returns (prefix, width).
+fn take_prefix_cols(s: &str, max_cols: usize) -> (&str, usize) {
+    if max_cols == 0 {
+        return ("", 0);
+    }
+    let mut w = 0usize;
+    let mut end = 0usize;
+    for (i, ch) in s.char_indices() {
+        let cw = char_width(ch);
+        if w + cw > max_cols {
+            break;
+        }
+        w += cw;
+        end = i + ch.len_utf8();
+    }
+    (&s[..end], w)
 }
 
 /// UI-only alert card mid-transcript (not LLM context).

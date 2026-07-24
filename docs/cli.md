@@ -754,20 +754,20 @@ Slash 命令：
 
 **IDE 风格（默认展开成功 diff）**
 
-- 形态类似 Cursor / VS Code inline diff：左侧 **行号 gutter** + 代码正文，**不**再显示 unified 的 `+`/`-` 前缀与 `---`/`+++`/`@@` 头。
-- **删除行**：浅红字 + 深红底（`Theme::diff_del` / `diff_ln_del`）。
-- **新增行**：浅绿字 + 深绿底（`Theme::diff_add` / `diff_ln_add`）。
+- 形态类似 Cursor / VS Code inline diff：左侧 **色条 + 行号 gutter + `│` 分隔** + 代码正文，**不**再显示 unified 的 `+`/`-` 前缀与 `---`/`+++`/`@@` 头。
+- **删除行**：柔和红底 + 行首 `┃`；相邻 del→add 配对时，**词级**更亮红底（`Theme::diff_del` / `diff_del_word`）。
+- **新增行**：柔和绿底 + 行首 `┃`；配对时词级更亮绿底（`Theme::diff_add` / `diff_add_word`）。
 - 同号可并排出现（删旧 / 增新各一行），例如：
 
 ```text
   ✓ edit  crates/one-cli/src/modes/interactive.rs
-  1696  // Prefer details.patch for edit/write-style diffs when present.
-  1699  let text = tool_output_for_ui(output);     ← 红底删除
-  1699  let text = tool_output_for_ui(&output);    ← 绿底新增
-  1700  app.finish_tool_with_output(
+┃ 1696│ // Prefer details.patch for edit/write-style diffs when present.
+┃ 1699│ let text = tool_output_for_ui(output);     ← 红底；output 词级高亮
+┃ 1699│ let text = tool_output_for_ui(&output);    ← 绿底；& 词级高亮
+  1700│ app.finish_tool_with_output(
 ```
 
-- 实现：`tool_view::parse_ide_diff_rows` 解析 unified → 行号 + kind；`ui::render_ide_diff` 铺色并按终端宽度 wrap（整行背景填满）。
+- 实现：`tool_view::parse_ide_diff_rows` 解析 unified → 行号 + kind；`inline_diff_segments` 对 del/add 做 token LCS；`ui::render_ide_diff` 铺色、词级 span、按终端宽度 wrap（整行背景填满）。
 - 解析失败时回退为带 `+/-` 的 plain unified 着色。
 - **错误**结果（`ToolStatus::Error`）不走 IDE diff，仍用普通树形 `│` / `└` 详情。
 - TUI 侧对 body 有展示截断（约 4k 字符存盘、渲染约 48 行）；**完整结果仍在 agent `ToolResult`**，只是 transcript 预览有限。
