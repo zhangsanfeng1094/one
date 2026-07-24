@@ -717,15 +717,67 @@ Slash 命令：
 | 工具 | 模式 | 说明 |
 |------|------|------|
 | `read` / `write` / `edit` | Act（write/edit 仅 Act） | 文件读写与补丁 |
-| `bash` | Act |  shell；支持后台 task_id |
-| `bash_output` | Act | 轮询/等待后台 bash 输出 |
-| `bash_kill` | Act | 终止后台 bash 任务 |
+| `bash` | Act | shell；`run_in_background=true` → 立即返回 `task_id`（**session-owned**，见下） |
+| `bash_output` | Act | 轮询/等待后台 bash 输出（`task_id` 可省略则列 `/ps` 式快照） |
+| `bash_kill` | Act | 终止指定后台 bash 任务 |
 | `grep` / `find` / `ls` | Act / Plan / read-only | 搜索与列举 |
 | `task` | Act / Plan / read-only | 子 agent（默认 explore）→ 同一 `harness::run`；见 [protocol.md](./protocol.md) |
 | `ask_user` | 均有（仅 Interactive） | 结构化澄清问题 |
 | `web_search` / `web_fetch` | Act / Plan / read-only | 联网（需 `network` feature，CLI 默认开） |
 | `plan` 相关 + `exit_plan_mode` | Plan | 写 plan 文件并退出 Plan |
 | MCP `server__tool` | Act | 来自已连接 MCP 服务器 |
+
+**后台任务生命周期（session-owned）**
+
+| 事件 | background bash | background agent job（`task`/`job_*`） |
+|------|-----------------|----------------------------------------|
+| 进程退出、`/new`、`/resume`（切换会话） | **全部 kill**；**不**往下一 session 注入 teardown 完成通知 | **全部 kill**；通知队列一并清空 |
+| 运行中 `Esc` / RPC `abort`（软取消当前 turn） | **保留**（`npm run dev` 等长驻进程可继续） | **kill_all**（与父 turn 绑定） |
+| 显式 `bash_kill` / `job_kill` | 按 id 终止 | 按 id 终止 |
+
+### Edit / Write 的 TUI diff 展示
+
+`edit`（以及 plan 写路径里复用同一套 diff 的工具）成功后会**拆分模型上下文与 UI**：
+
+| 通道 | 内容 | 是否进 LLM |
+|------|------|------------|
+| `ToolOutput.content` | 短摘要，如 `Updated path/to/file.rs (+1 −1)` | **是** |
+| `ToolOutput.details.patch` | unified diff（`@@` hunk + `+/-` 行） | **否**（UI-only） |
+
+设计对齐 Codex / OpenCode：模型只拿到 ack，避免把整段 patch 塞进 context；transcript 仍可展开看真实变更。
+
+**数据流**
+
+1. `one-tools`：`format_edit_success` 生成 summary + unified patch；`patch_for_details` 在体积 ≤ **100 KiB** 时写入 `details.patch`（更大则省略 patch，摘要仍有）。
+2. `one-cli` interactive：`tool_output_for_ui` 优先拼接 summary + `details.patch` 作为 TUI 预览文本。
+3. `one-tui`：展开 tool 行时，`looks_like_diff` 识别 patch → `render_ide_diff` 渲染。
+
+**IDE 风格（默认展开成功 diff）**
+
+- 形态类似 Cursor / VS Code inline diff：左侧 **行号 gutter** + 代码正文，**不**再显示 unified 的 `+`/`-` 前缀与 `---`/`+++`/`@@` 头。
+- **删除行**：浅红字 + 深红底（`Theme::diff_del` / `diff_ln_del`）。
+- **新增行**：浅绿字 + 深绿底（`Theme::diff_add` / `diff_ln_add`）。
+- 同号可并排出现（删旧 / 增新各一行），例如：
+
+```text
+  ✓ edit  crates/one-cli/src/modes/interactive.rs
+  1696  // Prefer details.patch for edit/write-style diffs when present.
+  1699  let text = tool_output_for_ui(output);     ← 红底删除
+  1699  let text = tool_output_for_ui(&output);    ← 绿底新增
+  1700  app.finish_tool_with_output(
+```
+
+- 实现：`tool_view::parse_ide_diff_rows` 解析 unified → 行号 + kind；`ui::render_ide_diff` 铺色并按终端宽度 wrap（整行背景填满）。
+- 解析失败时回退为带 `+/-` 的 plain unified 着色。
+- **错误**结果（`ToolStatus::Error`）不走 IDE diff，仍用普通树形 `│` / `└` 详情。
+- TUI 侧对 body 有展示截断（约 4k 字符存盘、渲染约 48 行）；**完整结果仍在 agent `ToolResult`**，只是 transcript 预览有限。
+
+**交互**
+
+- 默认 tool 行可能只显示一行 summary（`ok · …` / `Updated …`）；**点击 / 展开** tool 行后才看到完整红绿 diff。
+- `write` 工具当前 `details` 只有 `path` / `bytes`，**不**附带 before/after patch；文档里「edit/write」的 IDE 渲染主要指 **带 unified patch 的输出**（`edit`、plan 写编辑等）。若结果文本本身长得像 diff，TUI 仍可能按 diff 着色。
+
+**Status 条（底栏右侧）**：仅 **thinking 等级** + 当前上下文填充 `ctx <tokens> <%>`（最近 prompt / 估算，**不是** session 累计计费）。session 累计 `↑↓` / cache / cost **不**画在 chrome 上，避免被误读成 context 占用。
 
 ### Skills（Agent Skills 标准）
 

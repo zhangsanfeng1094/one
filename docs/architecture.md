@@ -79,7 +79,7 @@ flowchart TB
 | Agent loop（prompt→LLM→tool→loop） | ✅ | `one-core/agent` | 短循环，max_turns |
 | Streaming text / thinking | ✅ | `one-core` + `one-ai` + TUI | SSE 真流式 |
 | Thinking level | ✅ | settings / session / providers | off/low/medium/high |
-| 内置 coding tools | ✅ | `one-tools` | read/write/edit/bash/bash_output/bash_kill/grep/find/ls/ask_user + network |
+| 内置 coding tools | ✅ | `one-tools` | read/write/edit/bash/…；`edit` 的 `details.patch` 仅 UI，TUI IDE 红绿 diff 见 [cli.md](./cli.md#edit--write-的-tui-diff-展示) |
 | OAuth / 订阅登录 | ✅ | `one-ai/auth` + `one-cli/auth_cmd` | Codex · xAI · OpenCode Zen/Go；Claude/Copilot 待 |
 | 工作区 PathPolicy | ✅ | `one-tools/path_policy` | 默认 workspace-write |
 | OS sandbox (bwrap) | ✅ | `one-tools/os_sandbox` | bash 可选 |

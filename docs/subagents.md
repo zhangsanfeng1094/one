@@ -279,7 +279,7 @@ const EXPLORE_TOOLS: &[&str] = &[
 | **子 LLM stream** | **禁止**刷到主 transcript / 多路 delta 穿层 |
 | 进度 | 仅粗粒度：`ToolProgress` → `Turn 3/16`（可选 spinner），**无 token 碎片** |
 | 结束 | 子 run End 后 **一次性** 把 summary 写入 tool_view（静态块） |
-| abort | 主 Esc → 取消所有子 permit 等待 + 子 agent abort |
+| abort | 主 Esc → 取消所有子 permit 等待 + **agent jobs** `kill_all`（**不**杀 background bash） |
 | session | 子消息默认不进主 JSONL |
 | trace | Langfuse child under parent；TUI 不依赖子 stream |
 
@@ -384,8 +384,10 @@ pub enum TaskExitStatus {
 | 轮询 | `bash_output` / `bash_kill` | 无（阻塞到结束） | `job_output` / `job_kill` ✅ |
 | 阻塞等待 | — | — | **`wait_tasks`**（mode=all/any；完成流）✅ |
 | 立即返回 | `run_in_background=true` → id | 否 | `background=true` → `status=started` + `job_id` ✅ |
+| **Session 所有权** | 是：退出 / `/new` / `/resume` 杀光 | 同步 run 随父 | 是：同上 teardown |
+| **Esc / soft abort** | **不杀**（长驻 bash 可活过 soft cancel） | 父 abort 取消子 | **kill_all** agent jobs |
 
-**实现计划**：[plans/2026-07-20-worktree-background.md](./plans/2026-07-20-worktree-background.md)。**BG0 已落地**（2026-07-20）。
+**实现计划**：[plans/2026-07-20-worktree-background.md](./plans/2026-07-20-worktree-background.md)。**BG0/BG1 已落地**；session-owned teardown 见 `AppRuntime::shutdown_owned_tasks`。
 
 要点（绑定）：
 
@@ -393,7 +395,8 @@ pub enum TaskExitStatus {
 2. 通知只在 **父 turn 边界** `drain_notifications` 注入 User 消息。  
 3. 终态 status 与同步 `task` 同形；`started` 仅表示已接受。  
 4. 仍 **禁止** 子 token 流刷主 TUI。  
-5. 默认 **同步**；`background=true` 显式开启。
+5. 默认 **同步**；`background=true` 显式开启。  
+6. **软 abort ≠ session teardown**：`abort()` 只动 agent jobs；`shutdown_owned_tasks()`（进程退出、`/new`、`/resume`、`Drop`）杀 bash + jobs 并清空通知队列，避免下一会话读到 teardown 噪声。
 
 ### 4.4.1 Worktree 隔离（计划）
 
@@ -484,7 +487,7 @@ parent run
 ### Phase 4 — 高级（按需）
 
 - [x] `background=true` + 完成通知（**BG0**）  
-- [x] BG1：粗进度 turns/max、父 abort→kill_all、`ONE_JOB_MAX_WALL_MS` wall-time  
+- [x] BG1：粗进度 turns/max、父 abort→agent `kill_all`（bash 保留）、session teardown→`shutdown_owned_tasks`、`ONE_JOB_MAX_WALL_MS` wall-time  
 
 ### 4.4.2 后台 task 典型场景
 

@@ -126,7 +126,7 @@
 
 #### P4 — Background · Worktree · Teams（见 worktree-background plan）
 - [x] **BG0** `task(background=true)` + `AgentJobRegistry` + 共享 notification_queue + `job_output`/`job_kill`
-- [x] **BG1** 粗进度（turns/max）/ 父 abort→`kill_all` / wall-time（`ONE_JOB_MAX_WALL_MS`，默认 300s）
+- [x] **BG1** 粗进度（turns/max）/ 父 abort→agent `kill_all`（bash 保留）/ session 退出·`/new`·`/resume`→`shutdown_owned_tasks` / wall-time（`ONE_JOB_MAX_WALL_MS`，默认 300s）
 - [x] **WT0** `WorktreeManager` + `one agent run --isolation worktree`
 - [x] **WT1** `task isolation=` + harness PathPolicy 绑 worktree cwd（不自动 merge）
 - [x] **CMB** bg + 可写工具默认 worktree；共享 cwd 写串行

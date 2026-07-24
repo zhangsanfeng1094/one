@@ -274,9 +274,10 @@ impl AgentJobRegistry {
 
 ### Task BG1.2: Parent abort cancels all jobs
 
-- [ ] On session Esc / RPC abort: `registry.kill_all()`.
-- [ ] Test: parent abort → job `aborted`.
-- [ ] Commit `feat(cli): abort propagates to agent jobs`
+- [x] On session Esc / RPC abort: **agent** `JobRegistry::kill_all()` only — **not** background bash（dev servers survive soft cancel）。
+- [x] Session teardown（进程退出 / `/new` / `/resume` / `AppRuntime` Drop）: `shutdown_owned_tasks()` → bash `kill_all_running`（无 completion notify）+ agent `kill_all` + 清空 notification queue。
+- [x] Test: parent abort → job `aborted`；`kill_all_running` 不入队 teardown 通知。
+- [x] Commit `feat(cli): abort propagates to agent jobs` / session-owned bash teardown
 
 ### Task BG1.3: Budgets
 

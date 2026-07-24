@@ -18,7 +18,7 @@
 | 内置 tools | ⭐⭐⭐⭐⭐ | read/write/edit/bash + bash_output/bash_kill + grep/find/ls + ask_user + web_*（Pi 联网靠 skill） |
 | Session JSONL 树 | ⭐⭐⭐⭐ | v3 子集 + 迁移 + branch + resume/new/name；fork/clone/交互式 tree UI 弱 |
 | Providers | ⭐⭐⭐⭐ | mock / anthropic / openai / openai-codex / ollama / openrouter / deepseek / gemini + models.json `compat`；OAuth：Codex / xAI / OpenCode Zen·Go |
-| Interactive TUI | ⭐⭐⭐ | 多行、@file、Tab 补全、Settings、模型 select、Plan/Build、HITL 列表；主题/keybindings/差分渲染弱于 Pi |
+| Interactive TUI | ⭐⭐⭐ | 多行、@file、Tab 补全、Settings、模型 select、Plan/Build、HITL 列表；**edit 成功展开为 IDE 红绿 diff**（见 [cli.md](./cli.md#edit--write-的-tui-diff-展示)）；主题/keybindings 仍弱于 Pi |
 | 扩展系统 | ⭐⭐ | Rust Extension + hooks.json + plugins（本地）；**不兼容** TS 扩展 / 无 npm 包生态 |
 | Skills / Prompts | ⭐⭐⭐⭐ | progressive disclosure（XML catalog + `read`）+ `/skill:name` + `/skills` 开关 |
 | Compaction | ⭐⭐⭐⭐ | LLM 摘要 + overflow 重试 + `/compact`；阈值 70% context_window |
@@ -81,8 +81,8 @@ RPC/SDK  ██████░░░░░░░░░░░░░░  30%
 |------|---------|----------|------|
 | **OAuth 全量** | Claude Pro/Max、ChatGPT、Copilot、OpenCode… | ✅ Codex · xAI SuperGrok · OpenCode Zen/Go；❌ Claude / Copilot | 部分订阅用户仍须 API key |
 | **Provider 覆盖** | 30+ 内置 | 内置十余 + 任意 models.json 自定义 | Bedrock/Azure/Vertex 等靠兼容端点或 OpenRouter |
-| **TUI 精修** | 外部编辑器、模糊 `@`、主题热重载、完整 footer | 多行/`@`/Tab/图片粘贴已有；主题/keybindings 写死 | 质感与可定制性弱一档 |
-| **Footer / cost** | token↑↓、cache、cost、context % | usage 估算 + thinking 标签；pricing 表粗 | 费用判断不如 Pi 准 |
+| **TUI 精修** | 外部编辑器、模糊 `@`、主题热重载、完整 footer | 多行/`@`/Tab/图片粘贴 + **edit IDE 红绿 diff** 已有；主题/keybindings 写死 | 质感与可定制性仍弱一档 |
+| **Footer / cost** | token↑↓、cache、cost、context % | status 右侧仅 **thinking + `ctx` 填充**（非 session 累计 ↑↓/cost）；pricing/累计费用未做 chrome | 费用一眼可见性弱于 Pi；避免累计 token 被误读成 context |
 
 ### 3.2 P1 — 扩展生态与可编程面
 
