@@ -38,6 +38,15 @@ pub enum AlertLevel {
     Error,
 }
 
+/// Click target for a rendered chat display line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChatLineTarget {
+    /// Message index (tool row body/header, thinking, alert).
+    Message(usize),
+    /// Multi-tool group chip / expanded group header; value is streak start index.
+    ToolGroup(usize),
+}
+
 #[derive(Debug, Clone)]
 pub struct Message {
     pub role: MessageRole,

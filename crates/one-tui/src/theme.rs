@@ -445,16 +445,44 @@ impl Theme {
         Style::default().fg(Self::MUTED).bg(Self::PANEL)
     }
 
+    /// IDE-style insert line (Cursor / VS Code dark).
     pub fn diff_add() -> Style {
-        Style::default().fg(Self::SUCCESS).bg(Self::PANEL)
+        Style::default()
+            .fg(Color::Rgb(0xd6, 0xf5, 0xdc))
+            .bg(Color::Rgb(0x1b, 0x3a, 0x24))
     }
 
+    /// IDE-style delete line.
     pub fn diff_del() -> Style {
-        Style::default().fg(Self::ERROR).bg(Self::PANEL)
+        Style::default()
+            .fg(Color::Rgb(0xff, 0xcd, 0xd2))
+            .bg(Color::Rgb(0x4a, 0x18, 0x1c))
     }
 
     pub fn diff_meta() -> Style {
         Style::default().fg(Self::MUTED)
+    }
+
+    /// Gutter line number on context rows.
+    pub fn diff_ln() -> Style {
+        Style::default().fg(Self::MUTED).bg(Self::BG)
+    }
+
+    pub fn diff_ln_add() -> Style {
+        Style::default()
+            .fg(Color::Rgb(0x7f, 0xd8, 0x8f))
+            .bg(Color::Rgb(0x1b, 0x3a, 0x24))
+    }
+
+    pub fn diff_ln_del() -> Style {
+        Style::default()
+            .fg(Color::Rgb(0xe0, 0x6c, 0x75))
+            .bg(Color::Rgb(0x4a, 0x18, 0x1c))
+    }
+
+    /// Unchanged context code in an expanded edit diff.
+    pub fn diff_context() -> Style {
+        Style::default().fg(Self::FG).bg(Self::BG)
     }
 
     pub fn tool_group() -> Style {

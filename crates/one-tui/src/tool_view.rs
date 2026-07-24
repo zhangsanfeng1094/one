@@ -5,16 +5,13 @@ use crate::message::{Message, MessageRole, ToolStatus};
 /// Max tools shown as a single collapsed “N tools” chip before forcing expand.
 pub const COLLAPSE_GROUP_MIN: usize = 3;
 
-/// Whether this tool row can hide inside a collapsed multi-tool group.
-pub fn tool_collapsible(msg: &Message) -> bool {
-    if msg.role != MessageRole::Tool
-        || !matches!(msg.tool_status, Some(ToolStatus::Done))
-        || msg.tool_expanded
-        || msg.tool_ungroup
-    {
+/// Base eligibility for multi-tool grouping (ignores expand / ungroup flags).
+///
+/// Background bash lifecycle tools stay out of chips so start / wait / kill stay visible.
+pub fn tool_groupable_base(msg: &Message) -> bool {
+    if msg.role != MessageRole::Tool || !matches!(msg.tool_status, Some(ToolStatus::Done)) {
         return false;
     }
-    // Keep background bash lifecycle visible (start / wait / kill) — do not bury in a chip.
     let name = msg.tool_name.as_deref().unwrap_or("");
     if matches!(name, "bash_output" | "bash_kill") {
         return false;
@@ -38,6 +35,11 @@ pub fn tool_collapsible(msg: &Message) -> bool {
     true
 }
 
+/// Whether this tool row can hide inside a collapsed multi-tool group.
+pub fn tool_collapsible(msg: &Message) -> bool {
+    !msg.tool_expanded && !msg.tool_ungroup && tool_groupable_base(msg)
+}
+
 /// Consecutive tool messages starting at `start`.
 pub fn tool_streak_len(messages: &[Message], start: usize) -> usize {
     let mut n = 0;
@@ -47,12 +49,31 @@ pub fn tool_streak_len(messages: &[Message], start: usize) -> usize {
     n
 }
 
+/// True when the streak is long enough and every tool is base-groupable.
+pub fn streak_group_eligible(messages: &[Message], start: usize, len: usize) -> bool {
+    if len < COLLAPSE_GROUP_MIN {
+        return false;
+    }
+    messages[start..start + len]
+        .iter()
+        .all(tool_groupable_base)
+}
+
 /// True when the whole streak is done successes and none expanded → show group chip.
 pub fn streak_can_collapse(messages: &[Message], start: usize, len: usize) -> bool {
     if len < COLLAPSE_GROUP_MIN {
         return false;
     }
     messages[start..start + len].iter().all(tool_collapsible)
+}
+
+/// Ungrouped multi-tool stack that should show a clickable `▾ N tools` header.
+pub fn streak_shows_group_header(messages: &[Message], start: usize, len: usize) -> bool {
+    streak_group_eligible(messages, start, len)
+        && !streak_can_collapse(messages, start, len)
+        && messages[start..start + len]
+            .iter()
+            .any(|m| m.tool_ungroup)
 }
 
 /// Short label for a tool in a group header: `bash` / `edit:path`.
@@ -96,22 +117,28 @@ pub fn json_field(obj: &str, key: &str) -> Option<String> {
     json_string_value(rest)
 }
 
+/// Decode a JSON string literal starting at `s` (`"..."`), including escapes.
+///
+/// Important: a naive `\\` → next-char copy turns `\n` into the letter `n`,
+/// which collapses multi-line edit/write args into one giant red/green row.
 fn json_string_value(s: &str) -> Option<String> {
     let s = s.trim();
     if !s.starts_with('"') {
         return None;
     }
-    let mut out = String::new();
-    let mut chars = s[1..].chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                if let Some(n) = chars.next() {
-                    out.push(n);
-                }
+    // Slice the quoted literal (respecting escapes), then let serde decode it.
+    let bytes = s.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i = i.saturating_add(2);
             }
-            '"' => return Some(out),
-            other => out.push(other),
+            b'"' => {
+                let literal = s.get(..=i)?;
+                return serde_json::from_str(literal).ok();
+            }
+            _ => i += 1,
         }
     }
     None
@@ -119,9 +146,15 @@ fn json_string_value(s: &str) -> Option<String> {
 
 /// Build a synthetic unified diff from edit tool args when output lacks one.
 pub fn edit_diff_from_args(args: &str) -> Option<String> {
-    let path = json_field(args, "path")?;
-    let old = json_field(args, "old_string")?;
-    let new = json_field(args, "new_string")?;
+    let path = json_field(args, "path")
+        .or_else(|| json_field(args, "file_path"))
+        .or_else(|| json_field(args, "filePath"))?;
+    let old = json_field(args, "old_string")
+        .or_else(|| json_field(args, "oldString"))
+        .or_else(|| json_field(args, "oldText"))?;
+    let new = json_field(args, "new_string")
+        .or_else(|| json_field(args, "newString"))
+        .or_else(|| json_field(args, "newText"))?;
     Some(format_edit_diff(&path, &old, &new))
 }
 
@@ -131,8 +164,9 @@ pub fn format_edit_diff(path: &str, old: &str, new: &str) -> String {
     out.push_str(&format!("--- a/{path}\n+++ b/{path}\n"));
     let old_lines: Vec<&str> = old.lines().collect();
     let new_lines: Vec<&str> = new.lines().collect();
+    // Proper unified-diff header so IDE gutter numbers start at 1, not at line count.
     out.push_str(&format!(
-        "@@ -{} +{} @@\n",
+        "@@ -1,{} +1,{} @@\n",
         old_lines.len().max(1),
         new_lines.len().max(1)
     ));
@@ -220,6 +254,107 @@ pub fn classify_diff_line(line: &str) -> DiffLineKind {
     } else {
         DiffLineKind::Plain
     }
+}
+
+/// One visual row in an IDE-style edit/write diff (line number + code, no `+/-` chrome).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IdeDiffRow {
+    pub kind: DiffLineKind,
+    /// 1-based file line number to show in the gutter (`None` for meta / unknown).
+    pub line_no: Option<u32>,
+    /// Code text without unified-diff prefix.
+    pub text: String,
+}
+
+/// Parse unified / line-based tool output into IDE-style rows with line numbers.
+///
+/// Skips `Updated` / `---` / `+++` / `@@` headers so the transcript looks like a
+/// Cursor/VS Code inline diff: gutter numbers + red/green body.
+pub fn parse_ide_diff_rows(text: &str) -> Vec<IdeDiffRow> {
+    let mut rows = Vec::new();
+    let mut old_ln: u32 = 1;
+    let mut new_ln: u32 = 1;
+    let mut in_hunk = false;
+
+    for line in text.lines() {
+        if let Some((o, n)) = parse_hunk_header(line) {
+            old_ln = o;
+            new_ln = n;
+            in_hunk = true;
+            continue;
+        }
+        if line.starts_with("+++ ")
+            || line.starts_with("--- ")
+            || line.starts_with("Updated ")
+            || line.starts_with("Wrote ")
+            || line.starts_with("diff --git ")
+            || line.starts_with("index ")
+        {
+            continue;
+        }
+
+        if line.starts_with('+') && !line.starts_with("+++") {
+            let text = line[1..].to_string();
+            rows.push(IdeDiffRow {
+                kind: DiffLineKind::Add,
+                line_no: Some(new_ln),
+                text,
+            });
+            new_ln = new_ln.saturating_add(1);
+            in_hunk = true;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            let text = line[1..].to_string();
+            rows.push(IdeDiffRow {
+                kind: DiffLineKind::Del,
+                line_no: Some(old_ln),
+                text,
+            });
+            old_ln = old_ln.saturating_add(1);
+            in_hunk = true;
+        } else if line.starts_with(' ') || (in_hunk && !line.is_empty() && !line.starts_with('@')) {
+            // Context: leading space in unified diff, or bare context after a hunk.
+            let text = if line.starts_with(' ') {
+                line[1..].to_string()
+            } else {
+                line.to_string()
+            };
+            rows.push(IdeDiffRow {
+                kind: DiffLineKind::Context,
+                line_no: Some(old_ln),
+                text,
+            });
+            old_ln = old_ln.saturating_add(1);
+            new_ln = new_ln.saturating_add(1);
+        }
+        // ignore blank/unknown outside hunks
+    }
+    rows
+}
+
+/// `@@ -old_start,old_count +new_start,new_count @@` → (old_start, new_start).
+fn parse_hunk_header(line: &str) -> Option<(u32, u32)> {
+    let rest = line.strip_prefix("@@")?;
+    let rest = rest.trim_start();
+    // Expect `-N` or `-N,M`
+    let rest = rest.strip_prefix('-')?;
+    let (old_tok, rest) = split_hunk_token(rest)?;
+    let rest = rest.trim_start().strip_prefix('+')?;
+    let (new_tok, _) = split_hunk_token(rest)?;
+    let old = old_tok.parse::<u32>().ok()?;
+    let new = new_tok.parse::<u32>().ok()?;
+    Some((old.max(1), new.max(1)))
+}
+
+fn split_hunk_token(s: &str) -> Option<(&str, &str)> {
+    let end = s
+        .find(|c: char| c == ',' || c == ' ' || c == '@')
+        .unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    let tok = &s[..end];
+    let rest = s[end..].trim_start_matches(|c: char| c == ',' || c.is_ascii_digit());
+    Some((tok, rest))
 }
 
 /// Parse `exit N` / `exit signal` prefix from bash tool output.
@@ -436,6 +571,22 @@ mod tests {
             Message::tool("edit", r#"{"path":"b"}"#, ToolStatus::Done),
         ];
         assert!(streak_can_collapse(&msgs, 0, 3));
+        assert!(!streak_shows_group_header(&msgs, 0, 3));
+    }
+
+    #[test]
+    fn ungrouped_streak_shows_header() {
+        let mut msgs = vec![
+            Message::tool("read", r#"{"path":"a"}"#, ToolStatus::Done),
+            Message::tool("bash", r#"{"command":"ls"}"#, ToolStatus::Done),
+            Message::tool("edit", r#"{"path":"b"}"#, ToolStatus::Done),
+        ];
+        for m in &mut msgs {
+            m.tool_ungroup = true;
+        }
+        assert!(!streak_can_collapse(&msgs, 0, 3));
+        assert!(streak_shows_group_header(&msgs, 0, 3));
+        assert!(streak_group_eligible(&msgs, 0, 3));
     }
 
     #[test]
@@ -458,6 +609,50 @@ mod tests {
     }
 
     #[test]
+    fn json_field_unescapes_newlines_and_tabs() {
+        let args = r#"{"path":"x.rs","old_string":"a\nb","new_string":"a\n\tb\nc"}"#;
+        assert_eq!(json_field(args, "old_string").as_deref(), Some("a\nb"));
+        assert_eq!(json_field(args, "new_string").as_deref(), Some("a\n\tb\nc"));
+    }
+
+    #[test]
+    fn edit_diff_from_args_splits_multiline_bodies() {
+        // Regression: bad JSON unescape glued multi-line edits into one red/green row
+        // (literal `textn//` instead of line breaks), which made edit UI unreadable.
+        let args = r#"{"path":"ui.rs","old_string":"// chip\n// text\nfn a() {}","new_string":"// chip\n// text\nfn a() {\n  1\n}"}"#;
+        let d = edit_diff_from_args(args).unwrap();
+        assert!(
+            d.contains("@@ -1,3 +1,5 @@"),
+            "expected 1-based hunk header, got:\n{d}"
+        );
+        let del_lines: Vec<&str> = d
+            .lines()
+            .filter(|l| l.starts_with('-') && !l.starts_with("---"))
+            .collect();
+        let add_lines: Vec<&str> = d
+            .lines()
+            .filter(|l| l.starts_with('+') && !l.starts_with("+++"))
+            .collect();
+        assert_eq!(del_lines.len(), 3, "{d}");
+        assert_eq!(add_lines.len(), 5, "{d}");
+        assert!(del_lines.iter().any(|l| *l == "-fn a() {}"), "{d}");
+        assert!(add_lines.iter().any(|l| *l == "+fn a() {"), "{d}");
+
+        let rows = parse_ide_diff_rows(&d);
+        assert!(rows.len() >= 8, "expected per-line ide rows, got {}", rows.len());
+        assert!(rows.iter().any(|r| r.kind == DiffLineKind::Del && r.text == "fn a() {}"));
+        assert_eq!(rows[0].line_no, Some(1));
+    }
+
+    #[test]
+    fn edit_diff_from_args_accepts_aliases() {
+        let args = r#"{"filePath":"b.txt","oldString":"x\ny","newString":"z"}"#;
+        let d = edit_diff_from_args(args).unwrap();
+        assert!(d.contains("Updated b.txt"), "{d}");
+        assert!(d.contains("-x") && d.contains("-y") && d.contains("+z"), "{d}");
+    }
+
+    #[test]
     fn bash_exit_summary() {
         let (s, expand, _) =
             summarize_tool_special("bash", r#"{"command":"false"}"#, "exit 1\nboom", true).unwrap();
@@ -475,5 +670,42 @@ mod tests {
         let (c, body) = parse_bash_exit("exit 2\nstderr here");
         assert_eq!(c, Some(2));
         assert_eq!(body, "stderr here");
+    }
+
+    #[test]
+    fn ide_diff_rows_track_line_numbers() {
+        let text = "\
+Updated src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -49,4 +49,6 @@
+ limit: Optional[int] = Field(
+     default=None,
+     description=(
+-        \"Optional. Maximum rows returned. Defaults to the server limit; keep \"
+-        \"small for exploration.\"
++        \"Optional. Maximum rows returned. Prefer always
++setting this: exploration \"
++        \"LIMIT ≤ 50, filtered detail checks LIMIT ≤ 100.
++Do not omit for broad MATCH \"
++        \"that could return large node lists; prefer
++server-side aggregation instead.\"
+     ),
+ )
+";
+        let rows = parse_ide_diff_rows(text);
+        assert!(!rows.is_empty(), "expected ide rows");
+        // Headers skipped
+        assert!(rows.iter().all(|r| r.kind != DiffLineKind::Meta));
+        // First context starts at 49
+        assert_eq!(rows[0].line_no, Some(49));
+        assert_eq!(rows[0].kind, DiffLineKind::Context);
+        // Find first del/add
+        let del = rows.iter().find(|r| r.kind == DiffLineKind::Del).unwrap();
+        let add = rows.iter().find(|r| r.kind == DiffLineKind::Add).unwrap();
+        assert!(del.text.contains("Defaults to the server"));
+        assert!(add.text.contains("Prefer always"));
+        assert_eq!(del.line_no, Some(52));
+        assert_eq!(add.line_no, Some(52));
     }
 }

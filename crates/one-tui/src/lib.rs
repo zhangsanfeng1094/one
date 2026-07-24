@@ -38,7 +38,7 @@ pub use crate::state::{
 pub use app::{expand_at_files, App, InteractiveApp};
 pub use error::Result;
 pub use float::{FloatItem, FloatKind, FloatMenu, FloatSection};
-pub use message::{AlertLevel, Message, MessageRole, ToolStatus};
+pub use message::{AlertLevel, ChatLineTarget, Message, MessageRole, ToolStatus};
 pub use select::{SelectMode, SelectOption, SelectPhase, SelectPrompt, SelectResult};
 pub use slash::{ModelChoice, PopupKind, PopupRow, SlashCommand, SLASH_COMMANDS};
 pub use terminal::{ForceQuit, TerminalSession};

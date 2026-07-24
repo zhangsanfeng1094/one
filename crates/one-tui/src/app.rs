@@ -11,8 +11,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
 use crate::float::{FloatKind, FloatMenu};
 use crate::message::{
-    summarize_tool_output, truncate_tool_output_for_ui, AlertLevel, Message, MessageRole,
-    ToolStatus,
+    summarize_tool_output, truncate_tool_output_for_ui, AlertLevel, ChatLineTarget, Message,
+    MessageRole, ToolStatus,
 };
 use crate::slash::{self, ModelChoice, PopupKind, PopupRow};
 use crate::state::{
@@ -71,9 +71,9 @@ pub struct App {
     pub chat_view_height: usize,
     /// Last drawn transcript line count (after wrap).
     pub chat_total_lines: usize,
-    /// Parallel to display lines: which `messages` index owns each transcript line
-    /// (for click-to-expand). `None` = spacer / non-interactive.
-    pub chat_line_owners: Vec<Option<usize>>,
+    /// Parallel to display lines: click target for each transcript line.
+    /// `None` = spacer / non-interactive.
+    pub chat_line_owners: Vec<Option<ChatLineTarget>>,
     /// Top of chat viewport in the full line list (updated each draw).
     pub chat_view_start: usize,
     /// Blank rows painted above short transcripts (bottom-pin). Clicks skip these.
@@ -1578,30 +1578,34 @@ impl App {
         }
     }
 
+    /// Expand a multi-tool chip into individual rows (bodies stay collapsed).
+    fn expand_tool_group(&mut self, start: usize, len: usize) {
+        for msg in &mut self.messages[start..start + len] {
+            msg.tool_ungroup = true;
+        }
+    }
+
+    /// Collapse an ungrouped multi-tool stack back into a chip.
+    fn collapse_tool_group(&mut self, start: usize, len: usize) {
+        for msg in &mut self.messages[start..start + len] {
+            msg.tool_ungroup = false;
+            msg.tool_expanded = false;
+        }
+    }
+
     /// Toggle last tool body, or expand/collapse a multi-tool group chip.
     pub fn toggle_last_tool_expand(&mut self) {
         if let Some((start, len)) = self.last_tool_streak() {
             if tool_view::streak_can_collapse(&self.messages, start, len) {
-                // Chip → individual rows (bodies stay collapsed).
-                for msg in &mut self.messages[start..start + len] {
-                    msg.tool_ungroup = true;
-                }
+                self.expand_tool_group(start, len);
                 return;
             }
-            let all_ungrouped = self.messages[start..start + len]
-                .iter()
-                .all(|m| m.tool_ungroup || m.tool_expanded);
-            if len >= tool_view::COLLAPSE_GROUP_MIN
-                && all_ungrouped
+            if tool_view::streak_group_eligible(&self.messages, start, len)
                 && self.messages[start..start + len]
                     .iter()
-                    .all(|m| matches!(m.tool_status, Some(ToolStatus::Done)))
+                    .any(|m| m.tool_ungroup || m.tool_expanded)
             {
-                // Individual rows → chip again.
-                for msg in &mut self.messages[start..start + len] {
-                    msg.tool_ungroup = false;
-                    msg.tool_expanded = false;
-                }
+                self.collapse_tool_group(start, len);
                 return;
             }
         }
@@ -1613,7 +1617,28 @@ impl App {
         }
     }
 
-    /// Toggle the tool message at `msg_index` (click target).
+    /// Toggle multi-tool group at streak start (chip expand / header collapse).
+    pub fn toggle_tool_group_at(&mut self, start: usize) {
+        let Some((s, len)) = self.tool_streak_covering(start) else {
+            return;
+        };
+        if s != start {
+            return;
+        }
+        if tool_view::streak_can_collapse(&self.messages, start, len) {
+            self.expand_tool_group(start, len);
+            return;
+        }
+        if tool_view::streak_group_eligible(&self.messages, start, len)
+            && self.messages[start..start + len]
+                .iter()
+                .any(|m| m.tool_ungroup || m.tool_expanded)
+        {
+            self.collapse_tool_group(start, len);
+        }
+    }
+
+    /// Toggle the tool message at `msg_index` (click target for a tool row).
     pub fn toggle_tool_at(&mut self, msg_index: usize) {
         if self
             .messages
@@ -1623,12 +1648,10 @@ impl App {
         {
             return;
         }
-        // Collapsed multi-tool chip → show individual rows.
+        // Collapsed multi-tool chip owned by first tool index → expand group.
         if let Some((start, len)) = self.tool_streak_covering(msg_index) {
             if tool_view::streak_can_collapse(&self.messages, start, len) {
-                for m in &mut self.messages[start..start + len] {
-                    m.tool_ungroup = true;
-                }
+                self.expand_tool_group(start, len);
                 return;
             }
         }
@@ -1685,14 +1708,17 @@ impl App {
         let Some(line) = self.view_row_to_line(row_in_view) else {
             return;
         };
-        if let Some(Some(msg_i)) = self.chat_line_owners.get(line).copied() {
-            match self.messages.get(msg_i).map(|m| m.role) {
-                Some(MessageRole::Thinking) => self.toggle_thinking_at(msg_i),
-                Some(MessageRole::Tool) => self.toggle_tool_at(msg_i),
-                Some(MessageRole::Alert) => {
-                    // dismiss alerts if clickable — leave existing behaviour via tool path no-op
-                }
-                _ => self.toggle_tool_at(msg_i),
+        if let Some(Some(target)) = self.chat_line_owners.get(line).copied() {
+            match target {
+                ChatLineTarget::ToolGroup(start) => self.toggle_tool_group_at(start),
+                ChatLineTarget::Message(msg_i) => match self.messages.get(msg_i).map(|m| m.role) {
+                    Some(MessageRole::Thinking) => self.toggle_thinking_at(msg_i),
+                    Some(MessageRole::Tool) => self.toggle_tool_at(msg_i),
+                    Some(MessageRole::Alert) => {
+                        // dismiss alerts if clickable — leave existing behaviour via tool path no-op
+                    }
+                    _ => self.toggle_tool_at(msg_i),
+                },
             }
         }
     }
@@ -5173,5 +5199,23 @@ mod tests {
         app.toggle_last_tool_expand();
         assert!(app.messages.iter().all(|m| m.tool_ungroup));
         assert!(!tool_view::streak_can_collapse(&app.messages, 0, 3));
+        assert!(tool_view::streak_shows_group_header(&app.messages, 0, 3));
+
+        // Click middle tool: expand body only, do not re-chip.
+        app.toggle_tool_at(1);
+        assert!(app.messages[1].tool_expanded);
+        assert!(app.messages.iter().all(|m| m.tool_ungroup));
+        assert!(!tool_view::streak_can_collapse(&app.messages, 0, 3));
+
+        // Group header click: collapse back to chip.
+        app.toggle_tool_group_at(0);
+        assert!(app.messages.iter().all(|m| !m.tool_ungroup && !m.tool_expanded));
+        assert!(tool_view::streak_can_collapse(&app.messages, 0, 3));
+
+        // Ctrl+O expand then collapse last group.
+        app.toggle_last_tool_expand();
+        assert!(app.messages.iter().all(|m| m.tool_ungroup));
+        app.toggle_last_tool_expand();
+        assert!(tool_view::streak_can_collapse(&app.messages, 0, 3));
     }
 }

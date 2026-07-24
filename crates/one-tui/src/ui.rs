@@ -16,7 +16,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use crate::app::App;
 use crate::float::{FloatKind, FloatMenu, FloatRenderRow};
 use crate::markdown;
-use crate::message::{AlertLevel, Message, MessageRole, ToolStatus};
+use crate::message::{AlertLevel, ChatLineTarget, Message, MessageRole, ToolStatus};
 use crate::theme::Theme;
 use crate::tool_view::{self, DiffLineKind};
 
@@ -1005,15 +1005,18 @@ fn highlight_line_full(line: &Line<'static>) -> Line<'static> {
 }
 
 /// Build the full chat transcript as terminal lines (wrap-aware).
-/// Also returns per-line message ownership for click targeting.
-fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Option<usize>>) {
+/// Also returns per-line click targets (`Message` vs multi-tool `ToolGroup`).
+fn build_chat_lines(
+    app: &App,
+    wrap_width: usize,
+) -> (Vec<Line<'static>>, Vec<Option<ChatLineTarget>>) {
     let mut lines: Vec<Line<'static>> = Vec::new();
-    let mut owners: Vec<Option<usize>> = Vec::new();
+    let mut owners: Vec<Option<ChatLineTarget>> = Vec::new();
 
     let push_owned = |lines: &mut Vec<Line<'static>>,
-                      owners: &mut Vec<Option<usize>>,
+                      owners: &mut Vec<Option<ChatLineTarget>>,
                       chunk: Vec<Line<'static>>,
-                      owner: Option<usize>| {
+                      owner: Option<ChatLineTarget>| {
         for line in chunk {
             lines.push(line);
             owners.push(owner);
@@ -1042,24 +1045,53 @@ fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Op
                     lines.push(Line::from(Span::styled("", Theme::bg())));
                     owners.push(None);
                 }
-                let group_lines = render_tool_group(&app.messages[i..i + streak], wrap_width);
-                // Entire chip belongs to first tool index for click expand.
-                push_owned(&mut lines, &mut owners, group_lines, Some(i));
+                let group_lines =
+                    render_tool_group(&app.messages[i..i + streak], wrap_width, false);
+                // Collapsed chip → group toggle (expand all tools in streak).
+                push_owned(
+                    &mut lines,
+                    &mut owners,
+                    group_lines,
+                    Some(ChatLineTarget::ToolGroup(i)),
+                );
                 i += streak;
                 continue;
             }
+            // Expanded multi-tool stack: clickable ▾ header collapses back to chip.
+            let show_group_header =
+                tool_view::streak_shows_group_header(&app.messages, i, streak);
             // Tight stack: no blank between consecutive tools.
             for (k, tmsg) in app.messages[i..i + streak].iter().enumerate() {
-                if k == 0 && !lines.is_empty() {
-                    // Blank before the stack starts (separate from prior user/assistant).
-                    let prev_was_tool = i > 0 && app.messages[i - 1].role == MessageRole::Tool;
-                    if !prev_was_tool {
-                        lines.push(Line::from(Span::styled("", Theme::bg())));
-                        owners.push(None);
+                if k == 0 {
+                    if !lines.is_empty() {
+                        // Blank before the stack starts (separate from prior user/assistant).
+                        let prev_was_tool = i > 0 && app.messages[i - 1].role == MessageRole::Tool;
+                        if !prev_was_tool {
+                            lines.push(Line::from(Span::styled("", Theme::bg())));
+                            owners.push(None);
+                        }
+                    }
+                    if show_group_header {
+                        let header = render_tool_group(
+                            &app.messages[i..i + streak],
+                            wrap_width,
+                            true,
+                        );
+                        push_owned(
+                            &mut lines,
+                            &mut owners,
+                            header,
+                            Some(ChatLineTarget::ToolGroup(i)),
+                        );
                     }
                 }
                 let chunk = message_lines(tmsg, app, wrap_width);
-                push_owned(&mut lines, &mut owners, chunk, Some(i + k));
+                push_owned(
+                    &mut lines,
+                    &mut owners,
+                    chunk,
+                    Some(ChatLineTarget::Message(i + k)),
+                );
             }
             i += streak;
             continue;
@@ -1074,7 +1106,7 @@ fn build_chat_lines(app: &App, wrap_width: usize) -> (Vec<Line<'static>>, Vec<Op
             msg.role,
             MessageRole::Alert | MessageRole::Thinking | MessageRole::Tool
         ) {
-            Some(i)
+            Some(ChatLineTarget::Message(i))
         } else {
             None
         };
@@ -1228,12 +1260,17 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// Collapsed multi-tool chip (soft chip, not a raw text dump).
+/// Multi-tool group chip / expanded stack header.
 ///
 /// ```text
-///   ▸  3 tools   read · bash · edit
+///   ▸  3 tools   read · bash · edit   ↵   (collapsed chip)
+///   ▾  3 tools   read · bash · edit   ↵   (expanded — click collapses)
 /// ```
-fn render_tool_group(tools: &[Message], wrap_width: usize) -> Vec<Line<'static>> {
+fn render_tool_group(
+    tools: &[Message],
+    wrap_width: usize,
+    expanded: bool,
+) -> Vec<Line<'static>> {
     let n = tools.len();
     let mut labels: Vec<String> = tools
         .iter()
@@ -1250,9 +1287,10 @@ fn render_tool_group(tools: &[Message], wrap_width: usize) -> Vec<Line<'static>>
             joined = truncate_display(&joined, budget);
         }
     }
+    let chevron = if expanded { "▾" } else { "▸" };
     vec![Line::from(vec![
         Span::raw("  "),
-        Span::styled("▸", Theme::tool_icon_done()),
+        Span::styled(chevron, Theme::tool_icon_done()),
         Span::styled(format!("  {n} tools  "), Theme::tool_group_title()),
         Span::styled(joined, Theme::tool_group()),
         Span::styled("   ↵", Theme::meta()),
@@ -1557,68 +1595,151 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
     // tool output should participate in that scroll instead of feeling "clipped".
     if message.tool_expanded {
         if let Some(output) = message.tool_output.as_deref() {
-            let body_budget = wrap_width.saturating_sub(8).max(12);
             let is_diff = tool_view::looks_like_diff(output);
-            let max_lines = if status == ToolStatus::Error {
-                40
-            } else if is_diff {
-                48
+            // Edit/write: Cursor-style numbered red/green rows (no unified +/- chrome).
+            if is_diff && status != ToolStatus::Error {
+                lines.extend(render_ide_diff(output, wrap_width));
             } else {
-                60
-            };
-            let default_style = if status == ToolStatus::Error {
-                Theme::error_body()
-            } else {
-                Theme::tool_detail_done()
-            };
-            let rail_style = if status == ToolStatus::Error {
-                Theme::error_bar()
-            } else {
-                Theme::tool_tree()
-            };
-
-            // Flatten wrapped lines first so tree tips land on the true last visual row.
-            let mut visual: Vec<(String, Style)> = Vec::new();
-            let raw_lines: Vec<&str> = output.lines().collect();
-            let total_raw = raw_lines.len();
-            for line in raw_lines.iter().take(max_lines) {
-                let style = if is_diff {
-                    match tool_view::classify_diff_line(line) {
-                        DiffLineKind::Add => Theme::diff_add(),
-                        DiffLineKind::Del => Theme::diff_del(),
-                        DiffLineKind::Meta => Theme::diff_meta(),
-                        DiffLineKind::Context | DiffLineKind::Plain => default_style,
-                    }
-                } else if status == ToolStatus::Error {
-                    Theme::error_body()
-                } else if line.starts_with("exit 0") {
-                    Theme::tool_summary_ok()
-                } else if line.starts_with("exit ") {
-                    Theme::tool_summary_err()
+                let body_budget = wrap_width.saturating_sub(8).max(12);
+                let max_lines = if status == ToolStatus::Error {
+                    40
                 } else {
-                    default_style
+                    60
                 };
-                for wrapped in wrap_str(line, body_budget) {
-                    visual.push((wrapped, style));
-                }
-            }
-            if total_raw > max_lines {
-                visual.push((format!("… +{} lines", total_raw - max_lines), Theme::meta()));
-            }
+                let default_style = if status == ToolStatus::Error {
+                    Theme::error_body()
+                } else {
+                    Theme::tool_detail_done()
+                };
+                let rail_style = if status == ToolStatus::Error {
+                    Theme::error_bar()
+                } else {
+                    Theme::tool_tree()
+                };
 
-            let last = visual.len().saturating_sub(1);
-            for (i, (text, style)) in visual.into_iter().enumerate() {
-                let branch = if i == last { "└ " } else { "│ " };
-                lines.push(Line::from(vec![
-                    Span::raw("    "),
-                    Span::styled(branch, rail_style),
-                    Span::styled(text, style),
-                ]));
+                // Flatten wrapped lines first so tree tips land on the true last visual row.
+                let mut visual: Vec<(String, Style)> = Vec::new();
+                let raw_lines: Vec<&str> = output.lines().collect();
+                let total_raw = raw_lines.len();
+                for line in raw_lines.iter().take(max_lines) {
+                    let style = if status == ToolStatus::Error {
+                        Theme::error_body()
+                    } else if line.starts_with("exit 0") {
+                        Theme::tool_summary_ok()
+                    } else if line.starts_with("exit ") {
+                        Theme::tool_summary_err()
+                    } else {
+                        default_style
+                    };
+                    for wrapped in wrap_str(line, body_budget) {
+                        visual.push((wrapped, style));
+                    }
+                }
+                if total_raw > max_lines {
+                    visual.push((format!("… +{} lines", total_raw - max_lines), Theme::meta()));
+                }
+
+                let last = visual.len().saturating_sub(1);
+                for (i, (text, style)) in visual.into_iter().enumerate() {
+                    let branch = if i == last { "└ " } else { "│ " };
+                    lines.push(Line::from(vec![
+                        Span::raw("    "),
+                        Span::styled(branch, rail_style),
+                        Span::styled(text, style),
+                    ]));
+                }
             }
         }
     }
 
     lines
+}
+
+/// Cursor / VS Code style edit diff: `  52  code…` with red/green full-row paint.
+fn render_ide_diff(output: &str, wrap_width: usize) -> Vec<Line<'static>> {
+    const MAX_ROWS: usize = 48;
+    let rows = tool_view::parse_ide_diff_rows(output);
+    if rows.is_empty() {
+        // Fallback: plain paint of raw unified diff if parse failed.
+        let mut out = Vec::new();
+        let body_budget = wrap_width.saturating_sub(8).max(12);
+        for line in output.lines().take(MAX_ROWS) {
+            let style = match tool_view::classify_diff_line(line) {
+                DiffLineKind::Add => Theme::diff_add(),
+                DiffLineKind::Del => Theme::diff_del(),
+                DiffLineKind::Meta => Theme::diff_meta(),
+                DiffLineKind::Context | DiffLineKind::Plain => Theme::diff_context(),
+            };
+            for wrapped in wrap_str(line, body_budget) {
+                out.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(wrapped, style),
+                ]));
+            }
+        }
+        return out;
+    }
+
+    let max_ln = rows.iter().filter_map(|r| r.line_no).max().unwrap_or(1);
+    let ln_w = max_ln.to_string().len().max(2).min(5);
+    // `  ` + ln_w + `  ` + code
+    let gutter = 2 + ln_w + 2;
+    let body_budget = wrap_width.saturating_sub(gutter).max(8);
+
+    let mut out = Vec::new();
+    let total = rows.len();
+    for row in rows.iter().take(MAX_ROWS) {
+        let (ln_style, code_style) = match row.kind {
+            DiffLineKind::Add => (Theme::diff_ln_add(), Theme::diff_add()),
+            DiffLineKind::Del => (Theme::diff_ln_del(), Theme::diff_del()),
+            _ => (Theme::diff_ln(), Theme::diff_context()),
+        };
+        let ln_label = match row.line_no {
+            Some(n) => format!("{n:>ln_w$}"),
+            None => " ".repeat(ln_w),
+        };
+        let wrapped = wrap_str(&row.text, body_budget);
+        if wrapped.is_empty() {
+            out.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(ln_label, ln_style),
+                Span::styled("  ", code_style),
+            ]));
+            continue;
+        }
+        for (wi, piece) in wrapped.into_iter().enumerate() {
+            // Only first visual row of a logical line shows the gutter number.
+            let gutter_spans = if wi == 0 {
+                vec![
+                    Span::raw("  "),
+                    Span::styled(ln_label.clone(), ln_style),
+                    Span::styled("  ", code_style),
+                ]
+            } else {
+                vec![
+                    Span::raw("  "),
+                    Span::styled(" ".repeat(ln_w), ln_style),
+                    Span::styled("  ", code_style),
+                ]
+            };
+            let mut spans = gutter_spans;
+            // Pad code to remaining width so the red/green bg fills the row.
+            let pad = body_budget.saturating_sub(display_width(&piece));
+            let mut body = piece;
+            if pad > 0 {
+                body.push_str(&" ".repeat(pad));
+            }
+            spans.push(Span::styled(body, code_style));
+            out.push(Line::from(spans));
+        }
+    }
+    if total > MAX_ROWS {
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(format!("… +{} lines", total - MAX_ROWS), Theme::meta()),
+        ]));
+    }
+    out
 }
 
 /// UI-only alert card mid-transcript (not LLM context).
@@ -1702,21 +1823,23 @@ fn pretty_tool_args(s: &str) -> String {
 }
 
 fn json_string_value(s: &str) -> Option<String> {
+    // Keep in sync with tool_view::json_string_value — must decode `\n` etc.
     let s = s.trim();
     if !s.starts_with('"') {
         return None;
     }
-    let mut out = String::new();
-    let mut chars = s[1..].chars();
-    while let Some(c) = chars.next() {
-        match c {
-            '\\' => {
-                if let Some(n) = chars.next() {
-                    out.push(n);
-                }
+    let bytes = s.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i = i.saturating_add(2);
             }
-            '"' => return Some(out),
-            other => out.push(other),
+            b'"' => {
+                let literal = s.get(..=i)?;
+                return serde_json::from_str(literal).ok();
+            }
+            _ => i += 1,
         }
     }
     None
@@ -2182,6 +2305,92 @@ mod tests {
     }
 
     #[test]
+    fn expanded_tool_group_header_is_clickable_and_collapses() {
+        let backend = TestBackend::new(72, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        for (name, args) in [
+            ("read", r#"{"path":"a.rs"}"#),
+            ("bash", r#"{"command":"ls"}"#),
+            ("grep", r#"{"pattern":"x"}"#),
+        ] {
+            app.push_tool_call(name, args);
+            app.finish_tool_with_output(name, false, Some("ok\nline2".into()));
+            if let Some(last) = app.messages.last_mut() {
+                last.tool_expanded = false;
+                last.tool_ungroup = false;
+            }
+        }
+
+        // Collapsed chip first.
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            flat.contains("3 tools"),
+            "collapsed group chip should paint, got:\n{flat}"
+        );
+        assert!(
+            app.chat_line_owners
+                .iter()
+                .any(|o| matches!(o, Some(ChatLineTarget::ToolGroup(0)))),
+            "collapsed chip must be a ToolGroup click target"
+        );
+
+        // Expand via Ctrl+O path.
+        app.toggle_last_tool_expand();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            flat.contains("3 tools"),
+            "expanded stack should keep a group header, got:\n{flat}"
+        );
+        assert!(
+            app.chat_line_owners
+                .iter()
+                .any(|o| matches!(o, Some(ChatLineTarget::ToolGroup(0)))),
+            "expanded header must remain a ToolGroup click target"
+        );
+        // Individual tool rows still target Message.
+        assert!(
+            app.chat_line_owners
+                .iter()
+                .filter_map(|o| o.as_ref())
+                .any(|t| matches!(t, ChatLineTarget::Message(_))),
+            "expanded tools must still be Message click targets"
+        );
+
+        // Click header row → collapse back to chip.
+        let header_line = app
+            .chat_line_owners
+            .iter()
+            .position(|o| matches!(o, Some(ChatLineTarget::ToolGroup(0))))
+            .expect("header line");
+        let row = header_line
+            .saturating_sub(app.chat_view_start)
+            .saturating_add(app.chat_top_pad);
+        app.click_chat_row(row);
+        assert!(
+            app.messages
+                .iter()
+                .all(|m| !m.tool_ungroup && !m.tool_expanded),
+            "header click must re-chip the group"
+        );
+        assert!(tool_view::streak_can_collapse(&app.messages, 0, 3));
+    }
+
+    #[test]
     fn empty_session_shows_welcome_tips() {
         // Tall enough for chat pane to show welcome title + tips + try.
         let backend = TestBackend::new(72, 28);
@@ -2458,8 +2667,8 @@ mod tests {
             "think on status: {status_row}"
         );
         assert!(
-            status_row.contains("37k") || status_row.contains("tok"),
-            "tokens on status: {status_row}"
+            status_row.contains("ctx") && status_row.contains("37k"),
+            "context tokens on status: {status_row}"
         );
         assert!(
             !status_row.contains("MCP"),
@@ -2490,8 +2699,8 @@ fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
 /// Sparse, context-aware status strip.
 ///
 /// Left:  keybindings only (mode-aware).
-/// Right: session stats only (think level / token usage).
-/// Never MCP or bg — those live exclusively on the prompt meta strip.
+/// Right: session stats only (think level / live context fill).
+/// Never MCP, bg, or session-cumulative ↑↓ — those live elsewhere / not in chrome.
 fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     // Key + label pairs, joined with double-space (no middle-dot soup).
     fn pair(key: &'static str, label: &'static str) -> [Span<'static>; 2] {
@@ -2551,8 +2760,12 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     (left, status_stats_spans(app))
 }
 
-/// Right-side session stats for the status strip: think level + token usage.
+/// Right-side session stats for the status strip: think level + live context.
 /// Kept separate so busy/idle modes share one formatter (no MCP/bg).
+///
+/// Session-cumulative ↑↓ / cache / cost are **not** shown here — they inflate
+/// into hundreds of k and get misread as context fill. Status only surfaces
+/// current prompt size (`ctx`).
 fn status_stats_spans(app: &App) -> Vec<Span<'static>> {
     let mut right = Vec::new();
     let mut parts: Vec<String> = Vec::new();
@@ -2563,51 +2776,8 @@ fn status_stats_spans(app: &App) -> Vec<Span<'static>> {
         parts.push(format!("think:{}{vis}", app.thinking_level));
     }
 
-    // Prefer precise provider I/O tokens when available.
-    if app.usage_input > 0
-        || app.usage_output > 0
-        || app.usage_cache_read > 0
-        || app.usage_cache_write > 0
-    {
-        let mut usage = format!(
-            "↑{} ↓{}",
-            format_tokens(app.usage_input as usize),
-            format_tokens(app.usage_output as usize)
-        );
-        // Cache R = read hits, W = creation/write (Anthropic).
-        if app.usage_cache_read > 0 || app.usage_cache_write > 0 {
-            usage.push_str(&format!(
-                " cR{} cW{}",
-                format_tokens(app.usage_cache_read as usize),
-                format_tokens(app.usage_cache_write as usize)
-            ));
-        }
-        if app.usage_cost_usd > 0.0 {
-            if app.usage_cost_usd < 0.01 {
-                usage.push_str(&format!(" ${:.4}", app.usage_cost_usd));
-            } else {
-                usage.push_str(&format!(" ${:.3}", app.usage_cost_usd));
-            }
-        }
-        if app.context_window > 0 && app.usage_tokens > 0 {
-            let pct = (app.usage_tokens * 100) / app.context_window.max(1);
-            let approx = if app.usage_tokens_estimated { "~" } else { "" };
-            usage.push_str(&format!(
-                " ctx {approx}{} {}%",
-                format_tokens(app.usage_tokens),
-                pct
-            ));
-        }
-        parts.push(usage);
-    } else if app.usage_tokens > 0 {
-        let approx = if app.usage_tokens_estimated { "~" } else { "" };
-        let usage = if app.context_window > 0 {
-            let pct = (app.usage_tokens * 100) / app.context_window.max(1);
-            format!("{approx}{} tok {}%", format_tokens(app.usage_tokens), pct)
-        } else {
-            format!("{approx}{} tok", format_tokens(app.usage_tokens))
-        };
-        parts.push(usage);
+    if let Some(ctx) = format_context_usage(app) {
+        parts.push(ctx);
     }
 
     if !parts.is_empty() {
@@ -2615,6 +2785,21 @@ fn status_stats_spans(app: &App) -> Vec<Span<'static>> {
         right.push(Span::raw("  ")); // trailing pad
     }
     right
+}
+
+/// Last prompt / estimated context size (not session-cumulative billing).
+fn format_context_usage(app: &App) -> Option<String> {
+    if app.usage_tokens == 0 {
+        return None;
+    }
+    let approx = if app.usage_tokens_estimated { "~" } else { "" };
+    let tokens = format_tokens(app.usage_tokens);
+    if app.context_window > 0 {
+        let pct = (app.usage_tokens * 100) / app.context_window.max(1);
+        Some(format!("ctx {approx}{tokens} {pct}%"))
+    } else {
+        Some(format!("ctx {approx}{tokens}"))
+    }
 }
 
 fn format_tokens(n: usize) -> String {
@@ -2626,5 +2811,49 @@ fn format_tokens(n: usize) -> String {
         format!("{:.1}k", n as f64 / 1000.0)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod usage_format_tests {
+    use super::*;
+    use crate::app::App;
+
+    #[test]
+    fn status_shows_context_only_not_session_totals() {
+        let mut app = App::new("test");
+        // Cumulative bill is huge — must not appear on the status strip.
+        app.set_usage_io(714_677, 5_332);
+        app.set_usage_cache(599_040, 0);
+        app.set_usage_cost_usd(0.42);
+        app.set_usage_tokens(44_192);
+        app.set_usage_tokens_estimated(false);
+        app.set_context_window(1_000_000);
+
+        let ctx = format_context_usage(&app).expect("context");
+        assert_eq!(ctx, "ctx 44k 4%");
+
+        let spans = status_stats_spans(&app);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("ctx 44k"), "status: {text}");
+        assert!(
+            !text.contains('↑')
+                && !text.contains('↓')
+                && !text.contains("cR")
+                && !text.contains("session")
+                && !text.contains('$'),
+            "status must not show session cumulative I/O/cost: {text}"
+        );
+    }
+
+    #[test]
+    fn context_shown_without_window() {
+        let mut app = App::new("test");
+        app.set_usage_tokens(12_500);
+        app.set_usage_tokens_estimated(true);
+        assert_eq!(
+            format_context_usage(&app).as_deref(),
+            Some("ctx ~12k") // ≥10k uses integer k (format_tokens)
+        );
     }
 }
