@@ -184,7 +184,7 @@ impl Tool for PlanEditTool {
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
         use crate::edit_diff::{
             apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success,
-            normalize_to_lf,
+            normalize_to_lf, patch_for_details,
         };
         use crate::tool_args::{bool_arg_names, new_string_arg, old_string_arg, path_arg};
 
@@ -227,22 +227,29 @@ impl Tool for PlanEditTool {
             .await
             .map_err(|err| tool_error("edit", err.to_string()))?;
 
-        let text = format_edit_success(
-            &self.plan_path.to_string_lossy(),
+        let path_s = self.plan_path.to_string_lossy();
+        let success = format_edit_success(
+            &path_s,
             &content_lf,
             &applied.content_lf,
             applied.replacements,
             applied.strategy,
         );
-        Ok(ToolOutput::text_with_details(
-            text,
-            json!({
-                "path": self.plan_path.to_string_lossy(),
-                "plan": true,
-                "replacements": applied.replacements,
-                "strategy": applied.strategy.as_str(),
-            }),
-        ))
+        let mut details = json!({
+            "path": path_s,
+            "plan": true,
+            "replacements": applied.replacements,
+            "strategy": applied.strategy.as_str(),
+            "additions": success.additions,
+            "deletions": success.deletions,
+        });
+        if let Some(patch) = patch_for_details(&success.patch) {
+            details
+                .as_object_mut()
+                .expect("details object")
+                .insert("patch".into(), json!(patch));
+        }
+        Ok(ToolOutput::text_with_details(success.summary, details))
     }
 }
 

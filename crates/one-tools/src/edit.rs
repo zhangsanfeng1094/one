@@ -14,6 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::edit_diff::{
     apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success, normalize_to_lf,
+    patch_for_details,
 };
 use crate::path_policy::{AccessKind, PathPolicy};
 use crate::tool_args::{bool_arg_names, new_string_arg, old_string_arg, path_arg, path_properties};
@@ -136,7 +137,9 @@ impl Tool for EditTool {
             .await
             .map_err(|err| tool_error("edit", err.to_string()))?;
 
-        let text = format_edit_success(
+        // Model context: short ack only (OpenCode/Codex style).
+        // Unified patch lives in details for TUI — never ToolResult.content.
+        let success = format_edit_success(
             path,
             &content_lf,
             &applied.content_lf,
@@ -145,17 +148,23 @@ impl Tool for EditTool {
         );
         let old_lines = old_lf.lines().count().max(1);
         let new_lines = new_lf.lines().count().max(1);
-        Ok(ToolOutput::text_with_details(
-            text,
-            json!({
-                "path": path,
-                "replacements": applied.replacements,
-                "replace_all": replace_all,
-                "old_lines": old_lines,
-                "new_lines": new_lines,
-                "strategy": applied.strategy.as_str(),
-            }),
-        ))
+        let mut details = json!({
+            "path": path,
+            "replacements": applied.replacements,
+            "replace_all": replace_all,
+            "old_lines": old_lines,
+            "new_lines": new_lines,
+            "strategy": applied.strategy.as_str(),
+            "additions": success.additions,
+            "deletions": success.deletions,
+        });
+        if let Some(patch) = patch_for_details(&success.patch) {
+            details
+                .as_object_mut()
+                .expect("details object")
+                .insert("patch".into(), json!(patch));
+        }
+        Ok(ToolOutput::text_with_details(success.summary, details))
     }
 }
 
@@ -365,7 +374,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn result_contains_unified_diff_markers() {
+    async fn result_summary_excludes_patch_body() {
         let dir = temp_dir();
         let file = dir.join("d.txt");
         std::fs::write(&file, "a\nb\nc\n").unwrap();
@@ -384,9 +393,58 @@ mod tests {
             .await
             .unwrap();
         let t = out.as_text();
-        assert!(t.contains("--- a/d.txt"), "{t}");
-        assert!(t.contains("+++ b/d.txt"), "{t}");
-        assert!(t.contains("-b") || t.contains("- b"), "{t}");
+        // Model-facing content is a short ack — no unified diff body.
+        assert!(t.contains("Updated d.txt"), "{t}");
+        assert!(t.contains("+1") || t.contains("−1") || t.contains("-1"), "{t}");
+        assert!(!t.contains("--- a/"), "patch must not enter content: {t}");
+        assert!(!t.contains("+++ b/"), "patch must not enter content: {t}");
+        let details = out.details.as_ref().expect("details");
+        let patch = details["patch"].as_str().expect("details.patch");
+        assert!(patch.contains("--- a/d.txt"), "{patch}");
+        assert!(patch.contains("+++ b/d.txt"), "{patch}");
+        assert!(patch.contains("-b") || patch.contains("- b"), "{patch}");
+        assert_eq!(details["additions"], 1);
+        assert_eq!(details["deletions"], 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn large_file_surgical_edit_stays_small_in_context() {
+        let dir = temp_dir();
+        let file = dir.join("big.rs");
+        // ~3k lines → n*m would exceed old 2e6 cell cap without prefix/suffix strip.
+        let mut body = String::new();
+        for i in 0..3000 {
+            body.push_str(&format!("// line {i}\n"));
+        }
+        body.push_str("fn target() { old() }\n");
+        for i in 0..3000 {
+            body.push_str(&format!("// tail {i}\n"));
+        }
+        std::fs::write(&file, &body).unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "path": "big.rs",
+                    "old_string": "fn target() { old() }",
+                    "new_string": "fn target() { new() }"
+                }),
+            })
+            .await
+            .unwrap();
+
+        let t = out.as_text();
+        assert!(t.len() < 500, "model content must stay short, got {} bytes: {t}", t.len());
+        assert!(!t.contains("--- a/"), "{t}");
+        let patch = out.details.as_ref().unwrap()["patch"].as_str().unwrap();
+        // Real hunk, not whole-file dump (~12k lines of -/+).
+        assert!(patch.len() < 2_000, "patch too large: {} bytes", patch.len());
+        assert!(patch.contains("-fn target() { old() }"), "{patch}");
+        assert!(patch.contains("+fn target() { new() }"), "{patch}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -725,6 +725,23 @@ fn apply_spans(
     })
 }
 
+/// Soft cap for `details.patch` (UI-only). Larger patches are omitted from details;
+/// the model never sees the patch body.
+pub const MAX_DETAILS_PATCH_BYTES: usize = 100 * 1024;
+
+/// Model-facing summary + UI-only unified patch after a successful edit.
+///
+/// **`summary`** is what enters LLM context (short ack, Codex/OpenCode style).
+/// **`patch`** is optional UI metadata (`ToolOutput.details`) and must not be
+/// copied into `ToolResultMessage.content`.
+#[derive(Debug, Clone)]
+pub struct EditSuccess {
+    pub summary: String,
+    pub patch: String,
+    pub additions: usize,
+    pub deletions: usize,
+}
+
 /// Line-oriented unified diff of full before/after (LF). Single or multi-hunk.
 pub fn unified_diff(path: &str, before_lf: &str, after_lf: &str, context: usize) -> String {
     let before_lines: Vec<&str> = split_lines_no_trailing_empty(before_lf);
@@ -743,12 +760,13 @@ pub fn unified_diff(path: &str, before_lf: &str, after_lf: &str, context: usize)
         return trim_trailing_nl(out);
     }
 
-    // Simple LCS-free walk: emit hunks where lines differ (Myers-lite via SES).
+    // Prefix/suffix-stripped LCS; surgical edits on large files stay O(change²).
     let edits = line_diff(&before_lines, &after_lines);
     let hunks = group_hunks(&edits, before_lines.len(), after_lines.len(), context);
 
     if hunks.is_empty() {
-        // Fallback: whole-file hunk
+        // Should be rare after line_diff; emit a compact mid-only dump rather than
+        // duplicating equal lines.
         out.push_str(&format!(
             "@@ -1,{} +1,{} @@\n",
             before_lines.len().max(1),
@@ -791,31 +809,68 @@ pub fn unified_diff(path: &str, before_lf: &str, after_lf: &str, context: usize)
     trim_trailing_nl(out)
 }
 
-/// Header + unified diff for tool result text.
+fn count_line_ops(before_lf: &str, after_lf: &str) -> (usize, usize) {
+    let before_lines = split_lines_no_trailing_empty(before_lf);
+    let after_lines = split_lines_no_trailing_empty(after_lf);
+    let edits = line_diff(&before_lines, &after_lines);
+    let mut additions = 0usize;
+    let mut deletions = 0usize;
+    for e in edits {
+        match e.op {
+            DiffOp::Insert => additions += 1,
+            DiffOp::Delete => deletions += 1,
+            DiffOp::Equal => {}
+        }
+    }
+    (additions, deletions)
+}
+
+/// Build model summary + UI patch (OpenCode/Codex: model sees ack only).
 pub fn format_edit_success(
     path: &str,
     before_lf: &str,
     after_lf: &str,
     replacements: usize,
     strategy: MatchStrategy,
-) -> String {
-    let mut out = String::new();
+) -> EditSuccess {
+    let (additions, deletions) = count_line_ops(before_lf, after_lf);
+    let patch = unified_diff(path, before_lf, after_lf, 3);
+
+    let mut summary = String::new();
     let relaxed = strategy.is_relaxed();
     if replacements > 1 {
-        out.push_str(&format!("Updated {path} ({replacements} replacements"));
+        summary.push_str(&format!("Updated {path} ({replacements} replacements"));
         if relaxed {
-            out.push_str(&format!(", {} match", strategy.as_str()));
+            summary.push_str(&format!(", {} match", strategy.as_str()));
         }
-        out.push_str(")\n");
+        summary.push(')');
     } else {
-        out.push_str(&format!("Updated {path}"));
+        summary.push_str(&format!("Updated {path}"));
         if relaxed {
-            out.push_str(&format!(" ({} match)", strategy.as_str()));
+            summary.push_str(&format!(" ({} match)", strategy.as_str()));
         }
-        out.push('\n');
     }
-    out.push_str(&unified_diff(path, before_lf, after_lf, 3));
-    out
+    if additions > 0 || deletions > 0 {
+        summary.push_str(&format!(" (+{additions} −{deletions})"));
+    }
+
+    EditSuccess {
+        summary,
+        patch,
+        additions,
+        deletions,
+    }
+}
+
+/// Whether `patch` is small enough to attach on `ToolOutput.details`.
+pub fn patch_for_details(patch: &str) -> Option<String> {
+    if patch.is_empty() {
+        return None;
+    }
+    if patch.len() > MAX_DETAILS_PATCH_BYTES {
+        return None;
+    }
+    Some(patch.to_string())
 }
 
 fn split_lines_no_trailing_empty(s: &str) -> Vec<&str> {
@@ -852,31 +907,86 @@ struct DiffEdit {
     text: String,
 }
 
-/// Hunt–Szymanski / simple LCS DP for line diffs. Fine for typical source files.
+/// Hunt–Szymanski / simple LCS DP for line diffs.
+///
+/// Strips common prefix/suffix first so a surgical edit on a multi-thousand-line
+/// file does not hit the cell cap and fall back to a whole-file delete+insert
+/// (which used to flood model context when the patch was inlined into content).
 fn line_diff(a: &[&str], b: &[&str]) -> Vec<DiffEdit> {
     let n = a.len();
     let m = b.len();
-    // Cap pathological cost: fall back to delete-all + insert-all above threshold.
+    if n == 0 && m == 0 {
+        return Vec::new();
+    }
+
+    // Common prefix.
+    let mut prefix = 0usize;
+    while prefix < n && prefix < m && a[prefix] == b[prefix] {
+        prefix += 1;
+    }
+    // Common suffix (do not overlap prefix).
+    let mut suffix = 0usize;
+    while suffix < n - prefix && suffix < m - prefix && a[n - 1 - suffix] == b[m - 1 - suffix] {
+        suffix += 1;
+    }
+
+    let a_mid = &a[prefix..n - suffix];
+    let b_mid = &b[prefix..m - suffix];
+    let mid_edits = line_diff_middle(a_mid, b_mid, prefix);
+
+    let mut edits = Vec::with_capacity(prefix + mid_edits.len() + suffix);
+    for i in 0..prefix {
+        edits.push(DiffEdit {
+            op: DiffOp::Equal,
+            old_idx: i,
+            new_idx: i,
+            text: a[i].to_string(),
+        });
+    }
+    edits.extend(mid_edits);
+    for s in 0..suffix {
+        let old_idx = n - suffix + s;
+        let new_idx = m - suffix + s;
+        edits.push(DiffEdit {
+            op: DiffOp::Equal,
+            old_idx,
+            new_idx,
+            text: a[old_idx].to_string(),
+        });
+    }
+    edits
+}
+
+/// LCS (or delete-all+insert-all) for the non-common middle only.
+fn line_diff_middle(a: &[&str], b: &[&str], old_base: usize) -> Vec<DiffEdit> {
+    let n = a.len();
+    let m = b.len();
+    // Cap pathological cost on the *middle* only. Full-file rewrites still hit
+    // this; surgical edits on large files usually do not.
     const MAX_CELLS: usize = 2_000_000;
     if n.saturating_mul(m) > MAX_CELLS {
         let mut edits = Vec::with_capacity(n + m);
         for (i, t) in a.iter().enumerate() {
             edits.push(DiffEdit {
                 op: DiffOp::Delete,
-                old_idx: i,
-                new_idx: 0,
+                old_idx: old_base + i,
+                new_idx: old_base, // approximate; group_hunks uses op stream
                 text: (*t).to_string(),
             });
         }
         for (j, t) in b.iter().enumerate() {
             edits.push(DiffEdit {
                 op: DiffOp::Insert,
-                old_idx: n,
-                new_idx: j,
+                old_idx: old_base + n,
+                new_idx: old_base + j,
                 text: (*t).to_string(),
             });
         }
         return edits;
+    }
+
+    if n == 0 && m == 0 {
+        return Vec::new();
     }
 
     let mut dp = vec![vec![0u32; m + 1]; n + 1];
@@ -897,8 +1007,8 @@ fn line_diff(a: &[&str], b: &[&str]) -> Vec<DiffEdit> {
         if i > 0 && j > 0 && a[i - 1] == b[j - 1] {
             edits_rev.push(DiffEdit {
                 op: DiffOp::Equal,
-                old_idx: i - 1,
-                new_idx: j - 1,
+                old_idx: old_base + i - 1,
+                new_idx: old_base + j - 1,
                 text: a[i - 1].to_string(),
             });
             i -= 1;
@@ -906,16 +1016,16 @@ fn line_diff(a: &[&str], b: &[&str]) -> Vec<DiffEdit> {
         } else if j > 0 && (i == 0 || dp[i][j - 1] >= dp[i - 1][j]) {
             edits_rev.push(DiffEdit {
                 op: DiffOp::Insert,
-                old_idx: i,
-                new_idx: j - 1,
+                old_idx: old_base + i,
+                new_idx: old_base + j - 1,
                 text: b[j - 1].to_string(),
             });
             j -= 1;
         } else {
             edits_rev.push(DiffEdit {
                 op: DiffOp::Delete,
-                old_idx: i - 1,
-                new_idx: j,
+                old_idx: old_base + i - 1,
+                new_idx: old_base + j,
                 text: a[i - 1].to_string(),
             });
             i -= 1;
@@ -1086,6 +1196,31 @@ mod tests {
         assert!(d.contains("--- a/a.rs"));
         assert!(d.contains("-b"));
         assert!(d.contains("+B"));
+    }
+
+    #[test]
+    fn large_file_surgical_edit_is_compact_hunk() {
+        let mut before = String::new();
+        for i in 0..4000 {
+            before.push_str(&format!("line {i}\n"));
+        }
+        before.push_str("CHANGE_ME\n");
+        for i in 0..4000 {
+            before.push_str(&format!("tail {i}\n"));
+        }
+        let after = before.replace("CHANGE_ME", "CHANGED");
+        let d = unified_diff("big.rs", &before, &after, 3);
+        assert!(d.contains("-CHANGE_ME"), "{d}");
+        assert!(d.contains("+CHANGED"), "{d}");
+        // Must not dump ~16k dual-copy lines.
+        assert!(d.lines().count() < 40, "lines={}", d.lines().count());
+        let success = format_edit_success("big.rs", &before, &after, 1, MatchStrategy::Exact);
+        assert!(success.summary.contains("Updated big.rs"));
+        assert!(success.summary.contains("+1"));
+        assert!(!success.summary.contains("--- a/"));
+        assert_eq!(success.additions, 1);
+        assert_eq!(success.deletions, 1);
+        assert!(patch_for_details(&success.patch).is_some());
     }
 
     #[test]

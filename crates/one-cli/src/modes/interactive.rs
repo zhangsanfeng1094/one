@@ -1654,6 +1654,27 @@ fn is_overflow(err: &OneError) -> bool {
     }
 }
 
+/// Build TUI preview text from a tool result.
+///
+/// Uses `details.patch` when present (edit success) so the transcript can show a
+/// real hunk while the model only received the short `content` summary.
+fn tool_output_for_ui(output: &one_core::tool::ToolOutput) -> String {
+    let summary = output.as_ui_text();
+    if let Some(patch) = output
+        .details
+        .as_ref()
+        .and_then(|d| d.get("patch"))
+        .and_then(|v| v.as_str())
+        .filter(|p| !p.is_empty())
+    {
+        if summary.is_empty() {
+            return patch.to_string();
+        }
+        return format!("{summary}\n{patch}");
+    }
+    summary
+}
+
 fn drain_events(app: &mut App, events: &Arc<Mutex<Vec<AgentEvent>>>) {
     let mut batch = events.lock().expect("events lock");
     for event in batch.drain(..) {
@@ -1672,10 +1693,10 @@ fn drain_events(app: &mut App, events: &Arc<Mutex<Vec<AgentEvent>>>) {
                 tool_call,
                 output,
             } => {
-                // Full `output` is already on the agent as ToolResult (LLM context).
-                // TUI only keeps a truncated preview for mid-transcript display.
-                // Prefer as_ui_text so image tool results show `[image · png · …]`.
-                let text = output.as_ui_text();
+                // Agent ToolResult stores `content` only (model context).
+                // `details` (e.g. edit patch) is UI-only and never entered the LLM.
+                // Prefer details.patch for edit/write-style diffs when present.
+                let text = tool_output_for_ui(&output);
                 app.finish_tool_with_output(
                     &tool_call.name,
                     is_error,
