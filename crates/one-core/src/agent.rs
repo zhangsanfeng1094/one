@@ -121,7 +121,12 @@ pub struct AgentConfig {
     pub system_prompt: String,
     pub max_turns: usize,
     pub thinking_level: ThinkingLevel,
-    /// Enable provider-native search when the active provider/model supports it.
+    /// Request-side only: attach `provider.server_tools()` (hosted web/x search)
+    /// on the main completion. When false, do not declare them — local function
+    /// `web_search` may still be registered by the host.
+    ///
+    /// Does **not** gate response handling: `web_search_call` events and
+    /// `citations` are always parsed if the upstream/proxy returns them.
     pub server_search: bool,
 }
 
@@ -141,7 +146,8 @@ pub struct CompletionRequest {
     pub system_prompt: String,
     pub messages: Vec<AgentMessage>,
     pub tools: Vec<crate::tool::ToolDefinition>,
-    /// Provider-native tools, kept separate from locally executed functions.
+    /// Hosted tools to declare on this request only (not client-executed).
+    /// Empty when inject is off; response may still contain server tool events.
     pub server_tools: Vec<ServerTool>,
     pub thinking_level: ThinkingLevel,
 }

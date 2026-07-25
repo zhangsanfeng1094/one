@@ -32,6 +32,9 @@ pub struct ToolBuildContext {
     pub bg_registry: Arc<BackgroundTaskRegistry>,
     pub ask_user: Option<Arc<dyn AskUserHandler>>,
     pub tool_gate: Option<Arc<dyn ToolGate>>,
+    /// Optional provider-native search hop for `web_search` (feature-gated by host).
+    #[cfg(feature = "network")]
+    pub backend_web_search: Option<Arc<dyn crate::BackendWebSearch>>,
 }
 
 impl ToolBuildContext {
@@ -42,6 +45,8 @@ impl ToolBuildContext {
             bg_registry: opts.registry,
             ask_user: opts.ask_user,
             tool_gate: opts.tool_gate,
+            #[cfg(feature = "network")]
+            backend_web_search: None,
         }
     }
 
@@ -52,6 +57,8 @@ impl ToolBuildContext {
             bg_registry: Arc::new(BackgroundTaskRegistry::new()),
             ask_user: None,
             tool_gate: None,
+            #[cfg(feature = "network")]
+            backend_web_search: None,
         }
     }
 
@@ -77,6 +84,15 @@ impl ToolBuildContext {
 
     pub fn with_tool_gate(mut self, gate: Arc<dyn ToolGate>) -> Self {
         self.tool_gate = Some(gate);
+        self
+    }
+
+    #[cfg(feature = "network")]
+    pub fn with_backend_web_search(
+        mut self,
+        backend: Option<Arc<dyn crate::BackendWebSearch>>,
+    ) -> Self {
+        self.backend_web_search = backend;
         self
     }
 
@@ -347,8 +363,10 @@ impl ToolRegistry {
         });
         #[cfg(feature = "network")]
         {
-            self.register_factory("web_search", |_ctx| {
-                Arc::new(crate::WebSearchTool::new()) as Arc<dyn Tool>
+            self.register_factory("web_search", |ctx| {
+                Arc::new(crate::WebSearchTool::with_backend(
+                    ctx.backend_web_search.clone(),
+                )) as Arc<dyn Tool>
             });
             self.register_factory("web_fetch", |_ctx| {
                 Arc::new(crate::WebFetchTool::new()) as Arc<dyn Tool>

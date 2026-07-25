@@ -1,8 +1,19 @@
-//! Built-in web search (optional `network` feature).
+//! Built-in **local function** web search (optional `network` feature).
 //!
-//! Backend priority:
-//! 1. Brave Search API when `BRAVE_API_KEY` is set (same ecosystem as Pi brave-search skill)
-//! 2. DuckDuckGo HTML fallback (no key; best-effort)
+//! Feature `server_search` only controls **request inject** of hosted
+//! `{ type: web_search }`. When inject is active, this function is **not**
+//! registered (server wins — pi-xai `mergeXaiTools`). When inject is off,
+//! this tool stays available.
+//!
+//! Response handling is independent: `web_search_call` / citations from the
+//! upstream (or a proxy that injects tools) are always parsed.
+//!
+//! Local backend priority (when this function is registered):
+//! 1. Optional [`BackendWebSearch`] hop (tests / advanced hosts)
+//! 2. Brave Search API when `BRAVE_API_KEY` is set
+//! 3. DuckDuckGo HTML fallback (no key; best-effort)
+
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use one_core::error::Result;
@@ -12,18 +23,39 @@ use serde_json::json;
 const MAX_RESULTS: usize = 10;
 const USER_AGENT: &str = "one-agent/0.1 (+https://github.com/local/one; web_search)";
 
+/// Result from a provider-native (server-side) search hop.
+#[derive(Debug, Clone)]
+pub struct BackendSearchResult {
+    /// Full text returned to the model as the tool output body.
+    pub text: String,
+}
+
+/// Separate search hop implemented by the host (CLI wires Responses/native tools).
+///
+/// The main agent always sees a normal function tool `web_search`; this trait is
+/// only used inside the tool implementation.
+#[async_trait]
+pub trait BackendWebSearch: Send + Sync {
+    async fn search(&self, query: &str, count: usize) -> Result<BackendSearchResult>;
+}
+
 pub struct WebSearchTool {
     client: reqwest::Client,
+    backend: Option<Arc<dyn BackendWebSearch>>,
 }
 
 impl WebSearchTool {
     pub fn new() -> Self {
+        Self::with_backend(None)
+    }
+
+    pub fn with_backend(backend: Option<Arc<dyn BackendWebSearch>>) -> Self {
         let client = reqwest::Client::builder()
             .user_agent(USER_AGENT)
             .timeout(std::time::Duration::from_secs(30))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { client }
+        Self { client, backend }
     }
 }
 
@@ -36,12 +68,19 @@ impl Default for WebSearchTool {
 #[async_trait]
 impl Tool for WebSearchTool {
     fn definition(&self) -> ToolDefinition {
+        let backend_hint = if self.backend.is_some() {
+            " Uses a host search backend when available, otherwise Brave/DuckDuckGo."
+        } else {
+            " Uses Brave Search when BRAVE_API_KEY is set, otherwise DuckDuckGo HTML. \
+             (When the provider supports hosted web_search, that path is preferred and \
+             this local tool is not registered.)"
+        };
         ToolDefinition {
             name: "web_search".to_string(),
-            description: "Search the public web for current information, docs, or facts. \
-                 Prefer this over guessing. Uses Brave Search when BRAVE_API_KEY is set, \
-                 otherwise DuckDuckGo HTML."
-                .to_string(),
+            description: format!(
+                "Search the public web for current information, docs, or facts. \
+                 Prefer this over guessing.{backend_hint}"
+            ),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -77,6 +116,16 @@ impl Tool for WebSearchTool {
             .unwrap_or(5)
             .clamp(1, MAX_RESULTS as u64) as usize;
 
+        // 1) Provider-native hop (optional). Any failure falls through to local search.
+        if let Some(backend) = &self.backend {
+            if let Ok(result) = backend.search(query, count).await {
+                if !result.text.trim().is_empty() {
+                    return Ok(ToolOutput::text(result.text));
+                }
+            }
+        }
+
+        // 2) Brave / 3) DDG
         let text = if let Ok(key) = std::env::var("BRAVE_API_KEY") {
             if !key.trim().is_empty() {
                 brave_search(&self.client, key.trim(), query, count).await?
@@ -329,5 +378,67 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use one_core::tool::ToolCall;
+    use serde_json::json;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct FailingBackend;
+    #[async_trait]
+    impl BackendWebSearch for FailingBackend {
+        async fn search(&self, _query: &str, _count: usize) -> Result<BackendSearchResult> {
+            Err(tool_error("web_search", "backend down"))
+        }
+    }
+
+    struct OkBackend {
+        hits: AtomicUsize,
+    }
+    #[async_trait]
+    impl BackendWebSearch for OkBackend {
+        async fn search(&self, query: &str, _count: usize) -> Result<BackendSearchResult> {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            Ok(BackendSearchResult {
+                text: format!("native:{query}"),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn prefers_backend_when_present() {
+        let backend = Arc::new(OkBackend {
+            hits: AtomicUsize::new(0),
+        });
+        let tool = WebSearchTool::with_backend(Some(backend.clone()));
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "web_search".into(),
+                arguments: json!({"query": "rust async"}),
+            })
+            .await
+            .unwrap();
+        assert_eq!(out.as_text(), "native:rust async");
+        assert_eq!(backend.hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn backend_failure_does_not_block_local_path_args() {
+        // Ensure failing backend still validates args the same way.
+        let tool = WebSearchTool::with_backend(Some(Arc::new(FailingBackend)));
+        let err = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "web_search".into(),
+                arguments: json!({}),
+            })
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("query"));
     }
 }

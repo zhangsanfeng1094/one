@@ -37,9 +37,14 @@ pub const FEATURE_REGISTRY: &[FeatureDef] = &[
     FeatureDef {
         id: FEATURE_SERVER_SEARCH,
         label: "Server search",
-        description: "provider-native web/X search when supported",
-        default_enabled: false,
+        // Request-side only: whether we declare hosted `{type:web_search}` (+ x_search).
+        // Response parsing (web_search_call / citations) is always on — proxies may inject.
+        description: "Inject hosted web_search on main request when model supports it (else local Brave/DDG). Does not gate response handling",
+        // Match pi-xai agentic default-on for Responses-capable models.
+        default_enabled: true,
+        // Hosted inject changes the tools array the model sees (local function dropped).
         affects_context: true,
+        // Local function `web_search` is independent (present when not injecting).
         tool_names: &[],
     },
 ];
@@ -165,11 +170,11 @@ mod tests {
     use std::collections::HashMap;
 
     #[test]
-    fn default_subagent_on() {
+    fn default_subagent_and_server_search_on() {
         let s = FeatureState::default();
         assert!(s.subagent_enabled());
-        assert!(!s.server_search_enabled());
-        assert_eq!(s.fingerprint(), "server_search=0,subagent=1");
+        assert!(s.server_search_enabled());
+        assert_eq!(s.fingerprint(), "server_search=1,subagent=1");
     }
 
     #[test]
@@ -177,9 +182,11 @@ mod tests {
         let mut settings = Settings::default();
         let mut m = HashMap::new();
         m.insert("subagent".into(), false);
+        m.insert("server_search".into(), false);
         settings.features = Some(m);
         let s = FeatureState::from_settings(&settings);
         assert!(!s.subagent_enabled());
+        assert!(!s.server_search_enabled());
         assert_eq!(s.fingerprint(), "server_search=0,subagent=0");
     }
 
@@ -197,14 +204,22 @@ mod tests {
     }
 
     #[test]
-    fn server_search_is_context_affecting_and_can_be_enabled() {
+    fn server_search_is_inject_only_default_on() {
         let def = feature_def(FEATURE_SERVER_SEARCH).expect("server_search registered");
-        assert!(!def.default_enabled);
+        assert!(def.default_enabled);
         assert!(def.affects_context);
+        // Does not gate the local function tool — only request inject of hosted tools.
+        assert!(def.tool_names.is_empty());
+        let desc = def.description.to_ascii_lowercase();
+        assert!(
+            desc.contains("inject") && desc.contains("response"),
+            "description should say inject + response ungated: {}",
+            def.description
+        );
 
         let mut settings = Settings::default();
-        settings.set_feature(FEATURE_SERVER_SEARCH, true);
+        settings.set_feature(FEATURE_SERVER_SEARCH, false);
         let state = FeatureState::from_settings(&settings);
-        assert!(state.server_search_enabled());
+        assert!(!state.server_search_enabled());
     }
 }

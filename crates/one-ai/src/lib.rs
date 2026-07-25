@@ -21,6 +21,7 @@ pub mod remote_models;
 #[cfg(feature = "network")]
 pub mod sse;
 pub mod thinking;
+pub mod web_search_backend;
 pub mod xai_models;
 
 pub use anthropic::AnthropicProvider;
@@ -60,6 +61,10 @@ pub use registry::{ModelEntry, ModelRegistry, ProviderConfig};
 #[cfg(feature = "network")]
 pub use remote_models::{list_openai_compatible_models, RemoteModel};
 pub use thinking::ThinkingWire;
+pub use web_search_backend::{
+    responses_web_search, supports_backend_search, ResponsesWebSearchConfig,
+    ResponsesWebSearchResult,
+};
 pub use xai_models::{
     seed_xai_models, seed_xai_models_default, XaiSeedReport, XAI_BUILTIN_MODELS, XAI_DEFAULT_MODEL,
 };

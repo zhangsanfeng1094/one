@@ -100,6 +100,10 @@ pub struct AppRuntime {
     pending_features: Option<FeatureState>,
     /// Process kill-switch: never enable subagent this process (`--no-subagent`).
     no_subagent_process: bool,
+    /// Whether the active LLM advertises Responses hosted search tools
+    /// (`provider.server_tools()` non-empty). Combined with feature
+    /// `server_search` → request inject only (not response handling).
+    hosted_search_capable: bool,
 }
 
 impl AppRuntime {
@@ -108,6 +112,24 @@ impl AppRuntime {
         if let Some(host) = &self.task_host {
             host.bind_provider(provider).await;
         }
+    }
+
+    /// Refresh hosted-search capability from the active provider and rematerialize
+    /// tools. Feature `server_search` only controls request inject (hosted tools
+    /// vs local function `web_search`); response events/citations stay ungated.
+    pub async fn refresh_web_search_backend(
+        &mut self,
+        providers: &crate::provider::ProviderSet,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        // Truth source = what the live LlmProvider would attach via server_tools().
+        self.hosted_search_capable = !providers.as_llm().server_tools().is_empty();
+        self.rebuild_mode_tools_and_prompt().await
+    }
+
+    /// True when we should **inject** hosted search on the main request
+    /// (feature on + model capable). Response handling ignores this flag.
+    pub(super) fn hosted_search_active(&self) -> bool {
+        self.applied_features.server_search_enabled() && self.hosted_search_capable
     }
 
     /// Push current extension + MCP tools into the task host so children with
@@ -274,8 +296,25 @@ impl AppRuntime {
                 self.apply_act_tools_and_prompt().await?;
             }
         }
-        self.agent.lock().await.config.server_search =
-            self.applied_features.server_search_enabled();
+        // Feature `server_search` → request inject only:
+        // - active → declare hosted tools; local function web_search stripped (server wins)
+        // - inactive → no hosted declare; local function web_search kept if registered
+        // Response path always accepts web_search_call / citations (proxy may inject).
+        let inject = self.hosted_search_active();
+        self.agent.lock().await.config.server_search = inject;
+        if inject {
+            tracing::info!(
+                "server_search: inject hosted tools on main request (no local web_search function)"
+            );
+        } else if self.applied_features.server_search_enabled() {
+            tracing::info!(
+                "server_search: no inject (model not capable); local function web_search if present"
+            );
+        } else {
+            tracing::info!(
+                "server_search: feature off — no hosted inject; response still parses upstream search if any"
+            );
+        }
         Ok(())
     }
 
@@ -388,3 +427,5 @@ impl Drop for AppRuntime {
         self.shutdown_owned_tasks();
     }
 }
+
+

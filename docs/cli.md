@@ -897,11 +897,27 @@ One **内置**（默认 `http-providers` / `network` feature）：
 
 | 工具 | 作用 |
 |------|------|
-| `web_search` | 网页搜索：有 `BRAVE_API_KEY` 用 Brave API，否则 DuckDuckGo HTML |
+| `web_search` | **本地** function（Brave/DDG）；仅在 **未注入** hosted 时注册 |
 | `web_fetch` | 拉取 URL 正文（HTML 粗转文本） |
 
+**`features.server_search` 只控制请求侧注入，不控制响应解析。**
+
+| | feature **on**（默认） | feature **off** |
+|--|------------------------|-----------------|
+| 模型支持 Responses hosted（`gpt-*` / `grok-*` / `composer-*` + `openai-responses`） | 主请求注入 `{ "type": "web_search" }`（Grok 另加 `x_search`）；**不**注册本地 `web_search` | **不**注入；保留本地 `web_search` |
+| 模型不支持 | 本地 `web_search`（Brave/DDG） | 同上 |
+| 响应 | 始终解析 `web_search_call` / `citations`（与 feature 无关） | 同上 |
+
+Hosted 路径下搜索在**服务端**完成：客户端**不会**收到可回传的 tool_result；可见的是状态事件 + 正文 + **citations**。  
+部分代理（如 sub2api Free Grok）可能**自行**注入 hosted tools——关 feature 只能关掉 **one 主动声明**，挡不住上游；返回仍正常展示。
+
 ```bash
-export BRAVE_API_KEY=...   # 推荐；https://api-dashboard.search.brave.com/
+# 可选：本地 search key（feature off 或模型不支持 hosted 时）
+export BRAVE_API_KEY=...   # https://api-dashboard.search.brave.com/
+
+# 关闭 one 侧 hosted 注入：settings features.server_search = false
+# 或 TUI /features
+
 cargo run -p one-cli -- -p "search for rust async trait best practices"
 ```
 

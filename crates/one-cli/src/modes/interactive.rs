@@ -108,6 +108,10 @@ async fn apply_switch_model(
             runtime.set_context_window(ctx);
             // Keep nested task harness on the same provider after model switch.
             runtime.bind_task_provider(providers.as_arc()).await;
+            // Rebind hosted search inject for the new model (Pi agentic style).
+            if let Err(e) = runtime.refresh_web_search_backend(providers).await {
+                tracing::warn!(error = %e, "hosted search refresh after model switch failed");
+            }
             app.set_notice(format!(
                 "model → {} / {}",
                 providers.provider_id,

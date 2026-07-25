@@ -138,6 +138,8 @@ pub fn harness_build_context(
         bg_registry: Arc::new(one_tools::BackgroundTaskRegistry::new()),
         ask_user: Some(Arc::new(one_tools::FailClosedAskUser)),
         tool_gate: None,
+        #[cfg(feature = "network")]
+        backend_web_search: None,
     }
 }
 

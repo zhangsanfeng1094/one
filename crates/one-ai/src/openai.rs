@@ -53,12 +53,24 @@ pub fn server_tools_for(wire_api: ProviderApi, model: &str) -> Vec<one_core::age
     }
     let model = model.to_ascii_lowercase();
     if model.starts_with("grok-") {
+        // Grok / Grok Build: web + X.
         vec![ServerTool::WebSearch, ServerTool::XSearch]
-    } else if model.starts_with("gpt-") {
+    } else if model.starts_with("gpt-") || is_composer_search_model(&model) {
+        // OpenAI GPT + Cursor Composer 2.5 family: web search only.
         vec![ServerTool::WebSearch]
     } else {
         Vec::new()
     }
+}
+
+/// Cursor / proxy Composer models that expose Responses `web_search`.
+///
+/// Matches `composer-2.5`, `composer-2.5-fast`, plain `composer`, etc.
+/// `grok-composer-*` is already covered by the `grok-` branch (web + x_search).
+fn is_composer_search_model(model: &str) -> bool {
+    model == "composer"
+        || model.starts_with("composer-")
+        || model.starts_with("composer_")
 }
 
 impl ProviderApi {
@@ -167,7 +179,7 @@ mod wire_api_tests {
     }
 
     #[test]
-    fn server_search_auto_matrix_only_enables_responses_gpt_and_grok() {
+    fn server_search_auto_matrix_only_enables_responses_gpt_grok_composer() {
         assert_eq!(
             server_tools_for(ProviderApi::Responses, "gpt-5.2"),
             vec![ServerTool::WebSearch]
@@ -176,9 +188,23 @@ mod wire_api_tests {
             server_tools_for(ProviderApi::Responses, "grok-4"),
             vec![ServerTool::WebSearch, ServerTool::XSearch]
         );
+        assert_eq!(
+            server_tools_for(ProviderApi::Responses, "composer-2.5"),
+            vec![ServerTool::WebSearch]
+        );
+        assert_eq!(
+            server_tools_for(ProviderApi::Responses, "composer-2.5-fast"),
+            vec![ServerTool::WebSearch]
+        );
+        // grok-composer keeps the grok matrix (web + x).
+        assert_eq!(
+            server_tools_for(ProviderApi::Responses, "grok-composer-2.5-fast"),
+            vec![ServerTool::WebSearch, ServerTool::XSearch]
+        );
         assert!(server_tools_for(ProviderApi::Responses, "claude-sonnet").is_empty());
         assert!(server_tools_for(ProviderApi::Completions, "gpt-5.2").is_empty());
         assert!(server_tools_for(ProviderApi::Completions, "grok-4").is_empty());
+        assert!(server_tools_for(ProviderApi::Completions, "composer-2.5").is_empty());
     }
 }
 

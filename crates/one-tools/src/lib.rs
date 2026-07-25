@@ -69,7 +69,7 @@ pub use truncate::{
 #[cfg(feature = "network")]
 pub use web_fetch::WebFetchTool;
 #[cfg(feature = "network")]
-pub use web_search::WebSearchTool;
+pub use web_search::{BackendSearchResult, BackendWebSearch, WebSearchTool};
 pub use write::WriteTool;
 
 /// Options for building the default coding tool set.

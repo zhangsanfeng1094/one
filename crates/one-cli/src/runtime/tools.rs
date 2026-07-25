@@ -71,6 +71,10 @@ impl AppRuntime {
             bg_registry: self.bg_registry.clone(),
             ask_user: Some(self.ask_user_handler.clone()),
             tool_gate: Some(self.permission_gate.clone()),
+            // Pi style: hosted search is server-side on the main request — never
+            // a second-hop backend on the local function tool.
+            #[cfg(feature = "network")]
+            backend_web_search: None,
         };
         let mut registry = ToolRegistry::with_builtins();
         let ext = self.extensions.tools();
@@ -105,6 +109,12 @@ impl AppRuntime {
                     tools.push(t);
                 }
             }
+        }
+
+        // When we inject hosted web_search, drop the same-named local function
+        // (server wins — pi-xai mergeXaiTools). Feature off → keep local.
+        if self.hosted_search_active() {
+            tools.retain(|t| t.definition().name != "web_search");
         }
 
         self.push_task_tools(&mut tools);

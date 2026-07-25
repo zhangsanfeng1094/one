@@ -14,6 +14,8 @@ use one_ai::{
     AnthropicProvider, GeminiProvider, OpenAiCodexProvider, OpenAiProvider, OpenRouterProvider,
 };
 
+use clap::Parser;
+
 use crate::cli::{Cli, OpenaiApi, ProviderKind};
 use crate::preferences;
 use crate::settings;
@@ -197,6 +199,62 @@ impl ProviderSet {
             .find(&self.provider_id, self.as_llm().model())
             .and_then(|m| m.context_window)
             .unwrap_or(0) as usize
+    }
+
+    /// Config for a separate Responses web-search hop used by the `web_search` tool.
+    ///
+    /// Returns `None` when the active model is not Responses-capable for native search,
+    /// or credentials/base URL are missing. Codex OAuth path is not supported yet
+    /// (needs account headers beyond a plain OpenAI-compatible client).
+    pub fn backend_web_search_config(&self) -> Option<one_ai::ResponsesWebSearchConfig> {
+        // OpenAI-codex uses a different auth surface; skip for the first cut.
+        if matches!(
+            self.provider_id.as_str(),
+            "openai-codex" | "codex" | "chatgpt"
+        ) {
+            return None;
+        }
+
+        // Minimal CLI so resolve_settings picks up models.json + auth.json for this provider.
+        // `try_parse_from(["one"])` uses clap defaults without reading process argv.
+        let mut cli = Cli::try_parse_from(["one"]).ok()?;
+        cli.model = Some(self.as_llm().model().to_string());
+        let resolved = resolve_settings(&cli, &self.models_config, &self.provider_id);
+        let wire = ProviderApi::from(resolved.openai_api);
+        if !one_ai::supports_backend_search(wire, &resolved.model) {
+            return None;
+        }
+        let api_key = resolved.api_key.filter(|k| !k.is_empty())?;
+        let base_url = resolved
+            .base_url
+            .filter(|b| !b.is_empty())
+            .or_else(|| {
+                let d = default_base_for_detect(&self.provider_id);
+                if d.is_empty() {
+                    None
+                } else {
+                    Some(d.to_string())
+                }
+            })?;
+
+        let mut extra = std::collections::BTreeMap::new();
+        if matches!(self.provider_id.as_str(), PROVIDER_XAI | "grok" | "supergrok")
+            || base_url.contains("cli-chat-proxy.grok.com")
+            || base_url.contains("api.x.ai")
+        {
+            extra = one_ai::auth::xai_cli_headers();
+            extra.insert("x-grok-model-override".into(), resolved.model.clone());
+        }
+
+        let cfg = one_ai::ResponsesWebSearchConfig {
+            api_key,
+            base_url,
+            model: resolved.model,
+            provider_id: self.provider_id.clone(),
+            wire_api: wire,
+            extra_headers: extra,
+        };
+        cfg.is_usable().then_some(cfg)
     }
 
     pub fn available_models_line(&self) -> String {

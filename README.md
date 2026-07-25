@@ -5,7 +5,7 @@ Rust 实现的编程 Agent，灵感来自 [Pi Agent](https://pi.dev)：极简核
 ## 特性
 
 - **极简 Agent 核心**：短 system prompt + tool-calling 循环
-- **内置工具**：`read` / `write` / `edit` / `bash` / `bash_output` / `bash_kill` / `grep` / `find` / `ls` / `ask_user` / `web_search` / `web_fetch`
+- **内置工具**：`read` / `write` / `edit` / `bash` / `bash_output` / `bash_kill` / `grep` / `find` / `ls` / `ask_user` / `web_search` / `web_fetch`（联网：feature `server_search` 只控制是否注入 hosted `web_search`；否则本地 Brave/DDG；响应始终解析 citations，见 `docs/cli.md`）
 - **工作区路径沙箱**：默认只能读写 `--cwd`（+ `--add-dir`）；`--full-access` 关闭边界；可选 bash bubblewrap
 - **权限门控**：allow / deny / ask 规则 + 交互审批列表
 - **四种运行模式**：Interactive TUI / Print / JSON / RPC

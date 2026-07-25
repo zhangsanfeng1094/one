@@ -234,7 +234,8 @@ impl AppRuntime {
                 system_prompt,
                 max_turns,
                 thinking_level: ThinkingLevel::Off,
-                server_search: applied_features.server_search_enabled(),
+                // Set properly after refresh_web_search_backend (capability + feature).
+                server_search: false,
             },
             tools,
         );
@@ -385,6 +386,7 @@ impl AppRuntime {
             applied_features,
             pending_features: None,
             no_subagent_process,
+            hosted_search_capable: false,
         };
 
         // Seed session id for task parent metadata.

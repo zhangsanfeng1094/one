@@ -220,6 +220,8 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let mut runtime = AppRuntime::build(&cli).await?;
     // Drive auto-compact threshold from model/settings context_window (~70%).
     runtime.set_context_window(providers.context_window());
+    // Pi/Grok agentic search: hosted inject on main request when capable.
+    runtime.refresh_web_search_backend(&providers).await?;
     // Bind LLM for nested `task` → harness::run (same provider as parent).
     runtime.bind_task_provider(providers.as_arc()).await;
     runtime.sync_task_session().await;

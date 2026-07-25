@@ -394,6 +394,7 @@ pub fn plan_mode_tools_with_policy(
     ];
     #[cfg(feature = "network")]
     {
+        // Plan mode: no provider backend hop (CLI rebuilds with context when needed).
         tools.push(Arc::new(crate::web_search::WebSearchTool::new()));
         tools.push(Arc::new(crate::web_fetch::WebFetchTool::new()));
     }
