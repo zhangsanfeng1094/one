@@ -218,6 +218,22 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     let mut providers = ProviderSet::build(&cli)?;
     let mut runtime = AppRuntime::build(&cli).await?;
+    // A resumed session keeps its own most-recent model. Explicit CLI model
+    // arguments are an intentional one-off override of that session choice.
+    if cli.provider.is_none() && cli.model.is_none() {
+        if let Some((provider, model)) = runtime.session.as_ref().and_then(|session| {
+            let context = session.build_session_context();
+            context.provider.zip(context.model_id)
+        }) {
+            if let Err(err) = providers.restore_session_model(&provider, &model) {
+                tracing::warn!(
+                    provider = %provider,
+                    model = %model,
+                    "failed to restore session model; using the global default: {err}"
+                );
+            }
+        }
+    }
     // Drive auto-compact threshold from model/settings context_window (~70%).
     runtime.set_context_window(providers.context_window());
     // Pi/Grok agentic search: hosted inject on main request when capable.

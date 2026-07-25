@@ -82,6 +82,35 @@ impl ProviderSet {
         provider_name: &str,
         model: Option<String>,
     ) -> Result<(), String> {
+        self.switch_named_inner(provider_name, model, true)
+    }
+
+    /// Restore the model recorded in a session without replacing the user's
+    /// global default for future conversations.
+    pub fn restore_session_model(
+        &mut self,
+        provider_name: &str,
+        model: &str,
+    ) -> Result<(), String> {
+        self.switch_named_inner(provider_name, Some(model.to_string()), false)
+    }
+
+    /// Reapply the persisted global default before loading a session that has
+    /// no model selection of its own.
+    pub fn restore_global_default(&mut self) -> Result<(), String> {
+        let settings = settings::load();
+        let Some(provider) = settings.provider else {
+            return Ok(());
+        };
+        self.switch_named_inner(&provider, settings.model, false)
+    }
+
+    fn switch_named_inner(
+        &mut self,
+        provider_name: &str,
+        model: Option<String>,
+        persist_global_default: bool,
+    ) -> Result<(), String> {
         let provider_id = provider_name.trim().to_string();
         if provider_id.is_empty() {
             return Err("provider name is empty".into());
@@ -156,15 +185,17 @@ impl ProviderSet {
         self.provider_id = provider_id;
         self.openai_api = resolved.openai_api;
         self.base_url = resolved.base_url;
-        // Persist into unified settings + legacy preferences.
-        let mut s = settings::load();
-        s.provider = Some(self.provider_id.clone());
-        s.model = Some(self.as_llm().model().to_string());
-        if let Err(err) = settings::save(&s) {
-            tracing::warn!("failed to save settings: {err}");
-        }
-        if let Err(err) = preferences::save(&self.provider_id, self.as_llm().model()) {
-            tracing::warn!("failed to save model preferences: {err}");
+        if persist_global_default {
+            // A user-initiated model change becomes the default for future sessions.
+            let mut s = settings::load();
+            s.provider = Some(self.provider_id.clone());
+            s.model = Some(self.as_llm().model().to_string());
+            if let Err(err) = settings::save(&s) {
+                tracing::warn!("failed to save settings: {err}");
+            }
+            if let Err(err) = preferences::save(&self.provider_id, self.as_llm().model()) {
+                tracing::warn!("failed to save model preferences: {err}");
+            }
         }
         Ok(())
     }
@@ -1422,6 +1453,37 @@ mod tests {
             base_url: Some("https://proxy.example/v1".into()),
             config_warning: None,
         }
+    }
+
+    #[test]
+    fn restoring_a_session_model_keeps_the_global_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let old_home = std::env::var_os("HOME");
+        let home = temp_home("restore-session-model");
+        std::env::set_var("HOME", &home);
+
+        settings::save(&settings::Settings {
+            provider: Some("proxy".into()),
+            model: Some("m1".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        preferences::save("proxy", "m1").unwrap();
+
+        let mut providers = provider_set_for_test();
+        providers.restore_session_model("mock", "mock-v1").unwrap();
+
+        assert_eq!(providers.provider_id, "mock");
+        assert_eq!(providers.as_llm().model(), "mock-v1");
+        let settings = settings::load();
+        assert_eq!(settings.provider.as_deref(), Some("proxy"));
+        assert_eq!(settings.model.as_deref(), Some("m1"));
+        let preferences = preferences::load().unwrap();
+        assert_eq!(preferences.provider, "proxy");
+        assert_eq!(preferences.model, "m1");
+
+        restore_home(old_home);
+        let _ = std::fs::remove_dir_all(home);
     }
 
     #[test]

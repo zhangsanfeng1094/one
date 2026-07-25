@@ -335,6 +335,11 @@ impl AppRuntime {
         self.context_window = window;
     }
 
+    /// Context window currently used for auto-compaction thresholds.
+    pub fn context_window(&self) -> usize {
+        self.context_window
+    }
+
     /// Flush Langfuse batches and stop the upload worker (idempotent).
     pub fn flush_trace(&self) {
         if let Some(sink) = &self.langfuse {
@@ -421,11 +426,10 @@ impl AppRuntime {
     }
 }
 
+
 impl Drop for AppRuntime {
     fn drop(&mut self) {
         // Best-effort: process exit / early return paths that skip explicit cleanup.
         self.shutdown_owned_tasks();
     }
 }
-
-

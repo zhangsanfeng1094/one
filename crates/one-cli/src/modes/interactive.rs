@@ -94,6 +94,7 @@ async fn apply_switch_model(
     provider_name: &str,
     model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let previous_context_window = runtime.context_window();
     match providers.switch_named(provider_name, model) {
         Ok(()) => {
             app.set_mode_label(format_mode_label(providers));
@@ -111,6 +112,9 @@ async fn apply_switch_model(
             // Rebind hosted search inject for the new model (Pi agentic style).
             if let Err(e) = runtime.refresh_web_search_backend(providers).await {
                 tracing::warn!(error = %e, "hosted search refresh after model switch failed");
+            }
+            if ctx < previous_context_window {
+                runtime.maybe_compact(providers.as_llm(), false).await?;
             }
             app.set_notice(format!(
                 "model → {} / {}",
@@ -1859,7 +1863,7 @@ async fn handle_slash(
             if parts.len() > 1 {
                 let spec = parts[1..].join(" ");
                 if let Some(info) = resolve_resume_target(runtime, &spec).await? {
-                    load_session_into_app(runtime, app, &info).await?;
+                    load_session_into_app(runtime, providers, app, &info).await?;
                 } else {
                     app.set_notice(format!("session not found: {spec}"));
                 }
@@ -2541,18 +2545,52 @@ async fn resolve_resume_target(
 /// Open a past session and mirror messages into the TUI transcript.
 async fn load_session_into_app(
     runtime: &mut AppRuntime,
+    providers: &mut ProviderSet,
     app: &mut App,
     info: &one_session::SessionInfo,
 ) -> Result<(), Box<dyn std::error::Error>> {
     app.set_notice(format!("resuming {}…", info.display_label()));
+    let previous_context_window = runtime.context_window();
     runtime.open_session_path(&info.path).await?;
+    let session_model = runtime.session.as_ref().and_then(|session| {
+        let context = session.build_session_context();
+        context.provider.zip(context.model_id)
+    });
+    let model_notice = match session_model {
+        Some((provider, model)) => match providers.restore_session_model(&provider, &model) {
+            Ok(()) => format!("model → {provider} / {model}"),
+            Err(err) => {
+                tracing::warn!(%provider, %model, "failed to restore session model: {err}");
+                format!("session model unavailable; using default ({err})")
+            }
+        },
+        None => match providers.restore_global_default() {
+            Ok(()) => "using global default model".into(),
+            Err(err) => {
+                tracing::warn!("failed to restore global default model: {err}");
+                format!("global default unavailable ({err})")
+            }
+        },
+    };
+    app.set_mode_label(format_mode_label(providers));
+    app.set_current_model(&providers.provider_id, providers.as_llm().model());
+    let ctx = providers.context_window();
+    app.set_context_window(ctx);
+    runtime.set_context_window(ctx);
+    runtime.bind_task_provider(providers.as_arc()).await;
+    if let Err(err) = runtime.refresh_web_search_backend(providers).await {
+        tracing::warn!(error = %err, "hosted search refresh after session resume failed");
+    }
+    if ctx < previous_context_window {
+        runtime.maybe_compact(providers.as_llm(), false).await?;
+    }
     let msgs = runtime.agent.lock().await.messages.clone();
     rebuild_tui_from_agent(app, &msgs);
     // ↑ history is project-scoped (loaded at startup); do not re-append on resume.
     app.set_thinking_level(runtime.thinking_level().await.as_str());
     app.set_agent_label(runtime.mode().label());
     refresh_usage(app, runtime).await;
-    app.set_notice(format!("resumed {}", info.display_label()));
+    app.set_notice(format!("resumed {} · {model_notice}", info.display_label()));
     Ok(())
 }
 
