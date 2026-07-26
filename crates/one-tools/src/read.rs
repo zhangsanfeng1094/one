@@ -30,7 +30,9 @@ impl Tool for ReadTool {
             "any path".to_string()
         } else {
             format!(
-                "workspace `{}`, --add-dir roots, and agent skills dir",
+                "workspace `{}`, --add-dir roots, and agent skills dir \
+                 (interactive sessions may grant one-path or session-root read after approval; \
+                 prefer staying in the workspace — do not blind-scan home config dirs)",
                 self.policy.cwd().display()
             )
         };

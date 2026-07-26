@@ -72,7 +72,8 @@ impl Tool for GrepTool {
             description: "Search file contents with an in-process ripgrep-style engine \
                  (no host `rg` required). Prefer this over bash `rg`/`grep`. Use `glob` or \
                  `type` to narrow files, `output_mode` for files_with_matches/count, and \
-                 context lines for surrounding code."
+                 context lines for surrounding code. Default path is the workspace root; \
+                 paths outside need interactive approval or --add-dir (do not blind-scan ~/.xxx)."
                 .to_string(),
             parameters: json!({
                 "type": "object",

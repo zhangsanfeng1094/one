@@ -6,8 +6,13 @@
 //! `~/.agents/skills`, and compat harness skill dirs (`~/.codex/skills`, etc.).
 //! Use `FullAccess` / `--full-access` to disable the boundary (container / trusted
 //! environments only).
+//!
+//! Interactive sessions may accumulate **read-only** dynamic grants (Once path /
+//! Session root) behind a shared [`Arc`] so clones used by tools and the permission
+//! gate see the same allowlist.
 
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// How a tool intends to use a path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +53,27 @@ impl SandboxMode {
     }
 }
 
+/// Grants accumulated during an interactive session (read-only).
+///
+/// All paths stored here MUST already be policy-normalized (see `grant_*`).
+#[derive(Debug, Default)]
+pub struct DynamicGrants {
+    /// Session-scoped always-readable roots (from "Session root" approval).
+    readable_roots: Vec<PathBuf>,
+    /// Paths allowed for Read: files (exact) or directories (dir + descendants).
+    /// NOT the same as static `allowed_files` (exact + write-capable).
+    allowed_paths: Vec<PathBuf>,
+}
+
+/// Snapshot of dynamic grants for subagent spawn (paths only; no Arc share).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ExportedReadGrants {
+    /// From parent Session-root grants (and any `grant_readable_root`).
+    pub readable_roots: Vec<PathBuf>,
+    /// From parent Once grants (`grant_read_path` — files or dirs).
+    pub allowed_paths: Vec<PathBuf>,
+}
+
 /// Policy applied by read/write/edit/grep/find/ls (and plan read tools).
 #[derive(Debug, Clone)]
 pub struct PathPolicy {
@@ -60,6 +86,8 @@ pub struct PathPolicy {
     /// Specific files allowed for read+write outside roots (e.g. plan file).
     allowed_files: Vec<PathBuf>,
     mode: SandboxMode,
+    /// Shared across clones from one AppRuntime / ToolBuildContext.
+    dynamic: Arc<Mutex<DynamicGrants>>,
 }
 
 impl PathPolicy {
@@ -85,6 +113,7 @@ impl PathPolicy {
             readable_roots,
             allowed_files: Vec::new(),
             mode: SandboxMode::WorkspaceWrite,
+            dynamic: Arc::new(Mutex::new(DynamicGrants::default())),
         }
     }
 
@@ -93,6 +122,17 @@ impl PathPolicy {
         let mut p = Self::workspace(cwd);
         p.mode = SandboxMode::FullAccess;
         p
+    }
+
+    /// Shared handle for `Arc::ptr_eq` checks (runtime ↔ gate ↔ tools).
+    pub fn dynamic_handle(&self) -> Arc<Mutex<DynamicGrants>> {
+        Arc::clone(&self.dynamic)
+    }
+
+    /// Replace the dynamic grant set (e.g. reattach after rebuilding static roots).
+    pub fn with_shared_dynamic(mut self, dynamic: Arc<Mutex<DynamicGrants>>) -> Self {
+        self.dynamic = dynamic;
+        self
     }
 
     pub fn with_mode(mut self, mode: SandboxMode) -> Self {
@@ -115,6 +155,9 @@ impl PathPolicy {
     }
 
     /// Allow a single file outside roots (e.g. plan markdown under `~/.one/agent/plans`).
+    ///
+    /// **Write-capable** for plan-file exception. Do **not** use for interactive
+    /// path-read Once grants — use [`Self::grant_read_path`] instead.
     pub fn with_allowed_file(mut self, path: impl Into<PathBuf>) -> Self {
         let p = path.into();
         // Prefer canonical if the file already exists.
@@ -146,6 +189,94 @@ impl PathPolicy {
         self
     }
 
+    /// Read grant: file = exact path; directory = path + descendants. Idempotent.
+    ///
+    /// Write is never granted by this API (dynamic grants are ignored for Write).
+    pub fn grant_read_path(&self, path: impl AsRef<Path>) {
+        let normalized = normalize_for_check(path.as_ref());
+        let mut g = self.dynamic.lock().expect("dynamic grants lock");
+        if !g.allowed_paths.iter().any(|p| paths_match(p, &normalized)) {
+            g.allowed_paths.push(normalized);
+        }
+    }
+
+    /// Read-only root for the session. Idempotent. Normalizes as existing dir.
+    pub fn grant_readable_root(&self, root: impl AsRef<Path>) {
+        let p = root.as_ref();
+        let normalized = if p.is_dir() {
+            normalize_existing_dir(p.to_path_buf())
+        } else if let Some(parent) = p.parent() {
+            // If caller passed a file, grant its parent directory.
+            normalize_existing_dir(parent.to_path_buf())
+        } else {
+            normalize_existing_dir(p.to_path_buf())
+        };
+        let mut g = self.dynamic.lock().expect("dynamic grants lock");
+        if !g.readable_roots.iter().any(|r| paths_match(r, &normalized)) {
+            g.readable_roots.push(normalized);
+        }
+    }
+
+    /// Snapshot dynamic grants for subagent spawn (copy of paths only; no Arc share).
+    pub fn export_read_grants(&self) -> ExportedReadGrants {
+        let g = self.dynamic.lock().expect("dynamic grants lock");
+        ExportedReadGrants {
+            readable_roots: g.readable_roots.clone(),
+            allowed_paths: g.allowed_paths.clone(),
+        }
+    }
+
+    /// Apply an export onto **this** policy's dynamic grants (typically a fresh
+    /// child policy with a **new** `dynamic` Arc). Calls `grant_readable_root` /
+    /// `grant_read_path` only. **Must not** touch `allowed_files` / `with_allowed_file`.
+    pub fn apply_exported_read_grants(&self, exported: &ExportedReadGrants) {
+        for r in &exported.readable_roots {
+            self.grant_readable_root(r);
+        }
+        for p in &exported.allowed_paths {
+            self.grant_read_path(p);
+        }
+    }
+
+    /// Suggest a session-scoped read-only root for an outside path, or `None`
+    /// when only Once (exact path) should be offered (sensitive trees, `/`, `$HOME`).
+    ///
+    /// `resolved` should already be absolute / policy-normalized.
+    pub fn suggest_read_root(&self, resolved: &Path) -> Option<PathBuf> {
+        suggest_read_root_impl(resolved)
+    }
+
+    /// Shared error text for outside-workspace (tools + gate write deny).
+    pub fn format_outside_error(&self, path: &Path, access: AccessKind) -> String {
+        let kind = match access {
+            AccessKind::Read => "read",
+            AccessKind::Write => "write",
+        };
+        let roots: Vec<&Path> = match access {
+            AccessKind::Read => self.readable_roots().collect(),
+            AccessKind::Write => self.writable_roots().collect(),
+        };
+        let mut msg = format!(
+            "path outside workspace ({kind} denied): {}\n\
+             Allowed roots: {}\n\
+             Use --add-dir <path> to grant access, or --full-access to disable the boundary.",
+            path.display(),
+            roots
+                .iter()
+                .map(|r| r.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if matches!(access, AccessKind::Read) {
+            msg.push_str(
+                "\nPath boundary is independent of always-approve / --yes. \
+                 Re-run without Always-approve, pass --add-dir at launch, or approve a path \
+                 grant in a normal interactive session.",
+            );
+        }
+        msg
+    }
+
     pub fn cwd(&self) -> &Path {
         &self.cwd
     }
@@ -163,7 +294,7 @@ impl PathPolicy {
         std::iter::once(self.cwd.as_path()).chain(self.additional_roots.iter().map(|p| p.as_path()))
     }
 
-    /// Readable roots: writable + always-readable.
+    /// Readable roots: writable + always-readable (static only; dynamic checked separately).
     pub fn readable_roots(&self) -> impl Iterator<Item = &Path> {
         self.writable_roots()
             .chain(self.readable_roots.iter().map(|p| p.as_path()))
@@ -189,7 +320,7 @@ impl PathPolicy {
 
         let normalized = normalize_for_check(path);
 
-        // Exact allowed files (plan file, etc.).
+        // Exact allowed files (plan file, etc.) — write-capable by design.
         if self
             .allowed_files
             .iter()
@@ -213,21 +344,31 @@ impl PathPolicy {
             return Ok(());
         }
 
-        let kind = match access {
-            AccessKind::Read => "read",
-            AccessKind::Write => "write",
-        };
-        Err(format!(
-            "path outside workspace ({kind} denied): {}\n\
-             Allowed roots: {}\n\
-             Use --add-dir <path> to grant access, or --full-access to disable the boundary.",
-            path.display(),
-            roots
-                .iter()
-                .map(|r| r.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        ))
+        // Dynamic read grants (Once path / Session root) — Read only.
+        if matches!(access, AccessKind::Read) && self.dynamic_read_allows(&normalized, &lexical) {
+            return Ok(());
+        }
+
+        Err(self.format_outside_error(path, access))
+    }
+
+    fn dynamic_read_allows(&self, normalized: &Path, lexical: &Path) -> bool {
+        let g = self.dynamic.lock().expect("dynamic grants lock");
+        for p in &g.allowed_paths {
+            if paths_match(p, normalized)
+                || paths_match(p, lexical)
+                || is_within(p, normalized)
+                || is_within(p, lexical)
+            {
+                return true;
+            }
+        }
+        for root in &g.readable_roots {
+            if is_within(root, normalized) || is_within(root, lexical) {
+                return true;
+            }
+        }
+        false
     }
 }
 
@@ -345,6 +486,107 @@ fn paths_match(a: &Path, b: &Path) -> bool {
         return true;
     }
     clean_path(a) == clean_path(b)
+}
+
+/// Suggest a session read root for an outside path, or None for Once-only.
+fn suggest_read_root_impl(resolved: &Path) -> Option<PathBuf> {
+    let home = dirs_home();
+    let home_norm = normalize_existing_dir(home.clone());
+
+    // Find nearest existing directory ancestor (or the path itself if a dir).
+    let mut candidate = if resolved.is_dir() {
+        normalize_existing_dir(resolved.to_path_buf())
+    } else {
+        let mut cur = resolved.to_path_buf();
+        loop {
+            match cur.parent() {
+                Some(parent) if parent != cur.as_path() => {
+                    cur = parent.to_path_buf();
+                    if cur.is_dir() || cur.exists() {
+                        break normalize_existing_dir(cur);
+                    }
+                }
+                _ => return None,
+            }
+        }
+    };
+
+    // If the file doesn't exist, still walk lexical parents for an existing dir.
+    if !candidate.exists() {
+        let mut cur = clean_path(resolved);
+        loop {
+            if cur.is_dir() || (cur.exists() && cur.is_dir()) {
+                candidate = normalize_existing_dir(cur);
+                break;
+            }
+            match cur.parent() {
+                Some(parent) if parent != cur.as_path() => cur = parent.to_path_buf(),
+                _ => return None,
+            }
+        }
+    }
+
+    // Demote: filesystem root
+    if candidate.parent().is_none()
+        || candidate == Path::new("/")
+        || candidate.as_os_str() == std::ffi::OsStr::new("/")
+    {
+        return None;
+    }
+
+    // Demote: $HOME itself
+    if paths_match(&candidate, &home_norm) || paths_match(&candidate, &home) {
+        return None;
+    }
+
+    // Demote: path under sensitive home subtrees → Once only
+    if under_sensitive_home(resolved, &home_norm) || under_sensitive_home(&candidate, &home_norm) {
+        return None;
+    }
+
+    Some(candidate)
+}
+
+/// Well-known secret / credential trees under $HOME — no Session root offer.
+fn under_sensitive_home(path: &Path, home_norm: &Path) -> bool {
+    let path = clean_path(path);
+    let home = clean_path(home_norm);
+    if !path.starts_with(&home) {
+        return false;
+    }
+    let Ok(rel) = path.strip_prefix(&home) else {
+        return false;
+    };
+    let mut comps = rel.components();
+    let Some(Component::Normal(first)) = comps.next() else {
+        return false;
+    };
+    let first = first.to_string_lossy();
+    // Single-segment sensitive dirs
+    const SENSITIVE_TOP: &[&str] = &[
+        ".ssh",
+        ".gnupg",
+        ".aws",
+        ".kube",
+        ".docker",
+        ".netrc",
+        ".npmrc",
+        ".mozilla",
+    ];
+    if SENSITIVE_TOP.iter().any(|s| first == *s) {
+        return true;
+    }
+    // Nested under .config
+    if first == ".config" {
+        if let Some(Component::Normal(second)) = comps.next() {
+            let second = second.to_string_lossy();
+            const SENSITIVE_CONFIG: &[&str] = &["gcloud", "google-chrome", "chromium", "gh"];
+            if SENSITIVE_CONFIG.iter().any(|s| second == *s) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -492,6 +734,138 @@ mod tests {
         assert!(write_err.contains("outside workspace"), "{write_err}");
 
         let _ = std::fs::remove_dir_all(&extra);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clone_shares_dynamic_grants() {
+        let dir = temp_dir();
+        let outside = temp_dir();
+        let file = outside.join("secret.txt");
+        std::fs::write(&file, "x").unwrap();
+
+        let a = PathPolicy::workspace(dir.clone());
+        let b = a.clone();
+        assert!(
+            Arc::ptr_eq(&a.dynamic_handle(), &b.dynamic_handle()),
+            "clone must share dynamic Arc"
+        );
+
+        a.check(&file, AccessKind::Read)
+            .expect_err("before grant");
+        a.grant_read_path(&file);
+        b.check(&file, AccessKind::Read)
+            .expect("grant on A visible on B");
+        a.check(&file, AccessKind::Write)
+            .expect_err("dynamic grants are read-only");
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grant_dir_allows_descendants_read_not_write() {
+        let dir = temp_dir();
+        let outside = temp_dir();
+        let nested = outside.join("sub").join("a.rs");
+        std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        std::fs::write(&nested, "fn main() {}").unwrap();
+
+        let policy = PathPolicy::workspace(dir.clone());
+        policy.grant_read_path(&outside);
+        policy
+            .check(&nested, AccessKind::Read)
+            .expect("Once-on-dir covers descendants");
+        policy
+            .check(&nested, AccessKind::Write)
+            .expect_err("write still denied");
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builders_preserve_dynamic_arc() {
+        let dir = temp_dir();
+        let plan = dir.join("plan.md");
+        std::fs::write(&plan, "# p").unwrap();
+        let base = PathPolicy::workspace(dir.clone());
+        let handle = base.dynamic_handle();
+        let with_file = base.clone().with_allowed_file(plan);
+        let with_mode = base.clone().with_mode(SandboxMode::WorkspaceWrite);
+        let with_extra = base.clone().with_additional_dirs([temp_dir()]);
+        assert!(Arc::ptr_eq(&handle, &with_file.dynamic_handle()));
+        assert!(Arc::ptr_eq(&handle, &with_mode.dynamic_handle()));
+        assert!(Arc::ptr_eq(&handle, &with_extra.dynamic_handle()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn suggest_read_root_sensitive_ssh_none() {
+        let home = dirs_home();
+        let ssh = home.join(".ssh").join("id_rsa");
+        assert!(
+            suggest_read_root_impl(&ssh).is_none(),
+            "sensitive ~/.ssh must be Once-only"
+        );
+        let aws = home.join(".aws").join("credentials");
+        assert!(suggest_read_root_impl(&aws).is_none());
+    }
+
+    #[test]
+    fn suggest_read_root_codex_config() {
+        let home = dirs_home();
+        let codex = home.join(".codex");
+        // Only assert when parent exists so CI without ~/.codex still passes the algorithm.
+        if codex.is_dir() {
+            let cfg = codex.join("config.toml");
+            let suggested = suggest_read_root_impl(&cfg);
+            assert!(
+                suggested
+                    .as_ref()
+                    .map(|p| paths_match(p, &normalize_existing_dir(codex.clone())))
+                    .unwrap_or(false),
+                "expected ~/.codex, got {suggested:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn export_apply_detached_read_only() {
+        let dir = temp_dir();
+        let outside = temp_dir();
+        let file = outside.join("a.txt");
+        std::fs::write(&file, "hi").unwrap();
+
+        let parent = PathPolicy::workspace(dir.clone());
+        parent.grant_read_path(&file);
+        parent.grant_readable_root(&outside);
+        let exported = parent.export_read_grants();
+
+        let child = PathPolicy::workspace(dir.clone());
+        assert!(!Arc::ptr_eq(
+            &parent.dynamic_handle(),
+            &child.dynamic_handle()
+        ));
+        child.apply_exported_read_grants(&exported);
+        child
+            .check(&file, AccessKind::Read)
+            .expect("child sees exported Once path");
+        child
+            .check(&file, AccessKind::Write)
+            .expect_err("export must not enable Write");
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn with_shared_dynamic_reattach() {
+        let dir = temp_dir();
+        let a = PathPolicy::workspace(dir.clone());
+        let handle = a.dynamic_handle();
+        let b = PathPolicy::workspace(dir.clone()).with_shared_dynamic(handle.clone());
+        assert!(Arc::ptr_eq(&handle, &b.dynamic_handle()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

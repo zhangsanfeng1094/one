@@ -38,7 +38,9 @@ pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use os_sandbox::OsSandbox;
-pub use path_policy::{AccessKind, PathPolicy, SandboxMode};
+pub use path_policy::{
+    AccessKind, DynamicGrants, ExportedReadGrants, PathPolicy, SandboxMode,
+};
 pub use permissions::{
     bash_command, call_fingerprint, call_summary, command_matches_prefix,
     evaluate as evaluate_permissions, suggested_command_prefix, suggested_command_prefix_from_cmd,

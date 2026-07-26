@@ -28,7 +28,8 @@ impl Tool for FindTool {
         ToolDefinition {
             name: "find".to_string(),
             description: "Find files by glob pattern (Claude Code Glob-compatible). Prefer this \
-                 over bash `find`."
+                 over bash `find`. Default path is the workspace root; outside paths need \
+                 interactive approval or --add-dir."
                 .to_string(),
             parameters: json!({
                 "type": "object",

@@ -27,7 +27,9 @@ impl Tool for LsTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "ls".to_string(),
-            description: "List files in a directory.".to_string(),
+            description: "List files in a directory. Default is the workspace root; paths \
+                 outside need interactive approval or --add-dir."
+                .to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
