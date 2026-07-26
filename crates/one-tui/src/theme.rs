@@ -221,6 +221,108 @@ impl Theme {
         Style::default().bg(Self::PANEL).fg(Self::BORDER)
     }
 
+    // ── Subagent (`/tasks`) float accents ─────────────────────────────────
+
+    /// Subagent modal border — soft purple so it reads as agent-level (not bash).
+    pub fn subagent_border() -> Style {
+        Style::default().fg(Self::ACCENT).bg(Self::PANEL)
+    }
+
+    pub fn subagent_title() -> Style {
+        Style::default()
+            .fg(Self::ACCENT)
+            .bg(Self::PANEL)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn subagent_status_run() -> Style {
+        Style::default()
+            .bg(Self::PANEL)
+            .fg(Self::INFO)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn subagent_status_ok() -> Style {
+        Style::default()
+            .bg(Self::PANEL)
+            .fg(Self::SUCCESS)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn subagent_status_fail() -> Style {
+        Style::default()
+            .bg(Self::PANEL)
+            .fg(Self::ERROR)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn subagent_status_stop() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::MUTED)
+    }
+
+    pub fn subagent_status_run_sel() -> Style {
+        Style::default()
+            .bg(Self::ELEMENT)
+            .fg(Self::INFO)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn subagent_status_ok_sel() -> Style {
+        Style::default()
+            .bg(Self::ELEMENT)
+            .fg(Self::SUCCESS)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn subagent_status_fail_sel() -> Style {
+        Style::default()
+            .bg(Self::ELEMENT)
+            .fg(Self::ERROR)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn subagent_status_stop_sel() -> Style {
+        Style::default().bg(Self::ELEMENT).fg(Self::MUTED)
+    }
+
+    /// Live log: tool start (`→`).
+    pub fn subagent_log_tool() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::SECONDARY)
+    }
+
+    /// Live log: tool success (`✓`).
+    pub fn subagent_log_ok() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::SUCCESS)
+    }
+
+    /// Live log: tool/error fail (`✗` / `!`).
+    pub fn subagent_log_err() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::ERROR)
+    }
+
+    /// Live log: lifecycle / turn (`▸` / `◂`).
+    pub fn subagent_log_meta() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::ACCENT)
+    }
+
+    /// Live log body text next to a colored glyph.
+    pub fn subagent_log_body() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::FG)
+    }
+
+    pub fn subagent_log_muted() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::MUTED)
+    }
+
+    /// Right-side meta chip in list rows (time · id).
+    pub fn subagent_meta_chip() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::BORDER_ACTIVE)
+    }
+
+    pub fn subagent_meta_chip_sel() -> Style {
+        Style::default().bg(Self::ELEMENT).fg(Self::MUTED)
+    }
+
     /// Streaming caret in assistant text.
     pub fn cursor() -> Style {
         Style::default().fg(Self::PRIMARY)

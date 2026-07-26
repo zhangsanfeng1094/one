@@ -55,6 +55,8 @@ pub enum FloatKind {
     Rewind,
     /// Read-only info panel (session summary, …). Enter closes.
     Info,
+    /// Confirmation before starting a fresh conversation from Ctrl+N.
+    NewSessionConfirm,
     /// Settings root (Ctrl+G).
     Settings,
     /// Tool-output truncation limits (under Settings).
@@ -391,6 +393,37 @@ impl FloatMenu {
         }
     }
 
+    /// Ctrl+N confirmation. Keep Cancel selected by default so an accidental
+    /// shortcut followed by Enter cannot discard the current draft.
+    pub fn new_session_confirm() -> Self {
+        Self {
+            kind: FloatKind::NewSessionConfirm,
+            title: "New conversation?".into(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: "Start a fresh session. The current chat stays available to resume.".into(),
+                items: vec![
+                    item(
+                        "cancel",
+                        "Keep current conversation",
+                        "return to the current chat",
+                        "Enter",
+                    ),
+                    action_item(
+                        "new",
+                        "Start new conversation",
+                        "open a fresh session",
+                        "↓ + Enter",
+                    ),
+                ],
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
     /// `/ps` bash process list. `rows`: `(id, status_label, command, elapsed)`.
     pub fn background_picker(rows: &[(String, String, String, String)]) -> Self {
         let items: Vec<FloatItem> = if rows.is_empty() {
@@ -464,13 +497,16 @@ impl FloatMenu {
         }
     }
 
-    /// `/tasks` subagent list. `rows`: `(job_id, status, description, hint)`.
+    /// `/tasks` subagent list. `rows`: `(job_id, status_key, description, meta)`.
+    ///
+    /// `status_key` is `run` / `ok` / `fail` / `stop` (TUI paints a colored badge).
     pub fn subagent_picker(rows: &[(String, String, String, String)]) -> Self {
+        let running = rows.iter().filter(|(_, st, _, _)| st == "run").count();
         let items: Vec<FloatItem> = if rows.is_empty() {
             vec![FloatItem {
                 id: "_empty".into(),
-                label: "—".into(),
-                detail: "no subagents".into(),
+                label: "·".into(),
+                detail: "No subagents yet — the model uses task to spawn them".into(),
                 hint: String::new(),
                 style: FloatItemStyle::Normal,
             }]
@@ -485,16 +521,23 @@ impl FloatMenu {
                 })
                 .collect()
         };
+        let section = if rows.is_empty() {
+            "idle".into()
+        } else if running > 0 {
+            format!(
+                "{} total  ·  {} running  ·  ↵ live log",
+                rows.len(),
+                running
+            )
+        } else {
+            format!("{} total  ·  ↵ open log", rows.len())
+        };
         Self {
             kind: FloatKind::Subagent,
-            title: "Subagents".into(),
+            title: "◆ Subagents".into(),
             search: String::new(),
             sections: vec![FloatSection {
-                title: if rows.is_empty() {
-                    "idle · bash → /ps".into()
-                } else {
-                    format!("{} · enter live log · bash → /ps", rows.len())
-                },
+                title: section,
                 items,
             }],
             selected: 0,
@@ -504,8 +547,8 @@ impl FloatMenu {
         }
     }
 
-    /// Subagent live log: title = description, `section` = status/activity,
-    /// `rows` = turn/tool event lines.
+    /// Subagent live log: title = description, `section` = status strip,
+    /// `rows` = turn/tool event lines (glyph + body).
     pub fn subagent_detail(
         title: impl Into<String>,
         section: impl Into<String>,
@@ -522,9 +565,16 @@ impl FloatMenu {
                 style: FloatItemStyle::Normal,
             })
             .collect();
+        let title = title.into();
+        // Title bar: keep description; leading mark signals agent frame.
+        let title = if title.starts_with('◆') || title.starts_with('▸') {
+            title
+        } else {
+            format!("▸ {title}")
+        };
         Self {
             kind: FloatKind::SubagentDetail,
-            title: title.into(),
+            title,
             search: String::new(),
             sections: vec![FloatSection {
                 title: section.into(),

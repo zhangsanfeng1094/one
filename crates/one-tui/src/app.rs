@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -38,6 +38,13 @@ const CTRL_C_DOUBLE_MS: u128 = 900;
 
 const STATUS_IDLE: &str = "";
 const STATUS_BUSY: &str = "";
+
+#[derive(Debug, Clone)]
+struct RetryWait {
+    retry: usize,
+    max_retries: usize,
+    ready_at: Instant,
+}
 
 pub struct App {
     pub title: String,
@@ -101,6 +108,8 @@ pub struct App {
     pub agent_label: String,
     /// Spinner frame index while busy.
     pub spinner_frame: usize,
+    /// Pending provider retry, rendered as a countdown while the backoff runs.
+    retry_wait: Option<RetryWait>,
     /// Selected **row** index in the popup (may point at a header — navigation skips those).
     pub slash_selected: usize,
     /// Models from registry / models.json for `/model` picker.
@@ -225,7 +234,7 @@ pub struct App {
     next_image_id: u32,
     /// Next text-chip id (1-based).
     next_text_id: u32,
-    /// Submitted prompt history (oldest → newest). Up/Down / Ctrl+P/N navigate.
+    /// Submitted prompt history (oldest → newest). Up/Down / Ctrl+P navigate.
     prompt_history: Vec<String>,
     /// Index into `prompt_history` while browsing; `None` = live draft.
     history_index: Option<usize>,
@@ -298,6 +307,7 @@ impl App {
             mode_label: String::new(),
             agent_label: "Build".into(),
             spinner_frame: 0,
+            retry_wait: None,
             slash_selected: 0,
             model_catalog: Vec::new(),
             settings_provider_rows: Vec::new(),
@@ -1254,6 +1264,13 @@ impl App {
         self.clear_notice();
     }
 
+    /// Ctrl+N asks before switching to a fresh session so the current draft
+    /// and conversation are never replaced by accident.
+    pub fn open_new_session_confirm(&mut self) {
+        self.float = Some(FloatMenu::new_session_confirm());
+        self.clear_notice();
+    }
+
     /// Put text into the input for re-edit (after rewind). Does not submit.
     pub fn set_input_for_edit(&mut self, text: impl Into<String>) {
         self.set_input_for_edit_with_images(text, Vec::new());
@@ -2017,6 +2034,7 @@ impl App {
     }
 
     pub fn append_stream(&mut self, delta: &str) {
+        self.clear_retry_wait();
         // Text arriving after thinking finalizes the thinking bubble.
         if !self.thinking_buffer.is_empty() {
             self.finish_thinking_stream();
@@ -2028,6 +2046,7 @@ impl App {
     }
 
     pub fn append_thinking_stream(&mut self, delta: &str) {
+        self.clear_retry_wait();
         self.thinking_buffer.push_str(delta);
         if self.follow_bottom {
             self.scroll_to_bottom();
@@ -2181,12 +2200,35 @@ impl App {
         self.follow_bottom = true;
         self.turn_started = Some(Instant::now());
         self.spinner_frame = 0;
+        self.clear_retry_wait();
         self.scroll_to_bottom();
     }
 
     pub fn end_busy(&mut self) {
         self.busy = false;
         self.status = STATUS_IDLE.into();
+        self.clear_retry_wait();
+    }
+
+    /// Show a live retry countdown while the agent waits before re-sampling.
+    pub fn begin_retry_wait(&mut self, retry: usize, max_retries: usize, delay: Duration) {
+        self.retry_wait = Some(RetryWait {
+            retry,
+            max_retries,
+            ready_at: Instant::now() + delay,
+        });
+    }
+
+    pub fn clear_retry_wait(&mut self) {
+        self.retry_wait = None;
+    }
+
+    /// `(retry, max_retries, seconds_remaining)` for the animated status chip.
+    pub fn retry_wait_status(&self) -> Option<(usize, usize, u64)> {
+        let retry = self.retry_wait.as_ref()?;
+        let remaining = retry.ready_at.saturating_duration_since(Instant::now());
+        let seconds = ((remaining.as_millis() as u64).saturating_add(999)) / 1000;
+        Some((retry.retry, retry.max_retries, seconds))
     }
 
     pub fn take_followup(&mut self) -> Option<String> {
@@ -2297,6 +2339,35 @@ impl App {
         } else if delta < 0 {
             self.scroll_down((-delta) as usize);
         }
+    }
+
+    /// True while a centered float menu is open (steals wheel from chat).
+    pub fn has_float(&self) -> bool {
+        self.float.is_some()
+    }
+
+    /// Mouse wheel over a float: move selection / log scroll anchor.
+    ///
+    /// `up = true` → older / previous rows (selection decreases).
+    pub fn scroll_float_wheel(&mut self, up: bool, lines: usize) {
+        let Some(f) = self.float.as_mut() else {
+            return;
+        };
+        if lines == 0 {
+            return;
+        }
+        let delta = if up {
+            -(lines as isize)
+        } else {
+            lines as isize
+        };
+        f.move_selection(delta);
+    }
+
+    /// Page-scroll the open float (PgUp/PgDn).
+    pub fn scroll_float_page(&mut self, up: bool) {
+        // ~one viewport; float list is typically ≤28 rows.
+        self.scroll_float_wheel(up, 10);
     }
 
     pub fn toggle_cursor(&mut self) {
@@ -2452,8 +2523,7 @@ impl App {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) && self.busy => {
                 self.submit_steer()
             }
-            // Ctrl+P / Ctrl+N → prompt history (Claude Code / readline).
-            // Command palette remains `/` on empty input.
+            // Ctrl+P → older prompt history (readline).
             KeyCode::Char('p')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
@@ -2461,11 +2531,12 @@ impl App {
                 self.history_prev();
                 RunOutcome::Noop
             }
-            KeyCode::Char('n')
+            // Ctrl+N → fresh conversation, with an explicit confirmation.
+            KeyCode::Char('n') | KeyCode::Char('N')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT) =>
             {
-                self.history_next();
+                self.open_new_session_confirm();
                 RunOutcome::Noop
             }
             // Ctrl+A / Ctrl+E → caret home / end (readline).
@@ -2977,6 +3048,29 @@ impl App {
                 }
                 RunOutcome::Noop
             }
+            KeyCode::PageUp if !editing => {
+                self.scroll_float_page(true);
+                RunOutcome::Noop
+            }
+            KeyCode::PageDown if !editing => {
+                self.scroll_float_page(false);
+                RunOutcome::Noop
+            }
+            KeyCode::Home if !editing && !text_focus => {
+                if let Some(f) = self.float.as_mut() {
+                    f.selected = 0;
+                }
+                RunOutcome::Noop
+            }
+            KeyCode::End if !editing && !text_focus => {
+                if let Some(f) = self.float.as_mut() {
+                    let n = f.filtered_entries().len();
+                    if n > 0 {
+                        f.selected = n - 1;
+                    }
+                }
+                RunOutcome::Noop
+            }
             KeyCode::Backspace => {
                 let empty = self
                     .float
@@ -3181,6 +3275,23 @@ impl App {
             FloatKind::Info => {
                 self.close_float();
                 RunOutcome::Noop
+            }
+            FloatKind::NewSessionConfirm => {
+                self.close_float();
+                if entry.item.id != "new" {
+                    return RunOutcome::Noop;
+                }
+                // A fresh session must not carry an unsent draft or its
+                // attachments into the new conversation.
+                self.input.clear();
+                self.input_cursor = 0;
+                self.pending_images.clear();
+                self.image_jobs.clear();
+                self.pending_texts.clear();
+                self.committed_images.clear();
+                self.leave_history_browse();
+                self.cursor_on = true;
+                RunOutcome::Prompt("/new".into())
             }
             FloatKind::Background => {
                 if entry.item.id == "_empty" || entry.item.id.is_empty() {
@@ -4252,11 +4363,41 @@ mod tests {
         app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.input, "draft");
 
-        // Ctrl+P / Ctrl+N same as Up/Down.
+        // Ctrl+P matches Up; Down still moves forward through history.
         app.handle_key(key(KeyCode::Char('p'), KeyModifiers::CONTROL));
         assert_eq!(app.input, "second");
-        app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
         assert_eq!(app.input, "draft");
+    }
+
+    #[test]
+    fn ctrl_n_confirms_before_starting_new_conversation() {
+        let mut app = App::new("test");
+        app.input = "unsent draft".into();
+
+        let outcome = app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        assert!(matches!(outcome, RunOutcome::Noop));
+        let float = app.float.as_ref().expect("new-conversation confirmation");
+        assert_eq!(float.kind, FloatKind::NewSessionConfirm);
+        assert_eq!(float.selected, 0, "cancel must be the safe default");
+        assert_eq!(app.input, "unsent draft");
+
+        // Enter on the safe default cancels without changing the draft.
+        assert!(matches!(
+            app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+            RunOutcome::Noop
+        ));
+        assert!(app.float.is_none());
+        assert_eq!(app.input, "unsent draft");
+
+        let _ = app.handle_key(key(KeyCode::Char('n'), KeyModifiers::CONTROL));
+        let _ = app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            RunOutcome::Prompt(command) => assert_eq!(command, "/new"),
+            other => panic!("expected /new after confirmation, got {other:?}"),
+        }
+        assert!(app.float.is_none());
+        assert!(app.input.is_empty());
     }
 
     #[test]

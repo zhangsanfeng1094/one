@@ -263,11 +263,20 @@ impl TerminalSession {
         match mouse.kind {
             MouseEventKind::ScrollUp => {
                 self.left_down = false;
-                app.scroll_up(WHEEL_LINES);
+                // Float (e.g. /tasks live log) steals the wheel from chat.
+                if app.has_float() {
+                    app.scroll_float_wheel(true, WHEEL_LINES);
+                } else {
+                    app.scroll_up(WHEEL_LINES);
+                }
             }
             MouseEventKind::ScrollDown => {
                 self.left_down = false;
-                app.scroll_down(WHEEL_LINES);
+                if app.has_float() {
+                    app.scroll_float_wheel(false, WHEEL_LINES);
+                } else {
+                    app.scroll_down(WHEEL_LINES);
+                }
             }
             MouseEventKind::Down(MouseButton::Left) if in_chat => {
                 self.left_down = true;

@@ -341,7 +341,7 @@ fn refresh_task_chip(app: &mut App, runtime: &AppRuntime) {
                         || (matches!(j.state, crate::runtime::jobs::JobState::Completed) && !j.ok)
                 })
                 .count();
-            app.set_task_chip(format!("task:{n_fail} · fail · /tasks"), 4);
+            app.set_task_chip(format!("◆ {n_fail} · fail · /tasks"), 4);
         } else {
             app.clear_task_chip();
         }
@@ -362,7 +362,8 @@ fn refresh_task_chip(app: &mut App, runtime: &AppRuntime) {
         .unwrap_or_else(|| "running".into());
 
     let kind = if failed { 3 } else { 1 };
-    app.set_task_chip(format!("task:{running} · {label}"), kind);
+    // Distinct from bash `bg:N` — purple-adjacent wording via "task".
+    app.set_task_chip(format!("◆ {running} · {label}"), kind);
 }
 
 /// Selectable `/ps` list rows — **bash processes only**.
@@ -399,33 +400,48 @@ fn background_ps_detail(runtime: &AppRuntime, id: &str) -> (String, String, Vec<
 }
 
 /// Selectable `/tasks` list rows — **subagents only** (`AgentJobRegistry`).
+///
+/// Columns for the polished renderer: **status key · description · meta hint**.
+/// Status key is `run` / `ok` / `fail` / `stop` (colored in TUI).
 fn subagent_list_rows(runtime: &AppRuntime) -> Vec<(String, String, String, String)> {
     let jobs = runtime.agent_jobs().map(|j| j.list()).unwrap_or_default();
     let mut rows: Vec<(String, String, String, String)> = Vec::new();
     for j in &jobs {
-        let what = j
+        let desc = j
             .description
             .as_deref()
             .filter(|s| !s.is_empty())
             .unwrap_or(j.agent.as_str());
+        // Prefer "description  ·  agent" when both are useful.
+        let what = if j.description.as_deref().is_some_and(|d| !d.is_empty())
+            && j.description.as_deref() != Some(j.agent.as_str())
+        {
+            format!("{}  ·  {}", truncate_cmd(desc, 36), j.agent)
+        } else {
+            truncate_cmd(desc, 48)
+        };
         let progress = match (j.turns, j.max_turns) {
-            (Some(t), Some(m)) => format!("{t}/{m}"),
+            (Some(t), Some(m)) if j.state == crate::runtime::jobs::JobState::Running => {
+                format!("{t}/{m}")
+            }
+            (Some(t), Some(m)) => format!("{t}/{m}t"),
             (Some(t), None) => format!("t{t}"),
             _ => String::new(),
         };
-        let mut time = if progress.is_empty() {
-            human_elapsed(j.duration_ms)
-        } else {
-            format!("{} · {}", human_elapsed(j.duration_ms), progress)
-        };
-        if j.state == crate::runtime::jobs::JobState::Running && !j.activity.is_empty() {
-            time = format!("{} · {}", time, truncate_cmd(&j.activity, 28));
+        let mut meta_parts: Vec<String> = Vec::new();
+        if !progress.is_empty() {
+            meta_parts.push(progress);
         }
+        meta_parts.push(human_elapsed(j.duration_ms));
+        if j.state == crate::runtime::jobs::JobState::Running && !j.activity.is_empty() {
+            meta_parts.push(truncate_cmd(&j.activity, 22));
+        }
+        meta_parts.push(format!("#{}", short_task_id(&j.id)));
         rows.push((
             j.id.clone(),
-            job_status_label(j),
-            truncate_cmd(what, 48),
-            format!("{} · {}", time, short_task_id(&j.id)),
+            job_status_key(j).into(),
+            what,
+            meta_parts.join(" · "),
         ));
     }
     rows
@@ -435,16 +451,39 @@ fn subagent_list_rows(runtime: &AppRuntime) -> Vec<(String, String, String, Stri
 fn subagent_detail(runtime: &AppRuntime, id: &str) -> (String, String, Vec<(String, String)>) {
     if let Some(jobs) = runtime.agent_jobs() {
         if let Some(j) = jobs.get(id) {
-            let title = j
+            let desc = j
                 .description
-                .clone()
+                .as_deref()
                 .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| format!("{} · {}", j.kind, j.agent));
-            let mut section = job_status_line(&j);
-            if !j.activity.is_empty() && j.state == crate::runtime::jobs::JobState::Running {
-                section = format!("{section} · {}", truncate_cmd(&j.activity, 40));
+                .unwrap_or(j.agent.as_str());
+            // Title: short description; agent name lives in the status strip.
+            let title = truncate_cmd(desc, 48);
+            let st = match j.state {
+                crate::runtime::jobs::JobState::Running => "running",
+                crate::runtime::jobs::JobState::Completed if j.ok => "done",
+                crate::runtime::jobs::JobState::Completed => "failed",
+                crate::runtime::jobs::JobState::Aborted => "aborted",
+                crate::runtime::jobs::JobState::Failed => "failed",
+            };
+            let progress = match (j.turns, j.max_turns) {
+                (Some(t), Some(m)) => format!("turn {t}/{m}"),
+                (Some(t), None) => format!("turn {t}"),
+                _ => String::new(),
+            };
+            let mut section_parts = vec![
+                j.agent.clone(),
+                st.to_string(),
+                human_elapsed(j.duration_ms),
+            ];
+            if !progress.is_empty() {
+                section_parts.push(progress);
             }
-            section = format!("{section} · {}", short_task_id(&j.id));
+            if j.state == crate::runtime::jobs::JobState::Running && !j.activity.is_empty() {
+                section_parts.push(truncate_cmd(&j.activity, 36));
+            }
+            section_parts.push(format!("#{}", short_task_id(&j.id)));
+            let section = section_parts.join("  ·  ");
+
             let mut rows = Vec::new();
             for line in &j.event_lines {
                 let (label, body) = if let Some(rest) = line.strip_prefix("→ ") {
@@ -460,33 +499,36 @@ fn subagent_detail(runtime: &AppRuntime, id: &str) -> (String, String, Vec<(Stri
                 } else {
                     (String::new(), line.clone())
                 };
-                rows.push((label, truncate_cmd(&body, 90)));
+                rows.push((label, truncate_cmd(&body, 96)));
             }
             if let Some(err) = &j.error {
                 if !err.is_empty() {
-                    rows.push(("!".into(), truncate_cmd(err, 80)));
+                    rows.push(("!".into(), truncate_cmd(err, 90)));
                 }
             }
             if !j.summary.is_empty() {
                 rows.push(("──".into(), "summary".into()));
-                rows.extend(text_lines_as_rows(&j.summary, 24));
+                // Full summary — float already scrolls (↑/↓ · wheel · PgUp/Dn).
+                // Do not tail-clip like live bash logs: a finished child report is a
+                // document the user should be able to read from the top.
+                rows.extend(text_lines_as_rows(&j.summary));
             }
             if rows.is_empty() {
                 rows.push((
-                    String::new(),
-                    "(no activity yet · waiting for first turn)".into(),
+                    "·".into(),
+                    "waiting for first turn…".into(),
                 ));
             }
-            return (truncate_cmd(&title, 56), section, rows);
+            return (title, section, rows);
         }
     }
     (
-        id.to_string(),
-        "not found · subagents only · try /ps for bash".into(),
-        vec![(
-            String::new(),
-            format!("unknown subagent `{id}` (bash lives under /ps)"),
-        )],
+        "Subagent".into(),
+        format!("not found · #{id}"),
+        vec![
+            ("!".into(), format!("unknown job `{id}`")),
+            (String::new(), "bash processes live under /ps".into()),
+        ],
     )
 }
 
@@ -739,7 +781,24 @@ fn open_subagent_detail_panel(app: &mut App, runtime: &AppRuntime, id: &str) {
     refresh_task_chip(app, runtime);
     app.task_list = subagent_list_rows(runtime);
     let (title, section, rows) = subagent_detail(runtime, id);
+    // Running jobs: follow the live tail. Finished jobs with a summary: land on
+    // the summary divider so the report is readable top-down (scroll down / PgDn).
+    let running = runtime
+        .agent_jobs()
+        .and_then(|jobs| jobs.get(id))
+        .is_some_and(|j| j.state == crate::runtime::jobs::JobState::Running);
+    let summary_at = rows
+        .iter()
+        .position(|(label, detail)| label == "──" && detail == "summary");
     app.open_subagent_detail_float(id, title, &section, &rows);
+    if !running {
+        if let (Some(idx), Some(f)) = (summary_at, app.float.as_mut()) {
+            let n = f.filtered_entries().len();
+            if n > 0 {
+                f.selected = idx.min(n - 1);
+            }
+        }
+    }
 }
 
 /// Kill bash process by id, then refresh `/ps` list (async path).
@@ -843,38 +902,14 @@ fn short_task_id(id: &str) -> String {
     }
 }
 
-fn job_status_label(j: &crate::runtime::jobs::JobSnapshot) -> String {
+/// Compact status key for subagent list renderer (`run`/`ok`/`fail`/`stop`).
+fn job_status_key(j: &crate::runtime::jobs::JobSnapshot) -> &'static str {
     match j.state {
-        crate::runtime::jobs::JobState::Running => "● agent".into(),
-        crate::runtime::jobs::JobState::Completed if j.ok => "✓ agent".into(),
-        crate::runtime::jobs::JobState::Completed => "✗ agent".into(),
-        crate::runtime::jobs::JobState::Aborted => "■ agent".into(),
-        crate::runtime::jobs::JobState::Failed => "✗ agent".into(),
-    }
-}
-
-fn job_status_line(j: &crate::runtime::jobs::JobSnapshot) -> String {
-    let time = human_elapsed(j.duration_ms);
-    let progress = match (j.turns, j.max_turns) {
-        (Some(t), Some(m)) => format!(" · turn {t}/{m}"),
-        (Some(t), None) => format!(" · turn {t}"),
-        _ => String::new(),
-    };
-    match j.state {
-        crate::runtime::jobs::JobState::Running => {
-            if j.activity.is_empty() {
-                format!("running{progress} · {time}")
-            } else {
-                format!(
-                    "running{progress} · {} · {time}",
-                    truncate_cmd(&j.activity, 36)
-                )
-            }
-        }
-        crate::runtime::jobs::JobState::Completed if j.ok => format!("ok{progress} · {time}"),
-        crate::runtime::jobs::JobState::Completed => format!("failed{progress} · {time}"),
-        crate::runtime::jobs::JobState::Aborted => format!("aborted · {time}"),
-        crate::runtime::jobs::JobState::Failed => format!("failed · {time}"),
+        crate::runtime::jobs::JobState::Running => "run",
+        crate::runtime::jobs::JobState::Completed if j.ok => "ok",
+        crate::runtime::jobs::JobState::Completed => "fail",
+        crate::runtime::jobs::JobState::Aborted => "stop",
+        crate::runtime::jobs::JobState::Failed => "fail",
     }
 }
 
@@ -896,7 +931,12 @@ fn log_lines_as_rows(stdout: &str, stderr: &str, max_lines: usize) -> Vec<(Strin
     rows[start..].to_vec()
 }
 
-fn text_lines_as_rows(text: &str, max_lines: usize) -> Vec<(String, String)> {
+/// One float row per non-empty line of a finished subagent summary.
+///
+/// Unlike [`log_lines_as_rows`] (bash `/ps` detail), this keeps the **full**
+/// text: summary is already capped when the job finishes (`SUMMARY_MAX_CHARS`
+/// / tool_output), and the SubagentDetail float has a scrollbar + wheel/PgUp.
+fn text_lines_as_rows(text: &str) -> Vec<(String, String)> {
     let lines: Vec<&str> = text
         .lines()
         .map(str::trim_end)
@@ -905,12 +945,12 @@ fn text_lines_as_rows(text: &str, max_lines: usize) -> Vec<(String, String)> {
     if lines.is_empty() {
         return vec![(String::new(), "(no output yet)".into())];
     }
-    let start = lines.len().saturating_sub(max_lines);
-    lines[start..]
+    lines
         .iter()
         .map(|line| {
             // Empty label → full width for the log line in the detail column.
-            (String::new(), truncate_cmd(line, 96))
+            // Wider than bash log rows: subagent panels use ~3/4 terminal width.
+            (String::new(), truncate_cmd(line, 200))
         })
         .collect()
 }
@@ -1957,6 +1997,19 @@ fn drain_events(app: &mut App, events: &Arc<Mutex<Vec<AgentEvent>>>) {
         match event {
             AgentEvent::TextDelta { delta } => app.append_stream(&delta),
             AgentEvent::ThinkingDelta { delta } => app.append_thinking_stream(&delta),
+            AgentEvent::RetryScheduled {
+                retry,
+                max_retries,
+                delay,
+                reason,
+            } => {
+                app.begin_retry_wait(retry, max_retries, delay);
+                app.set_notice(format!(
+                    "{reason} · retry {retry}/{max_retries} in {}s",
+                    delay.as_secs()
+                ));
+            }
+            AgentEvent::RetryStarted { .. } => app.clear_retry_wait(),
             AgentEvent::ServerTool {
                 provider,
                 tool,
