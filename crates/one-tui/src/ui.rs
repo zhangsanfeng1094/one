@@ -1713,27 +1713,50 @@ fn message_lines(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'s
         MessageRole::Alert => render_alert(message, wrap_width),
         MessageRole::Thinking => render_thinking(message, app, wrap_width),
         MessageRole::Assistant => {
-            let mut lines = render_assistant(
-                &message.content,
-                message.streaming,
-                app.cursor_on,
-                wrap_width,
-            );
-            if !message.streaming {
-                if let Some(footer) = &message.footer {
-                    // Soft turn meta: muted hairline + peach mode glyph.
-                    lines.push(Line::from(vec![
-                        Span::raw("  "),
-                        Span::styled("╰ ", Theme::meta()),
-                        Span::styled(footer.clone(), Theme::meta()),
-                    ]));
-                }
+            let mut lines = render_assistant(&message.content, wrap_width);
+            if message.streaming {
+                // Live turn chrome — same `╰` slot as the finished footer; spinner
+                // stands in for duration so the row morphs into
+                // `╰ Build · model · 6m25s` without a second typewriter caret.
+                lines.push(streaming_turn_footer(app));
+            } else if let Some(footer) = &message.footer {
+                // Soft turn meta: muted hairline + peach mode glyph.
+                lines.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled("╰ ", Theme::meta()),
+                    Span::styled(footer.clone(), Theme::meta()),
+                ]));
             }
             lines
         }
         MessageRole::System => render_system(&message.content, wrap_width),
         MessageRole::Tool => render_tool(message, app, wrap_width),
     }
+}
+
+/// Live assistant footer while tokens are still arriving.
+///
+/// Mirrors the finished turn footer (`╰ agent · mode · duration`) so the
+/// chrome is continuous; the braille spinner (same family as tools / Working)
+/// occupies the duration slot until the turn seals.
+fn streaming_turn_footer(app: &App) -> Line<'static> {
+    let spin = SPINNER[app.spinner_frame % SPINNER.len()];
+    let agent = if app.agent_label.is_empty() {
+        "Build"
+    } else {
+        app.agent_label.as_str()
+    };
+    let mut meta = agent.to_string();
+    if !app.mode_label.is_empty() {
+        meta.push_str(" · ");
+        meta.push_str(&app.mode_label);
+    }
+    Line::from(vec![
+        Span::raw("  "),
+        Span::styled("╰ ", Theme::meta()),
+        Span::styled(format!("{meta} · "), Theme::meta()),
+        Span::styled(spin.to_string(), Theme::prompt_bar()),
+    ])
 }
 
 /// While thinking is streaming, only keep the rolling tail so long chains
@@ -1744,7 +1767,7 @@ const THINKING_STREAM_TAIL_LINES: usize = 3;
 ///
 /// ```text
 ///   ▸ thinking · 128 chars   ↵/click   (finished, default collapsed)
-///   ▾ thinking …                       (streaming: last 3 wrapped lines)
+///   ▾ thinking ⠋                       (streaming: spinner + last 3 lines)
 ///     …
 ///   ▾ thinking · 128 chars             (expanded full body)
 ///     …
@@ -1758,12 +1781,14 @@ fn render_thinking(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<
     let mut lines = Vec::new();
 
     if expanded {
+        let spin = SPINNER[app.spinner_frame % SPINNER.len()];
         lines.push(Line::from(vec![
             Span::raw("  "),
             Span::styled(chevron, Theme::thinking_chevron()),
             Span::styled(" thinking", Theme::thinking_title()),
             if message.streaming {
-                Span::styled(" …", Theme::thinking_meta())
+                // Same braille family as tools / Working — not an input caret.
+                Span::styled(format!(" {spin}"), Theme::thinking_meta())
             } else {
                 Span::styled(format!(" · {chars} chars"), Theme::thinking_meta())
             },
@@ -1780,34 +1805,13 @@ fn render_thinking(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<
         if message.streaming && body.len() > THINKING_STREAM_TAIL_LINES {
             body = body[body.len() - THINKING_STREAM_TAIL_LINES..].to_vec();
         }
-        let last = body.len().saturating_sub(1);
-        if body.is_empty() {
-            // Empty so far — reserve one row with a stable-width caret (no vertical jump).
-            if message.streaming {
-                let caret = if app.cursor_on {
-                    Span::styled("▌", Theme::cursor())
-                } else {
-                    Span::raw(" ")
-                };
-                lines.push(Line::from(vec![Span::raw("    "), caret]));
-            }
-        } else {
-            for (i, line) in body.into_iter().enumerate() {
-                let mut spans = vec![
-                    Span::raw("    "),
-                    Span::styled(line, Theme::thinking_body()),
-                ];
-                // Inline caret on the last line (same pattern as assistant stream).
-                // Always reserve width so blink does not shift layout.
-                if message.streaming && i == last {
-                    if app.cursor_on {
-                        spans.push(Span::styled(" ▌", Theme::cursor()));
-                    } else {
-                        spans.push(Span::raw("  "));
-                    }
-                }
-                lines.push(Line::from(spans));
-            }
+        // Body is pure text — activity lives on the header spinner, not a
+        // trailing caret that collides with the prompt typewriter.
+        for line in body {
+            lines.push(Line::from(vec![
+                Span::raw("    "),
+                Span::styled(line, Theme::thinking_body()),
+            ]));
         }
     } else {
         lines.push(Line::from(vec![
@@ -1849,26 +1853,16 @@ fn render_user(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// Assistant: soft indent + full markdown (tables, code, lists, …) + streaming caret.
-fn render_assistant(
-    content: &str,
-    streaming: bool,
-    cursor_on: bool,
-    wrap_width: usize,
-) -> Vec<Line<'static>> {
+/// Assistant: soft indent + full markdown (tables, code, lists, …).
+///
+/// Live activity is painted as the turn footer (`streaming_turn_footer`), not
+/// an end-of-line caret — that kept colliding with the prompt typewriter bar.
+fn render_assistant(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
     // 2-space indent leaves room without crowding the user bubble.
     let budget = wrap_width.saturating_sub(2).max(8);
     let mut out = Vec::new();
 
     if content.trim().is_empty() {
-        if streaming {
-            let caret = if cursor_on {
-                Span::styled("▌", Theme::cursor())
-            } else {
-                Span::raw(" ")
-            };
-            out.push(Line::from(vec![Span::raw("  "), caret]));
-        }
         return out;
     }
 
@@ -1882,17 +1876,9 @@ fn render_assistant(
         md_lines.pop();
     }
 
-    let last = md_lines.len().saturating_sub(1);
-    for (i, line) in md_lines.into_iter().enumerate() {
+    for line in md_lines {
         let mut spans = vec![Span::raw("  ")];
         spans.extend(line.spans);
-        if streaming && i == last {
-            if cursor_on {
-                spans.push(Span::styled(" ▌", Theme::cursor()));
-            } else {
-                spans.push(Span::raw("  "));
-            }
-        }
         out.push(Line::from(spans));
     }
     out
@@ -3236,22 +3222,62 @@ mod tests {
     }
 
     #[test]
-    fn streaming_thinking_caret_does_not_add_extra_row() {
-        // Blink off must not drop a full line (that was the vertical jump).
+    fn streaming_thinking_spinner_keeps_stable_row_count() {
+        // Spinner frame advance must not change layout height.
         let body = "alpha\nbeta\ngamma\ndelta";
         let msg = crate::message::Message::streaming_thinking(body);
         let mut app = App::new("test");
-        app.cursor_on = true;
-        let on = render_thinking(&msg, &app, 40);
-        app.cursor_on = false;
-        let off = render_thinking(&msg, &app, 40);
+        app.spinner_frame = 0;
+        let a = render_thinking(&msg, &app, 40);
+        app.spinner_frame = 3;
+        let b = render_thinking(&msg, &app, 40);
         assert_eq!(
-            on.len(),
-            off.len(),
-            "caret blink must keep the same row count (no vertical jump)"
+            a.len(),
+            b.len(),
+            "thinking spinner must keep the same row count"
         );
-        // Tail window: header + last 3 body lines (delta/beta/gamma/delta → last 3).
-        assert_eq!(on.len(), 1 + THINKING_STREAM_TAIL_LINES);
+        // Tail window: header + last 3 body lines.
+        assert_eq!(a.len(), 1 + THINKING_STREAM_TAIL_LINES);
+    }
+
+    #[test]
+    fn streaming_assistant_uses_live_turn_footer_not_caret() {
+        let backend = TestBackend::new(60, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.agent_label = "Build".into();
+        app.mode_label = "grok-4.5".into();
+        app.busy = true;
+        app.spinner_frame = 0;
+        app.append_stream("hello stream");
+        app.sync_stream_message();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+
+        assert!(flat.contains("hello stream"), "body: {flat}");
+        assert!(
+            flat.contains('╰') && flat.contains("Build") && flat.contains("grok-4.5"),
+            "live footer should mirror finished turn chrome, got:\n{flat}"
+        );
+        // Prompt still owns the typewriter bar — stream must not paint one.
+        let stream_area = flat.replace('▌', ""); // crude: ensure we still have content
+        assert!(
+            !flat.contains("hello stream▌") && !flat.contains("hello stream ▌"),
+            "streaming body must not end with typewriter caret, got:\n{flat}"
+        );
+        let _ = stream_area;
+        // Braille spinner occupies the duration slot.
+        assert!(
+            SPINNER.iter().any(|s| flat.contains(s)),
+            "live footer should show spinner, got:\n{flat}"
+        );
     }
 
     #[test]

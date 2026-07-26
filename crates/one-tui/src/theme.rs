@@ -323,11 +323,6 @@ impl Theme {
         Style::default().bg(Self::ELEMENT).fg(Self::MUTED)
     }
 
-    /// Streaming caret in assistant text.
-    pub fn cursor() -> Style {
-        Style::default().fg(Self::PRIMARY)
-    }
-
     /// Input caret on — software typewriter bar (▌).
     pub fn input_cursor_on() -> Style {
         Style::default().fg(Self::PRIMARY).bg(Self::ELEMENT)

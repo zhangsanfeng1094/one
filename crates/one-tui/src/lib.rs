@@ -7,7 +7,7 @@
 //! Architecture:
 //! - **Persistent** [`TerminalSession`]: alternate screen + mouse capture (hides shell scrollback)
 //! - **Structured** [`Message`] roles with soft, role-specific paint (not label soup)
-//! - **Streaming** via [`TerminalSession::run_busy`] (token paint + blink caret)
+//! - **Streaming** via [`TerminalSession::run_busy`] (token paint + live turn footer)
 //! - **Scroll + copy**: mouse wheel scrolls chat (capture on). Drag selects
 //!   text (character-level) in-app and copies via **OSC 52** (lazygit/Claude Code pattern).
 //!   `Ctrl+Shift+C` / `y` also copy; `Ctrl+Shift+M` toggles mouse;

@@ -1,7 +1,7 @@
 //! Settings, MCP, skills, features, and agents float UI for [`App`].
 //!
 //! Open/navigate/confirm handlers for the centered Settings hierarchy live here
-//! so `app.rs` stays focused on input, streaming, and chat chrome.
+//! so [`crate::app`] stays focused on input, streaming, and chat chrome.
 
 use crate::app::App;
 use crate::float::{FloatKind, FloatMenu};
