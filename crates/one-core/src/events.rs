@@ -1,5 +1,6 @@
 use crate::message::AgentMessage;
 use crate::tool::{ToolCall, ToolOutput};
+use std::time::Duration;
 
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
@@ -20,6 +21,20 @@ pub enum AgentEvent {
     },
     ThinkingDelta {
         delta: String,
+    },
+    /// A recoverable model failure will be retried after a short backoff.
+    RetryScheduled {
+        /// One-based retry number (the first retry is `1`).
+        retry: usize,
+        max_retries: usize,
+        delay: Duration,
+        /// Compact user-facing reason, never a full provider payload.
+        reason: String,
+    },
+    /// The scheduled retry's next provider request has started.
+    RetryStarted {
+        retry: usize,
+        max_retries: usize,
     },
     ServerTool {
         provider: String,

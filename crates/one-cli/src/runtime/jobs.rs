@@ -96,6 +96,27 @@ impl JobEventLog {
             AgentEvent::ThinkingDelta { .. } => {
                 self.set_activity("thinking");
             }
+            AgentEvent::RetryScheduled {
+                retry,
+                max_retries,
+                delay,
+                reason,
+            } => {
+                let line = format!(
+                    "▸ retry {retry}/{max_retries} in {}s · {reason}",
+                    delay.as_secs()
+                );
+                self.set_activity(line.clone());
+                self.push_line(line);
+            }
+            AgentEvent::RetryStarted {
+                retry,
+                max_retries,
+            } => {
+                let line = format!("→ retry {retry}/{max_retries} started");
+                self.set_activity(line.clone());
+                self.push_line(line);
+            }
             AgentEvent::ToolExecutionStart { tool_call } => {
                 let detail = tool_call_brief(tool_call);
                 let line = if detail.is_empty() {

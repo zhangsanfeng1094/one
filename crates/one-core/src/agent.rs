@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -116,10 +116,15 @@ impl ThinkingLevel {
     }
 }
 
-/// Extra LLM samples after an empty completion (no visible text / tool calls).
-/// Total attempts = 1 + this value. Aligns with Grok Build's EmptyResponse retry
-/// (their default is higher; we keep a small local budget).
-pub const DEFAULT_EMPTY_RESPONSE_RETRIES: usize = 2;
+/// Extra LLM samples after a retryable completion failure.
+///
+/// This covers blank model completions and temporary provider errors such as
+/// capacity, rate limiting, or unavailable upstreams. Total attempts = 1 +
+/// this value. Each retry is delayed with a capped backoff so we do not hammer
+/// a provider that is already overloaded.
+pub const DEFAULT_EMPTY_RESPONSE_RETRIES: usize = 10;
+
+const RETRY_BACKOFF_SECS: &[u64] = &[2, 3, 5, 8, 13, 20];
 
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -133,7 +138,7 @@ pub struct AgentConfig {
     /// Does **not** gate response handling: `web_search_call` events and
     /// `citations` are always parsed if the upstream/proxy returns them.
     pub server_search: bool,
-    /// How many times to re-sample after a blank model turn (no text, no tools).
+    /// How many times to retry a blank model turn or temporary provider error.
     /// Reasoning-only turns count as empty (same as Grok Build).
     pub empty_response_retries: usize,
 }
@@ -705,6 +710,40 @@ impl Agent {
                     Ok(r) => r,
                     Err(err) => {
                         let err = map_provider_error(err);
+                        if is_retryable_provider_error(&err) && sample_attempt <= empty_budget {
+                            self.record_trace(TraceEvent::LlmResponse {
+                                ts_ms: now_ms(),
+                                run_id: run_id.clone(),
+                                turn,
+                                latency_ms: llm_start.elapsed().as_millis() as u64,
+                                ttft_ms: *ttft_ms.lock().expect("ttft"),
+                                stop_reason: "provider_retry".into(),
+                                tool_calls_n: 0,
+                                text_len: 0,
+                                thinking_len: 0,
+                                usage: TokenUsage::default(),
+                                provider: provider.name().to_string(),
+                                model: provider.model().to_string(),
+                                output_preview: Some(format!(
+                                    "{} — retry {sample_attempt}/{empty_budget}",
+                                    retry_reason(&err)
+                                )),
+                            });
+                            if !self
+                                .wait_for_completion_retry(
+                                    sample_attempt,
+                                    empty_budget,
+                                    retry_reason(&err),
+                                )
+                                .await
+                            {
+                                return self
+                                    .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                                    .await;
+                            }
+                            *ttft_ms.lock().expect("ttft") = None;
+                            continue;
+                        }
                         self.record_trace(TraceEvent::RunEnd {
                             ts_ms: now_ms(),
                             run_id: run_id.clone(),
@@ -754,6 +793,18 @@ impl Agent {
                     });
                     if !response.usage.is_zero() {
                         self.token_usage.add_assign(&response.usage);
+                    }
+                    if !self
+                        .wait_for_completion_retry(
+                            sample_attempt,
+                            empty_budget,
+                            "empty model response",
+                        )
+                        .await
+                    {
+                        return self
+                            .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                            .await;
                     }
                     // Reset TTFT so the next sample can measure fresh.
                     *ttft_ms.lock().expect("ttft") = None;
@@ -1508,6 +1559,30 @@ impl Agent {
             listener(&event);
         }
     }
+
+    /// Wait between completion attempts while still allowing Esc to abort.
+    async fn wait_for_completion_retry(
+        &mut self,
+        retry: usize,
+        max_retries: usize,
+        reason: &str,
+    ) -> bool {
+        let delay = retry_backoff_delay(retry);
+        self.emit(AgentEvent::RetryScheduled {
+            retry,
+            max_retries,
+            delay,
+            reason: reason.to_string(),
+        });
+        if crate::streaming::race_abort(tokio::time::sleep(delay), Some(&self.abort_flag))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        self.emit(AgentEvent::RetryStarted { retry, max_retries });
+        true
+    }
 }
 
 type ParallelToolJob = (
@@ -1652,6 +1727,59 @@ fn map_provider_error(err: OneError) -> OneError {
             OneError::ContextOverflow(msg)
         }
         other => other,
+    }
+}
+
+/// Delay before the one-based `retry` attempt. Fibonacci-like growth gives an
+/// overloaded provider breathing room without making early recovery sluggish.
+pub fn retry_backoff_delay(retry: usize) -> Duration {
+    let index = retry.saturating_sub(1).min(RETRY_BACKOFF_SECS.len() - 1);
+    Duration::from_secs(RETRY_BACKOFF_SECS[index])
+}
+
+/// Whether the provider failure is likely temporary and safe to retry.
+///
+/// We deliberately do not retry auth, malformed-request, model-not-found, or
+/// context-overflow failures; those need user/configuration action instead.
+pub fn is_retryable_provider_error(err: &OneError) -> bool {
+    let OneError::Provider(message) = err else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    [
+        "at capacity",
+        "capacity due to high demand",
+        "overloaded",
+        "upstream request failed",
+        "upstream",
+        "rate limit",
+        "too many requests",
+        "status 429",
+        "status 500",
+        "status 502",
+        "status 503",
+        "status 504",
+        "timeout",
+        "timed out",
+        "temporarily unavailable",
+        "connection reset",
+        "connection refused",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
+}
+
+fn retry_reason(err: &OneError) -> &'static str {
+    let OneError::Provider(message) = err else {
+        return "provider request failed";
+    };
+    let message = message.to_ascii_lowercase();
+    if message.contains("capacity") || message.contains("overloaded") {
+        "provider at capacity"
+    } else if message.contains("rate limit") || message.contains("429") {
+        "provider rate limited"
+    } else {
+        "temporary upstream failure"
     }
 }
 
@@ -2185,6 +2313,86 @@ mod tests {
                     })
             )),
             "empty assistant should not be committed on failure"
+        );
+    }
+
+    #[test]
+    fn retryable_provider_errors_and_backoff_are_classified() {
+        assert!(is_retryable_provider_error(&OneError::Provider(
+            "The model is currently at capacity due to high demand".into()
+        )));
+        assert!(is_retryable_provider_error(&OneError::Provider(
+            "upstream request failed (status 503)".into()
+        )));
+        assert!(!is_retryable_provider_error(&OneError::Provider(
+            "invalid API key".into()
+        )));
+        assert_eq!(retry_backoff_delay(1), Duration::from_secs(2));
+        assert_eq!(retry_backoff_delay(4), Duration::from_secs(8));
+        assert_eq!(retry_backoff_delay(10), Duration::from_secs(20));
+    }
+
+    #[tokio::test]
+    async fn temporary_provider_errors_retry_then_succeed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CapacityThenText {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for CapacityThenText {
+            fn name(&self) -> &str {
+                "capacity-then-text"
+            }
+
+            fn model(&self) -> &str {
+                "test"
+            }
+
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                if call < 2 {
+                    Err(OneError::Provider("model at capacity".into()))
+                } else {
+                    Ok(empty_resp(vec![ContentBlock::text("recovered")]))
+                }
+            }
+        }
+
+        let provider = CapacityThenText {
+            calls: AtomicUsize::new(0),
+        };
+        let events = Arc::new(Mutex::new(Vec::<AgentEvent>::new()));
+        let mut agent = Agent::new(
+            AgentConfig {
+                empty_response_retries: 2,
+                ..AgentConfig::default()
+            },
+            Vec::new(),
+        );
+        let collector = events.clone();
+        agent.subscribe(Box::new(move |event| {
+            collector.lock().expect("events").push(event.clone());
+        }));
+
+        let out = agent.prompt(&provider, "hi").await.expect("should recover");
+        assert_eq!(out, "recovered");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        let events = events.lock().expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::RetryScheduled { .. }))
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::RetryStarted { .. }))
+                .count(),
+            2
         );
     }
 

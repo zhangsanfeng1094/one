@@ -149,10 +149,10 @@ pub struct Settings {
     pub tool_output: Option<ToolOutputSettings>,
     /// Context compaction strategy (threshold + optional tool prune).
     pub compaction: Option<CompactionSettings>,
-    /// Extra LLM samples after a blank turn (no text / no tool calls).
+    /// Extra LLM samples after a blank turn or temporary provider failure.
     ///
-    /// Default: [`one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES`] (2).
-    /// `0` disables re-sampling (fail on first empty). Override with env
+    /// Default: [`one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES`] (10).
+    /// `0` disables automatic retries. Override with env
     /// `ONE_EMPTY_RESPONSE_RETRIES` when set.
     pub empty_response_retries: Option<usize>,
 }
@@ -166,7 +166,7 @@ impl Settings {
             .unwrap_or_else(|| one_core::CompactionConfig::from_context_window(context_window))
     }
 
-    /// Empty-completion re-sample budget (env wins when parseable).
+    /// Retry budget for blank completions and temporary provider failures.
     pub fn empty_response_retries(&self) -> usize {
         if let Ok(v) = std::env::var("ONE_EMPTY_RESPONSE_RETRIES") {
             if let Ok(n) = v.trim().parse::<usize>() {

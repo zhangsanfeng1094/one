@@ -18,6 +18,32 @@ impl AppRuntime {
                 let line = serde_json::json!({"type":"thinking_delta","delta":delta});
                 println!("{line}");
             }
+            AgentEvent::RetryScheduled {
+                retry,
+                max_retries,
+                delay,
+                reason,
+            } if !json => {
+                eprintln!(
+                    "\n[retry] {reason} · retry {retry}/{max_retries} in {}s",
+                    delay.as_secs()
+                );
+            }
+            AgentEvent::RetryScheduled {
+                retry,
+                max_retries,
+                delay,
+                reason,
+            } if json => {
+                let line = serde_json::json!({
+                    "type":"retry_scheduled",
+                    "retry":retry,
+                    "max_retries":max_retries,
+                    "delay_secs":delay.as_secs(),
+                    "reason":reason,
+                });
+                println!("{line}");
+            }
             AgentEvent::TextDelta { delta } if !json => print!("{delta}"),
             AgentEvent::TextDelta { delta } if json => {
                 let line = serde_json::json!({"type":"text_delta","delta":delta});
