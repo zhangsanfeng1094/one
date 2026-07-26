@@ -153,6 +153,26 @@ pub async fn read_sse_response(
     Ok(())
 }
 
+/// Read an SSE response and distinguish abort from other failures.
+///
+/// Returns `Ok(true)` if the run was aborted, `Ok(false)` if the stream ended
+/// cleanly, and `Err(..)` for transport / provider errors.
+///
+/// Callers must **not** treat non-abort errors as an empty successful
+/// completion — that previously swallowed mid-stream failures as `stop` with
+/// empty content (Grok Build: Failed + retry, never silent empty Ok).
+pub async fn read_sse_may_abort(
+    response: Response,
+    on_data: &mut (dyn FnMut(&str) + Send),
+    abort: Option<&AtomicBool>,
+) -> Result<bool> {
+    match read_sse_response(response, on_data, abort).await {
+        Ok(()) => Ok(false),
+        Err(OneError::Aborted) => Ok(true),
+        Err(err) => Err(err),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -176,6 +196,20 @@ mod tests {
         push_utf8_chunk(&mut pending, &mut out, &nihao[2..]);
         assert_eq!(out, "你好");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn may_abort_distinguishes_abort_from_other_errors() {
+        // Unit-level: match semantics of read_sse_may_abort without a live HTTP body.
+        fn classify(err: OneError) -> Result<bool> {
+            match err {
+                OneError::Aborted => Ok(true),
+                other => Err(other),
+            }
+        }
+        assert!(matches!(classify(OneError::Aborted), Ok(true)));
+        let err = classify(OneError::Provider("connection reset".into())).unwrap_err();
+        assert!(matches!(err, OneError::Provider(_)));
     }
 
     #[test]

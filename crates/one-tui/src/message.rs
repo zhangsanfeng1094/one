@@ -71,6 +71,8 @@ pub struct Message {
     pub thinking_expanded: bool,
     /// Alert severity (Alert role only).
     pub alert_level: Option<AlertLevel>,
+    /// Live subagent job id for `task` — click opens `/tasks` detail (not `/ps`).
+    pub tool_job_id: Option<String>,
 }
 
 fn blank_message(role: MessageRole, content: String) -> Message {
@@ -87,6 +89,7 @@ fn blank_message(role: MessageRole, content: String) -> Message {
         tool_ungroup: false,
         thinking_expanded: false,
         alert_level: None,
+        tool_job_id: None,
     }
 }
 

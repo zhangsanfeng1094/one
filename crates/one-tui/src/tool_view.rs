@@ -54,9 +54,7 @@ pub fn streak_group_eligible(messages: &[Message], start: usize, len: usize) -> 
     if len < COLLAPSE_GROUP_MIN {
         return false;
     }
-    messages[start..start + len]
-        .iter()
-        .all(tool_groupable_base)
+    messages[start..start + len].iter().all(tool_groupable_base)
 }
 
 /// True when the whole streak is done successes and none expanded → show group chip.
@@ -71,9 +69,7 @@ pub fn streak_can_collapse(messages: &[Message], start: usize, len: usize) -> bo
 pub fn streak_shows_group_header(messages: &[Message], start: usize, len: usize) -> bool {
     streak_group_eligible(messages, start, len)
         && !streak_can_collapse(messages, start, len)
-        && messages[start..start + len]
-            .iter()
-            .any(|m| m.tool_ungroup)
+        && messages[start..start + len].iter().any(|m| m.tool_ungroup)
 }
 
 /// Short label for a tool in a group header: `bash` / `edit:path`.
@@ -389,7 +385,10 @@ pub fn diff_tokens(s: &str) -> Vec<&str> {
 pub fn inline_diff_segments(old: &str, new: &str) -> (Vec<(String, bool)>, Vec<(String, bool)>) {
     const MAX: usize = 400;
     if old == new || old.len() > MAX || new.len() > MAX {
-        return (vec![(old.to_string(), false)], vec![(new.to_string(), false)]);
+        return (
+            vec![(old.to_string(), false)],
+            vec![(new.to_string(), false)],
+        );
     }
     let a = diff_tokens(old);
     let b = diff_tokens(new);
@@ -398,7 +397,10 @@ pub fn inline_diff_segments(old: &str, new: &str) -> (Vec<(String, bool)>, Vec<(
     }
     // Cap token count for O(n*m) LCS.
     if a.len() > 120 || b.len() > 120 {
-        return (vec![(old.to_string(), false)], vec![(new.to_string(), false)]);
+        return (
+            vec![(old.to_string(), false)],
+            vec![(new.to_string(), false)],
+        );
     }
 
     let n = a.len();
@@ -519,6 +521,38 @@ pub fn summarize_tool_special(
             let bytes = json_field(args, "content").map(|c| c.len()).unwrap_or(0);
             let summary = format!("wrote {path} · {bytes} B");
             Some((summary, false, better))
+        }
+        "task" => {
+            // Prefer status from trailer; keep ungrouped so rows stay clickable.
+            let status = output
+                .lines()
+                .find_map(|l| {
+                    let l = l.trim();
+                    if l.starts_with('[') && l.contains("task") {
+                        l.split("status=")
+                            .nth(1)
+                            .map(|s| s.split([']', ' ', '·']).next().unwrap_or(s).to_string())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| if is_error { "error" } else { "done" }.into());
+            let desc = json_field(args, "description")
+                .or_else(|| json_field(args, "agent"))
+                .or_else(|| json_field(args, "mode"))
+                .unwrap_or_else(|| "explore".into());
+            let id_bit = output
+                .split("id=")
+                .nth(1)
+                .map(|s| {
+                    s.chars()
+                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                        .collect::<String>()
+                })
+                .filter(|s| !s.is_empty())
+                .map(|s| format!(" · {s}"))
+                .unwrap_or_default();
+            Some((format!("{status} · {desc}{id_bit}"), false, None))
         }
         "bash" | "shell" => {
             // Background start: show task_id prominently (Claude-style), keep expanded
@@ -739,8 +773,14 @@ mod tests {
         assert!(add_lines.iter().any(|l| *l == "+fn a() {"), "{d}");
 
         let rows = parse_ide_diff_rows(&d);
-        assert!(rows.len() >= 8, "expected per-line ide rows, got {}", rows.len());
-        assert!(rows.iter().any(|r| r.kind == DiffLineKind::Del && r.text == "fn a() {}"));
+        assert!(
+            rows.len() >= 8,
+            "expected per-line ide rows, got {}",
+            rows.len()
+        );
+        assert!(rows
+            .iter()
+            .any(|r| r.kind == DiffLineKind::Del && r.text == "fn a() {}"));
         assert_eq!(rows[0].line_no, Some(1));
     }
 
@@ -749,7 +789,10 @@ mod tests {
         let args = r#"{"filePath":"b.txt","oldString":"x\ny","newString":"z"}"#;
         let d = edit_diff_from_args(args).unwrap();
         assert!(d.contains("Updated b.txt"), "{d}");
-        assert!(d.contains("-x") && d.contains("-y") && d.contains("+z"), "{d}");
+        assert!(
+            d.contains("-x") && d.contains("-y") && d.contains("+z"),
+            "{d}"
+        );
     }
 
     #[test]
@@ -811,8 +854,10 @@ Updated src/a.rs
 
     #[test]
     fn inline_diff_highlights_changed_words() {
-        let (old, new) =
-            inline_diff_segments("let text = tool_output_for_ui(output);", "let text = tool_output_for_ui(&output);");
+        let (old, new) = inline_diff_segments(
+            "let text = tool_output_for_ui(output);",
+            "let text = tool_output_for_ui(&output);",
+        );
         let emp_old: String = old
             .iter()
             .filter(|(_, e)| *e)

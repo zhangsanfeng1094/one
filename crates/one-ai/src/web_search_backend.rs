@@ -158,10 +158,22 @@ mod tests {
     fn capability_matches_server_tools_matrix() {
         assert!(supports_backend_search(ProviderApi::Responses, "gpt-5.2"));
         assert!(supports_backend_search(ProviderApi::Responses, "grok-4.5"));
-        assert!(supports_backend_search(ProviderApi::Responses, "composer-2.5"));
-        assert!(!supports_backend_search(ProviderApi::Completions, "gpt-5.2"));
-        assert!(!supports_backend_search(ProviderApi::Completions, "composer-2.5"));
-        assert!(!supports_backend_search(ProviderApi::Responses, "claude-sonnet"));
+        assert!(supports_backend_search(
+            ProviderApi::Responses,
+            "composer-2.5"
+        ));
+        assert!(!supports_backend_search(
+            ProviderApi::Completions,
+            "gpt-5.2"
+        ));
+        assert!(!supports_backend_search(
+            ProviderApi::Completions,
+            "composer-2.5"
+        ));
+        assert!(!supports_backend_search(
+            ProviderApi::Responses,
+            "claude-sonnet"
+        ));
     }
 
     #[test]

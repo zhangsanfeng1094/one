@@ -324,6 +324,7 @@ async fn run_one_task(
             max_turns,
             thinking_level: one_core::ThinkingLevel::Off,
             server_search: false,
+            empty_response_retries: crate::settings::load().empty_response_retries(),
         },
         tools,
     );

@@ -395,7 +395,10 @@ mod tests {
         let t = out.as_text();
         // Model-facing content is a short ack — no unified diff body.
         assert!(t.contains("Updated d.txt"), "{t}");
-        assert!(t.contains("+1") || t.contains("−1") || t.contains("-1"), "{t}");
+        assert!(
+            t.contains("+1") || t.contains("−1") || t.contains("-1"),
+            "{t}"
+        );
         assert!(!t.contains("--- a/"), "patch must not enter content: {t}");
         assert!(!t.contains("+++ b/"), "patch must not enter content: {t}");
         let details = out.details.as_ref().expect("details");
@@ -438,11 +441,19 @@ mod tests {
             .unwrap();
 
         let t = out.as_text();
-        assert!(t.len() < 500, "model content must stay short, got {} bytes: {t}", t.len());
+        assert!(
+            t.len() < 500,
+            "model content must stay short, got {} bytes: {t}",
+            t.len()
+        );
         assert!(!t.contains("--- a/"), "{t}");
         let patch = out.details.as_ref().unwrap()["patch"].as_str().unwrap();
         // Real hunk, not whole-file dump (~12k lines of -/+).
-        assert!(patch.len() < 2_000, "patch too large: {} bytes", patch.len());
+        assert!(
+            patch.len() < 2_000,
+            "patch too large: {} bytes",
+            patch.len()
+        );
         assert!(patch.contains("-fn target() { old() }"), "{patch}");
         assert!(patch.contains("+fn target() { new() }"), "{patch}");
         let _ = std::fs::remove_dir_all(&dir);

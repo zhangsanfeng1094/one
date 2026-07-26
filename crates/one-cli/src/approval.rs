@@ -2,8 +2,12 @@
 //!
 //! Combines fine-grained [`one_tools::PermissionRules`] with session memory and
 //! an optional UI channel for Ask verdicts.
+//!
+//! Also enforces workspace [`PathPolicy`] for path tools: write outside is hard
+//! deny; read outside may escalate via interactive Select (`path read:` reason).
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -12,8 +16,8 @@ use one_core::tool::ToolCall;
 use one_core::tool_gate::{ToolGate, ToolGateDecision};
 use one_tools::{
     bash_command, call_fingerprint, call_summary, command_matches_prefix, evaluate_permissions,
-    requires_escalation, suggested_command_prefix, PermissionRule, PermissionRules,
-    PermissionVerdict,
+    requires_escalation, suggested_command_prefix, tool_args::path_arg, AccessKind, PathPolicy,
+    PermissionRule, PermissionRules, PermissionVerdict,
 };
 use tokio::sync::oneshot;
 
@@ -69,10 +73,23 @@ struct PrefixAllow {
     prefix: String,
 }
 
+/// What kind of approval is pending — drives `respond` side effects.
+#[derive(Debug, Clone)]
+enum PendingKind {
+    /// High-risk bash / permission rules Ask (existing Always behavior).
+    Standard,
+    /// `sandbox_permissions: require_escalated`.
+    SandboxEscalate,
+    /// Out-of-workspace path read. Grants applied here; never enable_session_auto.
+    PathRead {
+        resolved: PathBuf,
+        suggested_root: Option<PathBuf>,
+    },
+}
+
 struct Pending {
     request: ApprovalRequest,
-    /// Whether the pending call requested sandbox escalation.
-    escalate: bool,
+    kind: PendingKind,
     tx: oneshot::Sender<ApprovalChoice>,
 }
 
@@ -85,10 +102,20 @@ pub struct PermissionGate {
     session_allows: Mutex<HashSet<String>>,
     session_prefixes: Mutex<Vec<PrefixAllow>>,
     pending: Mutex<Option<Pending>>,
+    /// Same PathPolicy shell as tools (shared `dynamic` Arc). Tests may omit.
+    path_policy: Option<PathPolicy>,
 }
 
 impl PermissionGate {
     pub fn new(rules: PermissionRules, mode: ApprovalMode) -> Arc<Self> {
+        Self::new_with_policy(rules, mode, None)
+    }
+
+    pub fn new_with_policy(
+        rules: PermissionRules,
+        mode: ApprovalMode,
+        path_policy: Option<PathPolicy>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             rules: rules.compiled(),
             mode: Mutex::new(mode),
@@ -96,10 +123,20 @@ impl PermissionGate {
             session_allows: Mutex::new(HashSet::new()),
             session_prefixes: Mutex::new(Vec::new()),
             pending: Mutex::new(None),
+            path_policy,
         })
     }
 
     pub fn with_auto_approve(rules: PermissionRules, auto: bool, interactive: bool) -> Arc<Self> {
+        Self::with_auto_approve_and_policy(rules, auto, interactive, None)
+    }
+
+    pub fn with_auto_approve_and_policy(
+        rules: PermissionRules,
+        auto: bool,
+        interactive: bool,
+        path_policy: Option<PathPolicy>,
+    ) -> Arc<Self> {
         let mode = if auto {
             ApprovalMode::Auto
         } else if interactive {
@@ -107,7 +144,12 @@ impl PermissionGate {
         } else {
             ApprovalMode::FailClosed
         };
-        Self::new(rules, mode)
+        Self::new_with_policy(rules, mode, path_policy)
+    }
+
+    /// Shared policy handle (for wiring asserts / tests).
+    pub fn path_policy(&self) -> Option<&PathPolicy> {
+        self.path_policy.as_ref()
     }
 
     pub fn mode(&self) -> ApprovalMode {
@@ -156,41 +198,76 @@ impl PermissionGate {
     pub fn respond(&self, choice: ApprovalChoice) -> bool {
         let mut g = self.pending.lock().expect("pending lock");
         if let Some(pending) = g.take() {
-            match &choice {
-                ApprovalChoice::Session => {
-                    self.session_allows
-                        .lock()
-                        .expect("session allows")
-                        .insert(pending.request.fingerprint.clone());
-                }
-                ApprovalChoice::Prefix => {
-                    if let Some(prefix) = pending.request.suggested_prefix.clone() {
-                        let tool_lc = pending.request.tool.to_ascii_lowercase();
-                        let tool = match tool_lc.as_str() {
-                            "bash" | "shell" => "bash".to_string(),
-                            other => other.to_string(),
-                        };
-                        let mut list = self.session_prefixes.lock().expect("session prefixes");
-                        let entry = PrefixAllow {
-                            tool,
-                            escalate_only: pending.escalate,
-                            prefix,
-                        };
-                        if !list.contains(&entry) {
-                            list.push(entry);
+            match &pending.kind {
+                PendingKind::PathRead {
+                    resolved,
+                    suggested_root,
+                } => {
+                    // Grants applied here; NEVER enable_session_auto for path reads.
+                    if let Some(policy) = &self.path_policy {
+                        match &choice {
+                            ApprovalChoice::Once => {
+                                policy.grant_read_path(resolved);
+                            }
+                            ApprovalChoice::Session | ApprovalChoice::Prefix => {
+                                if let Some(root) = suggested_root {
+                                    policy.grant_readable_root(root);
+                                } else {
+                                    policy.grant_read_path(resolved);
+                                }
+                            }
+                            ApprovalChoice::Always => {
+                                // Must not flip Auto. Treat as session root or Once.
+                                if let Some(root) = suggested_root {
+                                    policy.grant_readable_root(root);
+                                } else {
+                                    policy.grant_read_path(resolved);
+                                }
+                            }
+                            ApprovalChoice::Deny { .. } => {}
                         }
-                    } else {
-                        // No prefix available — fall back to exact fingerprint.
-                        self.session_allows
-                            .lock()
-                            .expect("session allows")
-                            .insert(pending.request.fingerprint.clone());
                     }
                 }
-                ApprovalChoice::Always => {
-                    self.enable_session_auto();
+                PendingKind::Standard | PendingKind::SandboxEscalate => {
+                    let escalate =
+                        matches!(pending.kind, PendingKind::SandboxEscalate);
+                    match &choice {
+                        ApprovalChoice::Session => {
+                            self.session_allows
+                                .lock()
+                                .expect("session allows")
+                                .insert(pending.request.fingerprint.clone());
+                        }
+                        ApprovalChoice::Prefix => {
+                            if let Some(prefix) = pending.request.suggested_prefix.clone() {
+                                let tool_lc = pending.request.tool.to_ascii_lowercase();
+                                let tool = match tool_lc.as_str() {
+                                    "bash" | "shell" => "bash".to_string(),
+                                    other => other.to_string(),
+                                };
+                                let mut list =
+                                    self.session_prefixes.lock().expect("session prefixes");
+                                let entry = PrefixAllow {
+                                    tool,
+                                    escalate_only: escalate,
+                                    prefix,
+                                };
+                                if !list.contains(&entry) {
+                                    list.push(entry);
+                                }
+                            } else {
+                                self.session_allows
+                                    .lock()
+                                    .expect("session allows")
+                                    .insert(pending.request.fingerprint.clone());
+                            }
+                        }
+                        ApprovalChoice::Always => {
+                            self.enable_session_auto();
+                        }
+                        _ => {}
+                    }
                 }
-                _ => {}
             }
             let _ = pending.tx.send(choice);
             true
@@ -205,6 +282,85 @@ impl PermissionGate {
             let _ = pending.tx.send(ApprovalChoice::Deny { feedback: None });
         }
     }
+
+    async fn await_approval(
+        &self,
+        request: ApprovalRequest,
+        kind: PendingKind,
+    ) -> ToolGateDecision {
+        let reason = request.reason.clone();
+        let tool = request.tool.clone();
+        let (tx, rx) = oneshot::channel();
+        {
+            let mut g = self.pending.lock().expect("pending lock");
+            if g.is_some() {
+                return ToolGateDecision::Deny {
+                    message: "another approval is already pending".into(),
+                };
+            }
+            *g = Some(Pending {
+                request: request.clone(),
+                kind,
+                tx,
+            });
+        }
+        match rx.await {
+            Ok(ApprovalChoice::Once)
+            | Ok(ApprovalChoice::Session)
+            | Ok(ApprovalChoice::Prefix)
+            | Ok(ApprovalChoice::Always) => ToolGateDecision::Allow,
+            Ok(ApprovalChoice::Deny { feedback }) => {
+                let msg = match feedback {
+                    Some(fb) if !fb.trim().is_empty() => {
+                        format!("user denied tool `{tool}` ({reason}): {fb}")
+                    }
+                    _ => format!("user denied tool `{tool}` ({reason})"),
+                };
+                ToolGateDecision::Deny { message: msg }
+            }
+            Err(_) => ToolGateDecision::Deny {
+                message: format!("user denied tool `{tool}` ({reason})"),
+            },
+        }
+    }
+
+}
+
+fn is_path_read_tool(name: &str) -> bool {
+    matches!(name, "read" | "grep" | "find" | "ls")
+}
+
+fn is_path_write_tool(name: &str) -> bool {
+    matches!(name, "write" | "edit")
+}
+
+/// When Interactive and path Select is allowed (not session_auto / kill-switch).
+fn path_prompt_allowed(mode: ApprovalMode, session_auto: bool) -> bool {
+    matches!(mode, ApprovalMode::Interactive)
+        && !session_auto
+        && path_read_escalate_env_enabled()
+}
+
+/// Kill-switch: `ONE_PATH_READ_ESCALATE=0` disables Select (hard deny).
+/// Default: enabled (Select ships with this feature).
+fn path_read_escalate_env_enabled() -> bool {
+    match std::env::var("ONE_PATH_READ_ESCALATE") {
+        Ok(v) => {
+            let t = v.trim();
+            !(t == "0" || t.eq_ignore_ascii_case("false") || t.eq_ignore_ascii_case("off"))
+        }
+        Err(_) => true,
+    }
+}
+
+fn path_from_call(call: &ToolCall) -> Option<String> {
+    if let Some(p) = path_arg(&call.arguments) {
+        return Some(p.to_string());
+    }
+    if matches!(call.name.as_str(), "grep" | "find" | "ls") {
+        return Some(".".into());
+    }
+    None
 }
 
 #[async_trait]
@@ -222,14 +378,19 @@ impl ToolGate for PermissionGate {
             .expect("session allows")
             .contains(&fp)
         {
-            return ToolGateDecision::Allow;
+            // Still enforce path boundary even for fingerprint-allowed bash? Fingerprints
+            // are only inserted for Standard/SandboxEscalate, not path tools. Path re-access
+            // is via PathPolicy grants. Fall through only for non-path tools.
+            if !is_path_read_tool(&call.name) && !is_path_write_tool(&call.name) {
+                return ToolGateDecision::Allow;
+            }
         }
 
         if self.matches_session_prefix(call) {
             return ToolGateDecision::Allow;
         }
 
-        // Env override always wins for automation.
+        // Env override always wins for automation (permission Ask only).
         let env_auto = std::env::var("ONE_AUTO_APPROVE")
             .or_else(|_| std::env::var("PI_AUTO_APPROVE"))
             .ok()
@@ -238,67 +399,123 @@ impl ToolGate for PermissionGate {
 
         let mode = self.mode();
         let auto = env_auto || self.session_auto() || matches!(mode, ApprovalMode::Auto);
-        match evaluate_permissions(call, &self.rules, auto) {
-            PermissionVerdict::Allow => ToolGateDecision::Allow,
-            PermissionVerdict::Deny { reason } => ToolGateDecision::Deny { message: reason },
+        let perm = evaluate_permissions(call, &self.rules, auto);
+        match perm {
+            PermissionVerdict::Deny { reason } => {
+                return ToolGateDecision::Deny { message: reason };
+            }
             PermissionVerdict::Ask { reason } => {
                 if auto {
-                    return ToolGateDecision::Allow;
-                }
-                match mode {
-                    ApprovalMode::Auto => ToolGateDecision::Allow,
-                    ApprovalMode::FailClosed => ToolGateDecision::Deny {
-                        message: format!(
-                            "{reason}. Denied in non-interactive mode. \
-                             Re-run with --yes / ONE_AUTO_APPROVE=1, or add an allow rule."
-                        ),
-                    },
-                    ApprovalMode::Interactive => {
-                        let id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
-                        let escalate = requires_escalation(call);
-                        let request = ApprovalRequest {
-                            id,
-                            tool: call.name.clone(),
-                            summary: call_summary(call),
-                            reason: reason.clone(),
-                            fingerprint: fp.clone(),
-                            suggested_prefix: suggested_command_prefix(call),
-                        };
-                        let (tx, rx) = oneshot::channel();
-                        {
-                            let mut g = self.pending.lock().expect("pending lock");
-                            // If something is already pending, deny this one (shouldn't happen serially).
-                            if g.is_some() {
-                                return ToolGateDecision::Deny {
-                                    message: "another approval is already pending".into(),
-                                };
-                            }
-                            *g = Some(Pending {
-                                request: request.clone(),
-                                escalate,
-                                tx,
-                            });
+                    // Fall through to path phase after Allow-equivalent.
+                } else {
+                    match mode {
+                        ApprovalMode::Auto => {}
+                        ApprovalMode::FailClosed => {
+                            return ToolGateDecision::Deny {
+                                message: format!(
+                                    "{reason}. Denied in non-interactive mode. \
+                                     Re-run with --yes / ONE_AUTO_APPROVE=1, or add an allow rule."
+                                ),
+                            };
                         }
-                        match rx.await {
-                            Ok(ApprovalChoice::Once)
-                            | Ok(ApprovalChoice::Session)
-                            | Ok(ApprovalChoice::Prefix)
-                            | Ok(ApprovalChoice::Always) => ToolGateDecision::Allow,
-                            Ok(ApprovalChoice::Deny { feedback }) => {
-                                let msg = match feedback {
-                                    Some(fb) if !fb.trim().is_empty() => {
-                                        format!("user denied tool `{}` ({reason}): {fb}", call.name)
-                                    }
-                                    _ => format!("user denied tool `{}` ({reason})", call.name),
-                                };
-                                ToolGateDecision::Deny { message: msg }
+                        ApprovalMode::Interactive => {
+                            let id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+                            let escalate = requires_escalation(call);
+                            let request = ApprovalRequest {
+                                id,
+                                tool: call.name.clone(),
+                                summary: call_summary(call),
+                                reason: reason.clone(),
+                                fingerprint: fp.clone(),
+                                suggested_prefix: suggested_command_prefix(call),
+                            };
+                            let kind = if escalate {
+                                PendingKind::SandboxEscalate
+                            } else {
+                                PendingKind::Standard
+                            };
+                            let decision = self.await_approval(request, kind).await;
+                            if !matches!(decision, ToolGateDecision::Allow) {
+                                return decision;
                             }
-                            Err(_) => ToolGateDecision::Deny {
-                                message: format!("user denied tool `{}` ({reason})", call.name),
-                            },
+                            // After bash approval, still run path phase for path tools.
                         }
                     }
                 }
+            }
+            PermissionVerdict::Allow => {}
+        }
+
+        // --- Path boundary phase (after permission rules Allow) ---
+        self.check_path_boundary(call).await
+    }
+}
+
+impl PermissionGate {
+    async fn check_path_boundary(&self, call: &ToolCall) -> ToolGateDecision {
+        let Some(policy) = &self.path_policy else {
+            // Tests / missing wiring: skip path phase (tools still enforce).
+            return ToolGateDecision::Allow;
+        };
+        if policy.is_full_access() {
+            return ToolGateDecision::Allow;
+        }
+
+        let name = call.name.as_str();
+
+        if is_path_write_tool(name) {
+            let Some(path_str) = path_arg(&call.arguments) else {
+                return ToolGateDecision::Allow; // tool will invalid_args
+            };
+            return match policy.resolve(path_str, AccessKind::Write) {
+                Ok(_) => ToolGateDecision::Allow,
+                Err(msg) => ToolGateDecision::Deny { message: msg },
+            };
+        }
+
+        if !is_path_read_tool(name) {
+            return ToolGateDecision::Allow;
+        }
+
+        let Some(path_str) = path_from_call(call) else {
+            return ToolGateDecision::Allow;
+        };
+
+        match policy.resolve(&path_str, AccessKind::Read) {
+            Ok(_) => ToolGateDecision::Allow,
+            Err(hard_msg) => {
+                // Outside workspace — escalate or hard deny.
+                let mode = self.mode();
+                if !path_prompt_allowed(mode, self.session_auto()) {
+                    return ToolGateDecision::Deny { message: hard_msg };
+                }
+
+                // Resolve path for grant storage (same as resolve would use).
+                let resolved = one_tools::path_policy::resolve_against_cwd(policy.cwd(), &path_str);
+                let suggested_root = policy.suggest_read_root(&resolved);
+
+                let id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+                let root_note = match &suggested_root {
+                    Some(r) => format!("suggested session root: {}", r.display()),
+                    None => "suggested session root: (none — this path only)".into(),
+                };
+                let reason = format!(
+                    "path read: outside workspace\npath: {}\n{root_note}",
+                    resolved.display()
+                );
+                let request = ApprovalRequest {
+                    id,
+                    tool: call.name.clone(),
+                    summary: format!("read {}", resolved.display()),
+                    reason,
+                    fingerprint: call_fingerprint(call),
+                    suggested_prefix: None,
+                };
+                let kind = PendingKind::PathRead {
+                    resolved: resolved.clone(),
+                    suggested_root: suggested_root.clone(),
+                };
+                self.await_approval(request, kind).await
             }
         }
     }
@@ -308,6 +525,7 @@ impl ToolGate for PermissionGate {
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::sync::Arc;
 
     #[tokio::test]
     async fn fail_closed_denies_high_risk() {
@@ -606,5 +824,266 @@ mod tests {
             })
             .await;
         assert_eq!(d, ToolGateDecision::Allow);
+    }
+
+    fn temp_workspace() -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "one-gate-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn path_fail_closed_no_prompt() {
+        let ws = temp_workspace();
+        let outside = std::env::temp_dir().join(format!("one-out-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = outside.join("x.txt");
+        std::fs::write(&file, "hi").unwrap();
+
+        let policy = PathPolicy::workspace(ws.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            false, // fail-closed
+            Some(policy),
+        );
+        let d = gate
+            .check(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": file.to_str().unwrap() }),
+            })
+            .await;
+        match d {
+            ToolGateDecision::Deny { message } => {
+                assert!(message.contains("outside workspace"), "{message}");
+            }
+            other => panic!("expected hard deny, got {other:?}"),
+        }
+        assert!(gate.poll_request().is_none());
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_auto_mode_hard_deny() {
+        let ws = temp_workspace();
+        let outside = std::env::temp_dir().join(format!("one-out-auto-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = outside.join("x.txt");
+        std::fs::write(&file, "hi").unwrap();
+
+        let policy = PathPolicy::workspace(ws.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            true, // auto
+            false,
+            Some(policy),
+        );
+        let d = gate
+            .check(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": file.to_str().unwrap() }),
+            })
+            .await;
+        assert!(matches!(d, ToolGateDecision::Deny { .. }));
+        assert!(gate.poll_request().is_none());
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_once_grant_visible_to_cloned_policy() {
+        let ws = temp_workspace();
+        let outside = std::env::temp_dir().join(format!("one-out-once-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = outside.join("x.txt");
+        std::fs::write(&file, "hi").unwrap();
+
+        let policy = PathPolicy::workspace(ws.clone());
+        let tool_policy = policy.clone();
+        assert!(Arc::ptr_eq(
+            &policy.dynamic_handle(),
+            &tool_policy.dynamic_handle()
+        ));
+
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            true,
+            Some(policy.clone()),
+        );
+        assert!(Arc::ptr_eq(
+            &policy.dynamic_handle(),
+            &gate.path_policy().unwrap().dynamic_handle()
+        ));
+
+        let g = gate.clone();
+        let path = file.to_str().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": path }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if let Some(req) = gate.poll_request() {
+                assert!(req.reason.starts_with("path read:"), "{}", req.reason);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.respond(ApprovalChoice::Once));
+        assert_eq!(handle.await.unwrap(), ToolGateDecision::Allow);
+        tool_policy
+            .check(&file, AccessKind::Read)
+            .expect("tool clone sees Once grant");
+        tool_policy
+            .check(&file, AccessKind::Write)
+            .expect_err("write still denied");
+        assert!(!gate.session_auto());
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_always_does_not_enable_session_auto() {
+        let ws = temp_workspace();
+        let outside = std::env::temp_dir().join(format!("one-out-alw-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = outside.join("x.txt");
+        std::fs::write(&file, "hi").unwrap();
+
+        let policy = PathPolicy::workspace(ws.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            true,
+            Some(policy.clone()),
+        );
+        let g = gate.clone();
+        let path = file.to_str().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": path }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Force Always as if UI offered it — must not flip session_auto.
+        assert!(gate.respond(ApprovalChoice::Always));
+        assert_eq!(handle.await.unwrap(), ToolGateDecision::Allow);
+        assert!(
+            !gate.session_auto(),
+            "path Always must not enable session_auto"
+        );
+        assert_eq!(gate.mode(), ApprovalMode::Interactive);
+        policy
+            .check(&file, AccessKind::Read)
+            .expect("Always maps to grant");
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_write_outside_hard_deny() {
+        let ws = temp_workspace();
+        let outside = std::env::temp_dir().join(format!("one-out-w-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = outside.join("x.txt");
+
+        let policy = PathPolicy::workspace(ws.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            true,
+            Some(policy),
+        );
+        let d = gate
+            .check(&ToolCall {
+                id: "1".into(),
+                name: "write".into(),
+                arguments: json!({ "path": file.to_str().unwrap(), "content": "x" }),
+            })
+            .await;
+        match d {
+            ToolGateDecision::Deny { message } => {
+                assert!(message.contains("outside workspace"), "{message}");
+                assert!(message.contains("write"), "{message}");
+            }
+            other => panic!("expected write deny, got {other:?}"),
+        }
+        assert!(gate.poll_request().is_none());
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_session_root_grant() {
+        let ws = temp_workspace();
+        let outside = std::env::temp_dir().join(format!("one-out-sess-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = outside.join("a.txt");
+        let other = outside.join("b.txt");
+        std::fs::write(&file, "a").unwrap();
+        std::fs::write(&other, "b").unwrap();
+
+        let policy = PathPolicy::workspace(ws.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            true,
+            Some(policy.clone()),
+        );
+        let g = gate.clone();
+        let path = file.to_str().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": path }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.respond(ApprovalChoice::Session));
+        assert_eq!(handle.await.unwrap(), ToolGateDecision::Allow);
+        // Sibling under session root should pass without another prompt.
+        let d2 = gate
+            .check(&ToolCall {
+                id: "2".into(),
+                name: "read".into(),
+                arguments: json!({ "path": other.to_str().unwrap() }),
+            })
+            .await;
+        assert_eq!(d2, ToolGateDecision::Allow);
+        assert!(gate.poll_request().is_none());
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
     }
 }

@@ -82,7 +82,24 @@ one --max-turns 16           # 单 prompt 最大 tool 循环
 | `~/.agents/skills`（跨客户端通用 skill 安装位） | **仅读** |
 | `~/.codex/skills` · `~/.claude/skills` · `~/.grok/skills`（兼容） | **仅读** |
 | 已发现 skill 的 package 目录（含 symlink 真实路径） | **仅读** |
-| 其它绝对路径 / `../` 逃逸 | **拒绝** |
+| 其它绝对路径 / `../` 逃逸 | **拒绝**（见下：交互读可审批） |
+
+### 越界读审批（交互）
+
+Interactive 模式下，`read` / `grep` / `find` / `ls` 访问工作区外路径时弹出 **路径读审批**（与 bash 高危审批同一 Select 通道）：
+
+| 选项 | 语义 |
+|------|------|
+| Yes, allow this path only | 本进程内只读放行该路径（目录则含子孙） |
+| Yes, add session root `…` | 本进程只读放行建议根目录（敏感树如 `~/.ssh` 不提供此项） |
+| No, deny | 保持边界拒绝 |
+
+- **无 Always**；不会因此进入 always-approve。
+- `write` / `edit` 越界仍 **硬拒**（不弹窗）。
+- `--yes` / Auto / bash **Always** 之后：路径边界仍硬拒、**不弹窗**（路径与 bash 自动化解耦）。
+- `ONE_AUTO_APPROVE=1` 且仍为 Interactive：仍弹路径审批（不自动放行）。
+- 关闭：`ONE_PATH_READ_ESCALATE=0`。
+- 子 agent 继承父会话已批准的只读 grants（detached 快照，不可写）。
 
 ```bash
 # 默认：只能改当前项目
@@ -286,6 +303,7 @@ one --list-models
   "context_window": 128000,
   "sandbox": "workspace-write",
   "additional_directories": [],
+  "empty_response_retries": 2,
   "features": {
     "subagent": true
   }
@@ -295,11 +313,16 @@ one --list-models
 **Features**（能力包）：关闭后对应工具 + system prompt section 一并过滤。V1 仅 `subagent`（`task` / `job_*` + 提示词策略），默认 **on**。  
 改上下文的 feature 在已有消息时只写入 settings 并 **pending**，需 **`/new`**（或冷启动）后才应用到当前 agent。
 
+**空回复重试**（`empty_response_retries`）：模型结束 turn 时既无正文也无 tool call（仅 thinking 也算空）时，自动再采样的次数。默认 **2**（共最多 3 次请求）；`0` 表示不重试、首次空即报错。环境变量 `ONE_EMPTY_RESPONSE_RETRIES` 可覆盖 settings。
+
 交互内：
 
 ```text
 /settings                  # 查看（居中面板）
 /settings thinking high    # 写入并立即生效（thinking）
+/settings empty_response_retries 2
+/settings empty_response_retries 0   # 关闭重试
+/settings empty_response_retries default
 /settings auto_approve true
 /settings features         # Features 面板
 /settings feature subagent off
@@ -678,7 +701,8 @@ cargo run -p one-cli --features http-providers -- --provider openai -m gpt-4o
 - `Alt+H`：打开 Help 目录（同 `/help`；有草稿也能开；`Ctrl+K` / `F1` / `Ctrl+/` 仍兼容）
 - `Ctrl+L`：模型 select（输入框上方）
 - `Ctrl+G`：Settings 居中面板
-- `PageUp` / `PageDown`：滚动对话记录
+- `PageUp` / `PageDown` / 鼠标滚轮：滚动对话记录；生成中向上滚动会进入稳定的历史浏览，不会被后续输出拉回底部
+- `Shift+G`（或 `End`）：跳到最新输出并恢复实时跟随；向下滚到最底部也会恢复跟随
 - `Esc`：中止生成（运行中）；关闭浮层
 - `Ctrl+C`：渐进退出（防误触）——浮层打开时先关浮层；输入非空时先清空；其余情况需再按一次才退出（busy 下第二次为强制退出，不会当成“取消生成”）
 - `/quit`：强制退出
@@ -707,6 +731,8 @@ Slash 命令：
 | `/skills [enable\|disable <name>]` | 管理 skills：裸命令打开开关面板；`enable`/`disable` 按名称切换 |
 | `/skill:name [args]` | **可选**强制加载 skill（默认由模型 `read` 按需加载） |
 | `/mcp [import\|enable\|disable <name>]` | MCP 面板 / 导入 / 开关 |
+| `/ps` `[id]` | **仅** background bash 进程列表 / stdout-stderr 尾；`x` 杀进程（**不含** subagent） |
+| `/tasks` `[job_id]` | **Subagent**（`task` 工具）列表；Enter 打开 turn/tool **live log**；`x` 杀 job。别名：`/jobs` `/subagents` |
 | `/export [path]` | 导出 HTML |
 | `/reload` | 热重载扩展 / skills / prompts / MCP 配置 |
 | `/clear` | 清空屏幕历史 |
@@ -721,7 +747,7 @@ Slash 命令：
 | `bash_output` | Act | 轮询/等待后台 bash 输出（`task_id` 可省略则列 `/ps` 式快照） |
 | `bash_kill` | Act | 终止指定后台 bash 任务 |
 | `grep` / `find` / `ls` | Act / Plan / read-only | 搜索与列举 |
-| `task` | Act / Plan / read-only | 子 agent（默认 explore）→ 同一 `harness::run`；见 [protocol.md](./protocol.md) |
+| `task` | Act / Plan / read-only | 子 agent（默认 explore）→ 同一 `harness::run`；见 [protocol.md](./protocol.md)。观测面与 bash **分层**：chip `task:N`、`/tasks` live log；点击 transcript 的 `task` 行打开 subagent 详情（**不**进 `/ps`） |
 | `ask_user` | 均有（仅 Interactive） | 结构化澄清问题 |
 | `web_search` / `web_fetch` | Act / Plan / read-only | 联网（需 `network` feature，CLI 默认开） |
 | `plan` 相关 + `exit_plan_mode` | Plan | 写 plan 文件并退出 Plan |

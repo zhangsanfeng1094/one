@@ -273,17 +273,25 @@ const EXPLORE_TOOLS: &[&str] = &[
 
 ### 3.4 用户可见行为（TUI：MVP 禁止子流）
 
-| 面 | MVP（绑定） |
-|----|-------------|
-| TUI tool 行 | `▸ task · explore · <description>` |
-| **子 LLM stream** | **禁止**刷到主 transcript / 多路 delta 穿层 |
-| 进度 | 仅粗粒度：`ToolProgress` → `Turn 3/16`（可选 spinner），**无 token 碎片** |
-| 结束 | 子 run End 后 **一次性** 把 summary 写入 tool_view（静态块） |
-| abort | 主 Esc → 取消所有子 permit 等待 + **agent jobs** `kill_all`（**不**杀 background bash） |
-| session | 子消息默认不进主 JSONL |
-| trace | Langfuse child under parent；TUI 不依赖子 stream |
+| 面 | MVP（绑定） | P1c 现状（对齐 Grok Build） |
+|----|-------------|---------------------------|
+| TUI tool 行 | `▸ task · explore · <description>` | 运行中 `turn t/m · → grep · … · /tasks`；点击打开 **subagent** live log |
+| **子 LLM stream** | **禁止**刷到主 transcript / 多路 delta 穿层 | **仍禁止**多路灌主 transcript |
+| 进度 | 粗粒度 turns | job `activity` + event log（tool 起止 / turn） |
+| 观测入口 | — | **与 bash 分层**：chip `task:N` · `/tasks` 列表/详情 · 点击 task 行。**不是** `/ps` |
+| 结束 | 子 run End 后 **一次性** summary 写入 tool_view | summary 仍一次性；event log 可回看 |
+| abort | 主 Esc → agent jobs `kill_all`（**不**杀 background bash） | 同左；`/tasks` 内 `x` 杀单个 subagent |
+| session | 子消息默认不进主 JSONL | 同左 |
+| trace | Langfuse child under parent | 同左 |
 
-Phase 3+ 若做子 stream：必须 **单路展开**（一次只看一个 task 的 transcript），禁止 4 路并行打同一 viewport。
+**分层（硬约束）**
+
+| 层 | 命令 | Chip | 内容 |
+|----|------|------|------|
+| 进程 | `/ps` | `bg:N` | background **bash** stdout/stderr |
+| Subagent | `/tasks`（别名 `/jobs` `/subagents`） | `task:N` | `task` 工具 · turn/tool live log |
+
+**单路展开**（P1c）：一次只看一个 subagent 的 live log（`SubagentDetail` float），禁止 4 路并行打同一 viewport。全屏 framed 子 transcript 为后续 TV4。
 
 ### 3.5 ask_user / 反向提问污染（绑定）
 

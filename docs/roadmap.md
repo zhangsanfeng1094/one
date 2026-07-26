@@ -114,6 +114,16 @@
 - [x] status trailer；无子 TUI stream；并发 permit
 - [x] mock e2e 主→task
 
+#### P1c — Subagent 观测（对齐 Grok Build · **高于** bash `/ps`）
+> 分层：**bash 后台 = 进程**（`/ps`）；**task = subagent**（`/tasks`）。两套 chip / float / outcome，禁止混列表。
+
+- [x] **TV0** 子 agent `AgentEvent` → job 环形日志 + `activity`（turn / tool）
+- [x] **TV1** 同步 `task` 也注册进 `AgentJobRegistry`（完成后不发 `[job completed]`）
+- [x] **TV2** **分层 UI**：`bg:N` + `/ps` 仅 bash；`task:N` + `/tasks` 仅 subagent live log
+- [x] **TV3** transcript `task` 行 → `OpenSubagentDetail`（**不**走 `/ps`）
+- [ ] **TV4** 全屏 framed 子 transcript（Grok 子会话框）
+- [ ] **TV5** scrollback 生命周期块（`Subagent running…` 活动后缀）
+
 #### P2 — 扩展
 - [ ] RPC `spawn` / `run`
 - [ ] `agents/*.md` 磁盘 preset

@@ -149,6 +149,12 @@ pub struct Settings {
     pub tool_output: Option<ToolOutputSettings>,
     /// Context compaction strategy (threshold + optional tool prune).
     pub compaction: Option<CompactionSettings>,
+    /// Extra LLM samples after a blank turn (no text / no tool calls).
+    ///
+    /// Default: [`one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES`] (2).
+    /// `0` disables re-sampling (fail on first empty). Override with env
+    /// `ONE_EMPTY_RESPONSE_RETRIES` when set.
+    pub empty_response_retries: Option<usize>,
 }
 
 impl Settings {
@@ -158,6 +164,17 @@ impl Settings {
             .as_ref()
             .map(|c| c.to_config(context_window))
             .unwrap_or_else(|| one_core::CompactionConfig::from_context_window(context_window))
+    }
+
+    /// Empty-completion re-sample budget (env wins when parseable).
+    pub fn empty_response_retries(&self) -> usize {
+        if let Ok(v) = std::env::var("ONE_EMPTY_RESPONSE_RETRIES") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                return n;
+            }
+        }
+        self.empty_response_retries
+            .unwrap_or(one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES)
     }
 
     pub fn compaction_or_default(&self) -> CompactionSettings {
@@ -445,6 +462,20 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                 .map_err(|_| "compaction.prune_max_chars must be a number".to_string())?;
             settings.compaction_mut().prune_max_chars = Some(n);
         }
+        "empty_response_retries"
+        | "empty-response-retries"
+        | "empty_retries"
+        | "empty-retries" => {
+            let v = value.trim().to_ascii_lowercase();
+            if matches!(v.as_str(), "default" | "auto" | "clear" | "") {
+                settings.empty_response_retries = None;
+            } else {
+                let n: usize = v.parse().map_err(|_| {
+                    "empty_response_retries must be a non-negative integer (or default)".to_string()
+                })?;
+                settings.empty_response_retries = Some(n);
+            }
+        }
         // Feature flags: /settings feature.subagent off  or  /settings features.subagent on
         key if key.starts_with("feature.") || key.starts_with("features.") => {
             let id = key
@@ -497,7 +528,8 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                 "unknown setting `{other}` · known: provider model thinking auto_approve \
                  context_window sandbox add_dir bash_sandbox tool_output.max_lines \
                  tool_output.max_bytes compaction.auto|ratio|threshold|keep_recent|prune \
-                 |prune_protect_tokens|prune_max_chars feature.<id> allow deny ask"
+                 |prune_protect_tokens|prune_max_chars empty_response_retries \
+                 feature.<id> allow deny ask"
             ));
         }
     }
@@ -604,6 +636,16 @@ pub fn rows(settings: &Settings) -> Vec<(String, String)> {
             "compaction".into(),
             settings.compaction_or_default().summary_line(),
         ),
+        (
+            "empty_response_retries".into(),
+            match settings.empty_response_retries {
+                Some(n) => n.to_string(),
+                None => format!(
+                    "{} (default)",
+                    one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES
+                ),
+            },
+        ),
         ("path".into(), path_display()),
     ]
 }
@@ -654,10 +696,34 @@ mod tests {
                 prune_protect_tokens: Some(20_000),
                 prune_max_chars: Some(1000),
             }),
+            empty_response_retries: Some(3),
         };
         let json = serde_json::to_string(&s).unwrap();
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn empty_response_retries_set_key_and_effective() {
+        let mut s = Settings::default();
+        assert_eq!(
+            s.empty_response_retries(),
+            one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES
+        );
+        set_key(&mut s, "empty_response_retries", "0").unwrap();
+        assert_eq!(s.empty_response_retries, Some(0));
+        // Env wins over settings when set.
+        std::env::set_var("ONE_EMPTY_RESPONSE_RETRIES", "5");
+        assert_eq!(s.empty_response_retries(), 5);
+        std::env::remove_var("ONE_EMPTY_RESPONSE_RETRIES");
+        assert_eq!(s.empty_response_retries(), 0);
+        set_key(&mut s, "empty_response_retries", "default").unwrap();
+        assert_eq!(s.empty_response_retries, None);
+        assert_eq!(
+            s.empty_response_retries(),
+            one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES
+        );
+        assert!(set_key(&mut s, "empty_response_retries", "nope").is_err());
     }
 
     #[test]

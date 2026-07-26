@@ -111,6 +111,15 @@ impl AppRuntime {
         self.agent.lock().await.config.thinking_level
     }
 
+    /// Live-update empty-completion re-sample budget (from `/settings`).
+    pub async fn set_empty_response_retries(&self, retries: usize) {
+        self.agent.lock().await.config.empty_response_retries = retries;
+    }
+
+    pub async fn empty_response_retries(&self) -> usize {
+        self.agent.lock().await.config.empty_response_retries
+    }
+
     pub async fn estimated_tokens(&self) -> usize {
         let agent = self.agent.lock().await;
         one_core::estimate_tokens(&agent.messages)

@@ -98,12 +98,22 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/ps",
         usage: "/ps [task_id]",
-        description: "background bash/jobs · status · output tail (Codex-style)",
+        description: "background bash only · process list · stdout/stderr tail",
+    },
+    SlashCommand {
+        name: "/tasks",
+        usage: "/tasks [job_id]",
+        description: "subagents (task tool) · live turns/tools · higher-level than /ps",
     },
     SlashCommand {
         name: "/jobs",
-        usage: "/jobs [task_id]",
-        description: "alias for /ps",
+        usage: "/jobs [job_id]",
+        description: "alias for /tasks (agent jobs, not bash)",
+    },
+    SlashCommand {
+        name: "/subagents",
+        usage: "/subagents [job_id]",
+        description: "alias for /tasks",
     },
     SlashCommand {
         name: "/skill",

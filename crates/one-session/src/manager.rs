@@ -534,10 +534,7 @@ fn list_sessions_sync(cwd: &Path) -> Vec<SessionInfo> {
 
 /// Prefix-scan a session JSONL for list metadata only — never materializes full
 /// `SessionEntry` trees or multi-MB tool payloads into the agent message model.
-fn scan_session_list_info(
-    path: &Path,
-    fs_modified: chrono::DateTime<Utc>,
-) -> Option<SessionInfo> {
+fn scan_session_list_info(path: &Path, fs_modified: chrono::DateTime<Utc>) -> Option<SessionInfo> {
     let file = std::fs::File::open(path).ok()?;
     let mut limited = file.take(LIST_SCAN_MAX_BYTES);
     let mut content = String::new();
@@ -865,7 +862,9 @@ mod tests {
         // Labels come from lightweight scan.
         let labels: Vec<_> = list.iter().map(|s| s.display_label()).collect();
         assert!(
-            labels.iter().any(|l| l.contains("named-new") || l.contains("newer")),
+            labels
+                .iter()
+                .any(|l| l.contains("named-new") || l.contains("newer")),
             "expected newer label, got {labels:?}"
         );
         assert!(

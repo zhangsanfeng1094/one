@@ -488,12 +488,16 @@ impl Theme {
 
     /// 1-col left accent rail (add).
     pub fn diff_mark_add() -> Style {
-        Style::default().fg(Self::DIFF_ADD_MARK).bg(Self::DIFF_ADD_BG)
+        Style::default()
+            .fg(Self::DIFF_ADD_MARK)
+            .bg(Self::DIFF_ADD_BG)
     }
 
     /// 1-col left accent rail (delete).
     pub fn diff_mark_del() -> Style {
-        Style::default().fg(Self::DIFF_DEL_MARK).bg(Self::DIFF_DEL_BG)
+        Style::default()
+            .fg(Self::DIFF_DEL_MARK)
+            .bg(Self::DIFF_DEL_BG)
     }
 
     pub fn diff_mark_ctx() -> Style {

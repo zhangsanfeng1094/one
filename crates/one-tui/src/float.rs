@@ -5,6 +5,7 @@
 //! title · search · section headers · items with right-aligned hints · footer.
 
 use crate::slash::ModelChoice;
+use crate::state::SettingsDeleteTarget;
 
 /// Visual role of a float row.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -64,6 +65,8 @@ pub enum FloatKind {
     SettingsProviders,
     /// Actions for one provider.
     SettingsProviderDetail,
+    /// Advanced compatibility overrides for one provider.
+    SettingsProviderCompat,
     /// Provider-level API enum picker.
     SettingsProviderApi,
     /// Provider/model thinkingFormat picker.
@@ -78,6 +81,8 @@ pub enum FloatKind {
     SettingsModelDetail,
     /// Add-model form under a provider (stays in Settings float).
     SettingsModelAdd,
+    /// Typed confirmation for deleting a provider or model.
+    SettingsDeleteConfirm,
     /// Skills manager — list + enable/disable (Codex-style).
     Skills,
     /// Agent presets (disk JSON/MD + builtins) — paths + tools.
@@ -88,10 +93,14 @@ pub enum FloatKind {
     Mcp,
     /// Import MCP servers from Claude / Codex / Cursor.
     McpImport,
-    /// Background bash + agent jobs list (`/ps`).
+    /// Background **bash** process list (`/ps`) — shell only, not subagents.
     Background,
-    /// One background task detail (status + output tail). Esc → list.
+    /// One bash process detail (stdout/stderr tail). Esc → list.
     BackgroundDetail,
+    /// Subagent (`task`) list (`/tasks`) — agent-level, separate from `/ps`.
+    Subagent,
+    /// One subagent live log (turns/tools). Esc → subagent list.
+    SubagentDetail,
     /// Subscription / OAuth login provider picker (`/login`).
     Login,
     /// Logout provider picker (`/logout`).
@@ -382,13 +391,13 @@ impl FloatMenu {
         }
     }
 
-    /// `/ps` list. `rows`: `(id, status_label, command, elapsed)`.
+    /// `/ps` bash process list. `rows`: `(id, status_label, command, elapsed)`.
     pub fn background_picker(rows: &[(String, String, String, String)]) -> Self {
         let items: Vec<FloatItem> = if rows.is_empty() {
             vec![FloatItem {
                 id: "_empty".into(),
                 label: "—".into(),
-                detail: "nothing running".into(),
+                detail: "no background bash".into(),
                 hint: String::new(),
                 style: FloatItemStyle::Normal,
             }]
@@ -405,13 +414,13 @@ impl FloatMenu {
         };
         Self {
             kind: FloatKind::Background,
-            title: "Background".into(),
+            title: "Background bash".into(),
             search: String::new(),
             sections: vec![FloatSection {
                 title: if rows.is_empty() {
-                    "idle".into()
+                    "idle · subagents → /tasks".into()
                 } else {
-                    format!("{} · enter log", rows.len())
+                    format!("{} · enter log · subagents → /tasks", rows.len())
                 },
                 items,
             }],
@@ -422,9 +431,8 @@ impl FloatMenu {
         }
     }
 
-    /// Read-only log viewer: title = command, `section` = status line,
-    /// `rows` = log lines. Selection is a scroll anchor only (no focus cursor).
-    /// (`label` usually empty so the line uses the full detail column).
+    /// Read-only bash log: title = command, `section` = status line,
+    /// `rows` = stdout/stderr lines. Selection is a scroll anchor only.
     pub fn background_detail(
         title: impl Into<String>,
         section: impl Into<String>,
@@ -456,6 +464,79 @@ impl FloatMenu {
         }
     }
 
+    /// `/tasks` subagent list. `rows`: `(job_id, status, description, hint)`.
+    pub fn subagent_picker(rows: &[(String, String, String, String)]) -> Self {
+        let items: Vec<FloatItem> = if rows.is_empty() {
+            vec![FloatItem {
+                id: "_empty".into(),
+                label: "—".into(),
+                detail: "no subagents".into(),
+                hint: String::new(),
+                style: FloatItemStyle::Normal,
+            }]
+        } else {
+            rows.iter()
+                .map(|(id, label, detail, hint)| FloatItem {
+                    id: id.clone(),
+                    label: label.clone(),
+                    detail: detail.clone(),
+                    hint: hint.clone(),
+                    style: FloatItemStyle::Normal,
+                })
+                .collect()
+        };
+        Self {
+            kind: FloatKind::Subagent,
+            title: "Subagents".into(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: if rows.is_empty() {
+                    "idle · bash → /ps".into()
+                } else {
+                    format!("{} · enter live log · bash → /ps", rows.len())
+                },
+                items,
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Subagent live log: title = description, `section` = status/activity,
+    /// `rows` = turn/tool event lines.
+    pub fn subagent_detail(
+        title: impl Into<String>,
+        section: impl Into<String>,
+        rows: &[(String, String)],
+    ) -> Self {
+        let items: Vec<FloatItem> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (k, v))| FloatItem {
+                id: format!("L{i}"),
+                label: k.clone(),
+                detail: v.clone(),
+                hint: String::new(),
+                style: FloatItemStyle::Normal,
+            })
+            .collect();
+        Self {
+            kind: FloatKind::SubagentDetail,
+            title: title.into(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: section.into(),
+                items,
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
     /// Settings root — separate from `/` command palette.
     ///
     /// Hierarchy: Settings → Providers → Provider → Models → Model
@@ -465,6 +546,8 @@ impl FloatMenu {
             thinking,
             provider,
             model,
+            false,
+            "workspace-write",
             "open /mcp",
             "2000 · 50KB",
             "auto 70% · keep 12 · no prune",
@@ -479,6 +562,8 @@ impl FloatMenu {
         thinking: &str,
         provider: &str,
         model: &str,
+        saved_auto_approve: bool,
+        saved_sandbox: &str,
         mcp_summary: &str,
         tool_output_summary: &str,
         compaction_summary: &str,
@@ -500,14 +585,18 @@ impl FloatMenu {
                         item(
                             "auto_approve",
                             "Auto-approve",
-                            "toggle bash danger prompts",
-                            "toggle",
+                            if saved_auto_approve {
+                                "saved on · applies next session"
+                            } else {
+                                "saved off · applies next session"
+                            },
+                            "change",
                         ),
                         item(
                             "sandbox",
                             "Sandbox",
-                            "workspace-write / full-access",
-                            "cycle",
+                            &format!("saved {saved_sandbox} · applies next session"),
+                            "change",
                         ),
                         item("tool_output", "Tool output", tool_output_summary, "edit"),
                         item("compaction", "Compaction", compaction_summary, "edit"),
@@ -1069,8 +1158,6 @@ impl FloatMenu {
         let base_url = field_value("base_url", "unset");
         let api_key = field_value("api_key", "unset");
         let default_model = field_value("default_model", "unset");
-        let thinking_format = field_value("thinking_format", "auto");
-        let max_tokens_field = field_value("max_tokens_field", "auto");
         let compat_summary = field_value("compat", "auto (detect)");
         // Models is a top-level nav row (no section chrome); Connection / Danger
         // are section headers — three-column key · value · [action] in the list.
@@ -1079,69 +1166,6 @@ impl FloatMenu {
         } else {
             detail.to_string()
         };
-
-        let mut compat_items = vec![
-            item(
-                "set_thinking_format",
-                "thinkingFormat",
-                &thinking_format,
-                "select",
-            ),
-            item(
-                "set_max_tokens_field",
-                "maxTokensField",
-                &max_tokens_field,
-                "select",
-            ),
-        ];
-        // Common Pi compat bools — Enter cycles auto → true → false.
-        for (label, key) in [
-            ("supportsDeveloperRole", "supports_developer_role"),
-            ("supportsReasoningEffort", "supports_reasoning_effort"),
-            ("supportsUsageInStreaming", "supports_usage_in_streaming"),
-            ("supportsStrictMode", "supports_strict_mode"),
-            ("requiresToolResultName", "requires_tool_result_name"),
-            (
-                "requiresAssistantAfterToolResult",
-                "requires_assistant_after_tool_result",
-            ),
-            ("requiresThinkingAsText", "requires_thinking_as_text"),
-            (
-                "requiresReasoningContent",
-                "requires_reasoning_content_on_assistant_messages",
-            ),
-            ("forceAdaptiveThinking", "force_adaptive_thinking"),
-            ("allowEmptySignature", "allow_empty_signature"),
-        ] {
-            let display = fields
-                .iter()
-                .find(|(k, _)| {
-                    k == &format!("compat.{label}")
-                        || k.ends_with(&format!(":{key}"))
-                        || k.ends_with(&format!("compat.{label}"))
-                })
-                .map(|(_, v)| v.clone())
-                .or_else(|| {
-                    // provider_field_rows uses `id:compat.Label`
-                    fields
-                        .iter()
-                        .find(|(k, _)| k.contains(&format!("compat.{label}")))
-                        .map(|(_, v)| v.clone())
-                })
-                .unwrap_or_else(|| "auto".into());
-            compat_items.push(item(
-                &format!("cycle_compat:{key}"),
-                label,
-                &display,
-                "cycle",
-            ));
-        }
-        compat_items.push(item(
-            "clear_compat",
-            "Clear compat overrides",
-            &compat_summary,
-            "reset",
-        ));
 
         Self {
             kind: FloatKind::SettingsProviderDetail,
@@ -1170,8 +1194,8 @@ impl FloatMenu {
                     ],
                 },
                 FloatSection {
-                    title: "Compat (Pi)".into(),
-                    items: compat_items,
+                    title: "Advanced".into(),
+                    items: vec![item("compat", "Compatibility", &compat_summary, "open")],
                 },
                 FloatSection {
                     title: "Danger".into(),
@@ -1188,6 +1212,120 @@ impl FloatMenu {
             edit_label: String::new(),
             search_cursor: 0,
         }
+    }
+
+    /// Advanced provider compatibility overrides. Kept off the connection page
+    /// because these are wire-protocol escape hatches, not everyday settings.
+    pub fn settings_provider_compat(id: &str, fields: &[(String, String)]) -> Self {
+        let field_value = |key: &str, fallback: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == key)
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| fallback.to_string())
+        };
+        let compat_value = |label: &str| {
+            fields
+                .iter()
+                .find(|(k, _)| k == &format!("compat.{label}"))
+                .map(|(_, v)| v.clone())
+                .unwrap_or_else(|| "auto".into())
+        };
+        let mut flags = Vec::new();
+        for (label, key) in [
+            ("supportsDeveloperRole", "supports_developer_role"),
+            ("supportsReasoningEffort", "supports_reasoning_effort"),
+            ("supportsUsageInStreaming", "supports_usage_in_streaming"),
+            ("supportsStrictMode", "supports_strict_mode"),
+            ("requiresToolResultName", "requires_tool_result_name"),
+            (
+                "requiresAssistantAfterToolResult",
+                "requires_assistant_after_tool_result",
+            ),
+            ("requiresThinkingAsText", "requires_thinking_as_text"),
+            (
+                "requiresReasoningContent",
+                "requires_reasoning_content_on_assistant_messages",
+            ),
+            ("forceAdaptiveThinking", "force_adaptive_thinking"),
+            ("allowEmptySignature", "allow_empty_signature"),
+        ] {
+            flags.push(item(
+                &format!("cycle_compat:{key}"),
+                label,
+                &compat_value(label),
+                "cycle",
+            ));
+        }
+        Self {
+            kind: FloatKind::SettingsProviderCompat,
+            title: format!("Compatibility · {id}"),
+            search: String::new(),
+            sections: vec![
+                FloatSection {
+                    title: "Reasoning protocol".into(),
+                    items: vec![
+                        item(
+                            "set_thinking_format",
+                            "thinkingFormat",
+                            &field_value("thinking_format", "auto"),
+                            "select",
+                        ),
+                        item(
+                            "set_max_tokens_field",
+                            "maxTokensField",
+                            &field_value("max_tokens_field", "auto"),
+                            "select",
+                        ),
+                    ],
+                },
+                FloatSection {
+                    title: "Protocol flags · auto → true → false".into(),
+                    items: flags,
+                },
+                FloatSection {
+                    title: "Reset".into(),
+                    items: vec![item(
+                        "clear_compat",
+                        "Clear overrides",
+                        &field_value("compat", "auto (detect)"),
+                        "reset",
+                    )],
+                },
+            ],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        }
+    }
+
+    /// Typed delete confirmation. The only selected action is inert until the
+    /// exact provider/model identifier is entered in the visible field.
+    pub(crate) fn settings_delete_confirm(target: &SettingsDeleteTarget) -> Self {
+        let mut menu = Self {
+            kind: FloatKind::SettingsDeleteConfirm,
+            title: target.title(),
+            search: String::new(),
+            sections: vec![FloatSection {
+                title: target.warning(),
+                items: vec![item(
+                    "confirm",
+                    "Delete permanently",
+                    &format!("type `{}` above to enable", target.confirmation_text()),
+                    "Enter",
+                )],
+            }],
+            selected: 0,
+            edit_mode: false,
+            edit_label: String::new(),
+            search_cursor: 0,
+        };
+        menu.begin_edit(
+            format!("type `{}` to confirm", target.confirmation_text()),
+            "",
+        );
+        menu
     }
 
     /// Thinking format picker (provider or model scope — caller handles confirm).
@@ -1388,6 +1526,23 @@ impl FloatMenu {
                 .unwrap_or(default)
                 .to_string()
         };
+        let model_name = [
+            " ctx=",
+            " reasoning=",
+            " format=",
+            " map=",
+            " devRole=",
+            " effort=",
+        ]
+        .iter()
+        .filter_map(|marker| detail.find(marker))
+        .min()
+        .map(|idx| detail[..idx].trim())
+        .filter(|name| !name.is_empty())
+        .unwrap_or(short)
+        .trim_end_matches(" · active")
+        .to_string();
+        let context_window = field("ctx=", "unset");
         let reasoning = field("reasoning=", "unset");
         let tlm = {
             let raw = detail.split("map=").nth(1).map(str::trim).unwrap_or("");
@@ -1413,8 +1568,8 @@ impl FloatMenu {
                 FloatSection {
                     title: detail.into(),
                     items: vec![
-                        item("set_name", "name", short, "edit"),
-                        item("set_ctx", "context_window", "e.g. 128000", "edit"),
+                        item("set_name", "name", &model_name, "edit"),
+                        item("set_ctx", "context_window", &context_window, "edit"),
                         item("set_reasoning", "reasoning", &reasoning, "cycle"),
                         item("set_thinking_level_map", "thinkingLevelMap", &tlm, "edit"),
                         item(
@@ -1882,9 +2037,15 @@ fn default_command_sections() -> Vec<FloatSection> {
                 item("mcp", "MCP Servers", "status · enable · disable", "/mcp"),
                 item(
                     "ps",
-                    "Background Tasks",
-                    "bash · agent jobs · live status · /ps",
+                    "Background Bash",
+                    "shell processes · stdout/stderr · /ps",
                     "/ps",
+                ),
+                item(
+                    "tasks",
+                    "Subagents",
+                    "task tool · live turns/tools · /tasks",
+                    "/tasks",
                 ),
                 item(
                     "skill",

@@ -6,9 +6,10 @@
 //! Sync path returns tool_result. `background=true` returns `status=started` and
 //! pushes `[job completed]` onto the shared notification queue when done.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use one_core::agent::LlmProvider;
@@ -18,13 +19,14 @@ use one_tools::DEFAULT_MAX_BYTES;
 use serde_json::{json, Value};
 use tokio::sync::{RwLock, Semaphore};
 
-use super::harness::{self, HarnessOptions};
-use super::jobs::AgentJobRegistry;
+use super::harness::{self, HarnessOptions, ParentReadGrants};
+use super::jobs::{AgentJobRegistry, SpawnOptions};
 use super::presets;
 use crate::protocol::{
     error_code, AgentSpec, ProtocolError, RunParent, RunRequest, RunResult, SessionMode,
     TaskExitStatus,
 };
+use one_tools::PathPolicy;
 
 /// Cap tool_result text so a long child summary does not flood the parent.
 const SUMMARY_MAX_CHARS: usize = DEFAULT_MAX_BYTES;
@@ -34,6 +36,8 @@ pub struct TaskToolHost {
     /// Bound by CLI after `ProviderSet::build` / model switch.
     provider: RwLock<Option<Arc<dyn LlmProvider>>>,
     opts: RwLock<HarnessOptions>,
+    /// Same PathPolicy shell as main session (shares `dynamic` Arc with runtime).
+    parent_path_policy: RwLock<PathPolicy>,
     /// Parent harness face (spawn_policy + agents table).
     parent_agent: RwLock<AgentSpec>,
     parent_run_id: RwLock<String>,
@@ -43,6 +47,8 @@ pub struct TaskToolHost {
     task_slots: Arc<Semaphore>,
     /// Background agent jobs (completion → notification queue).
     jobs: Arc<AgentJobRegistry>,
+    /// Parent tool_call id → live job id (for TUI click-to-open while running).
+    tool_jobs: Mutex<HashMap<String, String>>,
 }
 
 impl TaskToolHost {
@@ -50,18 +56,63 @@ impl TaskToolHost {
         opts: HarnessOptions,
         parent_agent: AgentSpec,
         jobs: Arc<AgentJobRegistry>,
+        parent_path_policy: PathPolicy,
     ) -> Arc<Self> {
         let max_c = parent_agent.spawn_policy.max_concurrent.max(1) as usize;
         Arc::new(Self {
             provider: RwLock::new(None),
             opts: RwLock::new(opts),
+            parent_path_policy: RwLock::new(parent_path_policy),
             parent_agent: RwLock::new(parent_agent),
             parent_run_id: RwLock::new(format!("run_{}", uuid_simple())),
             parent_session_id: RwLock::new(None),
             parent_depth: AtomicU32::new(0),
             task_slots: Arc::new(Semaphore::new(max_c)),
             jobs,
+            tool_jobs: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Record that parent `tool_call_id` is backed by live `job_id`.
+    pub fn bind_tool_job(&self, tool_call_id: &str, job_id: &str) {
+        if let Ok(mut m) = self.tool_jobs.lock() {
+            m.insert(tool_call_id.to_string(), job_id.to_string());
+        }
+    }
+
+    pub fn unbind_tool_job(&self, tool_call_id: &str) {
+        if let Ok(mut m) = self.tool_jobs.lock() {
+            m.remove(tool_call_id);
+        }
+    }
+
+    /// Look up live job id for a parent tool call (if still bound).
+    pub fn job_for_tool(&self, tool_call_id: &str) -> Option<String> {
+        self.tool_jobs
+            .lock()
+            .ok()
+            .and_then(|m| m.get(tool_call_id).cloned())
+    }
+
+    /// All active tool→job bindings (for TUI: refresh running task rows).
+    pub fn tool_job_bindings(&self) -> Vec<(String, String)> {
+        self.tool_jobs
+            .lock()
+            .map(|m| m.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+            .unwrap_or_default()
+    }
+
+    /// If plan↔act rebuild ever replaces policy shell, re-bind the same dynamic Arc.
+    pub async fn set_parent_path_policy(&self, policy: PathPolicy) {
+        *self.parent_path_policy.write().await = policy;
+    }
+
+    /// Snapshot parent grants into harness opts at spawn time.
+    pub async fn child_harness_opts(&self) -> HarnessOptions {
+        let mut opts = self.opts.read().await.clone();
+        let exported = self.parent_path_policy.read().await.export_read_grants();
+        opts.parent_read_grants = ParentReadGrants::from(exported);
+        opts
     }
 
     pub fn jobs(&self) -> Arc<AgentJobRegistry> {
@@ -152,7 +203,7 @@ impl TaskHarness for DefaultTaskHarness {
                 0,
             );
         };
-        let opts = self.host.opts.read().await.clone();
+        let opts = self.host.child_harness_opts().await;
         harness::run(req, provider.as_ref(), &opts).await
     }
 }
@@ -363,7 +414,7 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                     .with_status(TaskExitStatus::RuntimeError),
                 ));
             };
-            let opts = self.host.opts.read().await.clone();
+            let opts = self.host.child_harness_opts().await;
             let job_id = self.host.jobs.spawn(
                 req,
                 provider,
@@ -372,6 +423,8 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                 description.clone(),
                 Some(slot),
             );
+            // Bind until completion notification is absorbed — keep for /ps open.
+            self.host.bind_tool_job(&call.id, &job_id);
             return Ok(format_task_started(
                 &agent_name,
                 description.as_deref(),
@@ -379,7 +432,95 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             ));
         }
 
-        // Sync: hold slot until harness returns.
+        // Sync with live job UI when a provider is bound (production path).
+        // Tests using FakeHarness leave provider unbound → harness.run only.
+        if let Some(provider) = self.host.provider.read().await.clone() {
+            let opts = self.host.child_harness_opts().await;
+            let job_id = self.host.jobs.spawn_with(
+                req,
+                provider,
+                opts,
+                agent_name.clone(),
+                description.clone(),
+                Some(slot),
+                SpawnOptions {
+                    // tool_result is the parent signal — do not also inject [job completed]
+                    notify_completion: false,
+                    // Foreground waits on the tool; wall budget is parent-abort / Esc.
+                    apply_wall_timeout: false,
+                },
+            );
+            self.host.bind_tool_job(&call.id, &job_id);
+            let snap = match self.host.jobs.wait_until_done(&job_id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    self.host.unbind_tool_job(&call.id);
+                    return Ok(format_task_output(
+                        &agent_name,
+                        description.as_deref(),
+                        &RunResult::failure(
+                            ProtocolError::new(error_code::INTERNAL, e),
+                            0,
+                        )
+                        .with_status(TaskExitStatus::RuntimeError),
+                    ));
+                }
+            };
+            self.host.unbind_tool_job(&call.id);
+            let result = self
+                .host
+                .jobs
+                .take_result_clone(&job_id)
+                .unwrap_or_else(|| {
+                    // Prefer fields from snapshot when result blob is missing.
+                    let mut rr = if snap.ok {
+                        RunResult::success(snap.summary.clone(), snap.duration_ms)
+                    } else {
+                        RunResult::failure(
+                            ProtocolError::new(
+                                error_code::INTERNAL,
+                                snap.error
+                                    .clone()
+                                    .unwrap_or_else(|| "task job finished without result".into()),
+                            ),
+                            snap.duration_ms,
+                        )
+                    };
+                    if let Some(st) = snap.status {
+                        rr = rr.with_status(st);
+                    }
+                    rr.result = snap.summary.clone();
+                    rr.turns = snap.turns;
+                    rr
+                });
+            let mut out = format_task_output(&agent_name, description.as_deref(), &result);
+            // Expose job_id so TUI can reopen log after completion.
+            if let Some(details) = out.details.as_mut() {
+                if let Some(obj) = details.as_object_mut() {
+                    obj.insert("job_id".into(), json!(job_id));
+                }
+            }
+            // Stamp id into the visible header line (click / parse).
+            if let Some(first) = out.content.first_mut() {
+                if let one_core::message::TextOrImage::Text { text } = first {
+                    if let Some(rest) = text.strip_prefix('[') {
+                        if let Some(end) = rest.find(']') {
+                            let inside = &rest[..end];
+                            if !inside.contains("id=") {
+                                let stamped = format!(
+                                    "[{inside} · id={job_id}]{}",
+                                    &rest[end + 1..]
+                                );
+                                *text = stamped;
+                            }
+                        }
+                    }
+                }
+            }
+            return Ok(out);
+        }
+
+        // Sync fallback (tests / unbound provider): hold slot until harness returns.
         let result = self.harness.run(req).await;
         drop(slot);
         Ok(format_task_output(
@@ -688,6 +829,7 @@ pub fn harness_opts_from_policy(
         add_dirs,
         auto_approve,
         dynamic_tools: vec![],
+        parent_read_grants: ParentReadGrants::default(),
     }
 }
 
@@ -722,6 +864,7 @@ mod tests {
             HarnessOptions::from_cwd(std::env::temp_dir()),
             AgentSpec::builtin_main(),
             jobs,
+            PathPolicy::workspace(std::env::temp_dir()),
         )
     }
 
@@ -867,7 +1010,12 @@ mod tests {
         let mut parent = AgentSpec::builtin_main();
         parent.spawn_policy = crate::protocol::SpawnPolicy::none();
         let jobs = AgentJobRegistry::new(Arc::new(std::sync::Mutex::new(Vec::new())));
-        let host = TaskToolHost::new(HarnessOptions::from_cwd(std::env::temp_dir()), parent, jobs);
+        let host = TaskToolHost::new(
+            HarnessOptions::from_cwd(std::env::temp_dir()),
+            parent,
+            jobs,
+            PathPolicy::workspace(std::env::temp_dir()),
+        );
         let tool = TaskTool::with_harness(
             host,
             Arc::new(FakeHarness {
@@ -1061,6 +1209,7 @@ mod tests {
                 max_turns: 8,
                 thinking_level: one_core::agent::ThinkingLevel::Off,
                 server_search: false,
+                empty_response_retries: one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES,
             },
             vec![task],
         );

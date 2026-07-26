@@ -108,6 +108,43 @@ impl PendingText {
     }
 }
 
+/// Destructive Settings action awaiting explicit typed confirmation.
+///
+/// Kept separate from [`ConfigOp`] so an incidental Enter on a danger row can
+/// never mutate `models.json` directly.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SettingsDeleteTarget {
+    Provider { id: String, model_count: usize },
+    Model { spec: String },
+}
+
+impl SettingsDeleteTarget {
+    pub(crate) fn confirmation_text(&self) -> &str {
+        match self {
+            Self::Provider { id, .. } => id,
+            Self::Model { spec } => spec,
+        }
+    }
+
+    pub(crate) fn title(&self) -> String {
+        match self {
+            Self::Provider { id, .. } => format!("Delete provider · {id}"),
+            Self::Model { spec } => format!("Delete model · {spec}"),
+        }
+    }
+
+    pub(crate) fn warning(&self) -> String {
+        match self {
+            Self::Provider { id, model_count } => {
+                format!("This removes provider `{id}` and {model_count} model(s) from models.json.")
+            }
+            Self::Model { spec } => {
+                format!("This removes model `{spec}` from models.json.")
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum RunOutcome {
     Prompt(String),
@@ -128,12 +165,26 @@ pub enum RunOutcome {
     OpenMcpPanel,
     /// Open MCP import picker; CLI scans foreign agents first.
     OpenMcpImportPanel,
-    /// Open / refresh background tasks list (`/ps`).
+    /// Open / refresh **bash** background process list (`/ps`).
     OpenBackgroundList,
-    /// Open one background task detail (fresh snapshot from runtime).
-    OpenBackgroundDetail { id: String },
-    /// Kill a background bash task or agent job (`/ps` → `x`).
-    KillBackground { id: String },
+    /// Open one **bash** process detail (stdout/stderr tail).
+    OpenBackgroundDetail {
+        id: String,
+    },
+    /// Kill a **bash** background process (`/ps` → `x`).
+    KillBackground {
+        id: String,
+    },
+    /// Open / refresh **subagent** list (`/tasks`) — higher level than `/ps`.
+    OpenSubagentList,
+    /// Open one subagent live transcript/log (`/tasks <job_id>`).
+    OpenSubagentDetail {
+        id: String,
+    },
+    /// Kill a subagent job (`/tasks` → `x`).
+    KillSubagent {
+        id: String,
+    },
     Quit,
     Noop,
 }
@@ -152,6 +203,9 @@ impl RunOutcome {
             | RunOutcome::OpenBackgroundList
             | RunOutcome::OpenBackgroundDetail { .. }
             | RunOutcome::KillBackground { .. }
+            | RunOutcome::OpenSubagentList
+            | RunOutcome::OpenSubagentDetail { .. }
+            | RunOutcome::KillSubagent { .. }
             | RunOutcome::SwitchModel { .. }
             | RunOutcome::ConfigOp(_)
             | RunOutcome::Quit => true,

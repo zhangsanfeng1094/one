@@ -438,10 +438,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(
-            target
-                .lock()
-                .unwrap()
-                .contains("hello-mid-run"),
+            target.lock().unwrap().contains("hello-mid-run"),
             "mid-run snapshot must see streamed bytes before EOF"
         );
         server.shutdown().await.unwrap();
@@ -481,11 +478,12 @@ mod tests {
         let target = Arc::new(Mutex::new(String::new()));
         let target2 = target.clone();
         let reader = tokio::spawn(async move {
-            stream_pipe_into(client, target2, Some(16))
-                .await
-                .unwrap();
+            stream_pipe_into(client, target2, Some(16)).await.unwrap();
         });
-        server.write_all(b"abcdefghijklmnopqrstuvwxyz").await.unwrap();
+        server
+            .write_all(b"abcdefghijklmnopqrstuvwxyz")
+            .await
+            .unwrap();
         server.shutdown().await.unwrap();
         reader.await.unwrap();
         let text = target.lock().unwrap().clone();

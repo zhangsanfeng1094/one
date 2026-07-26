@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use one_core::agent::{Agent, AgentConfig, LlmProvider, ThinkingLevel};
 use one_core::error::OneError;
-use one_tools::PathPolicy;
+use one_tools::{ExportedReadGrants, PathPolicy};
 
 use super::tool_materialize::{
     harness_build_context, harness_registry, materialize_tools, resolve_names,
@@ -17,6 +17,22 @@ use crate::protocol::{
     error_code, AgentRunEcho, AgentSpec, RunParent, RunRequest, RunResult, SessionMode,
     TaskExitStatus, UsageSnapshot,
 };
+
+/// Path-only snapshot of a parent's session read grants (not a live Arc).
+#[derive(Clone, Debug, Default)]
+pub struct ParentReadGrants {
+    pub readable_roots: Vec<PathBuf>,
+    pub allowed_paths: Vec<PathBuf>,
+}
+
+impl From<ExportedReadGrants> for ParentReadGrants {
+    fn from(g: ExportedReadGrants) -> Self {
+        Self {
+            readable_roots: g.readable_roots,
+            allowed_paths: g.allowed_paths,
+        }
+    }
+}
 
 /// Options for a harness invocation (cwd, path policy roots, etc.).
 #[derive(Clone)]
@@ -29,6 +45,8 @@ pub struct HarnessOptions {
     /// Optional pre-built tools (MCP / extensions) merged into the registry by name.
     /// Not used for explore-only; when set, `ToolsSpec` can allow those names.
     pub dynamic_tools: Vec<std::sync::Arc<dyn one_core::tool::Tool>>,
+    /// Snapshot of parent session read grants applied as detached child dynamic grants.
+    pub parent_read_grants: ParentReadGrants,
 }
 
 impl std::fmt::Debug for HarnessOptions {
@@ -39,6 +57,13 @@ impl std::fmt::Debug for HarnessOptions {
             .field("add_dirs", &self.add_dirs)
             .field("auto_approve", &self.auto_approve)
             .field("dynamic_tools", &self.dynamic_tools.len())
+            .field(
+                "parent_read_grants",
+                &(
+                    self.parent_read_grants.readable_roots.len(),
+                    self.parent_read_grants.allowed_paths.len(),
+                ),
+            )
             .finish()
     }
 }
@@ -51,17 +76,20 @@ impl HarnessOptions {
             add_dirs: vec![],
             auto_approve: true,
             dynamic_tools: vec![],
+            parent_read_grants: ParentReadGrants::default(),
         }
     }
 }
 
 /// Optional controls for nested / background runs.
-#[derive(Debug, Clone, Default)]
+#[derive(Clone, Default)]
 pub struct RunControl {
     /// Shared abort flag (job_kill / parent Esc).
     pub abort: Option<Arc<AtomicBool>>,
     /// 1-based turn progress for job_output while running.
     pub turn_progress: Option<Arc<AtomicU64>>,
+    /// Live event log for TUI `/tasks` subagent detail (not bash `/ps`).
+    pub event_log: Option<Arc<super::jobs::JobEventLog>>,
 }
 
 /// Run one agent (root or sub) according to [`RunRequest`].
@@ -124,12 +152,15 @@ pub async fn run_with_control(
     let system_prompt = resolve_system_prompt(&req.agent);
     let max_turns = req.agent.max_turns.unwrap_or(16);
     let thinking = resolve_thinking(&req.agent);
+    // Inherit empty-response policy from user settings / env (same as main agent).
+    let empty_response_retries = crate::settings::load().empty_response_retries();
 
     let config = AgentConfig {
         system_prompt,
         max_turns,
         thinking_level: thinking,
         server_search: false,
+        empty_response_retries,
     };
 
     let mut agent = Agent::new(config, tools);
@@ -138,6 +169,11 @@ pub async fn run_with_control(
     }
     if let Some(progress) = control.turn_progress {
         agent.set_turn_progress(Some(progress));
+    }
+    if let Some(log) = control.event_log {
+        agent.subscribe(Box::new(move |event| {
+            log.on_agent_event(event);
+        }));
     }
 
     // Fail-closed permissions for non-interactive harness (subagent / agent run).
@@ -336,9 +372,7 @@ fn last_assistant_citations(agent: &Agent) -> Vec<one_core::Citation> {
         .iter()
         .rev()
         .find_map(|message| match message {
-            one_core::message::AgentMessage::Assistant(message) => {
-                Some(message.citations.clone())
-            }
+            one_core::message::AgentMessage::Assistant(message) => Some(message.citations.clone()),
             _ => None,
         })
         .unwrap_or_default()
@@ -424,7 +458,15 @@ fn build_policy(cwd: &Path, opts: &HarnessOptions, spec: &AgentSpec) -> PathPoli
     for d in &spec.add_dirs {
         dirs.push(PathBuf::from(d));
     }
-    PathPolicy::workspace(cwd.to_path_buf()).with_additional_dirs(dirs)
+    // workspace() creates a **new** dynamic Arc (detached from parent).
+    let policy = PathPolicy::workspace(cwd.to_path_buf()).with_additional_dirs(dirs);
+    // Write-safe snapshot: only dynamic grants (Read-only). NEVER with_allowed_file.
+    let exported = ExportedReadGrants {
+        readable_roots: opts.parent_read_grants.readable_roots.clone(),
+        allowed_paths: opts.parent_read_grants.allowed_paths.clone(),
+    };
+    policy.apply_exported_read_grants(&exported);
+    policy
 }
 
 /// Convenience: run a named preset with a user prompt.

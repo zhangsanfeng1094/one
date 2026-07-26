@@ -19,6 +19,14 @@ pub enum OneError {
     #[error("agent run aborted")]
     Aborted,
 
+    /// Model finished a turn with no visible text and no tool calls.
+    ///
+    /// After optional empty-response retries are exhausted, the agent surfaces
+    /// this instead of treating a blank `stop` as a successful end (matches
+    /// Grok Build's EmptyResponse handling).
+    #[error("empty model response (no text or tool calls) after {attempts} attempt(s)")]
+    EmptyResponse { attempts: usize },
+
     /// Provider rejected the request because the prompt exceeds the context window.
     #[error("context overflow: {0}")]
     ContextOverflow(String),

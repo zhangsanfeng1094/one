@@ -5,7 +5,7 @@
 
 use crate::app::App;
 use crate::float::{FloatKind, FloatMenu};
-use crate::state::{ConfigOp, ModelDraft, RunOutcome};
+use crate::state::{ConfigOp, ModelDraft, RunOutcome, SettingsDeleteTarget};
 
 impl App {
     /// Open centered Settings (Ctrl+G / bare `/settings`).
@@ -16,11 +16,40 @@ impl App {
             &self.thinking_level,
             &self.current_provider,
             &self.current_model,
+            self.settings_saved_auto_approve,
+            &self.settings_saved_sandbox,
             &self.mcp_summary,
             &self.tool_output_summary(),
             &self.compaction_summary(),
         ));
         self.clear_notice();
+    }
+
+    /// Sync persisted execution settings into their Settings-page summaries.
+    /// These options are applied when `AppRuntime` is constructed, so the UI
+    /// deliberately presents them as saved preferences rather than live state.
+    pub fn set_settings_execution_preferences(
+        &mut self,
+        auto_approve: bool,
+        sandbox: impl Into<String>,
+    ) {
+        self.settings_saved_auto_approve = auto_approve;
+        self.settings_saved_sandbox = sandbox.into();
+    }
+
+    /// Rebuild the root panel without losing the user's place after a toggle.
+    pub fn reopen_settings_float(&mut self) {
+        let previous = self
+            .float
+            .as_ref()
+            .filter(|f| f.kind == FloatKind::Settings)
+            .map(|f| f.selected)
+            .unwrap_or(0);
+        self.open_settings_float();
+        if let Some(f) = self.float.as_mut() {
+            let max = f.filtered_entries().len().saturating_sub(1);
+            f.selected = previous.min(max);
+        }
     }
 
     /// Sync tool_output limits into Settings UI state.
@@ -159,7 +188,7 @@ impl App {
         self.mcp_chip_kind = 0;
     }
 
-    /// Background tasks chip (`bg:1 · cargo…`). Empty text hides it.
+    /// Background **bash** chip (`bg:1 · cargo…`). Empty text hides it.
     /// `kind`: 1 running · 2 idle/recent done · 3 mixed fail · 4 error-only
     pub fn set_bg_chip(&mut self, text: impl Into<String>, kind: u8) {
         self.bg_chip_text = text.into();
@@ -175,7 +204,22 @@ impl App {
         self.bg_chip_kind = 0;
     }
 
-    /// Open `/ps` list panel. `rows`: `(id, label, detail, hint)`.
+    /// Subagent chip (`task:1 · explore…`). Separate from bash `/ps`.
+    pub fn set_task_chip(&mut self, text: impl Into<String>, kind: u8) {
+        self.task_chip_text = text.into();
+        self.task_chip_kind = if self.task_chip_text.is_empty() {
+            0
+        } else {
+            kind
+        };
+    }
+
+    pub fn clear_task_chip(&mut self) {
+        self.task_chip_text.clear();
+        self.task_chip_kind = 0;
+    }
+
+    /// Open `/ps` bash process list. `rows`: `(id, label, detail, hint)`.
     pub fn open_background_float(&mut self, rows: &[(String, String, String, String)]) {
         self.bg_ps_list = rows.to_vec();
         self.bg_ps_detail_id = None;
@@ -185,7 +229,7 @@ impl App {
         self.clear_notice();
     }
 
-    /// Open one background task log panel (fresh rows from CLI).
+    /// Open one bash process log panel (fresh rows from CLI).
     pub fn open_background_detail_float(
         &mut self,
         id: impl Into<String>,
@@ -206,11 +250,49 @@ impl App {
         self.clear_notice();
     }
 
-    /// Re-open last `/ps` list (Esc from detail).
+    /// Re-open last `/ps` bash list (Esc from detail).
     pub fn reopen_background_list_float(&mut self) {
         self.bg_ps_detail_id = None;
         let rows = self.bg_ps_list.clone();
         self.float = Some(FloatMenu::background_picker(&rows));
+        self.clear_notice();
+    }
+
+    /// Open `/tasks` subagent list. `rows`: `(job_id, label, detail, hint)`.
+    pub fn open_subagent_float(&mut self, rows: &[(String, String, String, String)]) {
+        self.task_list = rows.to_vec();
+        self.task_detail_id = None;
+        self.close_float();
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::subagent_picker(rows));
+        self.clear_notice();
+    }
+
+    /// Open one subagent live-log panel.
+    pub fn open_subagent_detail_float(
+        &mut self,
+        id: impl Into<String>,
+        title: impl Into<String>,
+        section: impl Into<String>,
+        rows: &[(String, String)],
+    ) {
+        self.task_detail_id = Some(id.into());
+        self.clear_select_prompt();
+        self.float = Some(FloatMenu::subagent_detail(title, section, rows));
+        if let Some(f) = self.float.as_mut() {
+            let n = f.filtered_entries().len();
+            if n > 0 {
+                f.selected = n - 1;
+            }
+        }
+        self.clear_notice();
+    }
+
+    /// Re-open last `/tasks` list (Esc from detail).
+    pub fn reopen_subagent_list_float(&mut self) {
+        self.task_detail_id = None;
+        let rows = self.task_list.clone();
+        self.float = Some(FloatMenu::subagent_picker(&rows));
         self.clear_notice();
     }
 
@@ -381,6 +463,22 @@ impl App {
         self.clear_notice();
     }
 
+    /// Open the protocol-level provider overrides only when explicitly requested.
+    pub fn open_settings_provider_compat(&mut self, id: &str) {
+        self.settings_provider_focus = id.to_string();
+        let fields = self.provider_detail_fields(id);
+        self.float = Some(FloatMenu::settings_provider_compat(id, &fields));
+        self.clear_notice();
+    }
+
+    fn open_settings_delete_confirm(&mut self, target: SettingsDeleteTarget) {
+        self.settings_delete_target = Some(target.clone());
+        self.settings_inline_op = None;
+        self.settings_form_edit = None;
+        self.float = Some(FloatMenu::settings_delete_confirm(&target));
+        self.clear_notice();
+    }
+
     pub fn open_settings_provider_api(&mut self, id: &str) {
         self.settings_provider_focus = id.to_string();
         self.float = Some(FloatMenu::settings_provider_api(id));
@@ -492,6 +590,10 @@ impl App {
                 self.open_settings_providers(&self.settings_provider_rows.clone());
                 true
             }
+            FloatKind::SettingsProviderCompat => {
+                self.reopen_settings_provider_detail();
+                true
+            }
             FloatKind::SettingsProviderApi
             | FloatKind::SettingsRemoteModels
             | FloatKind::SettingsThinkingFormat
@@ -530,6 +632,24 @@ impl App {
                 self.open_settings_models_for_provider(&p);
                 true
             }
+            FloatKind::SettingsDeleteConfirm => {
+                let target = self.settings_delete_target.take();
+                if let Some(SettingsDeleteTarget::Provider { .. }) = target {
+                    self.reopen_settings_provider_detail();
+                } else if !self.settings_model_focus.is_empty() {
+                    let spec = self.settings_model_focus.clone();
+                    let detail = self
+                        .settings_model_rows
+                        .iter()
+                        .find(|(k, _)| k == &spec)
+                        .map(|(_, d)| d.clone())
+                        .unwrap_or_default();
+                    self.open_settings_model_detail(&spec, &detail);
+                } else {
+                    self.open_settings_float();
+                }
+                true
+            }
             FloatKind::Skills => {
                 // Same as Thinking: Esc returns to Settings root.
                 self.open_settings_float();
@@ -553,12 +673,12 @@ impl App {
                 self.open_mcp_float();
                 true
             }
-            FloatKind::BackgroundDetail => {
-                // Esc is handled in `handle_float_key` → OpenBackgroundList
-                // so the CLI reloads a fresh snapshot (not this cache).
+            FloatKind::BackgroundDetail | FloatKind::SubagentDetail => {
+                // Esc is handled in `handle_float_key` → OpenBackgroundList /
+                // OpenSubagentList so the CLI reloads a fresh snapshot.
                 false
             }
-            FloatKind::Background => {
+            FloatKind::Background | FloatKind::Subagent => {
                 // Esc closes the panel entirely.
                 false
             }
@@ -600,6 +720,42 @@ impl App {
             .find(|(k, _)| k == &format!("{provider}:{key}"))
             .map(|(_, v)| v.clone())
             .unwrap_or_default()
+    }
+
+    fn model_detail_value(&self, spec: &str, key: &str) -> String {
+        let detail = self
+            .settings_model_rows
+            .iter()
+            .find(|(k, _)| k == spec)
+            .map(|(_, d)| d.as_str())
+            .unwrap_or("");
+        match key {
+            "name" => {
+                let end = [
+                    " ctx=",
+                    " reasoning=",
+                    " format=",
+                    " map=",
+                    " devRole=",
+                    " effort=",
+                ]
+                .iter()
+                .filter_map(|marker| detail.find(marker))
+                .min()
+                .unwrap_or(detail.len());
+                detail[..end]
+                    .trim()
+                    .trim_end_matches(" · active")
+                    .to_string()
+            }
+            "ctx" => detail
+                .split("ctx=")
+                .nth(1)
+                .map(|s| s.split_whitespace().next().unwrap_or_default())
+                .unwrap_or_default()
+                .to_string(),
+            _ => String::new(),
+        }
     }
 
     pub(crate) fn float_allows_fetch_models(kind: FloatKind) -> bool {
@@ -972,6 +1128,35 @@ impl App {
                 );
                 RunOutcome::Noop
             }
+            "compat" => {
+                self.open_settings_provider_compat(&focus);
+                RunOutcome::Noop
+            }
+            "rm_provider" => {
+                if focus == self.current_provider {
+                    self.set_notice(format!(
+                        "cannot delete active provider `{focus}` · switch model first"
+                    ));
+                    return RunOutcome::Noop;
+                }
+                let model_count = self
+                    .settings_model_rows
+                    .iter()
+                    .filter(|(spec, _)| spec == &focus || spec.starts_with(&format!("{focus}:")))
+                    .count();
+                self.open_settings_delete_confirm(SettingsDeleteTarget::Provider {
+                    id: focus,
+                    model_count,
+                });
+                RunOutcome::Noop
+            }
+            _ => RunOutcome::Noop,
+        }
+    }
+
+    pub(crate) fn confirm_settings_provider_compat(&mut self, id: &str) -> RunOutcome {
+        let focus = self.settings_provider_focus.clone();
+        match id {
             "set_thinking_format" => {
                 self.open_settings_thinking_format(&focus, false);
                 RunOutcome::Noop
@@ -987,7 +1172,6 @@ impl App {
             }),
             id if id.starts_with("cycle_compat:") => {
                 let key = id.trim_start_matches("cycle_compat:").to_string();
-                // Field rows store camelCase labels: `compat.supportsDeveloperRole`.
                 let current = self
                     .provider_detail_fields(&focus)
                     .into_iter()
@@ -1000,15 +1184,41 @@ impl App {
                     })
                     .map(|(_, v)| v)
                     .unwrap_or_else(|| "auto".into());
-                let next = cycle_tri_display(&current);
                 RunOutcome::ConfigOp(ConfigOp::ProviderSet {
                     id: focus,
                     key,
-                    value: next.to_string(),
+                    value: cycle_tri_display(&current).to_string(),
                 })
             }
-            "rm_provider" => RunOutcome::ConfigOp(ConfigOp::ProviderRm { id: focus }),
             _ => RunOutcome::Noop,
+        }
+    }
+
+    pub(crate) fn confirm_settings_delete(&mut self) -> RunOutcome {
+        let typed = self
+            .float
+            .as_ref()
+            .map(|f| f.search.trim().to_string())
+            .unwrap_or_default();
+        let Some(target) = self.settings_delete_target.clone() else {
+            self.set_notice("nothing selected for deletion");
+            return RunOutcome::Noop;
+        };
+        if typed != target.confirmation_text() {
+            self.set_notice(format!(
+                "type `{}` exactly to delete",
+                target.confirmation_text()
+            ));
+            return RunOutcome::Noop;
+        }
+        self.settings_delete_target = None;
+        match target {
+            SettingsDeleteTarget::Provider { id, .. } => {
+                RunOutcome::ConfigOp(ConfigOp::ProviderRm { id })
+            }
+            SettingsDeleteTarget::Model { spec } => {
+                RunOutcome::ConfigOp(ConfigOp::ModelRm { spec })
+            }
         }
     }
 
@@ -1162,14 +1372,16 @@ impl App {
         let focus = self.settings_model_focus.clone();
         match id {
             "set_name" => {
-                self.start_settings_inline_edit(format!("model_set:{focus}:name"), "name", "");
+                let initial = self.model_detail_value(&focus, "name");
+                self.start_settings_inline_edit(format!("model_set:{focus}:name"), "name", initial);
                 RunOutcome::Noop
             }
             "set_ctx" => {
+                let initial = self.model_detail_value(&focus, "ctx");
                 self.start_settings_inline_edit(
                     format!("model_set:{focus}:ctx"),
                     "context_window",
-                    "",
+                    initial,
                 );
                 RunOutcome::Noop
             }
@@ -1261,7 +1473,16 @@ impl App {
                     value: next.to_string(),
                 })
             }
-            "rm_model" => RunOutcome::ConfigOp(ConfigOp::ModelRm { spec: focus }),
+            "rm_model" => {
+                if focus == format!("{}:{}", self.current_provider, self.current_model) {
+                    self.set_notice(format!(
+                        "cannot delete active model `{focus}` · switch model first"
+                    ));
+                    return RunOutcome::Noop;
+                }
+                self.open_settings_delete_confirm(SettingsDeleteTarget::Model { spec: focus });
+                RunOutcome::Noop
+            }
             _ => RunOutcome::Noop,
         }
     }
@@ -1354,4 +1575,110 @@ fn config_op_from_field(op: &str, value: &str) -> Option<ConfigOp> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::float::FloatKind;
+
+    #[test]
+    fn root_displays_saved_execution_state_and_next_session_scope() {
+        let mut app = App::new("test");
+        app.set_settings_execution_preferences(true, "full-access");
+        app.open_settings_float();
+        let rows = app.float.as_ref().unwrap().filtered_entries();
+        let auto = rows.iter().find(|e| e.item.id == "auto_approve").unwrap();
+        let sandbox = rows.iter().find(|e| e.item.id == "sandbox").unwrap();
+        assert!(auto.item.detail.contains("saved on"));
+        assert!(auto.item.detail.contains("next session"));
+        assert!(sandbox.item.detail.contains("full-access"));
+    }
+
+    #[test]
+    fn provider_compatibility_is_progressively_disclosed() {
+        let mut app = App::new("test");
+        app.set_settings_catalog(
+            vec![("proxy".into(), "1 model".into())],
+            vec![("proxy:fast".into(), "Fast ctx=128000".into())],
+            vec![
+                ("proxy:compat".into(), "1 override".into()),
+                ("proxy:thinking_format".into(), "auto".into()),
+                ("proxy:compat.supportsDeveloperRole".into(), "true".into()),
+            ],
+        );
+        app.open_settings_provider_detail("proxy", "1 model");
+        let rows = app.float.as_ref().unwrap().filtered_entries();
+        assert!(rows.iter().any(|e| e.item.id == "compat"));
+        assert!(!rows.iter().any(|e| e.item.id.starts_with("cycle_compat:")));
+
+        assert!(matches!(
+            app.confirm_settings_provider_detail("compat"),
+            RunOutcome::Noop
+        ));
+        assert_eq!(
+            app.float.as_ref().unwrap().kind,
+            FloatKind::SettingsProviderCompat
+        );
+        assert!(app
+            .float
+            .as_ref()
+            .unwrap()
+            .filtered_entries()
+            .iter()
+            .any(|e| e.item.id == "cycle_compat:supports_developer_role"));
+    }
+
+    #[test]
+    fn model_edits_start_with_the_current_value() {
+        let mut app = App::new("test");
+        app.set_settings_catalog(
+            Vec::new(),
+            vec![(
+                "proxy:fast".into(),
+                "Fast model ctx=128000 reasoning=true".into(),
+            )],
+            Vec::new(),
+        );
+        app.open_settings_model_detail("proxy:fast", "Fast model ctx=128000 reasoning=true");
+
+        assert!(matches!(
+            app.confirm_settings_model_detail("set_name"),
+            RunOutcome::Noop
+        ));
+        assert_eq!(app.float.as_ref().unwrap().search, "Fast model");
+        app.cancel_settings_inline_edit();
+
+        assert!(matches!(
+            app.confirm_settings_model_detail("set_ctx"),
+            RunOutcome::Noop
+        ));
+        assert_eq!(app.float.as_ref().unwrap().search, "128000");
+    }
+
+    #[test]
+    fn delete_requires_the_exact_target_before_emitting_a_config_op() {
+        let mut app = App::new("test");
+        app.set_settings_catalog(
+            vec![("proxy".into(), "1 model".into())],
+            vec![("proxy:fast".into(), "Fast ctx=128000".into())],
+            Vec::new(),
+        );
+        app.open_settings_provider_detail("proxy", "1 model");
+        assert!(matches!(
+            app.confirm_settings_provider_detail("rm_provider"),
+            RunOutcome::Noop
+        ));
+        assert_eq!(
+            app.float.as_ref().unwrap().kind,
+            FloatKind::SettingsDeleteConfirm
+        );
+        assert!(matches!(app.confirm_settings_delete(), RunOutcome::Noop));
+
+        app.float.as_mut().unwrap().search = "proxy".into();
+        assert!(matches!(
+            app.confirm_settings_delete(),
+            RunOutcome::ConfigOp(ConfigOp::ProviderRm { id }) if id == "proxy"
+        ));
+    }
 }

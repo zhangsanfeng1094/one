@@ -550,8 +550,7 @@ impl BackgroundTaskRegistry {
         let _ = self.kill_sync(id)?;
         // Brief yield so wait() reapers can settle.
         tokio::task::yield_now().await;
-        self.get(id)
-            .ok_or_else(|| format!("unknown task_id: {id}"))
+        self.get(id).ok_or_else(|| format!("unknown task_id: {id}"))
     }
 }
 
@@ -572,13 +571,7 @@ fn prune_terminal_tasks(tasks: &mut HashMap<String, TaskInner>) {
     let terminal: Vec<(String, Instant, u64)> = tasks
         .iter()
         .filter(|(_, t)| t.state.is_terminal())
-        .map(|(id, t)| {
-            (
-                id.clone(),
-                t.finished.unwrap_or(t.started),
-                t.seq,
-            )
-        })
+        .map(|(id, t)| (id.clone(), t.finished.unwrap_or(t.started), t.seq))
         .collect();
     if terminal.len() <= MAX_TERMINAL_TASKS {
         return;

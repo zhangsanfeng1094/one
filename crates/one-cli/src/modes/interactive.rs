@@ -257,45 +257,29 @@ fn refresh_mcp_chip(app: &mut App, runtime: &AppRuntime) {
     }
 }
 
-/// Live chip for background bash + agent jobs (`bg:1 · cargo…`). Open `/ps` for detail.
+/// Live chip for **bash** background only (`bg:1 · cargo…`). Open `/ps`.
+///
+/// Subagents use a separate chip (`task:N`) — do not mix process and agent UIs.
 fn refresh_bg_chip(app: &mut App, runtime: &AppRuntime) {
-    // Lightweight meta — no stdout/stderr clone on every tick.
     let bash = runtime.bg_registry().list_meta();
-    let jobs = runtime
-        .agent_jobs()
-        .map(|j| j.list())
-        .unwrap_or_default();
-
     let bash_running = bash
         .iter()
         .filter(|t| t.state == one_tools::TaskState::Running)
         .count();
-    let jobs_running = jobs
-        .iter()
-        .filter(|j| j.state == crate::runtime::jobs::JobState::Running)
-        .count();
-    let running = bash_running + jobs_running;
-
-    // Fail signal: real failures only — not intentional kill.
     let bash_failed = bash.iter().any(|t| {
         matches!(
             t.state,
             one_tools::TaskState::Failed | one_tools::TaskState::TimedOut
         ) || (t.state == one_tools::TaskState::Completed && t.exit_code.unwrap_or(0) != 0)
     });
-    let jobs_failed = jobs.iter().any(|j| {
-        matches!(j.state, crate::runtime::jobs::JobState::Failed)
-            || (matches!(j.state, crate::runtime::jobs::JobState::Completed) && !j.ok)
-    });
 
-    if running == 0 && bash.is_empty() && jobs.is_empty() {
+    if bash_running == 0 && bash.is_empty() {
         app.clear_bg_chip();
         return;
     }
 
-    if running == 0 {
-        // No active work: hide chip unless something failed recently still listed.
-        if bash_failed || jobs_failed {
+    if bash_running == 0 {
+        if bash_failed {
             let n_fail = bash
                 .iter()
                 .filter(|t| {
@@ -305,24 +289,14 @@ fn refresh_bg_chip(app: &mut App, runtime: &AppRuntime) {
                     ) || (t.state == one_tools::TaskState::Completed
                         && t.exit_code.unwrap_or(0) != 0)
                 })
-                .count()
-                + jobs
-                    .iter()
-                    .filter(|j| {
-                        matches!(j.state, crate::runtime::jobs::JobState::Failed)
-                            || (matches!(j.state, crate::runtime::jobs::JobState::Completed)
-                                && !j.ok)
-                    })
-                    .count();
+                .count();
             app.set_bg_chip(format!("bg:{n_fail} · fail · /ps"), 4);
         } else {
-            // Completed / killed successfully — clear so chrome stays quiet.
             app.clear_bg_chip();
         }
         return;
     }
 
-    // Prefer the newest running bash command as the label.
     let label = bash
         .iter()
         .filter(|t| t.state == one_tools::TaskState::Running)
@@ -335,32 +309,65 @@ fn refresh_bg_chip(app: &mut App, runtime: &AppRuntime) {
                 cmd.to_string()
             }
         })
-        .or_else(|| {
-            jobs.iter()
-                .filter(|j| j.state == crate::runtime::jobs::JobState::Running)
-                .map(|j| {
-                    j.description
-                        .clone()
-                        .unwrap_or_else(|| format!("task·{}", j.agent))
-                })
-                .next()
-        })
         .unwrap_or_else(|| "running".into());
 
-    let kind = if bash_failed || jobs_failed { 3 } else { 1 };
-    app.set_bg_chip(format!("bg:{running} · {label}"), kind);
+    let kind = if bash_failed { 3 } else { 1 };
+    app.set_bg_chip(format!("bg:{bash_running} · {label}"), kind);
 }
 
-/// Selectable `/ps` list rows: `(id, label, detail, hint)`.
-///
-/// Columns: **status · command · time · short id** (id helps with `bash_output`).
+/// Live chip for **subagents** (`task:1 · explore…`). Open `/tasks`.
+fn refresh_task_chip(app: &mut App, runtime: &AppRuntime) {
+    let jobs = runtime.agent_jobs().map(|j| j.list()).unwrap_or_default();
+    let running = jobs
+        .iter()
+        .filter(|j| j.state == crate::runtime::jobs::JobState::Running)
+        .count();
+    let failed = jobs.iter().any(|j| {
+        matches!(j.state, crate::runtime::jobs::JobState::Failed)
+            || (matches!(j.state, crate::runtime::jobs::JobState::Completed) && !j.ok)
+    });
+
+    if running == 0 && jobs.is_empty() {
+        app.clear_task_chip();
+        return;
+    }
+
+    if running == 0 {
+        if failed {
+            let n_fail = jobs
+                .iter()
+                .filter(|j| {
+                    matches!(j.state, crate::runtime::jobs::JobState::Failed)
+                        || (matches!(j.state, crate::runtime::jobs::JobState::Completed) && !j.ok)
+                })
+                .count();
+            app.set_task_chip(format!("task:{n_fail} · fail · /tasks"), 4);
+        } else {
+            app.clear_task_chip();
+        }
+        return;
+    }
+
+    let label = jobs
+        .iter()
+        .filter(|j| j.state == crate::runtime::jobs::JobState::Running)
+        .map(|j| {
+            j.description
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| j.agent.clone())
+        })
+        .next()
+        .map(|s| truncate_cmd(&s, 18))
+        .unwrap_or_else(|| "running".into());
+
+    let kind = if failed { 3 } else { 1 };
+    app.set_task_chip(format!("task:{running} · {label}"), kind);
+}
+
+/// Selectable `/ps` list rows — **bash processes only**.
 fn background_ps_list_rows(runtime: &AppRuntime) -> Vec<(String, String, String, String)> {
     let bash = runtime.bg_registry().list_meta();
-    let jobs = runtime
-        .agent_jobs()
-        .map(|j| j.list())
-        .unwrap_or_default();
-
     let mut rows: Vec<(String, String, String, String)> = Vec::new();
     for t in &bash {
         rows.push((
@@ -370,6 +377,31 @@ fn background_ps_list_rows(runtime: &AppRuntime) -> Vec<(String, String, String,
             format!("{} · {}", human_elapsed(t.elapsed_ms), short_task_id(&t.id)),
         ));
     }
+    rows
+}
+
+/// Bash detail: command + stdout/stderr tail.
+fn background_ps_detail(runtime: &AppRuntime, id: &str) -> (String, String, Vec<(String, String)>) {
+    if let Some(t) = runtime.bg_registry().get(id) {
+        let title = truncate_cmd(&t.command, 56);
+        let section = format!("{} · {}", bash_status_line(&t), short_task_id(&t.id));
+        let rows = log_lines_as_rows(&t.stdout, &t.stderr, 40);
+        return (title, section, rows);
+    }
+    (
+        id.to_string(),
+        "not found · bash only · try /tasks for subagents".into(),
+        vec![(
+            String::new(),
+            format!("unknown bash task `{id}` (subagents live under /tasks)"),
+        )],
+    )
+}
+
+/// Selectable `/tasks` list rows — **subagents only** (`AgentJobRegistry`).
+fn subagent_list_rows(runtime: &AppRuntime) -> Vec<(String, String, String, String)> {
+    let jobs = runtime.agent_jobs().map(|j| j.list()).unwrap_or_default();
+    let mut rows: Vec<(String, String, String, String)> = Vec::new();
     for j in &jobs {
         let what = j
             .description
@@ -381,11 +413,14 @@ fn background_ps_list_rows(runtime: &AppRuntime) -> Vec<(String, String, String,
             (Some(t), None) => format!("t{t}"),
             _ => String::new(),
         };
-        let time = if progress.is_empty() {
+        let mut time = if progress.is_empty() {
             human_elapsed(j.duration_ms)
         } else {
             format!("{} · {}", human_elapsed(j.duration_ms), progress)
         };
+        if j.state == crate::runtime::jobs::JobState::Running && !j.activity.is_empty() {
+            time = format!("{} · {}", time, truncate_cmd(&j.activity, 28));
+        }
         rows.push((
             j.id.clone(),
             job_status_label(j),
@@ -396,17 +431,8 @@ fn background_ps_list_rows(runtime: &AppRuntime) -> Vec<(String, String, String,
     rows
 }
 
-/// Detail: title = command, section = status line, body = log lines (one float row each).
-fn background_ps_detail(
-    runtime: &AppRuntime,
-    id: &str,
-) -> (String, String, Vec<(String, String)>) {
-    if let Some(t) = runtime.bg_registry().get(id) {
-        let title = truncate_cmd(&t.command, 56);
-        let section = format!("{} · {}", bash_status_line(&t), short_task_id(&t.id));
-        let rows = log_lines_as_rows(&t.stdout, &t.stderr, 40);
-        return (title, section, rows);
-    }
+/// Subagent detail: live event log + final summary.
+fn subagent_detail(runtime: &AppRuntime, id: &str) -> (String, String, Vec<(String, String)>) {
     if let Some(jobs) = runtime.agent_jobs() {
         if let Some(j) = jobs.get(id) {
             let title = j
@@ -414,27 +440,101 @@ fn background_ps_detail(
                 .clone()
                 .filter(|s| !s.is_empty())
                 .unwrap_or_else(|| format!("{} · {}", j.kind, j.agent));
-            let section = format!("{} · {}", job_status_line(&j), short_task_id(&j.id));
+            let mut section = job_status_line(&j);
+            if !j.activity.is_empty() && j.state == crate::runtime::jobs::JobState::Running {
+                section = format!("{section} · {}", truncate_cmd(&j.activity, 40));
+            }
+            section = format!("{section} · {}", short_task_id(&j.id));
             let mut rows = Vec::new();
+            for line in &j.event_lines {
+                let (label, body) = if let Some(rest) = line.strip_prefix("→ ") {
+                    ("→".into(), rest.to_string())
+                } else if let Some(rest) = line.strip_prefix("✓ ") {
+                    ("✓".into(), rest.to_string())
+                } else if let Some(rest) = line.strip_prefix("✗ ") {
+                    ("✗".into(), rest.to_string())
+                } else if let Some(rest) = line.strip_prefix("▸ ") {
+                    ("▸".into(), rest.to_string())
+                } else if let Some(rest) = line.strip_prefix("◂ ") {
+                    ("◂".into(), rest.to_string())
+                } else {
+                    (String::new(), line.clone())
+                };
+                rows.push((label, truncate_cmd(&body, 90)));
+            }
             if let Some(err) = &j.error {
                 if !err.is_empty() {
                     rows.push(("!".into(), truncate_cmd(err, 80)));
                 }
             }
             if !j.summary.is_empty() {
-                rows.extend(text_lines_as_rows(&j.summary, 40));
+                rows.push(("──".into(), "summary".into()));
+                rows.extend(text_lines_as_rows(&j.summary, 24));
             }
             if rows.is_empty() {
-                rows.push((String::new(), "(no summary yet)".into()));
+                rows.push((
+                    String::new(),
+                    "(no activity yet · waiting for first turn)".into(),
+                ));
             }
             return (truncate_cmd(&title, 56), section, rows);
         }
     }
     (
         id.to_string(),
-        "not found".into(),
-        vec![(String::new(), format!("unknown task `{id}`"))],
+        "not found · subagents only · try /ps for bash".into(),
+        vec![(
+            String::new(),
+            format!("unknown subagent `{id}` (bash lives under /ps)"),
+        )],
     )
+}
+
+/// Refresh running `task` tool rows with live activity; bind job ids for click-to-open.
+fn refresh_task_tools_live(app: &mut App, runtime: &AppRuntime) {
+    let Some(jobs) = runtime.agent_jobs() else {
+        return;
+    };
+    let list = jobs.list();
+    // Prefer explicit tool_call → job bindings from TaskToolHost.
+    let bindings = runtime
+        .task_host()
+        .map(|h| h.tool_job_bindings())
+        .unwrap_or_default();
+    let mut bound_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (_tool_id, job_id) in &bindings {
+        bound_ids.insert(job_id.clone());
+        if let Some(j) = list.iter().find(|j| j.id == *job_id) {
+            let summary = task_live_summary(j);
+            app.update_task_tool_live(&j.id, summary, true);
+        }
+    }
+    // Any other running jobs (orphaned binding edge cases).
+    for j in list.iter().filter(|j| j.state == crate::runtime::jobs::JobState::Running) {
+        if bound_ids.contains(&j.id) {
+            continue;
+        }
+        let summary = task_live_summary(j);
+        app.update_task_tool_live(&j.id, summary, true);
+    }
+}
+
+fn task_live_summary(j: &crate::runtime::jobs::JobSnapshot) -> String {
+    let progress = match (j.turns, j.max_turns) {
+        (Some(t), Some(m)) => format!("{t}/{m}"),
+        (Some(t), None) => format!("t{t}"),
+        _ => String::new(),
+    };
+    let act = if j.activity.is_empty() {
+        "running".to_string()
+    } else {
+        truncate_cmd(&j.activity, 36)
+    };
+    if progress.is_empty() {
+        format!("{act} · /tasks")
+    } else {
+        format!("turn {progress} · {act} · /tasks")
+    }
 }
 
 fn open_background_list_panel(app: &mut App, runtime: &AppRuntime) {
@@ -443,7 +543,13 @@ fn open_background_list_panel(app: &mut App, runtime: &AppRuntime) {
     app.open_background_float(&rows);
 }
 
-/// Live-refresh an already-open `/ps` list (preserve selection by id).
+fn open_subagent_list_panel(app: &mut App, runtime: &AppRuntime) {
+    refresh_task_chip(app, runtime);
+    let rows = subagent_list_rows(runtime);
+    app.open_subagent_float(&rows);
+}
+
+/// Live-refresh an already-open `/ps` bash list (preserve selection by id).
 fn refresh_background_list_if_open(app: &mut App, runtime: &AppRuntime) {
     let kind = app.float.as_ref().map(|f| f.kind);
     if kind != Some(FloatKind::Background) {
@@ -458,21 +564,35 @@ fn refresh_background_list_if_open(app: &mut App, runtime: &AppRuntime) {
     app.bg_ps_list = rows.clone();
     app.float = Some(FloatMenu::background_picker(&rows));
     if let (Some(id), Some(f)) = (sel_id, app.float.as_mut()) {
-        if let Some(idx) = f
-            .filtered_entries()
-            .iter()
-            .position(|e| e.item.id == id)
-        {
+        if let Some(idx) = f.filtered_entries().iter().position(|e| e.item.id == id) {
             f.selected = idx;
         }
     }
     refresh_bg_chip(app, runtime);
 }
 
-/// Live-refresh an already-open `/ps` task detail (status + log tail).
-///
-/// Follows the tail when the user was already on the last line; otherwise keeps
-/// their scroll index so ↑/↓ browsing is not yanked away by new output.
+fn refresh_subagent_list_if_open(app: &mut App, runtime: &AppRuntime) {
+    let kind = app.float.as_ref().map(|f| f.kind);
+    if kind != Some(FloatKind::Subagent) {
+        return;
+    }
+    let sel_id = app
+        .float
+        .as_ref()
+        .and_then(|f| f.selected_entry())
+        .map(|e| e.item.id);
+    let rows = subagent_list_rows(runtime);
+    app.task_list = rows.clone();
+    app.float = Some(FloatMenu::subagent_picker(&rows));
+    if let (Some(id), Some(f)) = (sel_id, app.float.as_mut()) {
+        if let Some(idx) = f.filtered_entries().iter().position(|e| e.item.id == id) {
+            f.selected = idx;
+        }
+    }
+    refresh_task_chip(app, runtime);
+}
+
+/// Live-refresh an already-open `/ps` bash detail (stdout/stderr tail).
 fn refresh_background_detail_if_open(app: &mut App, runtime: &AppRuntime) {
     let kind = app.float.as_ref().map(|f| f.kind);
     if kind != Some(FloatKind::BackgroundDetail) {
@@ -491,11 +611,9 @@ fn refresh_background_detail_if_open(app: &mut App, runtime: &AppRuntime) {
         })
         .unwrap_or((true, 0));
 
-    // Keep list cache warm for Esc-back.
     app.bg_ps_list = background_ps_list_rows(runtime);
     let (title, section, rows) = background_ps_detail(runtime, &id);
     app.open_background_detail_float(id, title, &section, &rows);
-    // `open_background_detail_float` pins to the last line; restore if scrolled up.
     if !follow_tail {
         if let Some(f) = app.float.as_mut() {
             let n = f.filtered_entries().len();
@@ -507,7 +625,40 @@ fn refresh_background_detail_if_open(app: &mut App, runtime: &AppRuntime) {
     refresh_bg_chip(app, runtime);
 }
 
-/// Apply UI outcomes queued mid-turn (Enter on `/ps`, kill from `/ps` panel, …).
+/// Live-refresh an already-open `/tasks` subagent detail (event log).
+fn refresh_subagent_detail_if_open(app: &mut App, runtime: &AppRuntime) {
+    let kind = app.float.as_ref().map(|f| f.kind);
+    if kind != Some(FloatKind::SubagentDetail) {
+        return;
+    }
+    let Some(id) = app.task_detail_id.clone() else {
+        return;
+    };
+    let (follow_tail, sel) = app
+        .float
+        .as_ref()
+        .map(|f| {
+            let n = f.filtered_entries().len();
+            let sel = f.selected;
+            (n == 0 || sel + 1 >= n, sel)
+        })
+        .unwrap_or((true, 0));
+
+    app.task_list = subagent_list_rows(runtime);
+    let (title, section, rows) = subagent_detail(runtime, &id);
+    app.open_subagent_detail_float(id, title, &section, &rows);
+    if !follow_tail {
+        if let Some(f) = app.float.as_mut() {
+            let n = f.filtered_entries().len();
+            if n > 0 {
+                f.selected = sel.min(n - 1);
+            }
+        }
+    }
+    refresh_task_chip(app, runtime);
+}
+
+/// Apply UI outcomes queued mid-turn (Enter on `/ps`/`/tasks`, kill, …).
 ///
 /// Avoids anything that needs `agent.lock()` — the streaming task already holds it.
 fn apply_busy_ui_outcome(app: &mut App, runtime: &AppRuntime, outcome: RunOutcome) {
@@ -519,8 +670,16 @@ fn apply_busy_ui_outcome(app: &mut App, runtime: &AppRuntime, outcome: RunOutcom
             open_background_detail_panel(app, runtime, &id);
         }
         RunOutcome::KillBackground { id } => {
-            // Sync kill so list refresh sees Killed immediately (no spawn race).
             kill_background_task_sync(app, runtime, &id);
+        }
+        RunOutcome::OpenSubagentList => {
+            open_subagent_list_panel(app, runtime);
+        }
+        RunOutcome::OpenSubagentDetail { id } => {
+            open_subagent_detail_panel(app, runtime, &id);
+        }
+        RunOutcome::KillSubagent { id } => {
+            kill_subagent_sync(app, runtime, &id);
         }
         RunOutcome::OpenMcpPanel => {
             refresh_mcp_rows(app, runtime);
@@ -534,12 +693,20 @@ fn apply_busy_ui_outcome(app: &mut App, runtime: &AppRuntime, outcome: RunOutcom
             // Safe mid-turn subset — no agent.lock / no nested prompt turn.
             let cmd = text.split_whitespace().next().unwrap_or(text.as_str());
             match cmd {
-                "/ps" | "/jobs" => {
+                "/ps" => {
                     let id = text.split_whitespace().nth(1);
                     if let Some(id) = id {
                         open_background_detail_panel(app, runtime, id);
                     } else {
                         open_background_list_panel(app, runtime);
+                    }
+                }
+                "/tasks" | "/jobs" | "/subagents" => {
+                    let id = text.split_whitespace().nth(1);
+                    if let Some(id) = id {
+                        open_subagent_detail_panel(app, runtime, id);
+                    } else {
+                        open_subagent_list_panel(app, runtime);
                     }
                 }
                 "/login" => {
@@ -563,20 +730,30 @@ fn apply_busy_ui_outcome(app: &mut App, runtime: &AppRuntime, outcome: RunOutcom
 
 fn open_background_detail_panel(app: &mut App, runtime: &AppRuntime, id: &str) {
     refresh_bg_chip(app, runtime);
-    // Always refresh list cache so Esc-back (if any) is not completely stale.
     app.bg_ps_list = background_ps_list_rows(runtime);
     let (title, section, rows) = background_ps_detail(runtime, id);
     app.open_background_detail_float(id, title, &section, &rows);
 }
 
-/// Kill bash task or agent job by id, then refresh `/ps` list (async path).
+fn open_subagent_detail_panel(app: &mut App, runtime: &AppRuntime, id: &str) {
+    refresh_task_chip(app, runtime);
+    app.task_list = subagent_list_rows(runtime);
+    let (title, section, rows) = subagent_detail(runtime, id);
+    app.open_subagent_detail_float(id, title, &section, &rows);
+}
+
+/// Kill bash process by id, then refresh `/ps` list (async path).
 async fn kill_background_task(app: &mut App, runtime: &AppRuntime, id: &str) {
     kill_background_task_sync(app, runtime, id);
-    // Yield so process-group reapers can settle.
     tokio::task::yield_now().await;
 }
 
-/// Sync kill + list refresh (safe from busy TUI tick).
+async fn kill_subagent(app: &mut App, runtime: &AppRuntime, id: &str) {
+    kill_subagent_sync(app, runtime, id);
+    tokio::task::yield_now().await;
+}
+
+/// Sync bash kill + list refresh (safe from busy TUI tick).
 fn kill_background_task_sync(app: &mut App, runtime: &AppRuntime, id: &str) {
     let bash = runtime.bg_registry();
     if bash.get(id).is_some() {
@@ -591,20 +768,31 @@ fn kill_background_task_sync(app: &mut App, runtime: &AppRuntime, id: &str) {
         open_background_list_panel(app, runtime);
         return;
     }
+    app.set_notice(format!(
+        "not a bash task `{id}` · use /tasks for subagents"
+    ));
+    open_background_list_panel(app, runtime);
+}
+
+fn kill_subagent_sync(app: &mut App, runtime: &AppRuntime, id: &str) {
     if let Some(jobs) = runtime.agent_jobs() {
         match jobs.kill(id) {
             Ok(snap) => {
-                app.set_notice(format!("killed {} · {}", snap.id, snap.state.as_str()));
+                app.set_notice(format!(
+                    "killed subagent {} · {}",
+                    snap.id,
+                    snap.state.as_str()
+                ));
             }
             Err(e) => {
-                app.set_notice(format!("kill failed: {e}"));
+                app.set_notice(format!("kill subagent failed: {e}"));
             }
         }
-        open_background_list_panel(app, runtime);
+        open_subagent_list_panel(app, runtime);
         return;
     }
-    app.set_notice(format!("unknown task `{id}`"));
-    open_background_list_panel(app, runtime);
+    app.set_notice(format!("unknown subagent `{id}` · bash lives under /ps"));
+    open_subagent_list_panel(app, runtime);
 }
 
 fn bash_meta_status_label(t: &one_tools::TaskMeta) -> String {
@@ -657,11 +845,11 @@ fn short_task_id(id: &str) -> String {
 
 fn job_status_label(j: &crate::runtime::jobs::JobSnapshot) -> String {
     match j.state {
-        crate::runtime::jobs::JobState::Running => "● job".into(),
-        crate::runtime::jobs::JobState::Completed if j.ok => "✓ job".into(),
-        crate::runtime::jobs::JobState::Completed => "✗ job".into(),
-        crate::runtime::jobs::JobState::Aborted => "■ job".into(),
-        crate::runtime::jobs::JobState::Failed => "✗ job".into(),
+        crate::runtime::jobs::JobState::Running => "● agent".into(),
+        crate::runtime::jobs::JobState::Completed if j.ok => "✓ agent".into(),
+        crate::runtime::jobs::JobState::Completed => "✗ agent".into(),
+        crate::runtime::jobs::JobState::Aborted => "■ agent".into(),
+        crate::runtime::jobs::JobState::Failed => "✗ agent".into(),
     }
 }
 
@@ -673,7 +861,16 @@ fn job_status_line(j: &crate::runtime::jobs::JobSnapshot) -> String {
         _ => String::new(),
     };
     match j.state {
-        crate::runtime::jobs::JobState::Running => format!("running{progress} · {time}"),
+        crate::runtime::jobs::JobState::Running => {
+            if j.activity.is_empty() {
+                format!("running{progress} · {time}")
+            } else {
+                format!(
+                    "running{progress} · {} · {time}",
+                    truncate_cmd(&j.activity, 36)
+                )
+            }
+        }
         crate::runtime::jobs::JobState::Completed if j.ok => format!("ok{progress} · {time}"),
         crate::runtime::jobs::JobState::Completed => format!("failed{progress} · {time}"),
         crate::runtime::jobs::JobState::Aborted => format!("aborted · {time}"),
@@ -684,11 +881,7 @@ fn job_status_line(j: &crate::runtime::jobs::JobSnapshot) -> String {
 /// One float row per log line (float UI is single-line; multi-line blobs are useless).
 ///
 /// Stderr lines get a `!` label so errors stay visible when mixed with stdout.
-fn log_lines_as_rows(
-    stdout: &str,
-    stderr: &str,
-    max_lines: usize,
-) -> Vec<(String, String)> {
+fn log_lines_as_rows(stdout: &str, stderr: &str, max_lines: usize) -> Vec<(String, String)> {
     let mut rows: Vec<(String, String)> = Vec::new();
     for line in stdout.lines().map(str::trim_end).filter(|l| !l.is_empty()) {
         rows.push((String::new(), truncate_cmd(line, 96)));
@@ -937,14 +1130,29 @@ async fn apply_config_op(
                     let lim = one_tools::tool_output_limits();
                     app.set_tool_output_limits(lim.max_lines, lim.max_bytes);
                     sync_compaction_settings(app, &s);
-                    app.set_notice(format!("settings.{key} = {apply_value}"));
+                    sync_execution_settings(app, &s);
+                    if key.eq_ignore_ascii_case("empty_response_retries")
+                        || key.eq_ignore_ascii_case("empty-response-retries")
+                        || key.eq_ignore_ascii_case("empty_retries")
+                        || key.eq_ignore_ascii_case("empty-retries")
+                    {
+                        runtime
+                            .set_empty_response_retries(s.empty_response_retries())
+                            .await;
+                    }
+                    let notice = if matches!(key.as_str(), "auto_approve" | "sandbox") {
+                        format!("settings.{key} = {apply_value} · applies next session")
+                    } else {
+                        format!("settings.{key} = {apply_value}")
+                    };
                     if key.contains("tool_output") {
                         app.open_settings_tool_output();
                     } else if key.contains("compaction") {
                         app.open_settings_compaction();
                     } else {
-                        app.open_settings_float();
+                        app.reopen_settings_float();
                     }
+                    app.set_notice(notice);
                 }
                 Err(err) => app.set_notice(format!("settings: {err}")),
             }
@@ -1072,6 +1280,7 @@ pub async fn run_interactive(
         app.set_tool_output_limits(lim.max_lines, lim.max_bytes);
         let s = crate::settings::load();
         sync_compaction_settings(&mut app, &s);
+        sync_execution_settings(&mut app, &s);
     }
     let ctx = providers.context_window();
     app.set_context_window(ctx);
@@ -1181,11 +1390,18 @@ pub async fn run_interactive(
             .wait_action_with(&mut app, |app| {
                 // Live MCP 4/5 chip while servers connect in the background.
                 refresh_mcp_chip(app, runtime);
-                // Live bg:N chip for background bash / agent jobs (/ps for detail).
+                // Separate chips: bash `/ps` vs subagent `/tasks`.
                 refresh_bg_chip(app, runtime);
-                // Keep open `/ps` list / detail elapsed + log tail current.
+                refresh_task_chip(app, runtime);
+                // Live task tool activity + click-to-open subagent detail.
+                refresh_task_tools_live(app, runtime);
                 refresh_background_list_if_open(app, runtime);
                 refresh_background_detail_if_open(app, runtime);
+                refresh_subagent_list_if_open(app, runtime);
+                refresh_subagent_detail_if_open(app, runtime);
+                while let Some(outcome) = app.take_busy_ui() {
+                    apply_busy_ui_outcome(app, runtime, outcome);
+                }
             })
             .await
             .map_err(|e| -> Box<dyn std::error::Error> { e })?
@@ -1326,6 +1542,24 @@ pub async fn run_interactive(
                     .draw(&mut app)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
+            RunOutcome::OpenSubagentList => {
+                open_subagent_list_panel(&mut app, runtime);
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            RunOutcome::OpenSubagentDetail { id } => {
+                open_subagent_detail_panel(&mut app, runtime, &id);
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            RunOutcome::KillSubagent { id } => {
+                kill_subagent(&mut app, runtime, &id).await;
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
             RunOutcome::ConfigOp(op) => {
                 // Paint "fetching…" before the network await so Ctrl+F feels responsive.
                 if let ConfigOp::ProviderFetchModels { ref id } = op {
@@ -1375,6 +1609,16 @@ fn sync_compaction_settings(app: &mut App, s: &crate::settings::Settings) {
             .unwrap_or(one_core::DEFAULT_PRUNE_PROTECT_TOKENS),
         c.prune_max_chars
             .unwrap_or(one_core::DEFAULT_PRUNE_MAX_CHARS),
+    );
+}
+
+/// `auto_approve` and `sandbox` shape the runtime at startup. Keep their
+/// persisted choices visible in the TUI without claiming that an active agent
+/// has already been rebuilt around a changed policy.
+fn sync_execution_settings(app: &mut App, s: &crate::settings::Settings) {
+    app.set_settings_execution_preferences(
+        s.auto_approve.unwrap_or(false),
+        s.sandbox.as_deref().unwrap_or("workspace-write"),
     );
 }
 
@@ -1508,9 +1752,13 @@ async fn run_turn_streaming(
                 drain_hitl(app, &gate, &hitl);
                 refresh_mcp_chip(app, runtime);
                 refresh_bg_chip(app, runtime);
+                refresh_task_chip(app, runtime);
+                refresh_task_tools_live(app, runtime);
                 refresh_background_list_if_open(app, runtime);
                 refresh_background_detail_if_open(app, runtime);
-                // UI slash / `/ps` while streaming — open floats without waiting for turn end.
+                refresh_subagent_list_if_open(app, runtime);
+                refresh_subagent_detail_if_open(app, runtime);
+                // UI slash / click subagent while streaming — open floats without waiting.
                 while let Some(outcome) = app.take_busy_ui() {
                     apply_busy_ui_outcome(app, runtime, outcome);
                 }
@@ -1810,12 +2058,21 @@ async fn handle_slash(
             app.open_info_float("Session", &rows);
             Ok(SlashAction::Consumed)
         }
-        // Codex-style process list: selectable panel → Enter detail.
-        Some("/ps") | Some("/jobs") => {
+        // Bash process list only (not subagents).
+        Some("/ps") => {
             if let Some(id) = parts.get(1).copied() {
                 open_background_detail_panel(app, runtime, id);
             } else {
                 open_background_list_panel(app, runtime);
+            }
+            Ok(SlashAction::Consumed)
+        }
+        // Subagent list / live log (higher level than `/ps`).
+        Some("/tasks") | Some("/jobs") | Some("/subagents") => {
+            if let Some(id) = parts.get(1).copied() {
+                open_subagent_detail_panel(app, runtime, id);
+            } else {
+                open_subagent_list_panel(app, runtime);
             }
             Ok(SlashAction::Consumed)
         }
@@ -2424,6 +2681,15 @@ async fn handle_slash(
                                 app.set_thinking_level(tl.as_str());
                             }
                         }
+                        if key.eq_ignore_ascii_case("empty_response_retries")
+                            || key.eq_ignore_ascii_case("empty-response-retries")
+                            || key.eq_ignore_ascii_case("empty_retries")
+                            || key.eq_ignore_ascii_case("empty-retries")
+                        {
+                            runtime
+                                .set_empty_response_retries(s.empty_response_retries())
+                                .await;
+                        }
                         if key.eq_ignore_ascii_case("context_window")
                             || key.eq_ignore_ascii_case("context-window")
                             || key.eq_ignore_ascii_case("context")
@@ -2440,10 +2706,19 @@ async fn handle_slash(
                         if key.contains("compaction") {
                             sync_compaction_settings(app, &s);
                         }
+                        sync_execution_settings(app, &s);
                         if key.eq_ignore_ascii_case("provider") || key.eq_ignore_ascii_case("model")
                         {
                             app.set_notice(format!(
                                 "settings.{key} = {value} · Ctrl+L to switch live"
+                            ));
+                        } else if key.eq_ignore_ascii_case("auto_approve")
+                            || key.eq_ignore_ascii_case("auto-approve")
+                            || key.eq_ignore_ascii_case("yes")
+                            || key.eq_ignore_ascii_case("sandbox")
+                        {
+                            app.set_notice(format!(
+                                "settings.{key} = {value} · applies next session"
                             ));
                         } else {
                             app.set_notice(format!("settings.{key} = {value}"));
@@ -2690,9 +2965,11 @@ fn rebuild_tui_from_agent(app: &mut App, messages: &[AgentMessage]) {
                 }
                 let sources = format_sources(&a.citations);
                 if !sources.is_empty() {
-                    if let Some(message) = app.messages.iter_mut().rev().find(|message| {
-                        message.role == one_tui::message::MessageRole::Assistant
-                    }) {
+                    if let Some(message) =
+                        app.messages.iter_mut().rev().find(|message| {
+                            message.role == one_tui::message::MessageRole::Assistant
+                        })
+                    {
                         message.content.push_str(&sources);
                     } else {
                         app.push_assistant(sources.trim_start());
@@ -2925,9 +3202,7 @@ mod server_search_tests {
             },
         ]);
         assert!(text.starts_with("\n\nSources:\n"));
-        assert!(text.contains(
-            "- Example source — https://example.com/a/really/long/path?x=1"
-        ));
+        assert!(text.contains("- Example source — https://example.com/a/really/long/path?x=1"));
         assert!(text.contains("- https://rust-lang.org"));
         assert_eq!(
             text.matches("https://example.com/a/really/long/path?x=1")

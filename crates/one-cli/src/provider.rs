@@ -256,21 +256,20 @@ impl ProviderSet {
             return None;
         }
         let api_key = resolved.api_key.filter(|k| !k.is_empty())?;
-        let base_url = resolved
-            .base_url
-            .filter(|b| !b.is_empty())
-            .or_else(|| {
-                let d = default_base_for_detect(&self.provider_id);
-                if d.is_empty() {
-                    None
-                } else {
-                    Some(d.to_string())
-                }
-            })?;
+        let base_url = resolved.base_url.filter(|b| !b.is_empty()).or_else(|| {
+            let d = default_base_for_detect(&self.provider_id);
+            if d.is_empty() {
+                None
+            } else {
+                Some(d.to_string())
+            }
+        })?;
 
         let mut extra = std::collections::BTreeMap::new();
-        if matches!(self.provider_id.as_str(), PROVIDER_XAI | "grok" | "supergrok")
-            || base_url.contains("cli-chat-proxy.grok.com")
+        if matches!(
+            self.provider_id.as_str(),
+            PROVIDER_XAI | "grok" | "supergrok"
+        ) || base_url.contains("cli-chat-proxy.grok.com")
             || base_url.contains("api.x.ai")
         {
             extra = one_ai::auth::xai_cli_headers();

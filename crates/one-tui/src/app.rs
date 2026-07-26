@@ -17,7 +17,7 @@ use crate::message::{
 use crate::slash::{self, ModelChoice, PopupKind, PopupRow};
 use crate::state::{
     display_col_to_caret, ApprovalAnswer, ApprovalPrompt, ModelDraft, PendingImage, PendingText,
-    RunOutcome, SelectKind, SelectPos, Toast, WELCOME_TRY_PROMPTS,
+    RunOutcome, SelectKind, SelectPos, SettingsDeleteTarget, Toast, WELCOME_TRY_PROMPTS,
 };
 use crate::tool_view;
 
@@ -61,10 +61,12 @@ pub struct App {
     /// Live streaming always shows a short rolling tail regardless of this flag.
     pub show_thinking: bool,
     pub busy: bool,
-    /// Lines scrolled **up from the bottom** of the transcript (0 = stick to end).
+    /// Absolute first visible display row while browsing transcript history.
     ///
     /// Must be line-based, not message-based: a single long assistant reply can be
     /// taller than the viewport, and Ratatui `List` cannot partial-scroll one item.
+    /// Ignored while `follow_bottom` is true, when the renderer derives the
+    /// latest start row from the transcript height.
     pub chat_scroll: usize,
     pub follow_bottom: bool,
     /// Last drawn chat viewport height (rows). Used for PageUp/PageDown page size.
@@ -136,18 +138,31 @@ pub struct App {
     pub compaction_prune: bool,
     pub compaction_prune_protect: usize,
     pub compaction_prune_max_chars: usize,
+    /// Persisted broad permission choice shown by Settings. This is intentionally
+    /// separate from the live `PermissionGate`, which is built at session start.
+    pub settings_saved_auto_approve: bool,
+    /// Persisted path-sandbox choice shown by Settings; applied when a new runtime starts.
+    pub settings_saved_sandbox: String,
     /// Status-bar / prompt-meta chip, e.g. `MCP 4/5…`. Empty = hidden.
     pub mcp_chip_text: String,
     /// 0=hide 1=loading 2=ok 3=partial 4=error
     pub mcp_chip_kind: u8,
-    /// Status-bar / prompt-meta chip for background bash/jobs, e.g. `bg:1`. Empty = hidden.
+    /// Status-bar chip for **bash** background only, e.g. `bg:1`. Empty = hidden.
     pub bg_chip_text: String,
     /// 0=hide 1=running 2=idle/done 3=failed mixed 4=error
     pub bg_chip_kind: u8,
-    /// Cached `/ps` list rows: `(id, label, detail, hint)` for Esc-back from detail.
+    /// Status-bar chip for **subagents** (`task`), e.g. `task:1`. Empty = hidden.
+    pub task_chip_text: String,
+    /// Same kind codes as `bg_chip_kind`.
+    pub task_chip_kind: u8,
+    /// Cached `/ps` bash list rows for Esc-back from detail.
     pub bg_ps_list: Vec<(String, String, String, String)>,
-    /// Task id currently shown in BackgroundDetail (for Enter refresh).
+    /// Bash task id currently shown in BackgroundDetail.
     pub bg_ps_detail_id: Option<String>,
+    /// Cached `/tasks` subagent list rows for Esc-back from detail.
+    pub task_list: Vec<(String, String, String, String)>,
+    /// Subagent job id currently shown in SubagentDetail.
+    pub task_detail_id: Option<String>,
     /// Ephemeral toast (top-right). **Not** chat context, **not** agent messages.
     pub toast: Option<Toast>,
     /// Centered floating secondary menu (Settings, commands, sessions, …).
@@ -169,6 +184,8 @@ pub struct App {
     /// When set, float search bar edits a ConfigOp field (never opens docked select).
     /// e.g. `provider_set:linuxdo:base_url`, `model_set:p:id:name`, `provider_add_id`.
     pub settings_inline_op: Option<String>,
+    /// Pending destructive Settings action; Enter only executes after its target is typed.
+    pub(crate) settings_delete_target: Option<SettingsDeleteTarget>,
     /// Thinking level label: off | low | medium | high.
     pub thinking_level: String,
     /// Context tokens for window %: last provider prompt size when known,
@@ -303,12 +320,18 @@ impl App {
             compaction_prune: false,
             compaction_prune_protect: 40_000,
             compaction_prune_max_chars: 2_000,
+            settings_saved_auto_approve: false,
+            settings_saved_sandbox: "workspace-write".into(),
             mcp_chip_text: String::new(),
             mcp_chip_kind: 0,
             bg_chip_text: String::new(),
             bg_chip_kind: 0,
+            task_chip_text: String::new(),
+            task_chip_kind: 0,
             bg_ps_list: Vec::new(),
             bg_ps_detail_id: None,
+            task_list: Vec::new(),
+            task_detail_id: None,
             toast: None,
             float: None,
             current_provider: String::new(),
@@ -319,6 +342,7 @@ impl App {
             model_draft: None,
             settings_form_edit: None,
             settings_inline_op: None,
+            settings_delete_target: None,
             thinking_level: "off".into(),
             usage_tokens: 0,
             usage_tokens_estimated: true,
@@ -1163,7 +1187,6 @@ impl App {
     pub fn push_alert(&mut self, level: AlertLevel, text: impl Into<String>) {
         self.seal_stream_segment();
         self.messages.push(Message::alert(level, text));
-        self.scroll_to_bottom();
     }
 
     pub fn push_error_alert(&mut self, text: impl Into<String>) {
@@ -1288,6 +1311,7 @@ impl App {
 
     pub fn close_float(&mut self) {
         self.float = None;
+        self.settings_delete_target = None;
     }
 
     /// Popup rows for current input (commands or models grouped by provider).
@@ -1443,12 +1467,10 @@ impl App {
         let mut msg = Message::assistant(text);
         msg.footer = Some(self.turn_footer(None));
         self.messages.push(msg);
-        self.scroll_to_bottom();
     }
 
     pub fn push_system(&mut self, text: impl Into<String>) {
         self.messages.push(Message::system(text));
-        self.scroll_to_bottom();
     }
 
     pub fn push_tool(&mut self, text: impl Into<String>) {
@@ -1457,7 +1479,6 @@ impl App {
         let (name, detail) = split_tool_text(&text);
         self.messages
             .push(Message::tool(name, detail, ToolStatus::Running));
-        self.scroll_to_bottom();
     }
 
     pub fn push_tool_call(&mut self, name: impl Into<String>, args: impl Into<String>) {
@@ -1468,7 +1489,6 @@ impl App {
         self.seal_stream_segment();
         self.messages
             .push(Message::tool(name, args, ToolStatus::Running));
-        self.scroll_to_bottom();
     }
 
     /// Finalize in-progress thinking / assistant stream bubbles and reset
@@ -1514,6 +1534,17 @@ impl App {
             msg.tool_status = Some(status);
             let args = msg.content.clone();
             let tool_name = msg.tool_name.clone().unwrap_or_else(|| name.to_string());
+            // Preserve / recover job_id from tool output for post-run reopen.
+            if tool_name == "task" {
+                if msg.tool_job_id.is_none() {
+                    if let Some(raw) = output.as_ref() {
+                        if let Some(id) = extract_job_id_from_task_output(raw) {
+                            msg.tool_job_id = Some(id);
+                        }
+                    }
+                }
+                msg.tool_ungroup = true;
+            }
             if let Some(raw) = output.clone() {
                 let mut stored = truncate_tool_output_for_ui(&raw, 4_000);
                 let (summary, expand) = if let Some((s, e, better)) =
@@ -1528,7 +1559,12 @@ impl App {
                 };
                 msg.tool_output = Some(stored);
                 msg.tool_summary = Some(summary);
-                msg.tool_expanded = expand;
+                // Task with job_id: prefer collapsed one-liner; click reopens log.
+                msg.tool_expanded = if tool_name == "task" && msg.tool_job_id.is_some() {
+                    false
+                } else {
+                    expand
+                };
             } else if error {
                 msg.tool_summary = Some("failed".into());
                 msg.tool_expanded = true;
@@ -1639,6 +1675,9 @@ impl App {
     }
 
     /// Toggle the tool message at `msg_index` (click target for a tool row).
+    ///
+    /// For `task` rows with a live `tool_job_id`, click opens the job detail
+    /// panel (Grok Build-style) instead of only expanding the summary.
     pub fn toggle_tool_at(&mut self, msg_index: usize) {
         if self
             .messages
@@ -1655,8 +1694,48 @@ impl App {
                 return;
             }
         }
+        // task · job_id → open **subagent** live log (`/tasks`, not `/ps` bash).
+        if let Some(msg) = self.messages.get(msg_index) {
+            if msg.tool_name.as_deref() == Some("task") {
+                if let Some(id) = msg.tool_job_id.clone() {
+                    self.queue_busy_ui(RunOutcome::OpenSubagentDetail { id });
+                    return;
+                }
+            }
+        }
         if let Some(msg) = self.messages.get_mut(msg_index) {
             msg.tool_expanded = !msg.tool_expanded;
+        }
+    }
+
+    /// Attach / refresh live job metadata on a running `task` tool row.
+    pub fn update_task_tool_live(
+        &mut self,
+        job_id: &str,
+        summary: impl Into<String>,
+        bind_if_unbound: bool,
+    ) {
+        let summary = summary.into();
+        for msg in self.messages.iter_mut().rev() {
+            if msg.role != MessageRole::Tool || msg.tool_name.as_deref() != Some("task") {
+                continue;
+            }
+            let matches = msg.tool_job_id.as_deref() == Some(job_id)
+                || (bind_if_unbound
+                    && msg.tool_job_id.is_none()
+                    && msg.tool_status == Some(ToolStatus::Running));
+            if !matches {
+                continue;
+            }
+            if msg.tool_job_id.is_none() {
+                msg.tool_job_id = Some(job_id.to_string());
+            }
+            // Keep auto-expanded so activity is visible without an extra click.
+            msg.tool_ungroup = true;
+            if msg.tool_status == Some(ToolStatus::Running) {
+                msg.tool_summary = Some(summary);
+            }
+            return;
         }
     }
 
@@ -2043,7 +2122,6 @@ impl App {
         }
         self.stream_buffer.clear();
         self.attach_turn_footer(interrupted);
-        self.scroll_to_bottom();
     }
 
     fn attach_turn_footer(&mut self, interrupted: bool) {
@@ -2167,7 +2245,7 @@ impl App {
             self.follow_bottom = true;
             self.chat_scroll = 0;
         } else {
-            self.chat_scroll = max;
+            self.chat_scroll = 0;
         }
     }
 
@@ -2192,21 +2270,23 @@ impl App {
         if lines == 0 {
             return;
         }
-        self.follow_bottom = false;
-        self.chat_scroll = self.chat_scroll.saturating_add(lines);
-        // Clamp when metrics are known (updated each draw); otherwise draw clamps.
-        if self.chat_total_lines > 0 && self.chat_view_height > 0 {
-            self.chat_scroll = self.chat_scroll.min(self.max_scroll());
+        if self.follow_bottom {
+            self.follow_bottom = false;
+            self.chat_scroll = self.max_scroll();
         }
+        self.chat_scroll = self.chat_scroll.saturating_sub(lines);
     }
 
     /// Scroll the transcript down by `lines` display rows (newer content).
     pub fn scroll_down(&mut self, lines: usize) {
-        self.chat_scroll = self.chat_scroll.saturating_sub(lines);
-        // Empty welcome is top-anchored; don't re-enter follow-bottom or the
-        // next draw will snap back to the title.
-        if self.chat_scroll == 0 && !self.messages.is_empty() {
+        if self.follow_bottom {
+            return;
+        }
+        let max = self.max_scroll();
+        self.chat_scroll = self.chat_scroll.saturating_add(lines).min(max);
+        if self.chat_scroll == max && !self.messages.is_empty() {
             self.follow_bottom = true;
+            self.chat_scroll = 0;
         }
     }
 
@@ -2343,6 +2423,11 @@ impl App {
         if Self::is_help_key(key) {
             self.select = None;
             self.open_help_float();
+            return RunOutcome::Noop;
+        }
+
+        if Self::is_goto_bottom_key(key) {
+            self.scroll_to_bottom();
             return RunOutcome::Noop;
         }
 
@@ -2626,6 +2711,15 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::ALT)
     }
 
+    /// Shift+G jumps to the live transcript without stealing Ctrl+G Settings.
+    fn is_goto_bottom_key(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char('G') | KeyCode::Char('g'))
+            && key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key
+                .modifiers
+                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+    }
+
     /// Ctrl+F — fetch remote models. Also accept legacy ASCII ACK (0x06).
     fn is_ctrl_f(key: KeyEvent) -> bool {
         match key.code {
@@ -2830,7 +2924,7 @@ impl App {
                 RunOutcome::Noop
             }
             // Esc / ← (nav only): cancel field edit, else one level up.
-            // `/ps` detail → ask CLI to reopen list with a fresh snapshot (not cache).
+            // Detail → ask CLI to reopen list with a fresh snapshot (not cache).
             KeyCode::Esc => {
                 if self
                     .float
@@ -2838,6 +2932,13 @@ impl App {
                     .is_some_and(|f| f.kind == FloatKind::BackgroundDetail)
                 {
                     return RunOutcome::OpenBackgroundList;
+                }
+                if self
+                    .float
+                    .as_ref()
+                    .is_some_and(|f| f.kind == FloatKind::SubagentDetail)
+                {
+                    return RunOutcome::OpenSubagentList;
                 }
                 if !self.settings_go_back() {
                     self.close_float();
@@ -2851,6 +2952,13 @@ impl App {
                     .is_some_and(|f| f.kind == FloatKind::BackgroundDetail)
                 {
                     return RunOutcome::OpenBackgroundList;
+                }
+                if self
+                    .float
+                    .as_ref()
+                    .is_some_and(|f| f.kind == FloatKind::SubagentDetail)
+                {
+                    return RunOutcome::OpenSubagentList;
                 }
                 if !self.settings_go_back() {
                     self.close_float();
@@ -2883,6 +2991,13 @@ impl App {
                     {
                         return RunOutcome::OpenBackgroundList;
                     }
+                    if self
+                        .float
+                        .as_ref()
+                        .is_some_and(|f| f.kind == FloatKind::SubagentDetail)
+                    {
+                        return RunOutcome::OpenSubagentList;
+                    }
                     if !self.settings_go_back() {
                         self.close_float();
                     }
@@ -2897,7 +3012,7 @@ impl App {
                 }
                 RunOutcome::Noop
             }
-            // `/ps`: `x` kills selected task (list or open detail) when not filtering.
+            // `/ps` or `/tasks`: `x` kills selected item when not filtering.
             KeyCode::Char('x') | KeyCode::Char('X')
                 if !editing
                     && !key.modifiers.contains(KeyModifiers::CONTROL)
@@ -2905,20 +3020,25 @@ impl App {
                     && self.float.as_ref().is_some_and(|f| {
                         matches!(
                             f.kind,
-                            FloatKind::Background | FloatKind::BackgroundDetail
+                            FloatKind::Background
+                                | FloatKind::BackgroundDetail
+                                | FloatKind::Subagent
+                                | FloatKind::SubagentDetail
                         ) && f.search.is_empty()
                     }) =>
             {
-                self.background_kill_selection()
+                self.background_or_subagent_kill_selection()
             }
-            // BackgroundDetail is a read-only log viewer — no type-to-filter.
+            // Detail log viewers — no type-to-filter.
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
-                    && !self
-                        .float
-                        .as_ref()
-                        .is_some_and(|f| f.kind == FloatKind::BackgroundDetail) =>
+                    && !self.float.as_ref().is_some_and(|f| {
+                        matches!(
+                            f.kind,
+                            FloatKind::BackgroundDetail | FloatKind::SubagentDetail
+                        )
+                    }) =>
             {
                 if let Some(f) = self.float.as_mut() {
                     f.push_search(ch);
@@ -2938,7 +3058,40 @@ impl App {
         }
     }
 
-    /// `/ps` list or detail: kill the focused background task (`x`).
+    /// `/ps` or `/tasks` list/detail: kill the focused item (`x`).
+    fn background_or_subagent_kill_selection(&mut self) -> RunOutcome {
+        let kind = self.float.as_ref().map(|f| f.kind);
+        let id = match kind {
+            Some(FloatKind::BackgroundDetail) => self.bg_ps_detail_id.clone(),
+            Some(FloatKind::Background) => self
+                .float
+                .as_ref()
+                .and_then(|f| f.selected_entry())
+                .map(|e| e.item.id)
+                .filter(|id| id != "_empty" && !id.is_empty()),
+            Some(FloatKind::SubagentDetail) => self.task_detail_id.clone(),
+            Some(FloatKind::Subagent) => self
+                .float
+                .as_ref()
+                .and_then(|f| f.selected_entry())
+                .map(|e| e.item.id)
+                .filter(|id| id != "_empty" && !id.is_empty()),
+            _ => None,
+        };
+        let Some(id) = id else {
+            self.set_notice("nothing to kill");
+            return RunOutcome::Noop;
+        };
+        match kind {
+            Some(FloatKind::Subagent | FloatKind::SubagentDetail) => {
+                RunOutcome::KillSubagent { id }
+            }
+            _ => RunOutcome::KillBackground { id },
+        }
+    }
+
+    /// Legacy name kept for tests — bash only.
+    #[allow(dead_code)]
     fn background_kill_selection(&mut self) -> RunOutcome {
         let kind = self.float.as_ref().map(|f| f.kind);
         let id = match kind {
@@ -3033,18 +3186,30 @@ impl App {
                 if entry.item.id == "_empty" || entry.item.id.is_empty() {
                     return RunOutcome::Noop;
                 }
-                // CLI re-fetches a fresh snapshot (live output tail).
+                // CLI re-fetches a fresh bash stdout/stderr snapshot.
                 RunOutcome::OpenBackgroundDetail {
                     id: entry.item.id.clone(),
                 }
             }
             FloatKind::BackgroundDetail => {
-                // Enter refreshes the open task (live output tail).
                 if let Some(id) = self.bg_ps_detail_id.clone() {
                     return RunOutcome::OpenBackgroundDetail { id };
                 }
-                // No id (edge case) → CLI reopens fresh list.
                 RunOutcome::OpenBackgroundList
+            }
+            FloatKind::Subagent => {
+                if entry.item.id == "_empty" || entry.item.id.is_empty() {
+                    return RunOutcome::Noop;
+                }
+                RunOutcome::OpenSubagentDetail {
+                    id: entry.item.id.clone(),
+                }
+            }
+            FloatKind::SubagentDetail => {
+                if let Some(id) = self.task_detail_id.clone() {
+                    return RunOutcome::OpenSubagentDetail { id };
+                }
+                RunOutcome::OpenSubagentList
             }
             FloatKind::Settings => self.confirm_settings_root(&entry.item.id),
             FloatKind::SettingsToolOutput => self.confirm_settings_tool_output(&entry.item.id),
@@ -3052,6 +3217,9 @@ impl App {
             FloatKind::SettingsProviders => self.confirm_settings_providers(&entry.item.id),
             FloatKind::SettingsProviderDetail => {
                 self.confirm_settings_provider_detail(&entry.item.id)
+            }
+            FloatKind::SettingsProviderCompat => {
+                self.confirm_settings_provider_compat(&entry.item.id)
             }
             FloatKind::SettingsProviderApi => self.confirm_settings_provider_api(&entry.item.id),
             FloatKind::SettingsThinkingFormat => {
@@ -3064,6 +3232,7 @@ impl App {
             FloatKind::SettingsModels => self.confirm_settings_models(&entry.item.id),
             FloatKind::SettingsModelDetail => self.confirm_settings_model_detail(&entry.item.id),
             FloatKind::SettingsModelAdd => self.confirm_settings_model_add(&entry.item.id),
+            FloatKind::SettingsDeleteConfirm => self.confirm_settings_delete(),
             FloatKind::Skills => self.confirm_skills_toggle(&entry.item.id),
             FloatKind::Agents => self.confirm_agents_item(&entry.item.id),
             FloatKind::Features => self.confirm_features_toggle(&entry.item.id),
@@ -3130,9 +3299,13 @@ impl App {
                 self.close_float();
                 RunOutcome::OpenMcpPanel
             }
-            "ps" | "jobs" => {
+            "ps" => {
                 self.close_float();
                 RunOutcome::OpenBackgroundList
+            }
+            "tasks" | "jobs" | "subagents" => {
+                self.close_float();
+                RunOutcome::OpenSubagentList
             }
             // These need runtime data → emit slash so CLI opens the right float.
             "resume" | "session" | "tree" | "rewind" | "new" | "name" | "export" | "compact"
@@ -3189,6 +3362,11 @@ impl App {
         if Self::is_help_key(key) {
             self.select = None;
             self.open_help_float();
+            return;
+        }
+
+        if Self::is_goto_bottom_key(key) {
+            self.scroll_to_bottom();
             return;
         }
 
@@ -3332,15 +3510,21 @@ impl App {
     fn queue_busy_ui_from_slash(&mut self, text: &str) {
         let parts: Vec<&str> = text.split_whitespace().collect();
         match parts.first().copied() {
-            Some("/ps") | Some("/jobs") => {
+            Some("/ps") => {
                 if let Some(id) = parts.get(1).copied() {
-                    self.queue_busy_ui(RunOutcome::OpenBackgroundDetail {
-                        id: id.to_string(),
-                    });
+                    self.queue_busy_ui(RunOutcome::OpenBackgroundDetail { id: id.to_string() });
                 } else {
                     self.queue_busy_ui(RunOutcome::OpenBackgroundList);
                 }
-                self.set_notice("background tasks…");
+                self.set_notice("background bash…");
+            }
+            Some("/tasks") | Some("/jobs") | Some("/subagents") => {
+                if let Some(id) = parts.get(1).copied() {
+                    self.queue_busy_ui(RunOutcome::OpenSubagentDetail { id: id.to_string() });
+                } else {
+                    self.queue_busy_ui(RunOutcome::OpenSubagentList);
+                }
+                self.set_notice("subagents…");
             }
             Some("/settings") if parts.len() == 1 => {
                 self.open_settings_float();
@@ -3686,6 +3870,23 @@ pub fn expand_at_files(text: &str) -> String {
     out
 }
 
+/// Pull `job_…` id from task tool text (`id=job_…` or `job_id: job_…`).
+fn extract_job_id_from_task_output(text: &str) -> Option<String> {
+    for token in ["id=", "job_id:", "job_id="] {
+        if let Some(pos) = text.find(token) {
+            let rest = text[pos + token.len()..].trim_start();
+            let id: String = rest
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+                .collect();
+            if id.starts_with("job_") || id.starts_with("task_") {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
 fn split_tool_text(content: &str) -> (String, String) {
     let content = content.trim();
     if let Some(open) = content.find('(') {
@@ -3738,7 +3939,9 @@ fn is_ui_slash(text: &str) -> bool {
             | "/agents"
             | "/mcp"
             | "/ps"
+            | "/tasks"
             | "/jobs"
+            | "/subagents"
             | "/tree"
             | "/rewind"
             | "/export"
@@ -4280,6 +4483,38 @@ mod tests {
     }
 
     #[test]
+    fn shift_g_restores_live_follow_in_idle_and_busy_input() {
+        let mut app = App::new("test");
+        app.chat_total_lines = 20;
+        app.chat_view_height = 5;
+        app.scroll_to_top();
+        assert!(!app.follow_bottom);
+
+        let outcome = app.handle_key(key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert!(matches!(outcome, RunOutcome::Noop));
+        assert!(app.follow_bottom);
+
+        app.scroll_to_top();
+        assert!(!app.follow_bottom);
+        app.handle_busy_key(key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+        assert!(app.follow_bottom);
+    }
+
+    #[test]
+    fn scrolling_down_to_bottom_reenters_live_follow() {
+        let mut app = App::new("test");
+        app.messages.push(Message::assistant("message"));
+        app.chat_total_lines = 20;
+        app.chat_view_height = 5;
+        app.scroll_to_top();
+        assert!(!app.follow_bottom);
+
+        app.scroll_down(app.max_scroll());
+        assert!(app.follow_bottom);
+        assert_eq!(app.chat_scroll, 0);
+    }
+
+    #[test]
     fn paste_preserves_newlines() {
         let mut app = App::new("test");
         app.handle_paste("foo\nbar");
@@ -4746,6 +4981,14 @@ mod tests {
             Some(RunOutcome::OpenBackgroundDetail { id }) => assert_eq!(id, "task-9"),
             other => panic!("expected OpenBackgroundDetail, got {other:?}"),
         }
+
+        // Subagent path is separate from bash `/ps`.
+        app.input = "/tasks job_1".into();
+        app.handle_busy_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        match app.take_busy_ui() {
+            Some(RunOutcome::OpenSubagentDetail { id }) => assert_eq!(id, "job_1"),
+            other => panic!("expected OpenSubagentDetail, got {other:?}"),
+        }
     }
 
     #[test]
@@ -5209,7 +5452,10 @@ mod tests {
 
         // Group header click: collapse back to chip.
         app.toggle_tool_group_at(0);
-        assert!(app.messages.iter().all(|m| !m.tool_ungroup && !m.tool_expanded));
+        assert!(app
+            .messages
+            .iter()
+            .all(|m| !m.tool_ungroup && !m.tool_expanded));
         assert!(tool_view::streak_can_collapse(&app.messages, 0, 3));
 
         // Ctrl+O expand then collapse last group.

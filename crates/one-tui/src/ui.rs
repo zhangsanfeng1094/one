@@ -409,20 +409,30 @@ fn draw_toast(frame: &mut Frame<'_>, full: Rect, app: &App) {
 /// When `edit_mode`, the list is fully dimmed and the `›` marker is hidden so
 /// the top field is the sole interaction focus.
 fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
-    // Leave ≥2 cols of terminal chrome outside the modal so chat never sits
-    // flush against the border (reduces “half glyph on the edge” artifacts).
-    let max_w = full.width.saturating_sub(6).max(36);
-    let width = (full.width.saturating_mul(7) / 10).clamp(42, max_w);
+    // Keep a little terminal chrome around the modal when possible, while
+    // remaining safe on narrow/short terminals. `u16::clamp` panics when its
+    // lower bound exceeds the upper bound, which used to make Settings crash
+    // below ~48 columns or ~12 rows.
+    let max_w = full.width.saturating_sub(2);
+    let min_w = 42.min(max_w);
+    let width = (full.width.saturating_mul(7) / 10).clamp(min_w, max_w);
     let render_rows = menu.render_rows();
     let show_filter = menu.edit_mode || !menu.search.is_empty();
     // Outer height includes border (2). Inner: top pad + optional filter+rule + list + bottom pad.
     let filter_h: u16 = if show_filter { 2 } else { 0 };
-    let list_rows = (render_rows.len() as u16).clamp(1, 16);
+    // Show more rows on tall terminals but never let the float exceed its frame.
+    let available_list_rows = full
+        .height
+        .saturating_sub(if show_filter { 7 } else { 5 })
+        .max(1);
+    let list_rows = (render_rows.len() as u16).clamp(1, available_list_rows.min(24));
     let inner_h = 1u16 // top pad
         .saturating_add(filter_h)
         .saturating_add(list_rows)
         .saturating_add(1); // bottom pad
-    let height = (inner_h.saturating_add(2)).clamp(10, full.height.saturating_sub(2));
+    let max_h = full.height.saturating_sub(2);
+    let min_h = 6.min(max_h);
+    let height = (inner_h.saturating_add(2)).clamp(min_h, max_h);
 
     let x = full.x + (full.width.saturating_sub(width)) / 2;
     let y = full.y + (full.height.saturating_sub(height)) / 2;
@@ -499,9 +509,12 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
         );
     }
 
-    // List with scroll around selected. BackgroundDetail is a read-only log:
+    // List with scroll around selected. Detail panels are read-only logs:
     // `selected` is only a scroll anchor — never a focus cursor.
-    let readonly_log = menu.kind == FloatKind::BackgroundDetail;
+    let readonly_log = matches!(
+        menu.kind,
+        FloatKind::BackgroundDetail | FloatKind::SubagentDetail
+    );
     let max_rows = list_area.height as usize;
     let selected_row = render_rows
         .iter()
@@ -566,6 +579,9 @@ fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMenu) {
 
 fn float_footer_text(menu: &FloatMenu) -> String {
     if menu.edit_mode {
+        if menu.kind == FloatKind::SettingsDeleteConfirm {
+            return " Type exact name  ·  Enter Delete  ·  Esc Cancel ".into();
+        }
         return " ←→ Cursor  ·  Enter Save  ·  Esc Cancel ".into();
     }
     let base = match menu.kind {
@@ -578,15 +594,18 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         FloatKind::Logout => " ↑/↓ Navigate  ·  Enter Logout  ·  Esc Close ",
         FloatKind::Help => " ↑/↓ Navigate  ·  Enter Open  ·  Esc Back ",
         FloatKind::Models => " ↑/↓ Navigate  ·  Enter Switch  ·  Esc Back ",
-        FloatKind::Settings => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
+        FloatKind::Settings => " ↑/↓ Navigate  ·  Type to filter  ·  Enter Select  ·  Esc Close ",
         FloatKind::SettingsModels => {
-            " ↑/↓ Navigate  ·  Enter Select  ·  Ctrl+F Import  ·  Esc Back "
+            " ↑/↓ Navigate  ·  Type to filter  ·  Enter Select  ·  Ctrl+F Import  ·  Esc Back "
         }
         FloatKind::SettingsProviderDetail => {
-            " ↑/↓ Navigate  ·  Enter Select  ·  Ctrl+F Import  ·  Esc Back "
+            " ↑/↓ Navigate  ·  Type to filter  ·  Enter Select  ·  Ctrl+F Import  ·  Esc Back "
+        }
+        FloatKind::SettingsProviderCompat => {
+            " ↑/↓ Navigate  ·  Type to filter  ·  Enter Select  ·  Esc Back "
         }
         FloatKind::SettingsRemoteModels => {
-            " ↑/↓ Navigate  ·  Enter Add  ·  Ctrl+F Re-import  ·  Esc Back "
+            " ↑/↓ Navigate  ·  Type to filter  ·  Enter Add  ·  Ctrl+F Re-import  ·  Esc Back "
         }
         FloatKind::SettingsToolOutput => " ↑/↓ Navigate  ·  Enter Edit  ·  Esc Back ",
         FloatKind::SettingsCompaction => " ↑/↓ Navigate  ·  Enter Edit/Toggle  ·  Esc Back ",
@@ -596,13 +615,16 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         | FloatKind::SettingsMaxTokensField
         | FloatKind::SettingsModelDetail => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Back ",
         FloatKind::SettingsModelAdd => " ↑/↓ Fields  ·  Enter Edit/Save  ·  Esc Back ",
+        FloatKind::SettingsDeleteConfirm => " Type exact name  ·  Enter Delete  ·  Esc Cancel ",
         FloatKind::Skills => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Close ",
         FloatKind::Agents => " ↑/↓ Navigate  ·  Enter details/path  ·  Esc Close ",
         FloatKind::Features => " ↑/↓ Navigate  ·  Enter Toggle  ·  Esc Back  ·  ctx needs /new ",
         FloatKind::Mcp => " ↑/↓  ·  Enter  ·  Import  ·  Esc ",
         FloatKind::McpImport => " ↑/↓  ·  Enter import  ·  Esc back ",
         FloatKind::Background => " ↑/↓  ·  Enter log  ·  x kill  ·  Esc ",
-        FloatKind::BackgroundDetail => " ↑/↓ scroll  ·  auto  ·  x kill  ·  Esc list ",
+        FloatKind::BackgroundDetail => " ↑/↓ scroll  ·  x kill  ·  Esc list ",
+        FloatKind::Subagent => " ↑/↓  ·  Enter live log  ·  x kill  ·  Esc ",
+        FloatKind::SubagentDetail => " ↑/↓ scroll  ·  live  ·  x kill  ·  Esc list ",
         FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
     };
     base.into()
@@ -872,24 +894,20 @@ fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         // Fresh session / after `/clear`: pin welcome to the top (title first).
         // Keep follow_bottom false so later PgDn can reveal lower tips.
         app.follow_bottom = false;
-        app.chat_scroll = max_from_bottom;
+        app.chat_scroll = 0;
     } else if app.follow_bottom {
         app.chat_scroll = 0;
     } else {
-        // Keep offset in range so PageDown can re-stick without a huge backlog.
+        // A history scroll is top-relative, so new output below the viewport
+        // cannot move what the reader is currently inspecting.
         app.chat_scroll = app.chat_scroll.min(max_from_bottom);
-        if app.chat_scroll == 0 && !empty_welcome {
-            app.follow_bottom = true;
-        }
     }
 
-    let from_bottom = if app.follow_bottom || view_h == 0 {
-        0
+    let start = if app.follow_bottom || view_h == 0 {
+        max_from_bottom
     } else {
         app.chat_scroll
     };
-    // start = first visible line index from the top of the transcript.
-    let start = max_from_bottom.saturating_sub(from_bottom);
     let end = (start + view_h).min(total);
     app.chat_view_start = start;
     // New / short chats start at the top of the pane (0,0) — not pinned to the prompt.
@@ -1058,8 +1076,7 @@ fn build_chat_lines(
                 continue;
             }
             // Expanded multi-tool stack: clickable ▾ header collapses back to chip.
-            let show_group_header =
-                tool_view::streak_shows_group_header(&app.messages, i, streak);
+            let show_group_header = tool_view::streak_shows_group_header(&app.messages, i, streak);
             // Tight stack: no blank between consecutive tools.
             for (k, tmsg) in app.messages[i..i + streak].iter().enumerate() {
                 if k == 0 {
@@ -1072,11 +1089,8 @@ fn build_chat_lines(
                         }
                     }
                     if show_group_header {
-                        let header = render_tool_group(
-                            &app.messages[i..i + streak],
-                            wrap_width,
-                            true,
-                        );
+                        let header =
+                            render_tool_group(&app.messages[i..i + streak], wrap_width, true);
                         push_owned(
                             &mut lines,
                             &mut owners,
@@ -1266,11 +1280,7 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
 ///   ▸  3 tools   read · bash · edit   ↵   (collapsed chip)
 ///   ▾  3 tools   read · bash · edit   ↵   (expanded — click collapses)
 /// ```
-fn render_tool_group(
-    tools: &[Message],
-    wrap_width: usize,
-    expanded: bool,
-) -> Vec<Line<'static>> {
+fn render_tool_group(tools: &[Message], wrap_width: usize, expanded: bool) -> Vec<Line<'static>> {
     let n = tools.len();
     let mut labels: Vec<String> = tools
         .iter()
@@ -1601,11 +1611,7 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
                 lines.extend(render_ide_diff(output, wrap_width));
             } else {
                 let body_budget = wrap_width.saturating_sub(8).max(12);
-                let max_lines = if status == ToolStatus::Error {
-                    40
-                } else {
-                    60
-                };
+                let max_lines = if status == ToolStatus::Error { 40 } else { 60 };
                 let default_style = if status == ToolStatus::Error {
                     Theme::error_body()
                 } else {
@@ -2239,7 +2245,7 @@ fn draw_prompt_meta(frame: &mut Frame<'_>, area: Rect, app: &App) {
             mcp_chip_style(app.mcp_chip_kind),
         ));
     }
-    // Background bash/jobs (e.g. bg:1 · cargo…) — open /ps for detail.
+    // Background bash only (e.g. bg:1 · cargo…) — open /ps.
     if !app.bg_chip_text.is_empty() {
         if !right.is_empty() {
             right.push(Span::styled("  ", Theme::bg()));
@@ -2247,6 +2253,16 @@ fn draw_prompt_meta(frame: &mut Frame<'_>, area: Rect, app: &App) {
         right.push(Span::styled(
             app.bg_chip_text.clone(),
             bg_chip_style(app.bg_chip_kind),
+        ));
+    }
+    // Subagents (e.g. task:1 · explore…) — open /tasks, not /ps.
+    if !app.task_chip_text.is_empty() {
+        if !right.is_empty() {
+            right.push(Span::styled("  ", Theme::bg()));
+        }
+        right.push(Span::styled(
+            app.task_chip_text.clone(),
+            bg_chip_style(app.task_chip_kind),
         ));
     }
     if app.busy {
@@ -2328,6 +2344,15 @@ mod tests {
     use crate::app::App;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
+
+    #[test]
+    fn settings_float_survives_a_narrow_short_terminal() {
+        let backend = TestBackend::new(40, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.open_settings_float();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    }
 
     #[test]
     fn typed_input_is_visible_in_buffer() {
@@ -2425,6 +2450,142 @@ mod tests {
             "scroll-to-top must show early history, got:\n{top}"
         );
         assert!(!app.follow_bottom);
+    }
+
+    #[test]
+    fn history_viewport_stays_fixed_while_streaming_finishes() {
+        let backend = TestBackend::new(40, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.push_user("history-anchor-marker");
+        let body: String = (0..50)
+            .map(|i| format!("earlier-line-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.push_assistant(&body);
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.scroll_to_top();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let anchored_start = app.chat_view_start;
+        let anchored_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(anchored_text.contains("history-anchor-marker"));
+
+        app.append_stream("late-stream-line-1\nlate-stream-line-2\nlate-stream-line-3");
+        app.sync_stream_message();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.chat_view_start, anchored_start,
+            "streaming output must not move a history viewport"
+        );
+        let streaming_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(streaming_text.contains("history-anchor-marker"));
+
+        app.finish_stream();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.chat_view_start, anchored_start,
+            "finishing a stream must not leave history browsing"
+        );
+        let finished_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(finished_text.contains("history-anchor-marker"));
+        assert!(!app.follow_bottom);
+    }
+
+    #[test]
+    fn history_viewport_survives_thinking_and_tool_transitions() {
+        let backend = TestBackend::new(40, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.push_user("history-tool-anchor");
+        let body: String = (0..50)
+            .map(|i| format!("earlier-line-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.push_assistant(&body);
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let live_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(!live_text.contains("Shift+G latest"));
+        app.scroll_to_top();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let anchored_start = app.chat_view_start;
+
+        app.append_thinking_stream("thinking about the next step");
+        app.sync_thinking_message();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.chat_view_start, anchored_start);
+
+        app.push_tool_call("read", r#"{\"path\":\"src/lib.rs\"}"#);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.chat_view_start, anchored_start,
+            "tool transitions must not re-enter live follow"
+        );
+        assert!(!app.follow_bottom);
+    }
+
+    #[test]
+    fn history_status_advertises_shift_g_latest() {
+        let backend = TestBackend::new(60, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        let body: String = (0..100)
+            .map(|i| format!("line-{i:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.push_assistant(&body);
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        app.scroll_to_top();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            flat.contains("Shift+G") && flat.contains("latest"),
+            "history status should expose the return-to-live shortcut, got:\n{flat}"
+        );
+
+        app.scroll_to_bottom();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let resumed_text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(!resumed_text.contains("Shift+G latest"));
     }
 
     #[test]
@@ -2868,9 +3029,9 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         let max = app.max_scroll().max(1);
         let pct = ((app.chat_scroll as f64 / max as f64) * 100.0).round() as u16;
         let mut left = vec![Span::raw("  ")];
-        left.extend(pair("end", " latest"));
+        left.extend(pair("Shift+G", " latest"));
         let right = vec![
-            Span::styled(format!("↑{pct}%"), Theme::status_faint()),
+            Span::styled(format!("history ↑{pct}%"), Theme::status_faint()),
             Span::raw("  "),
         ];
         return (left, right);

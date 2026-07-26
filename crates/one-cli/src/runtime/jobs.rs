@@ -1,13 +1,18 @@
-//! Background agent jobs (subagent). Completions push into the same
-//! notification queue as background bash; the parent `Agent` drains them
-//! before each LLM turn as User messages.
+//! Subagent jobs (`task` tool). Completions for **background** jobs push into
+//! the same notification queue as background bash; the parent `Agent` drains
+//! them before each LLM turn as User messages.
+//!
+//! **UI layer (separate from bash `/ps`):** each job keeps a live event log
+//! (turns / tools / activity) for TUI `/tasks` · `SubagentDetail` — not the
+//! process list.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use one_core::agent::LlmProvider;
+use one_core::events::AgentEvent;
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::time::timeout;
 
@@ -18,6 +23,190 @@ static JOB_SEQ: AtomicU64 = AtomicU64::new(1);
 
 /// Default wall-time for one background agent job (5 minutes).
 const DEFAULT_JOB_MAX_WALL_MS: u64 = 300_000;
+
+/// Cap live event lines retained per job (ring buffer).
+const EVENT_LOG_CAP: usize = 200;
+
+/// Live activity + event ring for one job (shared with harness subscribe).
+#[derive(Debug, Default)]
+pub struct JobEventLog {
+    lines: Mutex<VecDeque<String>>,
+    activity: Mutex<String>,
+}
+
+impl JobEventLog {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    pub fn set_activity(&self, text: impl Into<String>) {
+        let text = text.into();
+        if let Ok(mut a) = self.activity.lock() {
+            *a = text;
+        }
+    }
+
+    pub fn activity(&self) -> String {
+        self.activity
+            .lock()
+            .map(|a| a.clone())
+            .unwrap_or_default()
+    }
+
+    pub fn push_line(&self, line: impl Into<String>) {
+        let line = line.into();
+        if line.is_empty() {
+            return;
+        }
+        if let Ok(mut lines) = self.lines.lock() {
+            if lines.len() >= EVENT_LOG_CAP {
+                lines.pop_front();
+            }
+            lines.push_back(line);
+        }
+    }
+
+    pub fn lines(&self) -> Vec<String> {
+        self.lines
+            .lock()
+            .map(|l| l.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    /// Feed a child [`AgentEvent`] into activity + ring buffer.
+    pub fn on_agent_event(&self, event: &AgentEvent) {
+        match event {
+            AgentEvent::AgentStart => {
+                self.set_activity("starting");
+                self.push_line("▸ started");
+            }
+            AgentEvent::TurnStart { turn } => {
+                // Agent loop is 0-based; job progress UIs use 1-based.
+                let label = format!("turn {}", turn + 1);
+                self.set_activity(label.clone());
+                self.push_line(format!("▸ {label}"));
+            }
+            AgentEvent::TextDelta { .. } => {
+                // Don't spam the log with tokens; keep activity soft.
+                let act = self.activity();
+                if act.is_empty() || act.starts_with("turn ") || act == "starting" {
+                    self.set_activity("writing");
+                }
+            }
+            AgentEvent::ThinkingDelta { .. } => {
+                self.set_activity("thinking");
+            }
+            AgentEvent::ToolExecutionStart { tool_call } => {
+                let detail = tool_call_brief(tool_call);
+                let line = if detail.is_empty() {
+                    format!("→ {}", tool_call.name)
+                } else {
+                    format!("→ {} · {}", tool_call.name, detail)
+                };
+                self.set_activity(line.clone());
+                self.push_line(line);
+            }
+            AgentEvent::ToolExecutionEnd {
+                tool_call,
+                is_error,
+                output,
+            } => {
+                let mark = if *is_error { "✗" } else { "✓" };
+                let brief = truncate_chars(&output.as_text().replace('\n', " "), 48);
+                let line = if brief.is_empty() {
+                    format!("{mark} {}", tool_call.name)
+                } else {
+                    format!("{mark} {} · {brief}", tool_call.name)
+                };
+                self.push_line(line);
+                // Activity falls back to waiting for next model step.
+                self.set_activity(format!("{} done", tool_call.name));
+            }
+            AgentEvent::ServerTool {
+                provider,
+                tool,
+                status,
+            } => {
+                let st = match status {
+                    one_core::ServerToolStatus::Started => "start",
+                    one_core::ServerToolStatus::Completed => "done",
+                    one_core::ServerToolStatus::Failed => "fail",
+                };
+                let line = format!("server · {provider} · {} · {st}", tool.as_str());
+                self.set_activity(line.clone());
+                self.push_line(line);
+            }
+            AgentEvent::TurnEnd { turn, .. } => {
+                self.push_line(format!("◂ turn {} end", turn + 1));
+            }
+            AgentEvent::AgentEnd { .. } => {
+                self.set_activity("finishing");
+                self.push_line("▸ finishing");
+            }
+        }
+    }
+}
+
+fn tool_call_brief(call: &one_core::tool::ToolCall) -> String {
+    let args = &call.arguments;
+    let raw = match call.name.as_str() {
+        "read" | "write" | "edit" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "bash" | "shell" => args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "grep" => args
+            .get("pattern")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "find" => args
+            .get("glob")
+            .or_else(|| args.get("path"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        "ls" => args
+            .get("path")
+            .and_then(|v| v.as_str())
+            .unwrap_or(".")
+            .to_string(),
+        _ => String::new(),
+    };
+    truncate_chars(&raw.replace('\n', " "), 36)
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    let t = s.trim();
+    if t.chars().count() <= max {
+        t.to_string()
+    } else {
+        format!("{}…", t.chars().take(max.saturating_sub(1)).collect::<String>())
+    }
+}
+
+/// Options for [`AgentJobRegistry::spawn_with`].
+#[derive(Debug, Clone)]
+pub struct SpawnOptions {
+    /// Push `[job completed]` into the parent notification queue (background only).
+    pub notify_completion: bool,
+    /// Apply `ONE_JOB_MAX_WALL_MS` wall-time budget.
+    pub apply_wall_timeout: bool,
+}
+
+impl Default for SpawnOptions {
+    fn default() -> Self {
+        Self {
+            notify_completion: true,
+            apply_wall_timeout: true,
+        }
+    }
+}
 
 /// Override with `ONE_JOB_MAX_WALL_MS` (milliseconds). `0` = no wall limit.
 pub fn job_max_wall_ms() -> Option<u64> {
@@ -76,6 +265,12 @@ pub struct JobSnapshot {
     pub max_turns: Option<u64>,
     pub error: Option<String>,
     pub notified: bool,
+    /// Short live activity (e.g. `→ grep · auth`).
+    pub activity: String,
+    /// Condensed event log lines (newest last).
+    pub event_lines: Vec<String>,
+    /// When false, completion did not (and will not) notify the parent agent.
+    pub notify_completion: bool,
 }
 
 struct JobInner {
@@ -91,6 +286,8 @@ struct JobInner {
     turn_progress: Arc<AtomicU64>,
     max_turns: u64,
     done: Arc<Notify>,
+    event_log: Arc<JobEventLog>,
+    notify_completion: bool,
 }
 
 /// Registry for background `task` jobs (one-cli only).
@@ -120,7 +317,7 @@ impl AgentJobRegistry {
         format!("job_{ms:x}_{n}")
     }
 
-    /// Spawn background harness; holds `slot` until the job finishes.
+    /// Spawn harness as a background job (notifies parent on completion).
     pub fn spawn(
         self: &Arc<Self>,
         req: RunRequest,
@@ -130,11 +327,47 @@ impl AgentJobRegistry {
         description: Option<String>,
         slot: Option<OwnedSemaphorePermit>,
     ) -> String {
+        self.spawn_with(
+            req,
+            provider,
+            opts,
+            agent_name,
+            description,
+            slot,
+            SpawnOptions::default(),
+        )
+    }
+
+    /// Spawn harness with notification / wall-time options.
+    ///
+    /// Use `notify_completion: false` for **sync** `task` so the tool_result
+    /// is the only parent signal, while still exposing live status in `/ps`.
+    pub fn spawn_with(
+        self: &Arc<Self>,
+        req: RunRequest,
+        provider: Arc<dyn LlmProvider>,
+        opts: HarnessOptions,
+        agent_name: String,
+        description: Option<String>,
+        slot: Option<OwnedSemaphorePermit>,
+        spawn_opts: SpawnOptions,
+    ) -> String {
         let id = Self::next_id();
         let abort = Arc::new(AtomicBool::new(false));
         let turn_progress = Arc::new(AtomicU64::new(0));
         let done = Arc::new(Notify::new());
+        let event_log = JobEventLog::new();
         let max_turns = req.agent.max_turns.unwrap_or(16) as u64;
+        event_log.set_activity("queued");
+        event_log.push_line(format!(
+            "▸ job {} · {}{}",
+            id,
+            agent_name,
+            description
+                .as_ref()
+                .map(|d| format!(" · {d}"))
+                .unwrap_or_default()
+        ));
 
         {
             let mut jobs = self.jobs.lock().expect("jobs lock");
@@ -153,6 +386,8 @@ impl AgentJobRegistry {
                     turn_progress: turn_progress.clone(),
                     max_turns,
                     done: done.clone(),
+                    event_log: event_log.clone(),
+                    notify_completion: spawn_opts.notify_completion,
                 },
             );
         }
@@ -162,10 +397,16 @@ impl AgentJobRegistry {
         let control = RunControl {
             abort: Some(abort.clone()),
             turn_progress: Some(turn_progress),
+            event_log: Some(event_log),
         };
+        let apply_wall = spawn_opts.apply_wall_timeout;
         tokio::spawn(async move {
             let _slot = slot;
-            let wall = job_max_wall_ms();
+            let wall = if apply_wall {
+                job_max_wall_ms()
+            } else {
+                None
+            };
             let result = if let Some(ms) = wall {
                 match timeout(
                     Duration::from_millis(ms),
@@ -196,6 +437,15 @@ impl AgentJobRegistry {
         });
 
         id
+    }
+
+    /// Full [`RunResult`] for a finished job (if available).
+    pub fn take_result_clone(&self, id: &str) -> Option<RunResult> {
+        self.jobs
+            .lock()
+            .expect("jobs lock")
+            .get(id)
+            .and_then(|j| j.result.clone())
     }
 
     pub fn get(&self, id: &str) -> Option<JobSnapshot> {
@@ -230,6 +480,8 @@ impl AgentJobRegistry {
         job.abort.store(true, Ordering::Relaxed);
         job.state = JobState::Aborted;
         job.finished = Some(Instant::now());
+        job.event_log.set_activity("aborted");
+        job.event_log.push_line("▸ aborted");
         let mut rr = RunResult::failure(
             ProtocolError::new(error_code::ABORTED, "aborted by job_kill"),
             job.started.elapsed().as_millis() as u64,
@@ -237,7 +489,8 @@ impl AgentJobRegistry {
         .with_status(TaskExitStatus::Aborted);
         rr.ok = false;
         job.result = Some(rr);
-        if !job.notified {
+        let should_notify = job.notify_completion && !job.notified;
+        if should_notify {
             job.notified = true;
             let snap = snapshot_of(job);
             let text = format_job_completed_notification(&snap);
@@ -246,6 +499,7 @@ impl AgentJobRegistry {
             self.push_notification(text);
             return Ok(snap);
         }
+        job.notified = true;
         job.done.notify_waiters();
         Ok(snapshot_of(job))
     }
@@ -297,7 +551,11 @@ impl AgentJobRegistry {
         };
         job.finished = Some(Instant::now());
         job.result = Some(result);
-        if !job.notified {
+        let st = job.state.as_str();
+        job.event_log.set_activity(st);
+        job.event_log.push_line(format!("▸ {st}"));
+        let should_notify = job.notify_completion && !job.notified;
+        if should_notify {
             job.notified = true;
             let snap = snapshot_of(job);
             let text = format_job_completed_notification(&snap);
@@ -305,6 +563,10 @@ impl AgentJobRegistry {
             drop(jobs);
             self.push_notification(text);
             return;
+        }
+        // Sync jobs: mark notified so kill/finalize do not double-fire later.
+        if !job.notify_completion {
+            job.notified = true;
         }
         job.done.notify_waiters();
     }
@@ -326,6 +588,23 @@ impl AgentJobRegistry {
         }
         let _ = tokio::time::timeout(Duration::from_millis(ms), done.notified()).await;
         self.get(id).ok_or_else(|| format!("unknown job_id: {id}"))
+    }
+
+    /// Block until the job is terminal (used by sync `task`).
+    pub async fn wait_until_done(&self, id: &str) -> Result<JobSnapshot, String> {
+        loop {
+            let done = {
+                let jobs = self.jobs.lock().expect("jobs lock");
+                let job = jobs
+                    .get(id)
+                    .ok_or_else(|| format!("unknown job_id: {id}"))?;
+                if job.state.is_terminal() {
+                    return Ok(snapshot_of(job));
+                }
+                job.done.clone()
+            };
+            done.notified().await;
+        }
     }
 
     /// Ids currently non-terminal (for default `wait_tasks` target set).
@@ -651,6 +930,12 @@ fn snapshot_of(job: &JobInner) -> JobSnapshot {
             None,
         )
     };
+    let activity = if job.state == JobState::Running {
+        job.event_log.activity()
+    } else {
+        String::new()
+    };
+    let event_lines = job.event_log.lines();
     JobSnapshot {
         id: job.id.clone(),
         kind: "task",
@@ -665,6 +950,9 @@ fn snapshot_of(job: &JobInner) -> JobSnapshot {
         max_turns: Some(job.max_turns),
         error,
         notified: job.notified,
+        activity,
+        event_lines,
+        notify_completion: job.notify_completion,
     }
 }
 
@@ -755,6 +1043,16 @@ pub fn format_job_snapshot(snap: &JobSnapshot) -> String {
     if let Some(err) = &snap.error {
         out.push_str(&format!("error: {err}\n"));
     }
+    if !snap.activity.is_empty() && snap.state == JobState::Running {
+        out.push_str(&format!("activity: {}\n", snap.activity));
+    }
+    if !snap.event_lines.is_empty() {
+        out.push_str("--- live log ---\n");
+        for line in &snap.event_lines {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
     if snap.state == JobState::Running {
         out.push_str("(still running)\n");
     } else if snap.summary.is_empty() {
@@ -789,12 +1087,35 @@ mod tests {
             max_turns: Some(16),
             error: None,
             notified: true,
+            activity: String::new(),
+            event_lines: vec![],
+            notify_completion: true,
         };
         let t = format_job_completed_notification(&snap);
         assert!(t.starts_with("[job completed]"), "{t}");
         assert!(t.contains("id: job_1"));
         assert!(t.contains("found login"));
         assert!(t.contains("turns: 2/16"));
+    }
+
+    #[test]
+    fn event_log_records_tools_and_activity() {
+        let log = JobEventLog::new();
+        log.on_agent_event(&AgentEvent::AgentStart);
+        log.on_agent_event(&AgentEvent::TurnStart { turn: 0 });
+        log.on_agent_event(&AgentEvent::ToolExecutionStart {
+            tool_call: one_core::tool::ToolCall {
+                id: "c1".into(),
+                name: "grep".into(),
+                arguments: serde_json::json!({"pattern": "auth"}),
+            },
+        });
+        assert!(log.activity().contains("grep"), "{}", log.activity());
+        let lines = log.lines();
+        assert!(
+            lines.iter().any(|l| l.contains("grep") && l.contains("auth")),
+            "{lines:?}"
+        );
     }
 
     #[tokio::test]

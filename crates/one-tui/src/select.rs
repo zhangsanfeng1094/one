@@ -135,6 +135,11 @@ impl SelectPrompt {
         reason: &str,
         command_prefix: Option<&str>,
     ) -> Self {
+        // Path-boundary read escalation: dedicated branch — no Always / Ctrl+O.
+        if reason.starts_with("path read:") {
+            return Self::path_read_permission(tool, summary, reason);
+        }
+
         let escalate = reason.starts_with("sandbox escalation:");
         let body = if escalate {
             format_escalate_body(tool, summary, reason)
@@ -227,6 +232,57 @@ impl SelectPrompt {
         let esc_hint = if escalate { "Esc:deny" } else { "Esc:cancel" };
         p.footer_hint =
             format!("↑↓/1-{n}:select  Enter:confirm  Ctrl+o:always-approve  {esc_hint}");
+        p.other_label = "Feedback for the model (Enter empty to skip)".into();
+        p
+    }
+
+    /// Out-of-workspace path read: Once / optional Session root / Deny. No Always.
+    fn path_read_permission(tool: &str, summary: &str, reason: &str) -> Self {
+        let body = if reason.is_empty() {
+            format!("{tool}\n{summary}")
+        } else {
+            format!("{tool}\n{summary}\n{reason}")
+        };
+
+        // Parse suggested session root from reason lines.
+        let mut session_root: Option<String> = None;
+        for line in reason.lines() {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("suggested session root:") {
+                let rest = rest.trim();
+                if !rest.is_empty()
+                    && !rest.starts_with("(none")
+                    && rest != "(none — this path only)"
+                {
+                    session_root = Some(rest.to_string());
+                }
+            }
+        }
+
+        let mut options = vec![SelectOption::new(
+            "once",
+            "Yes, allow this path only",
+            "Grant read access to this path for the rest of this process",
+        )];
+        if let Some(ref root) = session_root {
+            options.push(SelectOption::new(
+                "session",
+                format!("Yes, add session root `{root}`"),
+                "Read-only access under this directory until one exits",
+            ));
+        }
+        options.push(SelectOption::new(
+            "deny",
+            "No, deny",
+            "Keep the workspace path boundary; optional message is sent to the model",
+        ));
+
+        let n = options.len();
+        let mut p = Self::single("Allow read outside workspace?", body, options);
+        p.selected = 0;
+        p.type_on_ids.insert("deny".into());
+        p.ctrl_o_id = None; // never Always for path reads
+        p.footer_hint = format!("↑↓/1-{n}:select  Enter:confirm  Esc:deny");
         p.other_label = "Feedback for the model (Enter empty to skip)".into();
         p
     }
@@ -818,6 +874,28 @@ mod tests {
         assert!(!p.options.iter().any(|o| o.id == "prefix"));
         assert_eq!(p.options.len(), 4);
         assert_eq!(p.options[0].id, "once");
+    }
+
+    #[test]
+    fn path_read_permission_once_and_deny_no_always() {
+        let reason = "path read: outside workspace\npath: /tmp/x.txt\nsuggested session root: (none — this path only)";
+        let p = SelectPrompt::permission("read", "read /tmp/x.txt", reason);
+        assert_eq!(p.options[0].id, "once");
+        assert!(!p.options.iter().any(|o| o.id == "always"));
+        assert!(!p.options.iter().any(|o| o.id == "session"));
+        assert!(p.options.iter().any(|o| o.id == "deny"));
+        assert!(p.ctrl_o_id.is_none());
+        assert!(!p.footer_hint.contains("Ctrl+o"));
+    }
+
+    #[test]
+    fn path_read_permission_with_session_root() {
+        let reason =
+            "path read: outside workspace\npath: /tmp/extra/a.txt\nsuggested session root: /tmp/extra";
+        let p = SelectPrompt::permission("grep", "read /tmp/extra/a.txt", reason);
+        assert!(p.options.iter().any(|o| o.id == "session"));
+        assert!(!p.options.iter().any(|o| o.id == "always"));
+        assert_eq!(p.selected, 0); // focus once
     }
 
     #[test]

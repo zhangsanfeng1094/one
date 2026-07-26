@@ -134,9 +134,7 @@ impl BashTool {
     ) -> Result<CapturedOutput> {
         let (prog, args) = sandbox.command_line(command);
         let mut cmd = Command::new(&prog);
-        cmd.args(&args)
-            .current_dir(&self.cwd)
-            .kill_on_drop(true);
+        cmd.args(&args).current_dir(&self.cwd).kill_on_drop(true);
         // Codex-aligned: piped stdio + process group for kill-on-timeout.
         configure_shell_stdio(&mut cmd);
         let child = cmd
@@ -198,7 +196,7 @@ impl BashTool {
                 body.trim_end(),
                 "bash",
                 &self.cwd,
-                crate::truncate::PreviewStyle::Head,
+                crate::truncate::PreviewStyle::Tail,
             );
             truncated = presented.truncated;
             spill_path = presented
@@ -259,9 +257,7 @@ impl BashTool {
         }
 
         let (sandboxed, sandbox_line) = self.sandbox_banner(sandbox, escalated);
-        let mut output = format!(
-            "command timed out after {timeout_secs}s\n{sandbox_line}"
-        );
+        let mut output = format!("command timed out after {timeout_secs}s\n{sandbox_line}");
         let mut truncated = false;
         let mut spill_path: Option<String> = None;
         if !body.is_empty() {
@@ -269,7 +265,7 @@ impl BashTool {
                 body.trim_end(),
                 "bash",
                 &self.cwd,
-                crate::truncate::PreviewStyle::Head,
+                crate::truncate::PreviewStyle::Tail,
             );
             truncated = presented.truncated;
             spill_path = presented
@@ -719,6 +715,55 @@ mod tests {
             .and_then(|d| d.get("exitCode"))
             .and_then(|v| v.as_i64());
         assert_eq!(code, Some(7));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn truncated_bash_result_keeps_tail() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-bash-tail-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let tool = BashTool::with_policy(
+            PathPolicy::workspace(dir.clone()),
+            true,
+            Arc::new(BackgroundTaskRegistry::new()),
+        );
+        let status = std::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .status()
+            .unwrap();
+        let stdout = format!("HEAD_MARKER\n{}\n", "x".repeat(60 * 1024));
+        let out = tool.present_result(
+            "simulated command",
+            None,
+            status,
+            stdout,
+            "TAIL_MARKER".into(),
+            &OsSandbox::disabled(dir.clone()),
+            false,
+            false,
+        );
+
+        let text = out.as_text();
+        assert!(
+            text.contains("TAIL_MARKER"),
+            "truncated command output must preserve the tail: {text}"
+        );
+        assert!(
+            !text.contains("HEAD_MARKER"),
+            "truncated command output should not use a head preview: {text}"
+        );
+        let details = out.details.as_ref().unwrap();
+        assert_eq!(
+            details.get("truncated").and_then(|v| v.as_bool()),
+            Some(true)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

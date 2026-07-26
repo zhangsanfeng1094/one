@@ -116,6 +116,11 @@ impl ThinkingLevel {
     }
 }
 
+/// Extra LLM samples after an empty completion (no visible text / tool calls).
+/// Total attempts = 1 + this value. Aligns with Grok Build's EmptyResponse retry
+/// (their default is higher; we keep a small local budget).
+pub const DEFAULT_EMPTY_RESPONSE_RETRIES: usize = 2;
+
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub system_prompt: String,
@@ -128,6 +133,9 @@ pub struct AgentConfig {
     /// Does **not** gate response handling: `web_search_call` events and
     /// `citations` are always parsed if the upstream/proxy returns them.
     pub server_search: bool,
+    /// How many times to re-sample after a blank model turn (no text, no tools).
+    /// Reasoning-only turns count as empty (same as Grok Build).
+    pub empty_response_retries: usize,
 }
 
 impl Default for AgentConfig {
@@ -137,6 +145,7 @@ impl Default for AgentConfig {
             max_turns: 32,
             thinking_level: ThinkingLevel::Off,
             server_search: false,
+            empty_response_retries: DEFAULT_EMPTY_RESPONSE_RETRIES,
         }
     }
 }
@@ -640,13 +649,19 @@ impl Agent {
 
             let llm_start = Instant::now();
             let ttft_ms: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
-            let response = {
+            // Sample (and re-sample on empty) until we get a usable completion.
+            // Empty = no visible text and no tool calls (reasoning-only counts
+            // as empty — Grok Build EmptyResponse policy).
+            let empty_budget = self.config.empty_response_retries;
+            let mut sample_attempt = 0usize;
+            let response = loop {
+                sample_attempt += 1;
                 let listeners: Vec<_> = self.listeners.iter().collect();
                 let ttft = ttft_ms.clone();
                 let llm_start_for_cb = llm_start;
-                provider
+                let sample = provider
                     .complete_streaming(
-                        request,
+                        request.clone(),
                         &mut |event| {
                             // First stream delta → time-to-first-token.
                             if ttft.lock().expect("ttft").is_none() {
@@ -684,30 +699,86 @@ impl Agent {
                         },
                         Some(&self.abort_flag),
                     )
-                    .await
-            };
+                    .await;
 
-            let response = match response {
-                Ok(r) => r,
-                Err(err) => {
-                    let err = map_provider_error(err);
-                    self.record_trace(TraceEvent::RunEnd {
+                let response = match sample {
+                    Ok(r) => r,
+                    Err(err) => {
+                        let err = map_provider_error(err);
+                        self.record_trace(TraceEvent::RunEnd {
+                            ts_ms: now_ms(),
+                            run_id: run_id.clone(),
+                            status: TraceRunStatus::Error,
+                            turns: turns_done,
+                            wall_ms: wall_start.elapsed().as_millis() as u64,
+                            usage: self.token_usage,
+                            final_text_len: None,
+                            final_text_preview: None,
+                            error: Some(err.to_string()),
+                        });
+                        self.is_busy = false;
+                        if let Some(hooks) = &self.hooks {
+                            hooks.on_agent_end().await;
+                        }
+                        return Err(err);
+                    }
+                };
+
+                // Abort is terminal — do not treat as empty or retry.
+                if self.is_aborted() || response.stop_reason == StopReason::Aborted {
+                    break response;
+                }
+
+                if !completion_is_empty(&response) {
+                    break response;
+                }
+
+                // Empty completion: retry within budget, then fail loudly.
+                if sample_attempt <= empty_budget {
+                    self.record_trace(TraceEvent::LlmResponse {
                         ts_ms: now_ms(),
                         run_id: run_id.clone(),
-                        status: TraceRunStatus::Error,
-                        turns: turns_done,
-                        wall_ms: wall_start.elapsed().as_millis() as u64,
-                        usage: self.token_usage,
-                        final_text_len: None,
-                        final_text_preview: None,
-                        error: Some(err.to_string()),
+                        turn,
+                        latency_ms: llm_start.elapsed().as_millis() as u64,
+                        ttft_ms: *ttft_ms.lock().expect("ttft"),
+                        stop_reason: "empty_retry".into(),
+                        tool_calls_n: 0,
+                        text_len: 0,
+                        thinking_len: extract_thinking_len(&response.content),
+                        usage: response.usage,
+                        provider: response.provider.clone(),
+                        model: response.model.clone(),
+                        output_preview: Some(format!(
+                            "empty response — retry {sample_attempt}/{empty_budget}"
+                        )),
                     });
-                    self.is_busy = false;
-                    if let Some(hooks) = &self.hooks {
-                        hooks.on_agent_end().await;
+                    if !response.usage.is_zero() {
+                        self.token_usage.add_assign(&response.usage);
                     }
-                    return Err(err);
+                    // Reset TTFT so the next sample can measure fresh.
+                    *ttft_ms.lock().expect("ttft") = None;
+                    continue;
                 }
+
+                let err = OneError::EmptyResponse {
+                    attempts: sample_attempt,
+                };
+                self.record_trace(TraceEvent::RunEnd {
+                    ts_ms: now_ms(),
+                    run_id: run_id.clone(),
+                    status: TraceRunStatus::Error,
+                    turns: turns_done,
+                    wall_ms: wall_start.elapsed().as_millis() as u64,
+                    usage: self.token_usage,
+                    final_text_len: None,
+                    final_text_preview: None,
+                    error: Some(err.to_string()),
+                });
+                self.is_busy = false;
+                if let Some(hooks) = &self.hooks {
+                    hooks.on_agent_end().await;
+                }
+                return Err(err);
             };
 
             let latency_ms = llm_start.elapsed().as_millis() as u64;
@@ -1613,6 +1684,24 @@ pub fn extract_text(content: &[ContentBlock]) -> String {
         .join("")
 }
 
+/// True when the model produced nothing actionable for the agent loop.
+///
+/// - Tool calls → not empty (even with blank text).
+/// - Non-empty text → not empty.
+/// - Reasoning/thinking only → **empty** (Grok Build `ReasoningOnly` policy:
+///   re-sample rather than end the turn with no user-visible action).
+/// - Completely blank content → empty.
+pub fn completion_is_empty(response: &CompletionResponse) -> bool {
+    if response
+        .content
+        .iter()
+        .any(|b| matches!(b, ContentBlock::ToolCall { .. }))
+    {
+        return false;
+    }
+    extract_text(&response.content).trim().is_empty()
+}
+
 fn extract_thinking_len(content: &[ContentBlock]) -> usize {
     content
         .iter()
@@ -1957,5 +2046,182 @@ mod tests {
             .expect("run");
         assert_eq!(out, "done");
         assert!(agent.messages.len() >= 3);
+    }
+
+    fn empty_resp(content: Vec<ContentBlock>) -> CompletionResponse {
+        CompletionResponse {
+            provider: "test".into(),
+            model: "test".into(),
+            content,
+            stop_reason: StopReason::Stop,
+            usage: TokenUsage::default(),
+            citations: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn completion_is_empty_rules() {
+        assert!(completion_is_empty(&empty_resp(vec![])));
+        assert!(completion_is_empty(&empty_resp(vec![
+            ContentBlock::thinking("only reasoning")
+        ])));
+        assert!(!completion_is_empty(&empty_resp(vec![ContentBlock::text(
+            "hello"
+        )])));
+        assert!(!completion_is_empty(&empty_resp(vec![
+            ContentBlock::thinking("reason"),
+            ContentBlock::text("hi"),
+        ])));
+        assert!(!completion_is_empty(&empty_resp(vec![
+            ContentBlock::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({}),
+            }
+        ])));
+        // Tool call with no text is still actionable.
+        assert!(!completion_is_empty(&empty_resp(vec![
+            ContentBlock::thinking("planning"),
+            ContentBlock::ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "ls"}),
+            }
+        ])));
+    }
+
+    #[tokio::test]
+    async fn empty_response_retries_then_succeeds() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct EmptyThenText {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for EmptyThenText {
+            fn name(&self) -> &str {
+                "empty-then-text"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Ok(empty_resp(vec![]))
+                } else {
+                    Ok(empty_resp(vec![ContentBlock::text("recovered")]))
+                }
+            }
+        }
+
+        let provider = EmptyThenText {
+            calls: AtomicUsize::new(0),
+        };
+        let mut agent = Agent::new(
+            AgentConfig {
+                empty_response_retries: 2,
+                ..AgentConfig::default()
+            },
+            Vec::new(),
+        );
+        let out = agent.prompt(&provider, "hi").await.expect("should recover");
+        assert_eq!(out, "recovered");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn empty_response_exhausted_returns_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AlwaysEmpty {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for AlwaysEmpty {
+            fn name(&self) -> &str {
+                "always-empty"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(empty_resp(vec![ContentBlock::thinking("…")]))
+            }
+        }
+
+        let provider = AlwaysEmpty {
+            calls: AtomicUsize::new(0),
+        };
+        let mut agent = Agent::new(
+            AgentConfig {
+                empty_response_retries: 2,
+                ..AgentConfig::default()
+            },
+            Vec::new(),
+        );
+        let err = agent.prompt(&provider, "hi").await.expect_err("must fail");
+        assert!(
+            matches!(err, OneError::EmptyResponse { attempts: 3 }),
+            "got {err:?}"
+        );
+        // 1 initial + 2 retries
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 3);
+        // Must not leave a blank assistant message in history.
+        assert!(
+            !agent.messages.iter().any(|m| matches!(
+                m,
+                AgentMessage::Assistant(a) if a.content.is_empty()
+                    || completion_is_empty(&CompletionResponse {
+                        provider: a.provider.clone(),
+                        model: a.model.clone(),
+                        content: a.content.clone(),
+                        stop_reason: a.stop_reason,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+            )),
+            "empty assistant should not be committed on failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_response_retries_disabled_fails_immediately() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AlwaysEmpty {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for AlwaysEmpty {
+            fn name(&self) -> &str {
+                "always-empty"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(empty_resp(vec![]))
+            }
+        }
+
+        let provider = AlwaysEmpty {
+            calls: AtomicUsize::new(0),
+        };
+        let mut agent = Agent::new(
+            AgentConfig {
+                empty_response_retries: 0,
+                ..AgentConfig::default()
+            },
+            Vec::new(),
+        );
+        let err = agent.prompt(&provider, "hi").await.expect_err("must fail");
+        assert!(matches!(err, OneError::EmptyResponse { attempts: 1 }));
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 }

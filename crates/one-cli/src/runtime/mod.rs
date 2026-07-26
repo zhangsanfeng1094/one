@@ -167,6 +167,11 @@ impl AppRuntime {
         self.task_host.as_ref().map(|h| h.jobs())
     }
 
+    /// Task tool host (live job bindings for TUI), if subagent is enabled.
+    pub fn task_host(&self) -> Option<Arc<task_tool::TaskToolHost>> {
+        self.task_host.clone()
+    }
+
     /// Whether the `task` tool is registered for this runtime.
     pub fn task_enabled(&self) -> bool {
         self.applied_features.subagent_enabled()
@@ -425,7 +430,6 @@ impl AppRuntime {
         }
     }
 }
-
 
 impl Drop for AppRuntime {
     fn drop(&mut self) {

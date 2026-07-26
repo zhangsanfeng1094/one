@@ -119,8 +119,12 @@ impl AppRuntime {
             .permissions
             .clone()
             .unwrap_or_else(PermissionRules::default);
-        let permission_gate =
-            PermissionGate::with_auto_approve(perm_rules, auto_approve, interactive);
+        let permission_gate = PermissionGate::with_auto_approve_and_policy(
+            perm_rules,
+            auto_approve,
+            interactive,
+            Some(path_policy.clone()),
+        );
 
         let hitl = HitlChannel::new(interactive);
         let ask_user_handler: Arc<dyn AskUserHandler> =
@@ -151,6 +155,7 @@ impl AppRuntime {
                 opts,
                 main_agent.clone(),
                 agent_jobs.clone(),
+                path_policy.clone(),
             ))
         };
 
@@ -229,6 +234,7 @@ impl AppRuntime {
             base_system_prompt.clone()
         };
         let max_turns = cli.max_turns.max(1);
+        let empty_response_retries = user_settings.empty_response_retries();
         let mut agent = Agent::new(
             AgentConfig {
                 system_prompt,
@@ -236,6 +242,7 @@ impl AppRuntime {
                 thinking_level: ThinkingLevel::Off,
                 // Set properly after refresh_web_search_backend (capability + feature).
                 server_search: false,
+                empty_response_retries,
             },
             tools,
         );
