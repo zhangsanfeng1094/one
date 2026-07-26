@@ -99,6 +99,9 @@ pub struct PermissionGate {
     mode: Mutex<ApprovalMode>,
     /// Set by ApprovalChoice::Always for the rest of the process.
     session_auto: AtomicBool,
+    /// TUI (or other) can poll [`Self::poll_request`] and answer.
+    /// When false, destructive Ask cannot hang — it is denied.
+    interactive: bool,
     session_allows: Mutex<HashSet<String>>,
     session_prefixes: Mutex<Vec<PrefixAllow>>,
     pending: Mutex<Option<Pending>>,
@@ -116,10 +119,22 @@ impl PermissionGate {
         mode: ApprovalMode,
         path_policy: Option<PathPolicy>,
     ) -> Arc<Self> {
+        // `new` is used by harness / tests without a TUI poller → not interactive.
+        let interactive = matches!(mode, ApprovalMode::Interactive);
+        Self::new_with_policy_interactive(rules, mode, path_policy, interactive)
+    }
+
+    fn new_with_policy_interactive(
+        rules: PermissionRules,
+        mode: ApprovalMode,
+        path_policy: Option<PathPolicy>,
+        interactive: bool,
+    ) -> Arc<Self> {
         Arc::new(Self {
             rules: rules.compiled(),
             mode: Mutex::new(mode),
             session_auto: AtomicBool::new(matches!(mode, ApprovalMode::Auto)),
+            interactive,
             session_allows: Mutex::new(HashSet::new()),
             session_prefixes: Mutex::new(Vec::new()),
             pending: Mutex::new(None),
@@ -144,7 +159,7 @@ impl PermissionGate {
         } else {
             ApprovalMode::FailClosed
         };
-        Self::new_with_policy(rules, mode, path_policy)
+        Self::new_with_policy_interactive(rules, mode, path_policy, interactive)
     }
 
     /// Shared policy handle (for wiring asserts / tests).
@@ -405,12 +420,25 @@ impl ToolGate for PermissionGate {
                 return ToolGateDecision::Deny { message: reason };
             }
             PermissionVerdict::Ask { reason } => {
-                if auto {
-                    // Fall through to path phase after Allow-equivalent.
-                } else {
+                // Destructive shapes (git checkout/restore/reset, rm -r, …) always
+                // need a real confirmation. auto_approve / Always / -y must not
+                // silently allow them.
+                let force = one_tools::sandbox::is_destructive_ask_reason(&reason);
+                if auto && !force {
+                    // Soft high-risk / ask-rule: auto_approve allows.
+                } else if force && !self.interactive {
+                    // Non-interactive (print/json/harness): refuse rather than hang
+                    // waiting for a TUI answer that will never come.
+                    return ToolGateDecision::Deny {
+                        message: format!(
+                            "{reason}. Denied in non-interactive mode — \
+                             destructive commands require an interactive confirmation \
+                             (cannot be auto-approved with --yes)."
+                        ),
+                    };
+                } else if !auto || force {
                     match mode {
-                        ApprovalMode::Auto => {}
-                        ApprovalMode::FailClosed => {
+                        ApprovalMode::FailClosed if !self.interactive => {
                             return ToolGateDecision::Deny {
                                 message: format!(
                                     "{reason}. Denied in non-interactive mode. \
@@ -418,7 +446,9 @@ impl ToolGate for PermissionGate {
                                 ),
                             };
                         }
-                        ApprovalMode::Interactive => {
+                        // Interactive TUI (including Auto mode from auto_approve /
+                        // Always): surface the Select dock.
+                        ApprovalMode::Interactive | ApprovalMode::Auto | ApprovalMode::FailClosed => {
                             let id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
                             let escalate = requires_escalation(call);
                             let request = ApprovalRequest {
@@ -551,6 +581,67 @@ mod tests {
             })
             .await;
         assert_eq!(decision, ToolGateDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn auto_noninteractive_denies_destructive_git() {
+        // -y / ONE_AUTO_APPROVE must not wipe a worktree unattended.
+        let gate = PermissionGate::with_auto_approve(PermissionRules::default(), true, false);
+        for cmd in [
+            "git checkout -- .",
+            "git restore .",
+            "git reset --hard",
+            "rm -rf ./build",
+        ] {
+            let decision = gate
+                .check(&ToolCall {
+                    id: "1".into(),
+                    name: "bash".into(),
+                    arguments: json!({ "command": cmd }),
+                })
+                .await;
+            match decision {
+                ToolGateDecision::Deny { message } => {
+                    assert!(
+                        message.contains("destructive") || message.contains("always confirm"),
+                        "cmd={cmd} message={message}"
+                    );
+                }
+                other => panic!("expected Deny for {cmd}, got {other:?}"),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn destructive_interactive_prompts_despite_auto() {
+        let gate = PermissionGate::with_auto_approve(PermissionRules::default(), true, true);
+        let g = gate.clone();
+        let check = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "git checkout -- ." }),
+            })
+            .await
+        });
+        // Wait until the prompt is pending.
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let req = gate
+            .poll_request()
+            .expect("destructive should surface approval dock even with auto_approve");
+        assert!(
+            one_tools::sandbox::is_destructive_ask_reason(&req.reason),
+            "reason={}",
+            req.reason
+        );
+        assert!(gate.respond(ApprovalChoice::Deny { feedback: None }));
+        let decision = check.await.expect("join");
+        assert!(matches!(decision, ToolGateDecision::Deny { .. }), "{decision:?}");
     }
 
     #[tokio::test]

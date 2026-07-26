@@ -41,7 +41,7 @@ pub use float::{FloatItem, FloatKind, FloatMenu, FloatSection};
 pub use message::{AlertLevel, ChatLineTarget, Message, MessageRole, ToolStatus};
 pub use select::{SelectMode, SelectOption, SelectPhase, SelectPrompt, SelectResult};
 pub use slash::{ModelChoice, PopupKind, PopupRow, SlashCommand, SLASH_COMMANDS};
-pub use terminal::{ForceQuit, TerminalSession};
+pub use terminal::{emergency_restore_terminal, ForceQuit, TerminalSession};
 
 pub use crossterm;
 pub use ratatui;

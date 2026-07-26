@@ -50,7 +50,14 @@ fn resolve_run_mode(cli: &Cli, matches: &clap::ArgMatches) -> RunMode {
 }
 
 fn init_tracing(interactive_tui: bool) {
-    let filter = EnvFilter::from_default_env();
+    // Default to `warn` so panics/errors leave a trail without RUST_LOG; override
+    // with RUST_LOG / ONE_LOG (ONE_LOG is accepted as an alias for RUST_LOG).
+    if std::env::var_os("RUST_LOG").is_none() {
+        if let Ok(one_log) = std::env::var("ONE_LOG") {
+            std::env::set_var("RUST_LOG", one_log);
+        }
+    }
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
     if interactive_tui {
         let log_dir = one_session::agent_dir().join("logs");
         let _ = std::fs::create_dir_all(&log_dir);
@@ -74,6 +81,57 @@ fn init_tracing(interactive_tui: bool) {
         .with_target(false)
         .without_time()
         .init();
+}
+
+/// Install a panic hook that restores the terminal and writes a panic log.
+///
+/// Without this, a panic inside the TUI alternate screen often looks like a
+/// silent flash-exit: raw mode is cleared by Drop, but the panic text is gone.
+fn install_panic_hook() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        // Leave alt screen / raw mode first so the following eprintln is visible.
+        one_tui::emergency_restore_terminal();
+
+        let log_dir = one_session::agent_dir().join("logs");
+        let _ = std::fs::create_dir_all(&log_dir);
+        let stamp = chrono::Local::now().format("%Y%m%d-%H%M%S");
+        let path = log_dir.join(format!("panic-{stamp}.log"));
+
+        let mut body = String::new();
+        body.push_str(&format!("one panicked at {stamp}\n"));
+        body.push_str(&format!("{info}\n"));
+        if let Some(loc) = info.location() {
+            body.push_str(&format!("location: {loc}\n"));
+        }
+        // Backtrace only when the user asked for it (or always capture a short one).
+        let bt = std::backtrace::Backtrace::force_capture();
+        body.push_str(&format!("\nbacktrace:\n{bt}\n"));
+
+        let written = std::fs::write(&path, &body).is_ok();
+        // Also append a one-liner to the rolling log when possible.
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(log_dir.join("one.log"))
+        {
+            use std::io::Write;
+            let _ = writeln!(f, "PANIC {stamp}: see {}", path.display());
+        }
+
+        eprintln!();
+        eprintln!("one crashed (panic).");
+        if written {
+            eprintln!("panic log: {}", path.display());
+        } else {
+            eprintln!("(could not write panic log under {})", log_dir.display());
+            eprintln!("{info}");
+        }
+        eprintln!("set RUST_BACKTRACE=1 for a fuller trace on the next run.");
+        eprintln!();
+
+        default_hook(info);
+    }));
 }
 
 /// Load `.env` files without overriding variables already present in the process.
@@ -139,6 +197,7 @@ fn load_env_from_exe_ancestors() {
 #[tokio::main]
 async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     load_env_files();
+    install_panic_hook();
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let run_mode = resolve_run_mode(&cli, &matches);

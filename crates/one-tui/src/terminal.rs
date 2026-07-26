@@ -532,3 +532,21 @@ impl Drop for TerminalSession {
         let _ = self.restore();
     }
 }
+
+/// Best-effort leave raw mode / alternate screen when the process is dying
+/// (panic hook). Safe to call when the terminal was never entered.
+///
+/// Prefer [`TerminalSession::restore`] on the normal exit path — this only
+/// exists so a panic mid-TUI does not leave the user's shell unusable, and so
+/// a subsequent `eprintln!` of the panic log path is actually visible.
+pub fn emergency_restore_terminal() {
+    // Order mirrors `restore`: mouse/paste off → leave alt screen → disable raw → show cursor.
+    let mut out = io::stdout();
+    let _ = out.execute(DisableBasicMouse);
+    let _ = out.execute(DisableAlternateScroll);
+    let _ = out.execute(crossterm::event::DisableBracketedPaste);
+    let _ = out.execute(LeaveAlternateScreen);
+    let _ = disable_raw_mode();
+    let _ = out.execute(crossterm::cursor::Show);
+    let _ = out.flush();
+}

@@ -392,7 +392,11 @@ pub fn call_summary(call: &ToolCall) -> String {
 
 /// Evaluate configured rules + safe defaults.
 ///
-/// `auto_approve` skips built-in high-risk bash asks (still respects explicit deny).
+/// `auto_approve` skips **soft** high-risk bash asks (`sudo`, plain `git push`, …)
+/// and configured Ask rules. It does **not** skip:
+/// - hard-blocked patterns (deny)
+/// - **destructive** shapes from [`crate::sandbox::requires_strict_confirmation`]
+///   (`git checkout`/`restore`/`reset`/`clean`, force-push, recursive `rm`, …)
 pub fn evaluate(
     call: &ToolCall,
     rules: &[PermissionRule],
@@ -457,6 +461,13 @@ fn default_verdict(call: &ToolCall, auto_approve: bool) -> PermissionVerdict {
             if let Some(pat) = crate::sandbox::is_command_blocked(command) {
                 return PermissionVerdict::Deny {
                     reason: format!("blocked command pattern: {pat}"),
+                };
+            }
+
+            // Destructive git / recursive rm: always Ask (even with auto_approve).
+            if let Some(pat) = crate::sandbox::requires_strict_confirmation(command) {
+                return PermissionVerdict::Ask {
+                    reason: crate::sandbox::destructive_ask_reason(pat),
                 };
             }
 
@@ -538,6 +549,34 @@ mod tests {
         assert!(matches!(v, PermissionVerdict::Ask { .. }), "{v:?}");
         let v2 = evaluate(&bash("sudo apt update"), &[], true);
         assert_eq!(v2, PermissionVerdict::Allow);
+    }
+
+    #[test]
+    fn destructive_git_asks_even_with_auto_approve() {
+        for cmd in [
+            "git checkout -- .",
+            "git restore .",
+            "git reset --hard",
+            "git clean -fd",
+            "git push --force",
+            "rm -rf ./target",
+        ] {
+            let v = evaluate(&bash(cmd), &[], true);
+            match v {
+                PermissionVerdict::Ask { reason } => {
+                    assert!(
+                        crate::sandbox::is_destructive_ask_reason(&reason),
+                        "cmd={cmd} reason={reason}"
+                    );
+                }
+                other => panic!("expected destructive Ask for {cmd}, got {other:?}"),
+            }
+        }
+        // Soft risks still skipped with auto_approve.
+        assert_eq!(
+            evaluate(&bash("git push origin main"), &[], true),
+            PermissionVerdict::Allow
+        );
     }
 
     #[test]

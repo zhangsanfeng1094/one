@@ -117,7 +117,7 @@ one --full-access
 | （默认） | 工作区路径硬边界 |
 | `--add-dir DIR` | 扩展可读写根 |
 | `--full-access` | 关闭路径边界 |
-| `-y` / `auto_approve` | 仅跳过**高危 bash** 确认，不放宽路径 |
+| `-y` / `auto_approve` | 仅跳过**软高危** bash（如 `sudo`、普通 `git push`）；**不**跳过破坏性命令（`git checkout` / `restore` / `reset` / `clean`、force-push、`rm -r` 等），也不放宽路径 |
 | `--read-only` | 去掉写工具与 bash |
 | `--plan` | 只能写 plan 文件 |
 
@@ -134,7 +134,10 @@ one --full-access
 
 ### 交互审批（人在环）
 
-高危 bash（如 `sudo`、`rm -rf`、`git push`）或命中 `ask` 规则时，TUI 弹出 **列表式单选**（Codex 风格）：
+高危 bash 或命中 `ask` 规则时，TUI 弹出 **列表式单选**（Codex 风格）：
+
+- **始终确认**（`-y` / Always 也不能静默放行）：`git checkout` / `restore` / `reset` / `clean`、force-push、`git branch -D`、递归 `rm` 等会丢工作区或改写历史的命令；非交互模式（print/json）直接拒绝并提示需交互确认。
+- **软高危**（可被 `auto_approve` 跳过）：`sudo`、普通 `git push`、`chmod` 等。
 
 | # | 选项 | 语义 |
 |---|------|------|
