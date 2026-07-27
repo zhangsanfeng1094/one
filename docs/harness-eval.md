@@ -140,18 +140,24 @@ Agent::run
 | `sessionId` | ✅ One session header id / bench 每次独立 id |
 | `userId` | ✅ `LANGFUSE_USER_ID` / `ONE_USER_ID` / `USER` |
 | Generation I/O 文本 | ✅ 默认短预览（240 字：input=末条 user，output=回复文本）；`--trace-full` 至 16k |
+| Root agent I/O | ✅ `observation.input`（user 原文）+ `observation.output`（final）；**不**写 root `model`/`gen_ai.usage`（避免被当成 generation） |
+| Turn 时长 | ✅ 下一 turn 开始时 end 上一 turn；不再拖到 RunEnd |
+| Empty/provider retry | ✅ 每次 sample 独立 generation；成功样本不再被吞 |
+| Subagent 嵌套 | ✅ `task` 子 agent fork 到同一 OTEL trace，挂在 tool span 下 |
+| Generation tool_calls | ✅ 结构化 `id/name/arguments` → metadata + output JSON |
 | Experiments dataset 属性 | ⚠️ 未接；bench 用 tags + harness scores |
 
 ## Trace 事件 → OTEL / Langfuse
 
 | `TraceEvent` | OTEL span | Langfuse 映射 |
 |--------------|-----------|---------------|
-| `run_start` | root span | observation **agent** |
-| `run_end` | end root | status / output / tokens |
-| `turn_start` | child | observation **chain** |
-| `llm_request` | child | observation **generation**（开始） |
-| `llm_response` | end generation | model + `gen_ai.usage.*` |
+| `run_start` | root span | observation **agent** + input preview（无裸 `model`） |
+| `run_end` | end root | status / output / token **metadata**（非 gen_ai） |
+| `turn_start` | child | observation **chain**（关闭上一 turn） |
+| `llm_request` | child | observation **generation**（开始；retry 时新开） |
+| `llm_response` | end generation | model + `gen_ai.usage.*`；retry 标 WARNING |
 | `tool_start` / `tool_end` | child | observation **tool** |
+| subagent `run_start` | nested under `task` tool | observation **agent** `subagent:name` |
 | `gate` | span event | event on tool/turn |
 | `compaction` | child span | span |
 | `score` | — | `POST /api/public/scores` |

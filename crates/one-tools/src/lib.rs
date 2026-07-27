@@ -7,6 +7,8 @@ pub mod edit_diff;
 pub mod find;
 pub mod grep;
 pub mod ls;
+pub mod memory_io;
+pub mod monitor;
 pub mod os_sandbox;
 pub mod path_policy;
 pub mod permissions;
@@ -17,6 +19,7 @@ pub mod registry;
 pub mod sandbox;
 pub mod sandbox_permissions;
 pub mod tasks;
+pub mod todo;
 pub mod tool_args;
 pub mod truncate;
 #[cfg(feature = "network")]
@@ -37,6 +40,11 @@ pub use edit::EditTool;
 pub use find::FindTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
+pub use memory_io::{
+    is_memory_index_path, is_memory_path, soft_check_memory_write, wrap_memory_read,
+    MemoryLookupBudget, DEFAULT_MAX_LOOKUPS_PER_TURN,
+};
+pub use monitor::MonitorTool;
 pub use os_sandbox::OsSandbox;
 pub use path_policy::{
     AccessKind, DynamicGrants, ExportedReadGrants, PathPolicy, SandboxMode,
@@ -59,7 +67,11 @@ pub use sandbox_permissions::{
     justification_of, looks_like_sandbox_denial, requires_escalation, sandbox_permissions_of,
     SandboxPermissions,
 };
-pub use tasks::{BackgroundTaskRegistry, TaskMeta, TaskSnapshot, TaskState};
+pub use tasks::{
+    format_task_list, format_task_output, BackgroundTaskRegistry, TaskMeta, TaskSnapshot, TaskState,
+    DEFAULT_MONITOR_MAX_EVENTS,
+};
+pub use todo::{TodoItem, TodoListState, TodoStatus, TodoWriteTool};
 pub use truncate::{
     apply_head_default, apply_tail_default, cleanup_tool_outputs, cleanup_tool_outputs_before,
     format_size, present_file_read, present_tool_output, present_tool_output_with,

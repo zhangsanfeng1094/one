@@ -10,6 +10,9 @@
 //! - [`subscribe`] — agent event fans-out
 
 mod build;
+pub mod env_context;
+pub mod memory_search_tool;
+pub mod memory_write_tool;
 pub mod explore_tools;
 pub mod features;
 pub mod harness;
@@ -40,7 +43,9 @@ use one_ext::ExtensionRuntime;
 use one_mcp::McpManager;
 use one_resources::ResourceLoader;
 use one_session::SessionManager;
-use one_tools::{AskUserHandler, BackgroundTaskRegistry, PathPolicy, PlanExitState};
+use one_tools::{
+    AskUserHandler, BackgroundTaskRegistry, PathPolicy, PlanExitState, TodoListState,
+};
 
 use crate::approval::PermissionGate;
 use crate::hitl::HitlChannel;
@@ -74,6 +79,14 @@ pub struct AppRuntime {
     plan_exit: Arc<Mutex<PlanExitState>>,
     /// Shared background bash registry (reused when leaving plan mode).
     bg_registry: Arc<BackgroundTaskRegistry>,
+    /// Session todo list for `todo_write` (survives plan/act rebuilds).
+    todo_state: TodoListState,
+    /// Per-turn memory read/grep budget (M3; reset each user prompt).
+    memory_lookups: std::sync::Arc<one_tools::MemoryLookupBudget>,
+    /// Frozen env snapshot (cwd/git/date) — boot / `/new` / `/reload` only.
+    env_context: String,
+    /// Frozen memory L2 catalog section (None when disabled).
+    memory_catalog: Option<String>,
     /// Base system prompt without plan-mode overlay.
     base_system_prompt: String,
     /// Shared permission gate (interactive ask / fail-closed / auto).
@@ -100,6 +113,8 @@ pub struct AppRuntime {
     pending_features: Option<FeatureState>,
     /// Process kill-switch: never enable subagent this process (`--no-subagent`).
     no_subagent_process: bool,
+    /// Process kill-switch: never enable memory this process (`--no-memory` / env).
+    no_memory_process: bool,
     /// Whether the active LLM advertises Responses hosted search tools
     /// (`provider.server_tools()` non-empty). Combined with feature
     /// `server_search` → request inject only (not response handling).
@@ -207,12 +222,36 @@ impl AppRuntime {
     }
 
     /// Recompose base + mode system prompt from applied features + resources.
+    ///
+    /// Keeps frozen `env_context` / `memory_catalog` (session-stable for prompt cache).
     pub(super) fn recompose_base_prompt(&mut self) {
         self.base_system_prompt = prompt_compose::compose_base_system_prompt(
-            &self.applied_features,
-            &self.resources,
-            self.can_spawn_policy(),
+            prompt_compose::ComposeBaseInput {
+                features: &self.applied_features,
+                resources: &self.resources,
+                can_spawn: self.can_spawn_policy(),
+                env_context: Some(self.env_context.as_str()),
+                memory_catalog: self.memory_catalog.as_deref(),
+            },
         );
+    }
+
+    /// Refresh env + memory L2 snapshots and recompose (cold start, `/new`, `/reload`).
+    pub(super) async fn refresh_context_snapshots(
+        &mut self,
+        memory_opts: &one_resources::MemoryLoadOptions,
+    ) {
+        self.memory_lookups
+            .set_max(memory_opts.max_lookups_per_turn);
+        self.env_context = env_context::build_env_context(&self.cwd);
+        self.memory_catalog = if memory_opts.enabled {
+            one_resources::load_memory_catalog(&self.resources.agent_dir, &self.cwd, memory_opts)
+                .await
+                .map(|c| c.prompt_section)
+        } else {
+            None
+        };
+        self.recompose_base_prompt();
     }
 
     /// Whether the agent currently has conversation messages (context-bound).
@@ -228,7 +267,9 @@ impl AppRuntime {
         id: &str,
         enabled: bool,
     ) -> Result<(bool, bool), Box<dyn std::error::Error>> {
-        use features::{env_no_subagent, feature_affects_context, feature_def};
+        use features::{
+            env_no_memory, env_no_subagent, feature_affects_context, feature_def, FEATURE_MEMORY,
+        };
 
         if feature_def(id).is_none() {
             return Err(format!(
@@ -246,20 +287,35 @@ impl AppRuntime {
                 "subagent disabled for this process (--no-subagent / ONE_DISABLE_SUBAGENT)".into(),
             );
         }
+        if (id == FEATURE_MEMORY || id == features::FEATURE_MEMORY_LEGACY)
+            && (self.no_memory_process || env_no_memory())
+        {
+            return Err(
+                "memory disabled for this process (--no-memory / ONE_NO_MEMORY)".into(),
+            );
+        }
 
         let mut s = crate::settings::load();
-        s.set_feature(id, enabled);
+        // Normalize legacy id so settings store `memory`, not `memory_write`.
+        let store_id = if id == features::FEATURE_MEMORY_LEGACY {
+            FEATURE_MEMORY
+        } else {
+            id
+        };
+        s.set_feature(store_id, enabled);
         crate::settings::save(&s)?;
 
-        let desired = FeatureState::from_settings(&s)
-            .with_process_overrides(self.no_subagent_process || env_no_subagent());
+        let desired = FeatureState::from_settings(&s).with_process_overrides(
+            self.no_subagent_process || env_no_subagent(),
+            self.no_memory_process || env_no_memory(),
+        );
 
         if desired.fingerprint() == self.applied_features.fingerprint() {
             self.pending_features = None;
             return Ok((enabled, true));
         }
 
-        let affects = feature_affects_context(id);
+        let affects = feature_affects_context(store_id);
         let has_msgs = self.has_messages().await;
         if affects && has_msgs {
             self.pending_features = Some(desired);
@@ -269,17 +325,26 @@ impl AppRuntime {
         // Apply immediately (no messages, or non-context feature).
         self.applied_features = desired;
         self.pending_features = None;
+        // Feature memory toggles L2 catalog + tools (path policy is cold-start; `/new` refreshes).
+        if store_id == FEATURE_MEMORY {
+            let mem_opts = features::effective_memory_options(&self.applied_features, &s);
+            self.refresh_context_snapshots(&mem_opts).await;
+        }
         self.rebuild_mode_tools_and_prompt().await?;
         Ok((enabled, true))
     }
 
     /// Load features from settings and apply to tools + prompt (cold start / `/new`).
     pub async fn apply_features_from_settings(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        use features::env_no_subagent;
+        use features::{env_no_memory, env_no_subagent};
         let s = crate::settings::load();
-        self.applied_features = FeatureState::from_settings(&s)
-            .with_process_overrides(self.no_subagent_process || env_no_subagent());
+        self.applied_features = FeatureState::from_settings(&s).with_process_overrides(
+            self.no_subagent_process || env_no_subagent(),
+            self.no_memory_process || env_no_memory(),
+        );
         self.pending_features = None;
+        let mem_opts = features::effective_memory_options(&self.applied_features, &s);
+        self.refresh_context_snapshots(&mem_opts).await;
         self.recompose_base_prompt();
         self.rebuild_mode_tools_and_prompt().await
     }

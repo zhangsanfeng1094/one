@@ -27,6 +27,28 @@ impl AppRuntime {
         }
         // Apply pending feature flags (context-affecting) now that history is clear.
         self.apply_features_from_settings().await?;
+        // New session: refresh env + memory L2 (session-frozen snapshots).
+        // apply_features_from_settings already refreshed memory; re-apply in case
+        // settings.memory.* changed without feature fingerprint change.
+        let settings = crate::settings::load();
+        let mem_opts = super::features::effective_memory_options(&self.applied_features, &settings);
+        self.refresh_context_snapshots(&mem_opts).await;
+        {
+            let mut agent = self.agent.lock().await;
+            agent.config.system_prompt = if self.mode == AgentMode::Plan {
+                if let Some(path) = &self.plan_path {
+                    format!(
+                        "{}{}",
+                        self.base_system_prompt,
+                        one_tools::plan_mode_system_overlay(path)
+                    )
+                } else {
+                    self.base_system_prompt.clone()
+                }
+            } else {
+                self.base_system_prompt.clone()
+            };
+        }
         // Ensure any MCP servers that finished loading attach to this clean slate.
         self.sync_mcp_tools().await?;
         if switching {

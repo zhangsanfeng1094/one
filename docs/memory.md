@@ -1,6 +1,8 @@
 # 分层 Memory 设计
 
-> **状态**：📝 仅设计，**暂不实现**（2026-07-21）  
+> **状态**：🟨 **M1–M6 已落地**（2026-07-27）— L2 + 写 + age/budget；子 agent 默认 off；`memory_search` / `memory_write`；compact→L4；**feature `memory` 为整包总开关（默认 on）**；MCP 外挂仍可选  
+
+
 > **问题**：跨 session 学到的偏好 / 教训 / 项目事实如何持久化，且 **不** 一股脑塞进 context。  
 > **核心判断**：**存多少几乎不重要；关键是在正确时机加载正确的 memory。**  
 > **相关**：[architecture.md](./architecture.md) §6.3 system prompt · [subagents.md](./subagents.md) · skills progressive disclosure（`one-resources`）
@@ -16,7 +18,7 @@
 | Session JSONL + compaction | ✅ | **会话内**工作记忆 |
 | `AGENTS.md` / `CLAUDE.md` | ✅ | **人写**的静态项目约定 |
 | Skills catalog + `read` body | ✅ | 工作流 **按需** 披露 |
-| 跨 session 自动/半自动记忆 | ❌ | **本文设计对象** |
+| 跨 session 自动/半自动记忆 | 🟨 M1–M6 | feature `memory` 整包；L2+写+age/budget；`memory_search`/`memory_write`；compact→L4；无自动 extract |
 
 静态 `AGENTS.md` 解决「团队约定」；不解决「上次对话里用户纠正了偏好」「上周踩过的部署坑」——这些不该靠人手工抄进 AGENTS。
 
@@ -292,8 +294,8 @@ Session boot in <cwd>:
 
 | 方案 | 说明 | V1 倾向 |
 |------|------|---------|
-| **A. 主 agent 同步写** | 用 write/edit 写 body + 更新 MEMORY.md；用户可见 | **首选**（简单、可监督） |
-| **B. 专用 memory tool** | 强制 schema / 防重复 | 可选增强 |
+| **A. 主 agent 同步写** | 用 write/edit 写 body + 更新 MEMORY.md；用户可见 | 仍可用（软校验） |
+| **B. 专用 `memory_write` tool** | 原子 body + MEMORY.md；schema；feature `memory` 包内 | **首选**（M6） |
 | **C. 异步 extract/consolidate** | Codex 双阶段 | **后置**，非默认 |
 
 **写时纪律（进 L0 短提示）**：
@@ -361,8 +363,17 @@ Session boot in <cwd>:
 | `load: index` | 仅 L2（默认） |
 | `load: off` + 用户 @memory | 纯手动 |
 | `subagent: off \| index` | 子 run 默认 off |
+| `write: true`（默认） | PathPolicy 授予 memory 根写权限 |
+| `max_lookups_per_turn`（默认 6） | 每 user turn 对 memory 路径的 read/grep 上限 |
+| `subagent: off`（默认） | 子 agent `resources.memory`；`index` 仅 opt-in 升级 Off→Index |
+| `archive_compaction: true`（默认，且 memory enabled） | compact 后写 L4 `memory/sessions/` |
 
-CLI 示意：`--no-memory` / 未来 `/memory` 列表与编辑——**仅文档预留**。
+CLI：`--no-memory` / `ONE_NO_MEMORY`（等同关掉 feature 包）。  
+**Feature 总开关**（整包）：`/settings feature.memory off` 或 `"features": { "memory": false }`  
+→ 关：无 L2、无 `memory_search`/`memory_write`、无 memory 路径权限、无 compact→L4。  
+子配置（feature 开启时仍有效）：`memory.write`、`index_max_lines`、`max_lookups_per_turn`、`subagent`、`archive_compaction`。  
+工具：`memory_search`；`memory_write`（还需 `memory.write` + 非 read-only）。  
+未来 `/memory` 列表与编辑——**仍预留**。
 
 ---
 
@@ -373,11 +384,12 @@ CLI 示意：`--no-memory` / 未来 `/memory` 列表与编辑——**仅文档�
 | 阶段 | 内容 | 依赖 |
 |------|------|------|
 | **M0** | 文档 + 目录约定 + L0 纪律文案定稿 | — |
-| **M1** | 读路径：发现 `_global` + project 索引 → 注入 L2；session 冻结 | `prompt_compose` / `one-resources` |
-| **M2** | 写路径：约定 + 可选校验；agent 可 write body/index | tools 已有 |
-| **M3** | tool 结果 age 包装；lookup 步数/budget | runtime |
-| **M4** | `AgentSpec.resources.memory`；subagent 默认 off | protocol |
-| **M5** | 可选：`memory_search`、session 摘要进 L4、MCP 外挂 | — |
+| **M1** ✅ | 读路径：发现 `_global` + project 索引 → 注入 L2；session 冻结；env 快照 | `prompt_compose` / `one-resources/memory` |
+| **M2** ✅ | 写路径：memory 根可写；L0 写纪律；write/edit 软校验 reminder | path policy + `memory_io` |
+| **M3** ✅ | 读 body age 包装；`max_lookups_per_turn`（默认 6） | `memory_io` + Read/Grep |
+| **M4** ✅ | `AgentSpec.resources.memory`：`off` \| `index`；explore/子 agent 默认 **off**；settings `memory.subagent` 可 opt-in index | protocol + harness + task |
+| **M5** ✅ | `memory_search` 工具；compaction 摘要进 `memory/sessions/`（L4）；MCP 外挂文档化（非默认） | tools + prompt + resources |
+| **M6** ✅ | 专用 `memory_write` + feature `memory` **整包总开关**（L2/tools/roots/archive） | `upsert_memory_entry` + feature + tools |
 
 验收直觉（M1+）：
 
@@ -400,7 +412,7 @@ CLI 示意：`--no-memory` / 未来 `/memory` 列表与编辑——**仅文档�
 | 写 | 倾向主 agent 同步；强 NO-OP 纪律 |
 | 子 agent | 默认不带 memory |
 | 向量 RAG | 非默认 |
-| 实现 | **暂缓**；本文为设计真源 |
+| 实现 | **M1–M6 已落地**；自动 extract / 向量 RAG 仍非目标 |
 
 ---
 

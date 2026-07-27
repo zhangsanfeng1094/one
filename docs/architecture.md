@@ -79,7 +79,7 @@ flowchart TB
 | Agent loop（prompt→LLM→tool→loop） | ✅ | `one-core/agent` | 短循环，max_turns |
 | Streaming text / thinking | ✅ | `one-core` + `one-ai` + TUI | SSE 真流式 |
 | Thinking level | ✅ | settings / session / providers | off/low/medium/high |
-| 内置 coding tools | ✅ | `one-tools` | read/write/edit/bash/…；`edit` 的 `details.patch` 仅 UI，TUI IDE 红绿 diff 见 [cli.md](./cli.md#edit--write-的-tui-diff-展示) |
+| 内置 coding tools | ✅ | `one-tools` | read/write/edit/bash/todo_write/monitor/…；`edit` 的 `details.patch` 仅 UI，TUI IDE 红绿 diff 见 [cli.md](./cli.md#edit--write-的-tui-diff-展示) |
 | OAuth / 订阅登录 | ✅ | `one-ai/auth` + `one-cli/auth_cmd` | Codex · xAI · OpenCode Zen/Go；Claude/Copilot 待 |
 | 工作区 PathPolicy | ✅ | `one-tools/path_policy` | 默认 workspace-write |
 | OS sandbox (bwrap) | ✅ | `one-tools/os_sandbox` | bash 可选 |
@@ -89,9 +89,9 @@ flowchart TB
 | Session UX（continue/resume/new/tree） | ✅ | runtime + TUI | export/share 有 |
 | AGENTS.md / CLAUDE.md | ✅ | `one-resources` | 向上发现（静态 L1） |
 | Skills progressive disclosure | ✅ | `one-resources/skills` | catalog + read |
-| 分层 Memory（跨 session） | 📝 | [memory.md](./memory.md) | L0–L4 工作集选择；**暂不实现** |
+| 分层 Memory（跨 session） | 🟨 | [memory.md](./memory.md) + `one-resources/memory` | **M1–M6**：feature `memory` 整包；L2+写+age/budget；`memory_search`/`memory_write`；compact→L4；子 agent 默认 off |
 | Prompt 模板 `/name` | ✅ | `one-resources/prompts` | |
-| Compaction | ✅ | `one-core/compaction` + runtime | LLM 摘要 + overflow 重试 |
+| Compaction | ✅ | `one-core/compaction` + runtime | 默认 prune 旧 tool body + prefire（~85% 阈值）+ LLM 摘要 + overflow 重试；`<system-reminder>` 用于空读/spill/后台完成 |
 | 四模式 Interactive/Print/JSON/RPC | ✅ | `one-cli/modes` | |
 | 执行轨迹 / harness 评测 | ✅ | `one-core/trace` + Langfuse `--trace` / `one bench` | 可选 TraceSink → Langfuse；见 [harness-eval.md](./harness-eval.md) |
 | Plan / Act 模式 | ✅ | runtime + tools/plan | 硬工具门控 |
@@ -300,10 +300,11 @@ DEFAULT_SYSTEM_PROMPT          # core role + tool policy（无 feature 包）
   + skills catalog XML（name/description/location only）
   + plugin system overlays
   + extension contribute_context()
+  + Environment snapshot（cwd / git / date · session 冻结）
+  + Memory L2 catalog（索引 only · session 冻结；body 按需 read）
   + [feature subagent on] TASK_TOOL_PROMPT_HINT
   + [Plan 模式] plan_mode_system_overlay
-  # 设计中 · 暂未实现：memory catalog（L2 索引，session 冻结）
-  # 见 docs/memory.md — body 不进 system，按需 read
+  # 见 docs/memory.md
 ```
 
 **Settings features**（`settings.json` → `features`）：能力包开关（V1：`subagent`）。  

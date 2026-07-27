@@ -92,7 +92,7 @@
 - [ ] TUI 差分渲染优化 / 贴图 / `@` 模糊搜索增强
 - [ ] 与官方 Pi session 全量兼容性回归测试
 - [ ] 更准的 per-model pricing 表
-- [ ] **分层 Memory**（跨 session）— 设计见 [memory.md](./memory.md)；**暂不实现**（L2 索引常驻 + L3/L4 按需；不限磁盘容量）
+- [x] **分层 Memory**（跨 session）— [memory.md](./memory.md) **M1–M6**：feature `memory` 整包开关 + L2/写/search/`memory_write`/compact→L4；自动 extract / 向量 RAG 仍非目标
 
 ### 程序化执行 · Subagent · Workflow（对齐 Claude，见设计）
 

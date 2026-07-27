@@ -172,6 +172,7 @@ impl ProviderSet {
             no_mcp: false,
             no_skills: false,
             no_subagent: false,
+            no_memory: false,
             trace: false,
             trace_full: false,
             max_turns: 32,

@@ -386,6 +386,27 @@ pub fn call_summary(call: &ToolCall) -> String {
                 .unwrap_or(".");
             format!("{} {path}", call.name)
         }
+        "memory_write" => {
+            let id = call
+                .arguments
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
+            let scope = call
+                .arguments
+                .get("scope")
+                .and_then(|v| v.as_str())
+                .unwrap_or("project");
+            format!("memory_write {scope}/{id}")
+        }
+        "memory_search" => {
+            let q = call
+                .arguments
+                .get("query")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            format!("memory_search {q}")
+        }
         other => format!("{other} {}", call.arguments),
     }
 }
@@ -450,8 +471,10 @@ pub fn evaluate(
 fn default_verdict(call: &ToolCall, auto_approve: bool) -> PermissionVerdict {
     match call.name.as_str() {
         "read" | "grep" | "find" | "ls" | "bash_output" | "bash_kill" | "web_search"
-        | "web_fetch" | "exit_plan_mode" => PermissionVerdict::Allow,
-        "write" | "edit" => PermissionVerdict::Allow, // PathPolicy enforces workspace
+        | "web_fetch" | "exit_plan_mode" | "memory_search" | "todo_write" => {
+            PermissionVerdict::Allow
+        }
+        "write" | "edit" | "memory_write" => PermissionVerdict::Allow, // PathPolicy / tool roots
         "bash" | "shell" => {
             let command = call
                 .arguments

@@ -40,8 +40,8 @@ pub struct ToolOutputSettings {
 /// Context compaction strategy (settings key `compaction`).
 ///
 /// Main path: auto threshold + keep_recent summary (OpenCode/Claude-style).
-/// Optional `prune` (default **off**): before summarization, clear tool bodies
-/// **outside** the keep_recent tail — does not touch recent turns.
+/// `prune` (default **on**): clear old tool bodies outside the keep_recent tail
+/// as a cheap pre-pass and as **prefire** (~85% of threshold) before full LLM compact.
 /// Omitted fields use defaults in [`CompactionSettings::to_config`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -56,12 +56,14 @@ pub struct CompactionSettings {
     /// Recent messages kept after LLM/extractive summary (default 12).
     /// These turns (including their tool outputs) are never pruned.
     pub keep_recent: Option<usize>,
-    /// Pre-pass: clear **old** tool bodies outside keep_recent (default false).
+    /// Pre-pass + prefire: clear **old** tool bodies outside keep_recent (default true).
     pub prune: Option<bool>,
     /// Within pre-tail only: soft-protect this many tokens of the newest old tools.
     pub prune_protect_tokens: Option<usize>,
     /// Max chars of original text kept on a pruned tool result (default 2000).
     pub prune_max_chars: Option<usize>,
+    /// Fraction of compact threshold at which prune-only prefire runs (default 0.85).
+    pub prefire_ratio: Option<f64>,
 }
 
 impl CompactionSettings {
@@ -79,17 +81,23 @@ impl CompactionSettings {
         if let Some(n) = self.keep_recent.filter(|n| *n > 0) {
             cfg.keep_recent_messages = n;
         }
-        cfg.prune = self.prune.unwrap_or(false);
+        cfg.prune = self.prune.unwrap_or(true);
         if let Some(n) = self.prune_protect_tokens {
             cfg.prune_protect_tokens = n;
         }
         if let Some(n) = self.prune_max_chars {
             cfg.prune_max_chars = n;
         }
+        if let Some(r) = self
+            .prefire_ratio
+            .filter(|r| r.is_finite() && *r > 0.0 && *r < 1.0)
+        {
+            cfg.prefire_ratio = r;
+        }
         cfg
     }
 
-    /// One-line summary for Settings UI, e.g. `auto 70% · keep 12 · prune off`.
+    /// One-line summary for Settings UI, e.g. `auto 70% · keep 12 · prune · prefire 85%`.
     pub fn summary_line(&self) -> String {
         let auto = if self.auto.unwrap_or(true) {
             "auto"
@@ -110,12 +118,94 @@ impl CompactionSettings {
             format!("{}%", (r * 100.0).round() as u32)
         };
         let keep = self.keep_recent.unwrap_or(12);
-        let prune = if self.prune.unwrap_or(false) {
-            "old-tools prune"
+        let prune = if self.prune.unwrap_or(true) {
+            let pf = self
+                .prefire_ratio
+                .filter(|r| r.is_finite() && *r > 0.0 && *r < 1.0)
+                .unwrap_or(one_core::DEFAULT_PREFIRE_RATIO);
+            format!("prune · prefire {}%", (pf * 100.0).round() as u32)
         } else {
-            "no prune"
+            "no prune".into()
         };
         format!("{auto} {thresh} · keep {keep} · {prune}")
+    }
+}
+
+/// Cross-session memory L2 index (see `docs/memory.md`).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MemorySettings {
+    /// Inject L2 catalog into system prompt (default true). Bodies still need `read`.
+    pub enabled: Option<bool>,
+    /// Max index entries in the catalog (default 80).
+    pub index_max_lines: Option<usize>,
+    /// Allow `write`/`edit` under memory roots (default true = agent write path).
+    pub write: Option<bool>,
+    /// Max memory `read`/`grep` ops per user turn (default 6).
+    pub max_lookups_per_turn: Option<usize>,
+    /// Default `AgentSpec.resources.memory` for **subagents** when not set on the
+    /// child spec: `off` (default) | `index` (M4).
+    pub subagent: Option<String>,
+    /// Write compaction summaries under `memory/sessions/` (L4 archive, M5).
+    /// Default true when memory is enabled.
+    pub archive_compaction: Option<bool>,
+}
+
+impl MemorySettings {
+    pub fn to_load_options(&self) -> one_resources::MemoryLoadOptions {
+        one_resources::MemoryLoadOptions {
+            enabled: self.enabled.unwrap_or(true),
+            index_max_lines: self
+                .index_max_lines
+                .filter(|n| *n > 0)
+                .unwrap_or(one_resources::DEFAULT_INDEX_MAX_LINES),
+            write_enabled: self.write.unwrap_or(true),
+            max_lookups_per_turn: self
+                .max_lookups_per_turn
+                .filter(|n| *n > 0)
+                .unwrap_or(one_resources::DEFAULT_MAX_LOOKUPS_PER_TURN),
+        }
+    }
+
+    /// Subagent memory mode (default off).
+    pub fn subagent_mode(&self) -> crate::protocol::MemoryResourceMode {
+        self.subagent
+            .as_deref()
+            .and_then(crate::protocol::MemoryResourceMode::parse)
+            .unwrap_or(crate::protocol::MemoryResourceMode::Off)
+    }
+
+    pub fn archive_compaction_enabled(&self) -> bool {
+        self.archive_compaction
+            .unwrap_or(true)
+            && self.enabled.unwrap_or(true)
+    }
+
+    pub fn summary_line(&self) -> String {
+        if self.enabled.unwrap_or(true) {
+            let n = self
+                .index_max_lines
+                .filter(|n| *n > 0)
+                .unwrap_or(one_resources::DEFAULT_INDEX_MAX_LINES);
+            let w = if self.write.unwrap_or(true) {
+                "write on"
+            } else {
+                "write off"
+            };
+            let lookups = self
+                .max_lookups_per_turn
+                .filter(|n| *n > 0)
+                .unwrap_or(one_resources::DEFAULT_MAX_LOOKUPS_PER_TURN);
+            let sub = self.subagent_mode().as_str();
+            let arch = if self.archive_compaction_enabled() {
+                "archive on"
+            } else {
+                "archive off"
+            };
+            format!("L2 on · max {n} · {w} · lookups/{lookups} · sub={sub} · {arch}")
+        } else {
+            "off".into()
+        }
     }
 }
 
@@ -143,12 +233,14 @@ pub struct Settings {
     /// Omitted paths default to enabled.
     pub skills_config: Option<Vec<SkillConfigEntry>>,
     /// Runtime feature flags (id → enabled). Omitted ids use registry defaults.
-    /// See `runtime/features.rs` (e.g. `subagent` → task tools + prompt section).
+    /// See `runtime/features.rs` (e.g. `subagent` → task tools; `memory` → whole memory package).
     pub features: Option<HashMap<String, bool>>,
     /// Unified tool-output truncation (OpenCode `tool_output`).
     pub tool_output: Option<ToolOutputSettings>,
     /// Context compaction strategy (threshold + optional tool prune).
     pub compaction: Option<CompactionSettings>,
+    /// Cross-session memory L2 catalog.
+    pub memory: Option<MemorySettings>,
     /// Extra LLM samples after a blank turn or temporary provider failure.
     ///
     /// Default: [`one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES`] (10).
@@ -164,6 +256,25 @@ impl Settings {
             .as_ref()
             .map(|c| c.to_config(context_window))
             .unwrap_or_else(|| one_core::CompactionConfig::from_context_window(context_window))
+    }
+
+    /// Memory L2 load options (settings only — CLI/env overrides applied by caller).
+    pub fn memory_load_options(&self) -> one_resources::MemoryLoadOptions {
+        self.memory
+            .as_ref()
+            .map(|m| m.to_load_options())
+            .unwrap_or_default()
+    }
+
+    pub fn memory_or_default(&self) -> MemorySettings {
+        self.memory.clone().unwrap_or_default()
+    }
+
+    pub fn memory_mut(&mut self) -> &mut MemorySettings {
+        if self.memory.is_none() {
+            self.memory = Some(MemorySettings::default());
+        }
+        self.memory.as_mut().unwrap()
     }
 
     /// Retry budget for blank completions and temporary provider failures.
@@ -210,8 +321,14 @@ impl Settings {
 
     /// Persist a feature flag (creates the map if needed).
     pub fn set_feature(&mut self, id: &str, enabled: bool) {
+        // Normalize legacy `memory_write` → package id `memory`.
+        let id = if id == "memory_write" { "memory" } else { id };
         let map = self.features.get_or_insert_with(HashMap::new);
         map.insert(id.to_string(), enabled);
+        // Drop legacy key if present so fingerprint stays clean.
+        if id == "memory" {
+            map.remove("memory_write");
+        }
     }
 
     pub fn skills_config_entries(&self) -> Vec<one_resources::SkillConfigEntry> {
@@ -436,13 +553,30 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             match v.as_str() {
                 "1" | "true" | "yes" | "on" => c.prune = Some(true),
                 "0" | "false" | "no" | "off" => c.prune = Some(false),
-                "toggle" => c.prune = Some(!c.prune.unwrap_or(false)),
+                "toggle" => c.prune = Some(!c.prune.unwrap_or(true)),
                 other => {
                     return Err(format!(
                         "compaction.prune must be on|off|toggle (got `{other}`)"
                     ));
                 }
             }
+        }
+        "compaction.prefire_ratio"
+        | "compaction.prefire-ratio"
+        | "compaction_prefire_ratio"
+        | "compaction.prefire" => {
+            let r: f64 = value
+                .trim()
+                .trim_end_matches('%')
+                .parse()
+                .map_err(|_| "compaction.prefire_ratio must be a number (0–1 or percent)".to_string())?;
+            let r = if r > 1.0 && r <= 100.0 { r / 100.0 } else { r };
+            if !(r > 0.0 && r < 1.0) {
+                return Err(
+                    "compaction.prefire_ratio must be in (0, 1) (or 1–99 as percent)".into(),
+                );
+            }
+            settings.compaction_mut().prefire_ratio = Some(r);
         }
         "compaction.prune_protect_tokens"
         | "compaction.prune-protect-tokens"
@@ -474,6 +608,100 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                     "empty_response_retries must be a non-negative integer (or default)".to_string()
                 })?;
                 settings.empty_response_retries = Some(n);
+            }
+        }
+        "memory.enabled" | "memory_enabled" | "memory" => {
+            let v = value.trim().to_ascii_lowercase();
+            let m = settings.memory_mut();
+            match v.as_str() {
+                "1" | "true" | "yes" | "on" | "enable" | "enabled" => m.enabled = Some(true),
+                "0" | "false" | "no" | "off" | "disable" | "disabled" => m.enabled = Some(false),
+                "toggle" => m.enabled = Some(!m.enabled.unwrap_or(true)),
+                other => {
+                    return Err(format!(
+                        "memory.enabled must be on|off|toggle (got `{other}`)"
+                    ));
+                }
+            }
+        }
+        "memory.index_max_lines"
+        | "memory.index-max-lines"
+        | "memory_index_max_lines"
+        | "memory.max_lines" => {
+            let n: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| "memory.index_max_lines must be a positive number".to_string())?;
+            if n < 1 {
+                return Err("memory.index_max_lines must be >= 1".into());
+            }
+            settings.memory_mut().index_max_lines = Some(n);
+        }
+        "memory.write" | "memory_write" => {
+            let v = value.trim().to_ascii_lowercase();
+            let m = settings.memory_mut();
+            match v.as_str() {
+                "1" | "true" | "yes" | "on" | "agent" | "enable" | "enabled" => {
+                    m.write = Some(true)
+                }
+                "0" | "false" | "no" | "off" | "disable" | "disabled" => m.write = Some(false),
+                "toggle" => m.write = Some(!m.write.unwrap_or(true)),
+                other => {
+                    return Err(format!(
+                        "memory.write must be on|off|agent|toggle (got `{other}`)"
+                    ));
+                }
+            }
+        }
+        "memory.max_lookups_per_turn"
+        | "memory.max-lookups-per-turn"
+        | "memory.max_lookups"
+        | "memory_max_lookups" => {
+            let n: usize = value.trim().parse().map_err(|_| {
+                "memory.max_lookups_per_turn must be a positive number".to_string()
+            })?;
+            if n < 1 {
+                return Err("memory.max_lookups_per_turn must be >= 1".into());
+            }
+            settings.memory_mut().max_lookups_per_turn = Some(n);
+        }
+        "memory.subagent" | "memory_subagent" => {
+            let v = value.trim().to_ascii_lowercase();
+            match v.as_str() {
+                "off" | "0" | "false" | "none" | "no" => {
+                    settings.memory_mut().subagent = Some("off".into());
+                }
+                "index" | "on" | "true" | "1" | "l2" | "yes" => {
+                    settings.memory_mut().subagent = Some("index".into());
+                }
+                other => {
+                    return Err(format!(
+                        "memory.subagent must be off|index (got `{other}`)"
+                    ));
+                }
+            }
+        }
+        "memory.archive_compaction"
+        | "memory.archive-compaction"
+        | "memory_archive_compaction"
+        | "memory.archive" => {
+            let v = value.trim().to_ascii_lowercase();
+            let m = settings.memory_mut();
+            match v.as_str() {
+                "1" | "true" | "yes" | "on" | "enable" | "enabled" => {
+                    m.archive_compaction = Some(true)
+                }
+                "0" | "false" | "no" | "off" | "disable" | "disabled" => {
+                    m.archive_compaction = Some(false)
+                }
+                "toggle" => {
+                    m.archive_compaction = Some(!m.archive_compaction.unwrap_or(true))
+                }
+                other => {
+                    return Err(format!(
+                        "memory.archive_compaction must be on|off|toggle (got `{other}`)"
+                    ));
+                }
             }
         }
         // Feature flags: /settings feature.subagent off  or  /settings features.subagent on
@@ -528,7 +756,9 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                 "unknown setting `{other}` · known: provider model thinking auto_approve \
                  context_window sandbox add_dir bash_sandbox tool_output.max_lines \
                  tool_output.max_bytes compaction.auto|ratio|threshold|keep_recent|prune \
-                 |prune_protect_tokens|prune_max_chars empty_response_retries \
+                 |prefire_ratio|prune_protect_tokens|prune_max_chars \
+                 memory.enabled|index_max_lines|write|max_lookups_per_turn|subagent|archive_compaction \
+                 empty_response_retries \
                  feature.<id> allow deny ask"
             ));
         }
@@ -695,6 +925,15 @@ mod tests {
                 prune: Some(true),
                 prune_protect_tokens: Some(20_000),
                 prune_max_chars: Some(1000),
+                prefire_ratio: Some(0.85),
+            }),
+            memory: Some(MemorySettings {
+                enabled: Some(true),
+                index_max_lines: Some(40),
+                write: Some(true),
+                max_lookups_per_turn: Some(6),
+                subagent: Some("off".into()),
+                archive_compaction: Some(true),
             }),
             empty_response_retries: Some(3),
         };
@@ -745,7 +984,7 @@ mod tests {
         assert!(s
             .compaction_or_default()
             .summary_line()
-            .contains("old-tools prune"));
+            .contains("prune"));
     }
 
     #[test]

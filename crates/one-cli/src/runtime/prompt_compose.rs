@@ -9,6 +9,16 @@ use super::features::FeatureState;
 use super::task_tool::TASK_TOOL_PROMPT_HINT;
 use super::AgentMode;
 
+/// Short write policy when feature `memory` is on and L2 catalog is present.
+pub const MEMORY_WRITE_PROMPT_HINT: &str = "\
+## Memory write
+
+Use `memory_write` to persist cross-session notes (atomic body + MEMORY.md index). \
+Default NO-OP — only when a future agent would clearly benefit. Prefer updating an \
+existing id after `memory_search`. Do not use raw `write` under memory dirs unless \
+`memory_write` is unavailable. New L2 index lines apply after `/reload` or a new session.
+";
+
 /// Inputs for composing the live system prompt.
 pub struct PromptComposeInput<'a> {
     pub features: &'a FeatureState,
@@ -17,6 +27,17 @@ pub struct PromptComposeInput<'a> {
     pub plan_path: Option<&'a Path>,
     /// Whether spawn_policy allows children (independent of feature flag).
     pub can_spawn: bool,
+    pub env_context: Option<&'a str>,
+    pub memory_catalog: Option<&'a str>,
+}
+
+/// Shared pieces for base system prompt (no plan overlay).
+pub struct ComposeBaseInput<'a> {
+    pub features: &'a FeatureState,
+    pub resources: &'a ResourceLoader,
+    pub can_spawn: bool,
+    pub env_context: Option<&'a str>,
+    pub memory_catalog: Option<&'a str>,
 }
 
 /// Base system prompt **without** plan-mode overlay.
@@ -24,23 +45,47 @@ pub struct PromptComposeInput<'a> {
 /// Order:
 /// 1. `DEFAULT_SYSTEM_PROMPT` (core role + tool policy; no feature packages)
 /// 2. AGENTS.md / skills catalog / plugin+ext append (`ResourceLoader`)
-/// 3. Feature sections (subagent when enabled + can_spawn)
-pub fn compose_base_system_prompt(
-    features: &FeatureState,
-    resources: &ResourceLoader,
-    can_spawn: bool,
-) -> String {
-    let mut base = resources.build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
-    if features.subagent_enabled() && can_spawn {
+/// 3. Environment snapshot (cwd / git / date) — session-frozen
+/// 4. Memory L2 catalog — session-frozen progressive disclosure
+/// 5. Feature sections (subagent when enabled + can_spawn)
+pub fn compose_base_system_prompt(input: ComposeBaseInput<'_>) -> String {
+    let mut base = input
+        .resources
+        .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
+    if let Some(env) = input.env_context.map(str::trim).filter(|s| !s.is_empty()) {
+        base.push_str("\n\n");
+        base.push_str(env);
+    }
+    if let Some(mem) = input.memory_catalog.map(str::trim).filter(|s| !s.is_empty()) {
+        base.push_str("\n\n");
+        base.push_str(mem);
+    }
+    if input.features.subagent_enabled() && input.can_spawn {
         base.push('\n');
         base.push_str(TASK_TOOL_PROMPT_HINT);
+    }
+    // Feature `memory` on + L2 catalog present → write discipline for memory_write tool.
+    if input.features.memory_enabled()
+        && input
+            .memory_catalog
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+    {
+        base.push('\n');
+        base.push_str(MEMORY_WRITE_PROMPT_HINT);
     }
     base
 }
 
 /// Full system prompt for the current mode (base + optional plan overlay).
 pub fn compose_system_prompt(input: PromptComposeInput<'_>) -> String {
-    let base = compose_base_system_prompt(input.features, input.resources, input.can_spawn);
+    let base = compose_base_system_prompt(ComposeBaseInput {
+        features: input.features,
+        resources: input.resources,
+        can_spawn: input.can_spawn,
+        env_context: input.env_context,
+        memory_catalog: input.memory_catalog,
+    });
     if input.mode == AgentMode::Plan {
         if let Some(path) = input.plan_path {
             return format!("{}{}", base, plan_mode_system_overlay(path));
@@ -68,11 +113,27 @@ mod tests {
         }
     }
 
+    fn base(
+        features: &FeatureState,
+        resources: &ResourceLoader,
+        can_spawn: bool,
+        env: Option<&str>,
+        mem: Option<&str>,
+    ) -> String {
+        compose_base_system_prompt(ComposeBaseInput {
+            features,
+            resources,
+            can_spawn,
+            env_context: env,
+            memory_catalog: mem,
+        })
+    }
+
     #[test]
     fn subagent_section_only_when_enabled() {
         let resources = empty_resources();
         let on = FeatureState::default();
-        let prompt_on = compose_base_system_prompt(&on, &resources, true);
+        let prompt_on = base(&on, &resources, true, None, None);
         assert!(
             prompt_on.contains("`task` tool"),
             "enabled feature should include task policy"
@@ -87,7 +148,7 @@ mod tests {
         m.insert(FEATURE_SUBAGENT.into(), false);
         settings.features = Some(m);
         let off = FeatureState::from_settings(&settings);
-        let prompt_off = compose_base_system_prompt(&off, &resources, true);
+        let prompt_off = base(&off, &resources, true, None, None);
         assert!(
             !prompt_off.contains("`task` tool"),
             "disabled feature must omit task section"
@@ -98,7 +159,56 @@ mod tests {
     fn can_spawn_false_omits_subagent_even_if_feature_on() {
         let resources = empty_resources();
         let on = FeatureState::default();
-        let prompt = compose_base_system_prompt(&on, &resources, false);
+        let prompt = base(&on, &resources, false, None, None);
         assert!(!prompt.contains("`task` tool"));
+    }
+
+    #[test]
+    fn injects_env_and_memory_sections() {
+        let resources = empty_resources();
+        let on = FeatureState::default();
+        let prompt = base(
+            &on,
+            &resources,
+            false,
+            Some("## Environment\n<env>\ncwd: /x\n</env>"),
+            Some("## Memory (L2 index)\n<memory-catalog></memory-catalog>"),
+        );
+        assert!(prompt.contains("<env>"));
+        assert!(prompt.contains("cwd: /x"));
+        assert!(prompt.contains("<memory-catalog>"));
+        assert!(
+            prompt.contains("memory_write"),
+            "memory feature + L2 catalog should add write hint"
+        );
+    }
+
+    #[test]
+    fn memory_write_hint_omitted_without_catalog() {
+        let resources = empty_resources();
+        let on = FeatureState::default();
+        let prompt = base(&on, &resources, false, None, None);
+        assert!(
+            !prompt.contains("## Memory write"),
+            "no L2 catalog → no memory_write section"
+        );
+    }
+
+    #[test]
+    fn memory_write_hint_off_when_feature_disabled() {
+        let resources = empty_resources();
+        let mut settings = Settings::default();
+        let mut m = HashMap::new();
+        m.insert(crate::runtime::features::FEATURE_MEMORY.into(), false);
+        settings.features = Some(m);
+        let off = FeatureState::from_settings(&settings);
+        let prompt = base(
+            &off,
+            &resources,
+            false,
+            None,
+            Some("## Memory (L2 index)\n<memory-catalog></memory-catalog>"),
+        );
+        assert!(!prompt.contains("## Memory write"));
     }
 }

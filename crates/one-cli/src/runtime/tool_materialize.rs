@@ -138,6 +138,8 @@ pub fn harness_build_context(
         bg_registry: Arc::new(one_tools::BackgroundTaskRegistry::new()),
         ask_user: Some(Arc::new(one_tools::FailClosedAskUser)),
         tool_gate: None,
+        todo_state: one_tools::TodoListState::new(),
+        memory_lookups: one_tools::MemoryLookupBudget::unlimited(),
         #[cfg(feature = "network")]
         backend_web_search: None,
     }

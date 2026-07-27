@@ -99,7 +99,8 @@ spawn 路径（主模型调 Agent 工具 vs 宿主 `query`）不同，**规格�
   },
   "resources": {
     "agents_md": false,
-    "claude_md": false
+    "claude_md": false,
+    "memory": "off"
   },
   "spawn_policy": {
     "allow": [],
@@ -127,7 +128,7 @@ spawn 路径（主模型调 Agent 工具 vs 宿主 `query`）不同，**规格�
 | `cwd` | string\|null | | `null` = 继承父 / CLI |
 | `add_dirs` | string[] | | 额外可读写根 |
 | `skills` | object | | 是否注入 catalog / 预加载 skill 正文 |
-| `resources` | object | | 是否加载 AGENTS.md / CLAUDE.md |
+| `resources` | object | | `agents_md` / `claude_md`；**`memory`**: `off`（子 agent 默认）\| `index`（注入 L2 + 可读 memory 根） |
 | `spawn_policy` | object | | **本 agent 能否再 spawn**；见 [§2.5](#25-spawn_policy--agents) |
 | `agents` | object | | 子角色表：`{ "name": AgentSpec \| AgentRef }`，**值仍是同构 AgentSpec** |
 | `meta` | object | | 扩展袋 |

@@ -26,6 +26,8 @@ impl AppRuntime {
     }
 
     /// Append task + job poll/kill tools when the feature + spawn policy allow.
+    ///
+    /// Job poll/wait/kill also accept bash `bg_*` ids (unified task surface).
     pub(super) fn push_task_tools(&self, tools: &mut Vec<Arc<dyn Tool>>) {
         if !self.should_register_task_tools() {
             return;
@@ -33,10 +35,11 @@ impl AppRuntime {
         let Some(host) = &self.task_host else {
             return;
         };
+        let bash = self.bg_registry.clone();
         tools.push(Arc::new(TaskTool::new(host.clone())));
-        tools.push(Arc::new(JobOutputTool::new(host.jobs())));
-        tools.push(Arc::new(WaitTasksTool::new(host.jobs())));
-        tools.push(Arc::new(JobKillTool::new(host.jobs())));
+        tools.push(Arc::new(JobOutputTool::with_bash(host.jobs(), bash.clone())));
+        tools.push(Arc::new(WaitTasksTool::with_bash(host.jobs(), bash.clone())));
+        tools.push(Arc::new(JobKillTool::with_bash(host.jobs(), bash)));
     }
 
     pub(super) async fn apply_act_tools_and_prompt(
@@ -71,6 +74,8 @@ impl AppRuntime {
             bg_registry: self.bg_registry.clone(),
             ask_user: Some(self.ask_user_handler.clone()),
             tool_gate: Some(self.permission_gate.clone()),
+            todo_state: self.todo_state.clone(),
+            memory_lookups: self.memory_lookups.clone(),
             // Pi style: hosted search is server-side on the main request — never
             // a second-hop backend on the local function tool.
             #[cfg(feature = "network")]
@@ -91,6 +96,38 @@ impl AppRuntime {
         // When false, materialize_tools strips MCP-looking names.
         let mut tools = materialize_tools(&tools_spec, &registry, &ctx, false)
             .map_err(|e| format!("main tools materialize failed: {e}"))?;
+
+        // Feature `memory` master switch: L2 tools only when package is on.
+        let settings = crate::settings::load();
+        let mem_opts =
+            super::features::effective_memory_options(&self.applied_features, &settings);
+        if mem_opts.enabled
+            && !tools_spec.deny.iter().any(|d| d == "memory_search")
+            && (tools_spec.allow.is_empty()
+                || tools_spec.allow.iter().any(|a| a == "memory_search"))
+        {
+            tools.push(std::sync::Arc::new(
+                super::memory_search_tool::MemorySearchTool::new(
+                    self.resources.agent_dir.clone(),
+                    self.cwd.clone(),
+                ),
+            ));
+        }
+        // memory_write: same package + write permission + not read-only.
+        if mem_opts.enabled
+            && mem_opts.write_enabled
+            && !self.read_only
+            && !tools_spec.deny.iter().any(|d| d == "memory_write")
+            && (tools_spec.allow.is_empty()
+                || tools_spec.allow.iter().any(|a| a == "memory_write"))
+        {
+            tools.push(std::sync::Arc::new(
+                super::memory_write_tool::MemoryWriteTool::new(
+                    self.resources.agent_dir.clone(),
+                    self.cwd.clone(),
+                ),
+            ));
+        }
 
         // Extensions always available in Act (unless ToolsSpec deny listed them —
         // materialize won't include them unless in allow/extra when allow non-empty).

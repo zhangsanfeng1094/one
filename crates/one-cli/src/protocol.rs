@@ -241,12 +241,49 @@ fn default_true() -> bool {
     true
 }
 
+/// Whether a harness run injects cross-session memory (M4).
+///
+/// Subagents default to [`Self::Off`] so they do not inherit the parent's L2 map.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MemoryResourceMode {
+    /// No L2 catalog; no memory path roots on the child path policy.
+    #[default]
+    Off,
+    /// Inject L2 index into system prompt + readable memory roots (bodies via `read`).
+    Index,
+}
+
+impl MemoryResourceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Index => "index",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" | "none" | "no" => Some(Self::Off),
+            "index" | "on" | "true" | "1" | "l2" | "yes" => Some(Self::Index),
+            _ => None,
+        }
+    }
+
+    pub fn is_index(self) -> bool {
+        matches!(self, Self::Index)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 pub struct ResourcesSpec {
     #[serde(default = "default_true")]
     pub agents_md: bool,
     #[serde(default = "default_true")]
     pub claude_md: bool,
+    /// Cross-session memory for this run (default **off** — safe for subagents).
+    #[serde(default)]
+    pub memory: MemoryResourceMode,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
@@ -455,6 +492,8 @@ impl AgentSpec {
             resources: ResourcesSpec {
                 agents_md: false,
                 claude_md: false,
+                // M4: subagent must not inherit parent memory by default.
+                memory: MemoryResourceMode::Off,
             },
             spawn_policy: SpawnPolicy::none(),
             agents: std::collections::BTreeMap::new(),
@@ -466,6 +505,9 @@ impl AgentSpec {
     /// Default root coding agent with explore as a child role.
     pub fn builtin_main() -> Self {
         let mut main = Self::default();
+        // Interactive main loads memory via settings; AgentSpec marks intent for
+        // harness dumps / isomorphic CLI runs.
+        main.resources.memory = MemoryResourceMode::Index;
         main.agents
             .insert("explore".into(), Self::builtin_explore());
         main

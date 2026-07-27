@@ -165,6 +165,9 @@ pub enum TraceEvent {
         user_id: Option<String>,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         trace_full: bool,
+        /// User-facing input for the root agent observation / trace list preview.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_preview: Option<String>,
     },
     RunEnd {
         ts_ms: u64,
@@ -217,6 +220,9 @@ pub enum TraceEvent {
         model: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output_preview: Option<String>,
+        /// Structured tool calls requested by this generation (for Langfuse UI).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        tool_calls: Vec<TraceToolCall>,
     },
     ToolStart {
         ts_ms: u64,
@@ -278,12 +284,50 @@ pub enum TraceEvent {
     },
 }
 
+/// One tool call attached to a generation observation (id / name / args).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TraceToolCall {
+    pub id: String,
+    pub name: String,
+    /// Arguments JSON, already size-bounded for tracing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<Value>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ScoreCheckResult {
     pub name: String,
     pub pass: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+}
+
+/// Build structured tool-call snapshots for generation traces.
+pub fn trace_tool_calls(
+    calls: &[crate::tool::ToolCall],
+    max_arg_chars: usize,
+) -> Vec<TraceToolCall> {
+    calls
+        .iter()
+        .map(|c| {
+            let arguments = if max_arg_chars == 0 {
+                None
+            } else {
+                let raw = serde_json::to_string(&c.arguments).unwrap_or_else(|_| "{}".into());
+                if raw.chars().count() <= max_arg_chars {
+                    Some(c.arguments.clone())
+                } else {
+                    // Keep a truncated string form so we don't ship huge args.
+                    text_preview(&raw, max_arg_chars).map(Value::String)
+                }
+            };
+            TraceToolCall {
+                id: c.id.clone(),
+                name: c.name.clone(),
+                arguments,
+            }
+        })
+        .collect()
 }
 
 impl TraceEvent {
@@ -665,6 +709,7 @@ mod tests {
             session_id: None,
             user_id: None,
             trace_full: false,
+            input_preview: None,
         });
         assert_eq!(t.len(), 1);
     }
@@ -704,6 +749,7 @@ mod tests {
                 session_id: Some("sess-1".into()),
                 user_id: None,
                 trace_full: false,
+                input_preview: Some("hi".into()),
             },
             TraceEvent::LlmResponse {
                 ts_ms: 10,
@@ -723,6 +769,11 @@ mod tests {
                 provider: "mock".into(),
                 model: "m".into(),
                 output_preview: None,
+                tool_calls: vec![TraceToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    arguments: Some(json!({"command": "ls"})),
+                }],
             },
             TraceEvent::ToolStart {
                 ts_ms: 11,

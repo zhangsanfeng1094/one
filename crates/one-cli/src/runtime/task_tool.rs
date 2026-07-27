@@ -49,6 +49,10 @@ pub struct TaskToolHost {
     jobs: Arc<AgentJobRegistry>,
     /// Parent tool_call id → live job id (for TUI click-to-open while running).
     tool_jobs: Mutex<HashMap<String, String>>,
+    /// Parent Langfuse sink — children fork under the open `task` tool span.
+    langfuse: RwLock<Option<Arc<crate::langfuse::LangfuseTraceSink>>>,
+    /// Inherit `--trace-full` for nested subagent I/O previews.
+    langfuse_trace_full: std::sync::atomic::AtomicBool,
 }
 
 impl TaskToolHost {
@@ -70,7 +74,67 @@ impl TaskToolHost {
             task_slots: Arc::new(Semaphore::new(max_c)),
             jobs,
             tool_jobs: Mutex::new(HashMap::new()),
+            langfuse: RwLock::new(None),
+            langfuse_trace_full: std::sync::atomic::AtomicBool::new(false),
         })
+    }
+
+    /// Attach the parent process Langfuse sink (called once from runtime build).
+    pub async fn set_langfuse(
+        &self,
+        sink: Option<Arc<crate::langfuse::LangfuseTraceSink>>,
+        trace_full: bool,
+    ) {
+        self.langfuse_trace_full
+            .store(trace_full, Ordering::Relaxed);
+        *self.langfuse.write().await = sink;
+    }
+
+    /// Build a nested child trace under the open `task` tool span (or parent root).
+    pub async fn child_trace(
+        &self,
+        tool_call_id: &str,
+        agent_name: &str,
+        parent: &RunParent,
+    ) -> (
+        Option<one_core::SharedTrace>,
+        Option<one_core::TraceRunMeta>,
+    ) {
+        let parent_sink = self.langfuse.read().await.clone();
+        let Some(parent_sink) = parent_sink else {
+            return (None, None);
+        };
+        // Prefer nesting under the live `task` tool span; fall back to agent root
+        // (background jobs may race if tool already closed — rare for sync path).
+        let parent_cx = parent_sink
+            .context_for_tool(tool_call_id)
+            .or_else(|| parent_sink.root_context());
+        let Some(parent_cx) = parent_cx else {
+            tracing::debug!(
+                tool_call_id,
+                "langfuse: no parent span for subagent; skipping child trace"
+            );
+            return (None, None);
+        };
+        let child = parent_sink.fork_child(parent_cx);
+        let session_id = self.parent_session_id.read().await.clone();
+        let trace_full = self.langfuse_trace_full.load(Ordering::Relaxed);
+        let meta = one_core::TraceRunMeta {
+            task_id: Some(format!("subagent:{agent_name}")),
+            agent_version: Some(env!("CARGO_PKG_VERSION").into()),
+            config: Some(json!({
+                "subagent": true,
+                "agent": agent_name,
+                "parent_run_id": parent.run_id,
+                "parent_tool_use_id": parent.tool_use_id,
+                "depth": parent.depth,
+            })),
+            session_id,
+            user_id: crate::langfuse::user_id_from_env(),
+            trace_full,
+        };
+        let shared: one_core::SharedTrace = child;
+        (Some(shared), Some(meta))
     }
 
     /// Record that parent `tool_call_id` is backed by live `job_id`.
@@ -361,7 +425,7 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             &parent_agent,
             &agent_name,
             &prompt,
-            parent_meta,
+            parent_meta.clone(),
             call.arguments.get("agent_spec"),
             &self.host.opts.read().await.cwd,
         ) {
@@ -375,6 +439,8 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                 ));
             }
         };
+        // M4: settings.memory.subagent may opt-in Index for children still at Off.
+        apply_subagent_memory_settings(&mut req.agent);
         // task arg overrides AgentSpec.isolation when provided.
         if let Some(iso) = isolation_arg {
             req.agent.isolation = iso;
@@ -397,6 +463,12 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             ));
         }
 
+        // Nest Langfuse under this `task` tool span (same OTEL trace as parent).
+        let (child_trace, child_trace_meta) = self
+            .host
+            .child_trace(&call.id, &agent_name, &parent_meta)
+            .await;
+
         if background {
             let provider = self.host.provider.read().await.clone();
             let Some(provider) = provider else {
@@ -415,13 +487,19 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                 ));
             };
             let opts = self.host.child_harness_opts().await;
-            let job_id = self.host.jobs.spawn(
+            let job_id = self.host.jobs.spawn_with(
                 req,
                 provider,
                 opts,
                 agent_name.clone(),
                 description.clone(),
                 Some(slot),
+                SpawnOptions {
+                    notify_completion: true,
+                    apply_wall_timeout: true,
+                    trace: child_trace,
+                    trace_meta: child_trace_meta,
+                },
             );
             // Bind until completion notification is absorbed — keep for /ps open.
             self.host.bind_tool_job(&call.id, &job_id);
@@ -448,6 +526,8 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                     notify_completion: false,
                     // Foreground waits on the tool; wall budget is parent-abort / Esc.
                     apply_wall_timeout: false,
+                    trace: child_trace,
+                    trace_meta: child_trace_meta,
                 },
             );
             self.host.bind_tool_job(&call.id, &job_id);
@@ -545,6 +625,28 @@ fn resolve_agent_name(args: &Value) -> String {
         }
     }
     "explore".into()
+}
+
+/// Apply `settings.memory.subagent` (default off). Only **upgrades** Off → Index
+/// so an explicit AgentSpec `resources.memory: index` is never cleared.
+///
+/// No-op when feature `memory` is off (whole package disabled).
+fn apply_subagent_memory_settings(agent: &mut AgentSpec) {
+    use crate::protocol::MemoryResourceMode;
+    use crate::runtime::features::{env_no_memory, FeatureState};
+    if !matches!(agent.resources.memory, MemoryResourceMode::Off) {
+        return;
+    }
+    let settings = crate::settings::load();
+    let features = FeatureState::from_settings(&settings)
+        .with_process_overrides(false, env_no_memory());
+    if !features.memory_enabled() {
+        return;
+    }
+    let mode = settings.memory_or_default().subagent_mode();
+    if mode.is_index() {
+        agent.resources.memory = MemoryResourceMode::Index;
+    }
 }
 
 fn child_tools_look_writable(spec: &AgentSpec) -> bool {
@@ -776,7 +878,7 @@ pub fn format_task_output(
 
 /// One-liner for main agent system prompt.
 pub const TASK_TOOL_PROMPT_HINT: &str = "\
-- To delegate work to a sub-agent, use the `task` tool with `agent` set to a name allowed by spawn policy (default: explore for multi-file research). Findings return as a summary so this conversation stays small. Do not use task for a trivial single-file read. For long work that should not block this turn, use task(background=true); when you have spawned all background tasks and have nothing else to do, call wait_tasks (mode=all) to block until they finish — or wait_tasks(mode=any) for the next one. job_output polls without waiting. For agents that write/edit/bash, prefer isolation=worktree (or background, which defaults worktree for writable tools) so changes stay under .one/worktrees and are not auto-merged.";
+- To delegate work to a sub-agent, use the `task` tool with `agent` set to a name allowed by spawn policy (default: explore for multi-file research). Findings return as a summary so this conversation stays small. Do not use task for a trivial single-file read. For long work that should not block this turn, use task(background=true); when you have spawned all background work (agent jobs and/or bash bg tasks) and have nothing else to do, call wait_tasks (mode=all) to block until they finish — or wait_tasks(mode=any) for the next one. job_output / job_kill accept both `job_*` and `bg_*` ids. For agents that write/edit/bash, prefer isolation=worktree (or background, which defaults worktree for writable tools) so changes stay under .one/worktrees and are not auto-merged.";
 
 /// Build parent AgentSpec for the interactive / -p main agent.
 ///

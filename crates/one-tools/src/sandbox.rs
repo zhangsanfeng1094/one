@@ -168,6 +168,10 @@ fn normalize_command(command: &str) -> String {
 }
 
 /// Split on common shell list / pipe operators for per-segment matching.
+///
+/// Operators are ASCII-only. Indices must stay on UTF-8 char boundaries so
+/// multi-byte text in comments/strings (e.g. en-dash `–`) cannot panic on
+/// `&str` slicing — a previous byte-step loop did.
 fn shell_segments(normalized: &str) -> Vec<&str> {
     // Split on ; && || | and newlines (already spaces from normalize for \n).
     let mut parts = Vec::new();
@@ -175,28 +179,40 @@ fn shell_segments(normalized: &str) -> Vec<&str> {
     let bytes = normalized.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        let two = if i + 1 < bytes.len() {
-            &normalized[i..i + 2]
-        } else {
-            ""
-        };
-        if two == "&&" || two == "||" {
+        // Compare bytes, not `&str[i..i+2]` — the latter panics mid multi-byte char.
+        if i + 1 < bytes.len()
+            && ((bytes[i] == b'&' && bytes[i + 1] == b'&')
+                || (bytes[i] == b'|' && bytes[i + 1] == b'|'))
+        {
             parts.push(&normalized[start..i]);
             i += 2;
             start = i;
             continue;
         }
-        let c = bytes[i] as char;
-        if c == ';' || c == '|' || c == '\n' {
+        let b = bytes[i];
+        if b == b';' || b == b'|' || b == b'\n' {
             parts.push(&normalized[start..i]);
             i += 1;
             start = i;
             continue;
         }
-        i += 1;
+        // Advance one full UTF-8 character so `i` stays on a char boundary.
+        i += utf8_char_width(b);
     }
     parts.push(&normalized[start..]);
     parts
+}
+
+/// Byte length of the UTF-8 character that starts at `first`.
+fn utf8_char_width(first: u8) -> usize {
+    match first {
+        0x00..=0x7F => 1,
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        // Invalid lead / continuation — skip one byte to avoid hanging.
+        _ => 1,
+    }
 }
 
 fn segment_tokens(segment: &str) -> Vec<&str> {
@@ -487,5 +503,23 @@ mod tests {
         let r = destructive_ask_reason("git checkout");
         assert!(is_destructive_ask_reason(&r));
         assert!(!is_destructive_ask_reason("high-risk bash pattern `sudo`"));
+    }
+
+    #[test]
+    fn shell_segments_handles_multibyte_utf8() {
+        // En-dash U+2013 is 3 UTF-8 bytes; old byte-step slice panicked here.
+        let cmd = "echo hello – world && git push origin main";
+        let normalized = normalize_command(cmd);
+        let segs = shell_segments(&normalized);
+        assert!(segs.iter().any(|s| s.contains("git push")));
+        assert!(requires_confirmation(cmd).is_some());
+        // Must not panic when scanning for rm-root / blocked shapes either.
+        assert!(is_command_blocked("echo path – with dash; true").is_none());
+        // Relative path so substring hard-block `rm -rf /` does not match.
+        assert!(is_command_blocked("rm -rf ./tmp/foo – backup").is_none());
+        // Long multi-byte prefix (same class of bug as panic at byte ~1563).
+        let long = format!("{} && git status", "–".repeat(600));
+        assert!(is_command_blocked(&long).is_none());
+        assert!(requires_strict_confirmation(&long).is_none());
     }
 }

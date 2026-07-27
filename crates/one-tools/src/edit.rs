@@ -164,7 +164,19 @@ impl Tool for EditTool {
                 .expect("details object")
                 .insert("patch".into(), json!(patch));
         }
-        Ok(ToolOutput::text_with_details(success.summary, details))
+        let mut summary = success.summary;
+        if crate::memory_io::is_memory_path(&resolved) {
+            if let Some(hint) =
+                crate::memory_io::soft_check_memory_write(&resolved, &applied.content_lf)
+            {
+                summary = one_core::append_system_reminder(&summary, hint);
+            }
+            if let Some(obj) = details.as_object_mut() {
+                obj.insert("memory".into(), json!(true));
+            }
+        }
+
+        Ok(ToolOutput::text_with_details(summary, details))
     }
 }
 

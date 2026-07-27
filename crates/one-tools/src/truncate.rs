@@ -556,10 +556,10 @@ pub fn present_tool_output_with(
     };
     let unit = if hit_bytes { "bytes" } else { "lines" };
     let preview = trunc.content;
-    let hint = format!(
-        "The tool call succeeded but the output was truncated. Full output saved to: {path_disp}\n\
-         Use Grep to search the full content or Read with offset/limit to view specific sections."
-    );
+    let hint = one_core::system_reminder(format!(
+        "Output truncated ({removed} {unit} omitted). Full output saved to: {path_disp}\n\
+         Prefer `read` / `grep` on that path — do not re-run a wider command."
+    ));
 
     let text = match style {
         PreviewStyle::Head => {

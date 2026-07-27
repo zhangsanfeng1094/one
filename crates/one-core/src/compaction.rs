@@ -12,6 +12,11 @@ pub const DEFAULT_PRUNE_PROTECT_TOKENS: usize = 40_000;
 pub const DEFAULT_PRUNE_MAX_CHARS: usize = 2_000;
 /// Marker left in place of cleared tool output (idempotent for re-prune).
 pub const PRUNED_TOOL_PLACEHOLDER: &str = "[Old tool result content cleared]";
+/// Fraction of [`CompactionConfig::token_threshold`] at which prune-only prefire runs.
+///
+/// Prefire clears old tool bodies **without** an LLM summary, so long sessions
+/// shed bulk before hitting the full compact threshold (Grok-style prefire).
+pub const DEFAULT_PREFIRE_RATIO: f64 = 0.85;
 
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
@@ -23,15 +28,19 @@ pub struct CompactionConfig {
     pub keep_recent_messages: usize,
     /// Max chars of the fallback extract summary (when LLM summary is unavailable).
     pub max_summary_chars: usize,
-    /// When true, as a cheap pre-pass before LLM summary: clear tool *bodies*
-    /// that sit **outside** the keep_recent tail (recent turns are never pruned).
-    /// Default false — most users only need threshold + keep_recent.
+    /// When true, clear tool *bodies* outside the keep_recent tail as a cheap
+    /// pre-pass (and as prefire before full compact). Recent turns are never pruned.
+    /// Default **true** — long sessions otherwise fill the window with old dumps.
     pub prune: bool,
     /// Within the older (pre-tail) region only: keep about this many tokens of
     /// the newest old tool outputs before clearing older ones (char/4).
     pub prune_protect_tokens: usize,
     /// Max chars retained on a pruned tool result (plus placeholder).
     pub prune_max_chars: usize,
+    /// Fraction of `token_threshold` that triggers prune-only prefire (0..1).
+    /// Default [`DEFAULT_PREFIRE_RATIO`] (0.85). Full LLM compact still uses
+    /// `token_threshold` (typically 70% of context_window).
+    pub prefire_ratio: f64,
 }
 
 impl Default for CompactionConfig {
@@ -41,9 +50,10 @@ impl Default for CompactionConfig {
             token_threshold: FALLBACK_COMPACT_THRESHOLD,
             keep_recent_messages: 12,
             max_summary_chars: 6_000,
-            prune: false,
+            prune: true,
             prune_protect_tokens: DEFAULT_PRUNE_PROTECT_TOKENS,
             prune_max_chars: DEFAULT_PRUNE_MAX_CHARS,
+            prefire_ratio: DEFAULT_PREFIRE_RATIO,
         }
     }
 }
@@ -151,9 +161,34 @@ pub fn should_compact_tokens(tokens: usize, config: &CompactionConfig) -> bool {
     config.enabled && tokens >= config.token_threshold
 }
 
+/// Token count at which prune-only prefire may run (below full compact threshold).
+pub fn prefire_threshold(config: &CompactionConfig) -> usize {
+    let r = if config.prefire_ratio.is_finite()
+        && config.prefire_ratio > 0.0
+        && config.prefire_ratio < 1.0
+    {
+        config.prefire_ratio
+    } else {
+        DEFAULT_PREFIRE_RATIO
+    };
+    let t = ((config.token_threshold as f64) * r).round() as usize;
+    // Never above the full threshold; leave at least a small gap when possible.
+    t.min(config.token_threshold.saturating_sub(1))
+}
+
+/// True when tokens are high enough for prune-only prefire but not yet full compact.
+///
+/// Prefire only runs when prune is enabled; otherwise there is nothing cheap to do.
+pub fn should_prefire_prune(tokens: usize, config: &CompactionConfig) -> bool {
+    config.enabled
+        && config.prune
+        && tokens >= prefire_threshold(config)
+        && tokens < config.token_threshold
+}
+
 /// Cheap pre-pass before LLM summary (Hermes/OpenCode-style).
 ///
-/// **When:** only if `config.prune` is true (default off) and the session still
+/// **When:** only if `config.prune` is true (default on) and the session still
 /// holds older messages beyond [`CompactionConfig::keep_recent_messages`].
 ///
 /// **What:** clear tool *result bodies* in the **pre-tail** region (everything
@@ -600,5 +635,35 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(prune_old_tool_outputs(&mut messages, &config), 0);
+    }
+
+    #[test]
+    fn default_enables_prune() {
+        assert!(CompactionConfig::default().prune);
+        assert!(CompactionConfig::from_context_window(200_000).prune);
+    }
+
+    #[test]
+    fn prefire_below_full_threshold() {
+        let config = CompactionConfig {
+            token_threshold: 100_000,
+            prefire_ratio: 0.85,
+            prune: true,
+            enabled: true,
+            ..Default::default()
+        };
+        let pre = prefire_threshold(&config);
+        assert_eq!(pre, 85_000);
+        assert!(should_prefire_prune(85_000, &config));
+        assert!(should_prefire_prune(99_999, &config));
+        assert!(!should_prefire_prune(84_999, &config));
+        assert!(!should_prefire_prune(100_000, &config)); // full compact, not prefire
+        assert!(should_compact_tokens(100_000, &config));
+
+        let no_prune = CompactionConfig {
+            prune: false,
+            ..config
+        };
+        assert!(!should_prefire_prune(90_000, &no_prune));
     }
 }

@@ -1644,7 +1644,7 @@ fn sync_compaction_settings(app: &mut App, s: &crate::settings::Settings) {
         c.ratio.unwrap_or(one_core::DEFAULT_COMPACT_RATIO),
         c.threshold,
         c.keep_recent.unwrap_or(12),
-        c.prune.unwrap_or(false),
+        c.prune.unwrap_or(true),
         c.prune_protect_tokens
             .unwrap_or(one_core::DEFAULT_PRUNE_PROTECT_TOKENS),
         c.prune_max_chars

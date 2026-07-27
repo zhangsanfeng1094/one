@@ -43,6 +43,7 @@ File changes:
 
 Search:
 - Prefer `grep` with `glob` / `type` / `output_mode` / `head_limit` / context (`-A`/`-B`/`-C`) over any shell search.
+- Multi-step work: use `todo_write` to track progress (3+ steps). Keep at most one item `in_progress`.
 
 Bash / sandbox:
 - Default bash runs under a Codex-style OS sandbox (workspace-write): full filesystem is readable; only the workspace and /tmp are writable. Prefer dedicated file tools so path policy and truncation stay consistent.
@@ -566,6 +567,9 @@ impl Agent {
         let wall_start = Instant::now();
         let meta = self.trace_meta.clone();
 
+        // Root observation input = last user message (trace list / agent graph preview).
+        let run_input_preview =
+            crate::trace::last_user_preview(&self.messages, self.preview_limit());
         self.record_trace(TraceEvent::RunStart {
             ts_ms: now_ms(),
             run_id: run_id.clone(),
@@ -578,6 +582,7 @@ impl Agent {
             session_id: meta.session_id.clone(),
             user_id: meta.user_id.clone(),
             trace_full: meta.trace_full,
+            input_preview: run_input_preview,
         });
 
         self.emit(AgentEvent::AgentStart);
@@ -642,15 +647,20 @@ impl Agent {
             } else {
                 crate::trace::last_user_preview(&request.messages, self.preview_limit())
             };
-            self.record_trace(TraceEvent::LlmRequest {
-                ts_ms: now_ms(),
-                run_id: run_id.clone(),
-                turn,
-                message_count: request.messages.len(),
-                tools_n: request.tools.len(),
-                system_prompt_len: request.system_prompt.len(),
-                input_preview,
-            });
+            // Helper: open a generation span. Re-emitted after empty/provider retries so
+            // Langfuse keeps a separate generation per sample attempt.
+            let record_llm_request = |this: &Self, run_id: &str, turn: usize| {
+                this.record_trace(TraceEvent::LlmRequest {
+                    ts_ms: now_ms(),
+                    run_id: run_id.to_string(),
+                    turn,
+                    message_count: request.messages.len(),
+                    tools_n: request.tools.len(),
+                    system_prompt_len: request.system_prompt.len(),
+                    input_preview: input_preview.clone(),
+                });
+            };
+            record_llm_request(self, &run_id, turn);
 
             let llm_start = Instant::now();
             let ttft_ms: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
@@ -728,6 +738,7 @@ impl Agent {
                                     "{} — retry {sample_attempt}/{empty_budget}",
                                     retry_reason(&err)
                                 )),
+                                tool_calls: vec![],
                             });
                             if !self
                                 .wait_for_completion_retry(
@@ -742,6 +753,8 @@ impl Agent {
                                     .await;
                             }
                             *ttft_ms.lock().expect("ttft") = None;
+                            // Open a fresh generation for the next sample attempt.
+                            record_llm_request(self, &run_id, turn);
                             continue;
                         }
                         self.record_trace(TraceEvent::RunEnd {
@@ -790,6 +803,7 @@ impl Agent {
                         output_preview: Some(format!(
                             "empty response — retry {sample_attempt}/{empty_budget}"
                         )),
+                        tool_calls: vec![],
                     });
                     if !response.usage.is_zero() {
                         self.token_usage.add_assign(&response.usage);
@@ -808,6 +822,8 @@ impl Agent {
                     }
                     // Reset TTFT so the next sample can measure fresh.
                     *ttft_ms.lock().expect("ttft") = None;
+                    // Open a fresh generation for the next sample attempt.
+                    record_llm_request(self, &run_id, turn);
                     continue;
                 }
 
@@ -843,6 +859,8 @@ impl Agent {
             // --trace-full only raises the preview budget (16k vs 240 chars).
             let output_preview =
                 crate::trace::llm_output_preview(&text, &tool_calls, self.preview_limit());
+            let tool_calls_trace =
+                crate::trace::trace_tool_calls(&tool_calls, self.preview_limit());
 
             self.record_trace(TraceEvent::LlmResponse {
                 ts_ms: now_ms(),
@@ -858,6 +876,7 @@ impl Agent {
                 provider: response.provider.clone(),
                 model: response.model.clone(),
                 output_preview,
+                tool_calls: tool_calls_trace,
             });
 
             if !response.usage.is_zero() {
@@ -1037,6 +1056,12 @@ impl Agent {
         let items: Vec<_> = queue.drain(..).collect();
         drop(queue);
         for text in items {
+            // Prefer harness-style system-reminder so models do not treat notices as user chat.
+            let text = if crate::reminder::has_system_reminder(&text) {
+                text
+            } else {
+                crate::reminder::system_reminder(text)
+            };
             self.messages.push(AgentMessage::user_text(text));
         }
     }

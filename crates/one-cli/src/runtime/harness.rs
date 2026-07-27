@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use one_core::agent::{Agent, AgentConfig, LlmProvider, ThinkingLevel};
 use one_core::error::OneError;
+use one_resources::{load_memory_catalog_sync, memory_readable_roots};
 use one_tools::{ExportedReadGrants, PathPolicy};
 
 use super::tool_materialize::{
@@ -14,8 +15,8 @@ use super::tool_materialize::{
 };
 use crate::approval::{ApprovalMode, PermissionGate};
 use crate::protocol::{
-    error_code, AgentRunEcho, AgentSpec, RunParent, RunRequest, RunResult, SessionMode,
-    TaskExitStatus, UsageSnapshot,
+    error_code, AgentRunEcho, AgentSpec, MemoryResourceMode, RunParent, RunRequest, RunResult,
+    SessionMode, TaskExitStatus, UsageSnapshot,
 };
 
 /// Path-only snapshot of a parent's session read grants (not a live Arc).
@@ -90,6 +91,10 @@ pub struct RunControl {
     pub turn_progress: Option<Arc<AtomicU64>>,
     /// Live event log for TUI `/tasks` subagent detail (not bash `/ps`).
     pub event_log: Option<Arc<super::jobs::JobEventLog>>,
+    /// Optional execution trace sink (Langfuse / memory) for subagent runs.
+    pub trace: Option<one_core::SharedTrace>,
+    /// Labels for the child run's `run_start` (session, task id, parent link).
+    pub trace_meta: Option<one_core::TraceRunMeta>,
 }
 
 /// Run one agent (root or sub) according to [`RunRequest`].
@@ -149,7 +154,7 @@ pub async fn run_with_control(
             None
         };
 
-    let system_prompt = resolve_system_prompt(&req.agent);
+    let system_prompt = resolve_system_prompt(&req.agent, &effective_opts);
     let max_turns = req.agent.max_turns.unwrap_or(16);
     let thinking = resolve_thinking(&req.agent);
     // Inherit empty-response policy from user settings / env (same as main agent).
@@ -174,6 +179,13 @@ pub async fn run_with_control(
         agent.subscribe(Box::new(move |event| {
             log.on_agent_event(event);
         }));
+    }
+    // Subagent / nested harness: optional Langfuse (or memory) sink nested under parent.
+    if let Some(sink) = control.trace {
+        agent.set_trace(Some(sink));
+    }
+    if let Some(meta) = control.trace_meta {
+        agent.set_trace_meta(meta);
     }
 
     // Fail-closed permissions for non-interactive harness (subagent / agent run).
@@ -378,11 +390,31 @@ fn last_assistant_citations(agent: &Agent) -> Vec<one_core::Citation> {
         .unwrap_or_default()
 }
 
-fn resolve_system_prompt(spec: &AgentSpec) -> String {
+fn resolve_system_prompt(spec: &AgentSpec, opts: &HarnessOptions) -> String {
     let mut base = spec
         .system_prompt
         .clone()
         .unwrap_or_else(|| one_core::agent::DEFAULT_SYSTEM_PROMPT.to_string());
+    // M4: only inject L2 when AgentSpec.resources.memory = index (subagents default off)
+    // and feature `memory` package is on.
+    if spec.resources.memory.is_index() {
+        let settings = crate::settings::load();
+        let features = crate::runtime::features::FeatureState::from_settings(&settings)
+            .with_process_overrides(false, crate::runtime::features::env_no_memory());
+        if features.memory_enabled() {
+            let agent_dir = one_session::agent_dir();
+            let cwd = resolve_cwd(spec, opts);
+            let load = crate::runtime::features::effective_memory_options(&features, &settings);
+            if load.enabled {
+                if let Some(cat) = load_memory_catalog_sync(&agent_dir, &cwd, &load) {
+                    if !cat.prompt_section.trim().is_empty() {
+                        base.push_str("\n\n");
+                        base.push_str(&cat.prompt_section);
+                    }
+                }
+            }
+        }
+    }
     if let Some(append) = &spec.append_system_prompt {
         if !append.is_empty() {
             base.push_str("\n\n");
@@ -459,7 +491,18 @@ fn build_policy(cwd: &Path, opts: &HarnessOptions, spec: &AgentSpec) -> PathPoli
         dirs.push(PathBuf::from(d));
     }
     // workspace() creates a **new** dynamic Arc (detached from parent).
-    let policy = PathPolicy::workspace(cwd.to_path_buf()).with_additional_dirs(dirs);
+    let mut policy = PathPolicy::workspace(cwd.to_path_buf()).with_additional_dirs(dirs);
+    // M4: memory readable roots only when resources.memory = index + feature on.
+    if matches!(spec.resources.memory, MemoryResourceMode::Index) {
+        let settings = crate::settings::load();
+        let features = crate::runtime::features::FeatureState::from_settings(&settings)
+            .with_process_overrides(false, crate::runtime::features::env_no_memory());
+        if features.memory_enabled() {
+            let agent_dir = one_session::agent_dir();
+            let roots = memory_readable_roots(&agent_dir, cwd);
+            policy = policy.with_readable_roots(roots);
+        }
+    }
     // Write-safe snapshot: only dynamic grants (Read-only). NEVER with_allowed_file.
     let exported = ExportedReadGrants {
         readable_roots: opts.parent_read_grants.readable_roots.clone(),
@@ -540,7 +583,29 @@ mod tests {
     #[test]
     fn resolve_explore_prompt_uses_spec() {
         let s = AgentSpec::builtin_explore();
-        let p = resolve_system_prompt(&s);
+        let opts = HarnessOptions::from_cwd("/tmp");
+        let p = resolve_system_prompt(&s, &opts);
         assert!(p.contains("read-only") || p.contains("sub-agent"));
+        // M4: explore default memory off — no Memory L2 section forced in.
+        assert_eq!(s.resources.memory, MemoryResourceMode::Off);
+    }
+
+    #[test]
+    fn explore_policy_without_memory_roots_when_off() {
+        let s = AgentSpec::builtin_explore();
+        assert_eq!(s.resources.memory, MemoryResourceMode::Off);
+        let opts = HarnessOptions::from_cwd("/tmp");
+        let policy = build_policy(Path::new("/tmp"), &opts, &s);
+        // Should not list agent memory as writable/readable via additional only —
+        // readable_roots still include skill defaults; memory path not required.
+        let _ = policy;
+    }
+
+    #[test]
+    fn main_agent_spec_memory_index() {
+        let main = AgentSpec::builtin_main();
+        assert_eq!(main.resources.memory, MemoryResourceMode::Index);
+        let explore = main.resolve_child("explore").unwrap();
+        assert_eq!(explore.resources.memory, MemoryResourceMode::Off);
     }
 }

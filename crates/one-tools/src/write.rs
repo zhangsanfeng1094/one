@@ -83,9 +83,18 @@ impl Tool for WriteTool {
             .await
             .map_err(|err| tool_error("write", err.to_string()))?;
 
+        let mut text = format!("Wrote {} bytes to {path}", content.len());
+        if let Some(hint) = crate::memory_io::soft_check_memory_write(&resolved, content) {
+            text = one_core::append_system_reminder(&text, hint);
+        }
+
         Ok(ToolOutput::text_with_details(
-            format!("Wrote {} bytes to {path}", content.len()),
-            json!({ "path": path, "bytes": content.len() }),
+            text,
+            json!({
+                "path": path,
+                "bytes": content.len(),
+                "memory": crate::memory_io::is_memory_path(&resolved),
+            }),
         ))
     }
 }
@@ -127,6 +136,30 @@ mod tests {
         .unwrap();
         let content = std::fs::read_to_string(dir.join("hello.txt")).unwrap();
         assert_eq!(content, "hi");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_write_soft_check_reminder() {
+        let dir = std::env::temp_dir().join(format!("one-write-mem-{}", std::process::id()));
+        let mem = dir.join("memory").join("_global");
+        std::fs::create_dir_all(&mem).unwrap();
+        let policy = PathPolicy::workspace(dir.clone()).with_additional_dirs([mem.clone()]);
+        let tool = WriteTool::with_policy(policy);
+        let path = mem.join("tip.md");
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "write".into(),
+                arguments: json!({
+                    "path": path.to_string_lossy(),
+                    "content": "no frontmatter body\n"
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(out.as_text().contains("system-reminder"), "{}", out.as_text());
+        assert!(out.as_text().contains("frontmatter"), "{}", out.as_text());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

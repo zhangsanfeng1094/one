@@ -5,6 +5,7 @@
 //! same on Linux, macOS, and Windows.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use ignore::overrides::OverrideBuilder;
@@ -14,11 +15,13 @@ use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, T
 use regex::RegexBuilder;
 use serde_json::json;
 
+use crate::memory_io::{is_memory_path, MemoryLookupBudget};
 use crate::path_policy::{AccessKind, PathPolicy};
 use crate::tool_args::{bool_arg, path_arg, u64_arg};
 
 pub struct GrepTool {
     policy: PathPolicy,
+    memory_lookups: Arc<MemoryLookupBudget>,
 }
 
 impl GrepTool {
@@ -27,7 +30,15 @@ impl GrepTool {
     }
 
     pub fn with_policy(policy: PathPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            memory_lookups: MemoryLookupBudget::unlimited(),
+        }
+    }
+
+    pub fn with_memory_lookups(mut self, budget: Arc<MemoryLookupBudget>) -> Self {
+        self.memory_lookups = budget;
+        self
     }
 }
 
@@ -200,6 +211,19 @@ impl Tool for GrepTool {
             .policy
             .resolve(&path, AccessKind::Read)
             .map_err(|err| tool_error("grep", err))?;
+
+        if is_memory_path(&resolved) {
+            if let Err(msg) = self.memory_lookups.try_consume() {
+                let text = one_core::system_reminder(msg);
+                return Ok(ToolOutput::text_with_details(
+                    text,
+                    json!({
+                        "path": path,
+                        "memoryLookupBudgetExceeded": true,
+                    }),
+                ));
+            }
+        }
 
         let opts = SearchOpts {
             pattern,

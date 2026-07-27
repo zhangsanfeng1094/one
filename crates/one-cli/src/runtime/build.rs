@@ -90,10 +90,14 @@ impl AppRuntime {
         // Codex-style skills enable/disable (settings.skills_config).
         resources.apply_skills_config(&user_settings.skills_config_entries());
         let no_subagent_process = cli.no_subagent || env_no_subagent();
-        let applied_features =
-            FeatureState::from_settings(&user_settings).with_process_overrides(no_subagent_process);
+        let no_memory_process = cli.no_memory || super::features::env_no_memory();
+        let applied_features = FeatureState::from_settings(&user_settings)
+            .with_process_overrides(no_subagent_process, no_memory_process);
         if no_subagent_process {
             tracing::info!("subagent feature disabled (--no-subagent / ONE_DISABLE_SUBAGENT)");
+        }
+        if no_memory_process {
+            tracing::info!("memory feature disabled (--no-memory / ONE_NO_MEMORY)");
         }
         let auto_approve = cli.auto_approve || user_settings.auto_approve.unwrap_or(false);
 
@@ -225,8 +229,26 @@ impl AppRuntime {
         }
         let mcp_tools_generation = mcp.generation();
 
-        let base_system_prompt =
-            compose_base_system_prompt(&applied_features, &resources, can_spawn);
+        // Session-frozen env + memory L2 (recomputed on /new and /reload only).
+        // Feature `memory` is the package master switch (also honors --no-memory / env).
+        let env_context = super::env_context::build_env_context(&cwd);
+        let memory_opts =
+            super::features::effective_memory_options(&applied_features, &user_settings);
+        let memory_catalog = if memory_opts.enabled {
+            one_resources::load_memory_catalog(&agent_dir, &cwd, &memory_opts)
+                .await
+                .map(|c| c.prompt_section)
+        } else {
+            None
+        };
+
+        let base_system_prompt = compose_base_system_prompt(super::prompt_compose::ComposeBaseInput {
+            features: &applied_features,
+            resources: &resources,
+            can_spawn,
+            env_context: Some(env_context.as_str()),
+            memory_catalog: memory_catalog.as_deref(),
+        });
         let system_prompt = if start_plan {
             let p = plan_path.as_ref().expect("plan path");
             format!("{base_system_prompt}{}", plan_mode_system_overlay(p))
@@ -278,6 +300,10 @@ impl AppRuntime {
                     eprintln!("trace: langfuse otel ({host}/api/public/otel/v1/traces)");
                     if cli.trace_full {
                         eprintln!("trace: full I/O previews enabled (--trace-full)");
+                    }
+                    // Subagents nest under parent `task` tool spans via this host handle.
+                    if let Some(host) = &task_host {
+                        host.set_langfuse(Some(sink.clone()), cli.trace_full).await;
                     }
                     langfuse_sink = Some(sink);
                 }
@@ -380,6 +406,12 @@ impl AppRuntime {
             plan_path,
             plan_exit,
             bg_registry,
+            todo_state: one_tools::TodoListState::new(),
+            memory_lookups: one_tools::MemoryLookupBudget::new(
+                memory_opts.max_lookups_per_turn,
+            ),
+            env_context,
+            memory_catalog,
             base_system_prompt,
             permission_gate,
             hitl,
@@ -393,6 +425,7 @@ impl AppRuntime {
             applied_features,
             pending_features: None,
             no_subagent_process,
+            no_memory_process,
             hosted_search_capable: false,
         };
 

@@ -25,8 +25,18 @@ const DEFAULT_OUTPUT_CHARS: usize = 50_000;
 const MAX_TERMINAL_TASKS: usize = 32;
 /// Drop terminal tasks older than this once they exceed the soft cap path.
 const TERMINAL_TTL: Duration = Duration::from_secs(5 * 60);
+/// Default hard cap on monitor line events before auto-stop (Grok-style flood guard).
+pub const DEFAULT_MONITOR_MAX_EVENTS: usize = 200;
+/// Truncate each monitor event line for the notification payload.
+const MONITOR_LINE_MAX_CHARS: usize = 400;
 
 static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskKind {
+    Bash,
+    Monitor,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskState {
@@ -98,6 +108,9 @@ struct TaskInner {
     done: Arc<Notify>,
     /// Monotonic spawn order for "newest" chip label / sort.
     seq: u64,
+    kind: TaskKind,
+    /// Monitor line events emitted (flood guard).
+    mon_events: usize,
 }
 
 impl TaskInner {
@@ -243,6 +256,8 @@ impl BackgroundTaskRegistry {
                     child: Some(child),
                     done: done.clone(),
                     seq,
+                    kind: TaskKind::Bash,
+                    mon_events: 0,
                 },
             );
         }
@@ -251,23 +266,141 @@ impl BackgroundTaskRegistry {
         // snapshots). Cap retained bytes; keep draining past the cap so writers
         // never block on a full pipe.
         let out_target = stdout_buf.clone();
-        let mut stdout_handle = tokio::spawn(async move {
+        let stdout_handle = tokio::spawn(async move {
             if let Some(out) = stdout {
                 let _ = stream_pipe_into(out, out_target, Some(EXEC_OUTPUT_MAX_BYTES)).await;
             }
         });
         let err_target = stderr_buf.clone();
-        let mut stderr_handle = tokio::spawn(async move {
+        let stderr_handle = tokio::spawn(async move {
             if let Some(err) = stderr {
                 let _ = stream_pipe_into(err, err_target, Some(EXEC_OUTPUT_MAX_BYTES)).await;
             }
         });
 
+        self.spawn_wait_task(
+            id.clone(),
+            done,
+            timeout_secs,
+            stdout_handle,
+            stderr_handle,
+            "background command",
+        );
+
+        Ok(id)
+    }
+
+    /// Spawn a **monitor**: each stdout line → notification (Grok-style stream).
+    ///
+    /// - `max_events`: auto-stop after this many lines (default
+    ///   [`DEFAULT_MONITOR_MAX_EVENTS`]).
+    /// - `timeout_secs`: hard wall clock; `None` = no wall limit (use with care;
+    ///   session end / kill still stops it).
+    pub async fn spawn_monitor(
+        self: &Arc<Self>,
+        command: String,
+        cwd: PathBuf,
+        timeout_secs: Option<u64>,
+        max_events: usize,
+    ) -> Result<String, String> {
+        let sandbox = self.os_sandbox.lock().expect("os_sandbox lock").clone();
+        let (id, seq) = Self::next_monitor_id_and_seq();
+        let done = Arc::new(Notify::new());
+        let stdout_buf = Arc::new(Mutex::new(String::new()));
+        let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let max_events = max_events.max(1);
+
+        let (prog, args) = sandbox.command_line(&command);
+        let mut cmd = Command::new(&prog);
+        cmd.args(&args)
+            .current_dir(&cwd)
+            .stdin(std::process::Stdio::null())
+            .kill_on_drop(false);
+        configure_shell_stdio(&mut cmd);
+
+        let mut child = cmd
+            .spawn()
+            .map_err(|err| format!("failed to spawn monitor: {err}"))?;
+
+        let pid = child.id();
+        let stdout = child.stdout.take();
+        let stderr = child.stderr.take();
+
+        {
+            let mut tasks = self.tasks.lock().expect("tasks lock");
+            prune_terminal_tasks(&mut tasks);
+            tasks.insert(
+                id.clone(),
+                TaskInner {
+                    id: id.clone(),
+                    command: command.clone(),
+                    state: TaskState::Running,
+                    exit_code: None,
+                    stdout: stdout_buf.clone(),
+                    stderr: stderr_buf.clone(),
+                    error: None,
+                    started: Instant::now(),
+                    finished: None,
+                    notified: false,
+                    pid,
+                    child: Some(child),
+                    done: done.clone(),
+                    seq,
+                    kind: TaskKind::Monitor,
+                    mon_events: 0,
+                },
+            );
+        }
+
         let registry = Arc::clone(self);
         let task_id = id.clone();
+        let out_target = stdout_buf.clone();
+        let stdout_handle = tokio::spawn(async move {
+            if let Some(out) = stdout {
+                stream_monitor_lines(out, out_target, registry, task_id, max_events).await;
+            }
+        });
 
+        let err_target = stderr_buf.clone();
+        let stderr_handle = tokio::spawn(async move {
+            if let Some(err) = stderr {
+                let _ = stream_pipe_into(err, err_target, Some(EXEC_OUTPUT_MAX_BYTES)).await;
+            }
+        });
+
+        self.spawn_wait_task(
+            id.clone(),
+            done,
+            timeout_secs,
+            stdout_handle,
+            stderr_handle,
+            "monitor",
+        );
+
+        Ok(id)
+    }
+
+    fn next_monitor_id_and_seq() -> (String, u64) {
+        let n = TASK_SEQ.fetch_add(1, Ordering::Relaxed);
+        let ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() % 0xFFFF)
+            .unwrap_or(0);
+        (format!("mon_{ms:x}_{n}"), n)
+    }
+
+    /// Shared reaper for bash bg + monitor (child stored on TaskInner).
+    fn spawn_wait_task(
+        self: &Arc<Self>,
+        task_id: String,
+        done: Arc<Notify>,
+        timeout_secs: Option<u64>,
+        mut stdout_handle: tokio::task::JoinHandle<()>,
+        mut stderr_handle: tokio::task::JoinHandle<()>,
+        label: &'static str,
+    ) {
+        let registry = Arc::clone(self);
         tokio::spawn(async move {
-            // Take child for exclusive wait.
             let mut child = {
                 let mut tasks = registry.tasks.lock().expect("tasks lock");
                 tasks.get_mut(&task_id).and_then(|t| t.child.take())
@@ -276,7 +409,7 @@ impl BackgroundTaskRegistry {
             let wait_result = async {
                 match child.as_mut() {
                     Some(c) => c.wait().await.map(Some),
-                    None => Ok(None), // already taken by kill
+                    None => Ok(None),
                 }
             };
 
@@ -285,20 +418,18 @@ impl BackgroundTaskRegistry {
                     Ok(Ok(status)) => Ok(status),
                     Ok(Err(err)) => Err(err.to_string()),
                     Err(_) => {
-                        // Hard timeout: kill process group + child (Codex).
                         if let Some(ref mut c) = child {
                             force_kill(c);
                             let _ = c.wait().await;
                         } else {
                             registry.force_kill_pid(&task_id);
                         }
-                        // Bound reader wait so inherited fds cannot hang finalize.
                         await_bg_readers(&mut stdout_handle, &mut stderr_handle).await;
                         registry.finalize(
                             &task_id,
                             TaskState::TimedOut,
                             None,
-                            Some(format!("background command timed out after {secs}s")),
+                            Some(format!("{label} timed out after {secs}s")),
                         );
                         done.notify_waiters();
                         return;
@@ -310,9 +441,7 @@ impl BackgroundTaskRegistry {
 
             match outcome {
                 Ok(Some(status)) => {
-                    // Await pipe readers with drain timeout (Codex IO_DRAIN_TIMEOUT).
                     await_bg_readers(&mut stdout_handle, &mut stderr_handle).await;
-                    // If kill already finalized, keep Killed and only fill exit if missing.
                     let already = {
                         let tasks = registry.tasks.lock().expect("tasks lock");
                         tasks
@@ -321,7 +450,6 @@ impl BackgroundTaskRegistry {
                             .unwrap_or(true)
                     };
                     if already {
-                        // Still record exit code if we have it and state is Killed.
                         let mut tasks = registry.tasks.lock().expect("tasks lock");
                         if let Some(t) = tasks.get_mut(&task_id) {
                             if t.exit_code.is_none() {
@@ -333,7 +461,6 @@ impl BackgroundTaskRegistry {
                     }
                 }
                 Ok(None) => {
-                    // Child taken by kill path — still bound reader wait.
                     await_bg_readers(&mut stdout_handle, &mut stderr_handle).await;
                 }
                 Err(err) => {
@@ -352,8 +479,32 @@ impl BackgroundTaskRegistry {
             }
             done.notify_waiters();
         });
+    }
 
-        Ok(id)
+    /// Called from monitor stdout reader when event flood is hit.
+    fn auto_stop_monitor(&self, id: &str, reason: &str) {
+        let _ = self.kill_sync_inner(id, reason, true);
+    }
+
+    fn emit_monitor_line(&self, id: &str, line: &str) -> bool {
+        let mut tasks = self.tasks.lock().expect("tasks lock");
+        let Some(task) = tasks.get_mut(id) else {
+            return false;
+        };
+        if task.state.is_terminal() || task.kind != TaskKind::Monitor {
+            return false;
+        }
+        task.mon_events = task.mon_events.saturating_add(1);
+        let n = task.mon_events;
+        let cmd = task.command.clone();
+        drop(tasks);
+
+        let truncated = truncate_monitor_line(line);
+        let body = format!(
+            "[Monitor event · {id} · #{n}]\ncommand: {cmd}\n{truncated}"
+        );
+        self.push_notification(one_core::system_reminder(body));
+        true
     }
 
     fn force_kill_pid(&self, id: &str) {
@@ -603,7 +754,12 @@ async fn await_bg_readers(
 
 pub fn format_completion_notification(snap: &TaskSnapshot) -> String {
     let mut out = String::new();
-    out.push_str("[Background task completed]\n");
+    let is_monitor = snap.id.starts_with("mon_");
+    if is_monitor {
+        out.push_str("[Monitor stopped]\n");
+    } else {
+        out.push_str("[Background task completed]\n");
+    }
     out.push_str(&format!("task_id: {}\n", snap.id));
     out.push_str(&format!("command: {}\n", snap.command));
     out.push_str(&format!("status: {}\n", snap.state.as_str()));
@@ -617,11 +773,84 @@ pub fn format_completion_notification(snap: &TaskSnapshot) -> String {
     if let Some(err) = &snap.error {
         out.push_str(&format!("error: {err}\n"));
     }
-    let body = format_output_body(&snap.stdout, &snap.stderr, DEFAULT_OUTPUT_CHARS);
-    if !body.is_empty() {
-        out.push_str(&body);
+    // Monitors already streamed lines as events — keep completion compact.
+    if !is_monitor {
+        let body = format_output_body(&snap.stdout, &snap.stderr, DEFAULT_OUTPUT_CHARS);
+        if !body.is_empty() {
+            out.push_str(&body);
+        }
+    } else if !snap.stdout.is_empty() {
+        let lines = snap.stdout.lines().count();
+        out.push_str(&format!("stdout_lines_captured: {lines}\n"));
     }
-    out
+    // Wrap so the model treats this as harness notice, not a user message.
+    one_core::system_reminder(out)
+}
+
+fn truncate_monitor_line(line: &str) -> String {
+    let t = line.trim_end();
+    if t.chars().count() <= MONITOR_LINE_MAX_CHARS {
+        return t.to_string();
+    }
+    let head: String = t.chars().take(MONITOR_LINE_MAX_CHARS).collect();
+    format!("{head}…")
+}
+
+/// Line-buffered stdout for monitors: append buffer + emit notification per line.
+async fn stream_monitor_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
+    reader: R,
+    buf: Arc<Mutex<String>>,
+    registry: Arc<BackgroundTaskRegistry>,
+    task_id: String,
+    max_events: usize,
+) {
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    let mut lines = BufReader::new(reader).lines();
+    loop {
+        match lines.next_line().await {
+            Ok(Some(line)) => {
+                {
+                    let mut g = buf.lock().expect("stdout lock");
+                    if g.len() < EXEC_OUTPUT_MAX_BYTES {
+                        g.push_str(&line);
+                        g.push('\n');
+                    }
+                }
+                // Check flood before emit so we stop cleanly.
+                let events = {
+                    let tasks = registry.tasks.lock().expect("tasks lock");
+                    tasks.get(&task_id).map(|t| t.mon_events).unwrap_or(0)
+                };
+                if events >= max_events {
+                    registry.auto_stop_monitor(
+                        &task_id,
+                        &format!(
+                            "monitor auto-stopped after {max_events} events (tighten filter / use grep --line-buffered)"
+                        ),
+                    );
+                    break;
+                }
+                if !registry.emit_monitor_line(&task_id, &line) {
+                    break;
+                }
+                let events_after = {
+                    let tasks = registry.tasks.lock().expect("tasks lock");
+                    tasks.get(&task_id).map(|t| t.mon_events).unwrap_or(0)
+                };
+                if events_after >= max_events {
+                    registry.auto_stop_monitor(
+                        &task_id,
+                        &format!(
+                            "monitor auto-stopped after {max_events} events (tighten filter / use grep --line-buffered)"
+                        ),
+                    );
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => break,
+        }
+    }
 }
 
 pub fn format_task_output(snap: &TaskSnapshot, max_chars: usize) -> String {

@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use one_core::error::Result;
@@ -6,11 +7,13 @@ use one_core::image::{is_image_path, mime_from_bytes, mime_from_path, MAX_IMAGE_
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
+use crate::memory_io::{is_memory_path, wrap_memory_read, MemoryLookupBudget};
 use crate::path_policy::{AccessKind, PathPolicy};
 use crate::tool_args::{path_arg, path_properties};
 
 pub struct ReadTool {
     policy: PathPolicy,
+    memory_lookups: Arc<MemoryLookupBudget>,
 }
 
 impl ReadTool {
@@ -19,7 +22,15 @@ impl ReadTool {
     }
 
     pub fn with_policy(policy: PathPolicy) -> Self {
-        Self { policy }
+        Self {
+            policy,
+            memory_lookups: MemoryLookupBudget::unlimited(),
+        }
+    }
+
+    pub fn with_memory_lookups(mut self, budget: Arc<MemoryLookupBudget>) -> Self {
+        self.memory_lookups = budget;
+        self
     }
 }
 
@@ -78,6 +89,20 @@ impl Tool for ReadTool {
             .resolve(path, AccessKind::Read)
             .map_err(|err| tool_error("read", err))?;
 
+        let is_mem = is_memory_path(&resolved);
+        if is_mem {
+            if let Err(msg) = self.memory_lookups.try_consume() {
+                let text = one_core::system_reminder(msg);
+                return Ok(ToolOutput::text_with_details(
+                    text,
+                    json!({
+                        "path": path,
+                        "memoryLookupBudgetExceeded": true,
+                    }),
+                ));
+            }
+        }
+
         // Prefer extension, then magic-byte sniff for extension-less images.
         if is_image_path(&resolved) || looks_like_image_file(&resolved).await {
             return read_image(path, &resolved).await;
@@ -86,6 +111,25 @@ impl Tool for ReadTool {
         let content = tokio::fs::read_to_string(&resolved)
             .await
             .map_err(|err| tool_error("read", err.to_string()))?;
+
+        // Empty files still "succeed" — remind the model not to invent contents.
+        if content.is_empty() {
+            let text = one_core::system_reminder(format!(
+                "File exists but is empty: `{path}`.\n\
+                 Do not invent file contents. If you expected content, check the path or create it with `write`."
+            ));
+            return Ok(ToolOutput::text_with_details(
+                text,
+                json!({
+                    "path": path,
+                    "lines": 0,
+                    "offset": 1,
+                    "fileLines": 0,
+                    "truncated": false,
+                    "empty": true,
+                }),
+            ));
+        }
 
         let offset = call
             .arguments
@@ -127,6 +171,10 @@ impl Tool for ReadTool {
             ));
         }
 
+        if is_mem {
+            text = wrap_memory_read(&resolved, &content, &text);
+        }
+
         Ok(ToolOutput::text_with_details(
             text,
             json!({
@@ -135,6 +183,7 @@ impl Tool for ReadTool {
                 "offset": offset,
                 "fileLines": lines.len(),
                 "truncated": presented.truncated || more_in_file,
+                "memory": is_mem,
             }),
         ))
     }
@@ -269,6 +318,70 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn memory_body_gets_age_reminder() {
+        let dir = tempfile_dir();
+        let mem = dir.join("memory").join("_global");
+        std::fs::create_dir_all(&mem).unwrap();
+        let body = mem.join("tip.md");
+        std::fs::write(
+            &body,
+            "---\nupdated: 2020-01-01\n---\n\nPrefer cargo test.\n",
+        )
+        .unwrap();
+
+        let policy = PathPolicy::workspace(dir.clone()).with_readable_root(mem.clone());
+        let tool = ReadTool::with_policy(policy);
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": body.to_string_lossy() }),
+            })
+            .await
+            .unwrap();
+        let text = out.as_text();
+        assert!(text.contains("system-reminder"), "{text}");
+        assert!(text.contains("Point-in-time") || text.contains("verify"), "{text}");
+        assert!(text.contains("Prefer cargo test") || text.contains("cargo"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn memory_lookup_budget_blocks() {
+        let dir = tempfile_dir();
+        let mem = dir.join("memory").join("_global");
+        std::fs::create_dir_all(&mem).unwrap();
+        let body = mem.join("a.md");
+        std::fs::write(&body, "hello memory\n").unwrap();
+
+        let budget = MemoryLookupBudget::new(1);
+        let policy = PathPolicy::workspace(dir.clone()).with_readable_root(mem);
+        let tool = ReadTool::with_policy(policy).with_memory_lookups(budget.clone());
+        let path = body.to_string_lossy().to_string();
+        tool.execute(&ToolCall {
+            id: "1".into(),
+            name: "read".into(),
+            arguments: json!({ "path": path.clone() }),
+        })
+        .await
+        .unwrap();
+        let out = tool
+            .execute(&ToolCall {
+                id: "2".into(),
+                name: "read".into(),
+                arguments: json!({ "path": path }),
+            })
+            .await
+            .unwrap();
+        assert!(
+            out.as_text().contains("budget exceeded") || out.as_text().contains("Lookup budget"),
+            "{}",
+            out.as_text()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn tempfile_dir() -> PathBuf {
         use std::sync::atomic::{AtomicU64, Ordering};
         static N: AtomicU64 = AtomicU64::new(0);
@@ -284,6 +397,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&dir).unwrap();
+        // keep dir non-empty for walkers; also used by empty-dir tests
         let mut f = std::fs::File::create(dir.join(".keep")).unwrap();
         let _ = writeln!(f, "test");
         dir

@@ -23,8 +23,9 @@ impl Tool for BashKillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "bash_kill".to_string(),
-            description: "Stop a running background bash task by task_id \
-(from bash with run_in_background=true). No-op if already finished."
+            description: "Stop a running background bash task or monitor by task_id \
+(`bg_*` from bash run_in_background, `mon_*` from monitor). No-op if already finished. \
+When subagent tools are enabled, `job_kill` / `wait_tasks` also accept these ids."
                 .to_string(),
             parameters: json!({
                 "type": "object",

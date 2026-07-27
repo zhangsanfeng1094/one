@@ -18,9 +18,12 @@ use crate::edit::EditTool;
 use crate::find::FindTool;
 use crate::grep::GrepTool;
 use crate::ls::LsTool;
+use crate::memory_io::MemoryLookupBudget;
+use crate::monitor::MonitorTool;
 use crate::path_policy::PathPolicy;
 use crate::read::ReadTool;
 use crate::tasks::BackgroundTaskRegistry;
+use crate::todo::{TodoListState, TodoWriteTool};
 use crate::write::WriteTool;
 use crate::ToolBuildOptions;
 
@@ -32,6 +35,10 @@ pub struct ToolBuildContext {
     pub bg_registry: Arc<BackgroundTaskRegistry>,
     pub ask_user: Option<Arc<dyn AskUserHandler>>,
     pub tool_gate: Option<Arc<dyn ToolGate>>,
+    /// Session todo list (shared across `todo_write` instances).
+    pub todo_state: TodoListState,
+    /// Per-turn memory read/grep budget (shared Arc; reset each user turn).
+    pub memory_lookups: Arc<MemoryLookupBudget>,
     /// Optional provider-native search hop for `web_search` (feature-gated by host).
     #[cfg(feature = "network")]
     pub backend_web_search: Option<Arc<dyn crate::BackendWebSearch>>,
@@ -45,6 +52,8 @@ impl ToolBuildContext {
             bg_registry: opts.registry,
             ask_user: opts.ask_user,
             tool_gate: opts.tool_gate,
+            todo_state: TodoListState::new(),
+            memory_lookups: MemoryLookupBudget::unlimited(),
             #[cfg(feature = "network")]
             backend_web_search: None,
         }
@@ -57,9 +66,21 @@ impl ToolBuildContext {
             bg_registry: Arc::new(BackgroundTaskRegistry::new()),
             ask_user: None,
             tool_gate: None,
+            todo_state: TodoListState::new(),
+            memory_lookups: MemoryLookupBudget::unlimited(),
             #[cfg(feature = "network")]
             backend_web_search: None,
         }
+    }
+
+    pub fn with_todo_state(mut self, state: TodoListState) -> Self {
+        self.todo_state = state;
+        self
+    }
+
+    pub fn with_memory_lookups(mut self, budget: Arc<MemoryLookupBudget>) -> Self {
+        self.memory_lookups = budget;
+        self
     }
 
     pub fn with_policy(mut self, policy: PathPolicy) -> Self {
@@ -176,6 +197,8 @@ impl BuiltinToolProfile {
                     "find".into(),
                     "ls".into(),
                     "ask_user".into(),
+                    "todo_write".into(),
+                    "monitor".into(),
                 ];
                 #[cfg(feature = "network")]
                 {
@@ -327,7 +350,10 @@ impl ToolRegistry {
 
     fn register_builtins(&mut self) {
         self.register_factory("read", |ctx| {
-            Arc::new(ReadTool::with_policy(ctx.policy.clone())) as Arc<dyn Tool>
+            Arc::new(
+                ReadTool::with_policy(ctx.policy.clone())
+                    .with_memory_lookups(ctx.memory_lookups.clone()),
+            ) as Arc<dyn Tool>
         });
         self.register_factory("write", |ctx| {
             Arc::new(WriteTool::with_policy(ctx.policy.clone())) as Arc<dyn Tool>
@@ -350,7 +376,10 @@ impl ToolRegistry {
             Arc::new(BashKillTool::new(ctx.bg_registry.clone())) as Arc<dyn Tool>
         });
         self.register_factory("grep", |ctx| {
-            Arc::new(GrepTool::with_policy(ctx.policy.clone())) as Arc<dyn Tool>
+            Arc::new(
+                GrepTool::with_policy(ctx.policy.clone())
+                    .with_memory_lookups(ctx.memory_lookups.clone()),
+            ) as Arc<dyn Tool>
         });
         self.register_factory("find", |ctx| {
             Arc::new(FindTool::with_policy(ctx.policy.clone())) as Arc<dyn Tool>
@@ -360,6 +389,15 @@ impl ToolRegistry {
         });
         self.register_factory("ask_user", |ctx| {
             Arc::new(AskUserTool::new(ctx.ask_handler())) as Arc<dyn Tool>
+        });
+        self.register_factory("todo_write", |ctx| {
+            Arc::new(TodoWriteTool::new(ctx.todo_state.clone())) as Arc<dyn Tool>
+        });
+        self.register_factory("monitor", |ctx| {
+            Arc::new(MonitorTool::new(
+                ctx.bg_registry.clone(),
+                ctx.policy.cwd().to_path_buf(),
+            )) as Arc<dyn Tool>
         });
         #[cfg(feature = "network")]
         {

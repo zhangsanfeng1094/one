@@ -2,8 +2,8 @@
 
 use one_core::agent::{CompletionRequest, LlmProvider, ThinkingLevel};
 use one_core::compaction::{
-    compact_messages, prune_old_tool_outputs, should_compact_tokens, split_for_compaction,
-    summarization_prompt, tokens_for_compaction, CompactionConfig,
+    compact_messages, prune_old_tool_outputs, should_compact_tokens, should_prefire_prune,
+    split_for_compaction, summarization_prompt, tokens_for_compaction, CompactionConfig,
 };
 use one_core::message::AgentMessage;
 use one_ext::ExtensionEvent;
@@ -35,6 +35,9 @@ impl AppRuntime {
 
         let text = self.resources.resolve_prompt(text);
         self.maybe_compact(provider, false).await?;
+
+        // M3: memory read/grep budget is per user turn.
+        self.memory_lookups.reset_turn();
 
         let _ = self
             .extensions
@@ -115,14 +118,15 @@ impl AppRuntime {
     /// Compact when over threshold, or when `force` (e.g. context overflow recovery / `/compact`).
     ///
     /// Strategy from `settings.compaction` (auto / ratio|threshold / keep_recent;
-    /// optional prune default **off**).
+    /// prune default **on** + prefire at ~85% of threshold).
     /// Token pressure prefers last provider-reported prompt size over char/4 estimate.
     ///
     /// Flow:
-    /// 1. Optional pre-pass (`prune=on`): clear tool bodies **outside** keep_recent tail
-    ///    (recent turns untouched). Cheap; does not replace summarization.
-    /// 2. If still over threshold (or forced) → LLM/extractive summary of older messages,
-    ///    keep_recent tail kept verbatim (including their tools).
+    /// 1. **Prefire** (tokens ≥ prefire_ratio × threshold, prune on): clear old tool
+    ///    bodies outside keep_recent. If that alone drops under the full threshold,
+    ///    stop — no LLM summary yet.
+    /// 2. **Full compact** (tokens ≥ threshold, or force): prune again if needed, then
+    ///    LLM/extractive summary of older messages; keep_recent tail kept verbatim.
     pub async fn maybe_compact(
         &mut self,
         provider: &dyn LlmProvider,
@@ -147,11 +151,13 @@ impl AppRuntime {
         };
         let mut tokens = tokens_for_compaction(&messages, observed);
 
-        if !force && !should_compact_tokens(tokens, &config) {
+        let over_full = force || should_compact_tokens(tokens, &config);
+        let over_prefire = !force && should_prefire_prune(tokens, &config);
+        if !over_full && !over_prefire {
             return Ok(());
         }
 
-        // 1) Optional prune of old tool outputs (cheaper than full summary).
+        // 1) Prune old tool outputs (prefire and full path). Cheap; may be enough alone.
         let mut did_prune = false;
         if config.prune {
             let n = prune_old_tool_outputs(&mut messages, &config);
@@ -166,8 +172,15 @@ impl AppRuntime {
             }
         }
 
-        // Prune alone relieved pressure — skip summary unless forced.
-        if !force && did_prune && !should_compact_tokens(tokens, &config) {
+        // Prefire / prune-only: if under full threshold, skip LLM summary unless forced.
+        if !force && !should_compact_tokens(tokens, &config) {
+            if did_prune || over_prefire {
+                tracing::debug!(
+                    tokens,
+                    threshold = config.token_threshold,
+                    "compaction prefire/prune-only; skipping LLM summary"
+                );
+            }
             return Ok(());
         }
         if split_for_compaction(&messages, &config).is_none() {
@@ -196,6 +209,30 @@ impl AppRuntime {
             session
                 .append_compaction(&summary, first_kept, tokens_before)
                 .await?;
+        }
+
+        // M5: optional L4 archive under memory/sessions/ (not injected into L2).
+        // Whole package must be on (feature `memory`).
+        if self.applied_features.memory_enabled()
+            && settings.memory_or_default().archive_compaction_enabled()
+        {
+            let sid = self
+                .session
+                .as_ref()
+                .map(|s| s.header().id.clone())
+                .unwrap_or_else(|| "no-session".into());
+            match one_resources::archive_session_summary(
+                &self.resources.agent_dir,
+                &self.cwd,
+                &sid,
+                &summary,
+            ) {
+                Ok(path) => tracing::info!(
+                    path = %path.display(),
+                    "archived compaction summary to memory L4"
+                ),
+                Err(e) => tracing::warn!(error = %e, "memory L4 archive failed"),
+            }
         }
 
         let mut agent = self.agent.lock().await;

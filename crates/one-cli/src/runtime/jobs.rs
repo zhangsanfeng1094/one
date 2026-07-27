@@ -212,20 +212,38 @@ fn truncate_chars(s: &str, max: usize) -> String {
 }
 
 /// Options for [`AgentJobRegistry::spawn_with`].
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SpawnOptions {
     /// Push `[job completed]` into the parent notification queue (background only).
     pub notify_completion: bool,
     /// Apply `ONE_JOB_MAX_WALL_MS` wall-time budget.
     pub apply_wall_timeout: bool,
+    /// Optional trace sink for the child harness (Langfuse nested under parent tool).
+    pub trace: Option<one_core::SharedTrace>,
+    /// Trace labels for the child run.
+    pub trace_meta: Option<one_core::TraceRunMeta>,
 }
 
 impl Default for SpawnOptions {
     fn default() -> Self {
+        // Background jobs: notify + wall timeout on by default.
         Self {
             notify_completion: true,
             apply_wall_timeout: true,
+            trace: None,
+            trace_meta: None,
         }
+    }
+}
+
+impl std::fmt::Debug for SpawnOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SpawnOptions")
+            .field("notify_completion", &self.notify_completion)
+            .field("apply_wall_timeout", &self.apply_wall_timeout)
+            .field("trace", &self.trace.is_some())
+            .field("trace_meta", &self.trace_meta.is_some())
+            .finish()
     }
 }
 
@@ -419,6 +437,8 @@ impl AgentJobRegistry {
             abort: Some(abort.clone()),
             turn_progress: Some(turn_progress),
             event_log: Some(event_log),
+            trace: spawn_opts.trace,
+            trace_meta: spawn_opts.trace_meta,
         };
         let apply_wall = spawn_opts.apply_wall_timeout;
         tokio::spawn(async move {
@@ -454,6 +474,7 @@ impl AgentJobRegistry {
             } else {
                 harness::run_with_control(req, provider.as_ref(), &opts, control).await
             };
+            // Nested LangfuseTraceSink flushes on Drop when `control.trace` is dropped here.
             registry.finalize(&job_id, result);
         });
 
@@ -1012,7 +1033,7 @@ pub fn format_job_completed_notification(snap: &JobSnapshot) -> String {
             out.push('\n');
         }
     }
-    out
+    one_core::system_reminder(out)
 }
 
 pub fn format_job_list(jobs: &[JobSnapshot]) -> String {
@@ -1113,7 +1134,8 @@ mod tests {
             notify_completion: true,
         };
         let t = format_job_completed_notification(&snap);
-        assert!(t.starts_with("[job completed]"), "{t}");
+        assert!(t.contains("[job completed]"), "{t}");
+        assert!(t.contains("<system-reminder>"), "{t}");
         assert!(t.contains("id: job_1"));
         assert!(t.contains("found login"));
         assert!(t.contains("turns: 2/16"));

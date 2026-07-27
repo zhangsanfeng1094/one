@@ -188,6 +188,11 @@ pub struct Cli {
     #[arg(long = "no-subagent")]
     pub no_subagent: bool,
 
+    /// Do not inject the cross-session memory L2 catalog into the system prompt.
+    /// Also set via env `ONE_NO_MEMORY=1` / `ONE_MEMORY=0`.
+    #[arg(long = "no-memory")]
+    pub no_memory: bool,
+
     /// Export execution trace to Langfuse (turns / LLM / tools / usage / scores).
     ///
     /// Requires `LANGFUSE_PUBLIC_KEY` + `LANGFUSE_SECRET_KEY`.

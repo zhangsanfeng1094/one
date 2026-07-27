@@ -77,6 +77,11 @@ impl AppRuntime {
             }
         }
 
+        // Refresh frozen env + memory L2 (user asked for /reload).
+        let mem_opts =
+            super::features::effective_memory_options(&self.applied_features, &user_settings);
+        self.refresh_context_snapshots(&mem_opts).await;
+
         // Rebuild tools + prompt for current mode (keeps applied features).
         match self.mode {
             AgentMode::Plan => {

@@ -26,6 +26,10 @@
 //! - Trace-level attrs (`session`, `user`, `tags`, `metadata`, `release`, `env`)
 //!   are **propagated to every span** so Langfuse filters/aggregations work.
 //! - `langfuse.trace.tags` is emitted as an OTEL string **array**.
+//! - Root observation is type **agent**: never set bare `model` / `gen_ai.usage.*`
+//!   on the root (Langfuse promotes any span with `model` to a generation).
+//! - Turn spans end on the next turn (or RunEnd) so waterfall durations are real.
+//! - Empty/provider retries open a **new** generation per sample attempt.
 //! - Scores: `force_flush` OTLP first, then POST Scores API; `shutdown` joins workers.
 //!
 //! Short-lived CLI: call [`LangfuseTraceSink::shutdown`] before process exit.
@@ -147,6 +151,9 @@ fn tags_attr(tags: &[String]) -> KeyValue {
 }
 
 /// Build attrs that must appear on **every** span for Langfuse filter/aggregate.
+///
+/// Keep this lean: session/user/tags/task/model only. Full `config` blobs go on
+/// the root agent observation only (see RunStart) so every span is not bloated.
 fn build_propagated(
     session_id: Option<&str>,
     user_id: Option<&str>,
@@ -154,23 +161,27 @@ fn build_propagated(
     agent_version: Option<&str>,
     provider: Option<&str>,
     model: Option<&str>,
-    config: Option<&serde_json::Value>,
     trace_name: &str,
+    extra_tags: &[String],
 ) -> Vec<KeyValue> {
     let mut tags = vec!["one".to_string(), "agent".to_string()];
     if let Some(t) = task_id {
         tags.push(format!("task:{t}"));
+    }
+    for t in extra_tags {
+        if !tags.iter().any(|x| x == t) {
+            tags.push(t.clone());
+        }
     }
 
     let mut attrs = vec![
         tags_attr(&tags),
         KeyValue::new("langfuse.trace.name", trace_name.to_string()),
         KeyValue::new("langfuse.release", release()),
-        KeyValue::new(
-            "langfuse.version",
-            agent_version.unwrap_or_default().to_string(),
-        ),
     ];
+    if let Some(v) = agent_version.filter(|s| !s.is_empty()) {
+        attrs.push(KeyValue::new("langfuse.version", v.to_string()));
+    }
     if let Some(env) = tracing_environment() {
         attrs.push(KeyValue::new("langfuse.environment", env));
     }
@@ -200,23 +211,6 @@ fn build_propagated(
             m.to_string(),
         ));
     }
-    // Flatten config object keys for filterable top-level metadata.
-    if let Some(cfg) = config {
-        if let Some(obj) = cfg.as_object() {
-            for (k, v) in obj {
-                let val = match v {
-                    serde_json::Value::String(s) => s.clone(),
-                    other => other.to_string(),
-                };
-                attrs.push(KeyValue::new(format!("langfuse.trace.metadata.{k}"), val));
-            }
-        } else {
-            attrs.push(KeyValue::new(
-                "langfuse.trace.metadata.config",
-                cfg.to_string(),
-            ));
-        }
-    }
     attrs
 }
 
@@ -233,13 +227,21 @@ struct RunState {
     tools: HashMap<String, Context>,
     /// Copied onto every child span (session/user/tags/metadata/…).
     propagated: Vec<KeyValue>,
+    /// Sample attempt counter within the current run (for retry span names).
+    llm_attempt: u32,
+    /// Model/provider for generation attrs at LlmRequest time (before response).
+    model: Option<String>,
+    provider: Option<String>,
 }
 
 /// TraceSink exporting to Langfuse over OTLP/HTTP.
 pub struct LangfuseTraceSink {
     config: LangfuseConfig,
     tracer: opentelemetry_sdk::trace::Tracer,
-    provider: Mutex<Option<SdkTracerProvider>>,
+    /// Shared so subagent forks can flush without owning shutdown.
+    provider: Arc<Mutex<Option<SdkTracerProvider>>>,
+    /// Only the process-root sink tears down the OTEL provider.
+    owns_provider: bool,
     events: Mutex<Vec<TraceEvent>>,
     state: Mutex<RunState>,
     http: reqwest::blocking::Client,
@@ -247,6 +249,8 @@ pub struct LangfuseTraceSink {
     pending_scores: Mutex<Vec<JoinHandle<()>>>,
     /// True when a real OTLP exporter is attached (false for memory-only fallback).
     exporting: bool,
+    /// When set, `RunStart` nests the agent root under this parent span (same OTEL trace).
+    parent_for_root: Option<Context>,
 }
 
 impl LangfuseTraceSink {
@@ -271,12 +275,14 @@ impl LangfuseTraceSink {
         Arc::new(Self {
             config,
             tracer,
-            provider: Mutex::new(Some(provider)),
+            provider: Arc::new(Mutex::new(Some(provider))),
+            owns_provider: true,
             events: Mutex::new(Vec::new()),
             state: Mutex::new(RunState::default()),
             http: reqwest::blocking::Client::new(),
             pending_scores: Mutex::new(Vec::new()),
             exporting: false,
+            parent_for_root: None,
         })
     }
 
@@ -331,17 +337,52 @@ impl LangfuseTraceSink {
         Ok(Arc::new(Self {
             config,
             tracer,
-            provider: Mutex::new(Some(provider)),
+            provider: Arc::new(Mutex::new(Some(provider))),
+            owns_provider: true,
             events: Mutex::new(Vec::new()),
             state: Mutex::new(RunState::default()),
             http,
             pending_scores: Mutex::new(Vec::new()),
             exporting: true,
+            parent_for_root: None,
         }))
     }
 
     pub fn events(&self) -> Vec<TraceEvent> {
         self.events.lock().expect("events").clone()
+    }
+
+    /// Open tool span context (for nesting a subagent under `task`).
+    pub fn context_for_tool(&self, call_id: &str) -> Option<Context> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|st| st.tools.get(call_id).cloned())
+    }
+
+    /// Root agent span context (fallback parent for background children).
+    pub fn root_context(&self) -> Option<Context> {
+        self.state.lock().ok().and_then(|st| st.root.clone())
+    }
+
+    /// Fork a child sink that shares the OTEL exporter but has its own run state.
+    ///
+    /// The child's `RunStart` nests under `parent` so Langfuse shows a single
+    /// connected tree (same OTEL trace id). The child does **not** own provider
+    /// shutdown — only the process-root sink should call full teardown.
+    pub fn fork_child(&self, parent: Context) -> Arc<Self> {
+        Arc::new(Self {
+            config: self.config.clone(),
+            tracer: self.tracer.clone(),
+            provider: Arc::clone(&self.provider),
+            owns_provider: false,
+            events: Mutex::new(Vec::new()),
+            state: Mutex::new(RunState::default()),
+            http: self.http.clone(),
+            pending_scores: Mutex::new(Vec::new()),
+            exporting: self.exporting,
+            parent_for_root: Some(parent),
+        })
     }
 
     /// Force-flush pending OTLP spans without shutting the provider down.
@@ -372,6 +413,8 @@ impl LangfuseTraceSink {
     ///
     /// OTLP HTTP uses a blocking reqwest client; flush/shutdown must not run on a
     /// Tokio worker thread (would panic: "Cannot drop a runtime in async context").
+    ///
+    /// Child forks only flush + join their score workers; they never take the provider.
     pub fn shutdown(&self) {
         // End any open spans best-effort.
         if let Ok(mut st) = self.state.lock() {
@@ -397,7 +440,10 @@ impl LangfuseTraceSink {
         // 2) Wait for score HTTP posts (posted after flush on Score events, or earlier).
         self.join_pending_scores();
 
-        // 3) Tear down provider.
+        // 3) Tear down provider only from the owning root sink.
+        if !self.owns_provider {
+            return;
+        }
         let provider = match self.provider.lock() {
             Ok(mut guard) => guard.take(),
             Err(_) => None,
@@ -443,20 +489,40 @@ impl LangfuseTraceSink {
                 session_id,
                 user_id,
                 trace_full: _,
+                input_preview,
             } => {
                 // Close previous run if any.
                 if let Some(cx) = state.root.take() {
                     cx.span().end();
                 }
-                state.turns.clear();
-                state.llms.clear();
-                state.tools.clear();
+                for (_, cx) in state.tools.drain() {
+                    cx.span().end();
+                }
+                for (_, cx) in state.llms.drain() {
+                    cx.span().end();
+                }
+                for (_, cx) in state.turns.drain() {
+                    cx.span().end();
+                }
                 state.run_id = Some(run_id.clone());
                 state.otel_trace_id = None;
+                state.llm_attempt = 0;
+                state.model = model.clone();
+                state.provider = provider.clone();
 
+                let is_subagent = self.parent_for_root.is_some()
+                    || task_id
+                        .as_ref()
+                        .is_some_and(|t| t.starts_with("subagent:"));
                 let name = match task_id {
+                    Some(t) if t.starts_with("subagent:") => t.clone(),
                     Some(t) => format!("one:{t}"),
                     None => format!("one:{agent}"),
+                };
+                let extra_tags = if is_subagent {
+                    vec!["subagent".to_string()]
+                } else {
+                    vec![]
                 };
 
                 state.propagated = build_propagated(
@@ -466,10 +532,13 @@ impl LangfuseTraceSink {
                     agent_version.as_deref(),
                     provider.as_deref(),
                     model.as_deref(),
-                    config.as_ref(),
                     &name,
+                    &extra_tags,
                 );
 
+                // Root is observation type **agent**. Do NOT set bare `model` or
+                // `gen_ai.usage.*` here — Langfuse promotes any span with `model`
+                // to a generation, which makes the UI look wrong.
                 let mut attrs = vec![
                     KeyValue::new("langfuse.observation.type", "agent"),
                     KeyValue::new("agent", agent.clone()),
@@ -477,23 +546,54 @@ impl LangfuseTraceSink {
                     KeyValue::new("langfuse.trace.metadata.run_id", run_id.clone()),
                 ];
                 if let Some(p) = provider {
-                    attrs.push(KeyValue::new("provider", p.clone()));
+                    attrs.push(KeyValue::new(
+                        "langfuse.observation.metadata.provider",
+                        p.clone(),
+                    ));
                 }
                 if let Some(m) = model {
-                    attrs.push(KeyValue::new("model", m.clone()));
+                    // metadata only — never the bare key `model`
+                    attrs.push(KeyValue::new(
+                        "langfuse.observation.metadata.model",
+                        m.clone(),
+                    ));
                 }
                 if let Some(v) = agent_version {
-                    attrs.push(KeyValue::new("agent_version", v.clone()));
+                    attrs.push(KeyValue::new(
+                        "langfuse.observation.metadata.agent_version",
+                        v.clone(),
+                    ));
+                }
+                // Full config only on the root observation (not every child span).
+                if let Some(cfg) = config {
+                    attrs.push(KeyValue::new(
+                        "langfuse.observation.metadata.config",
+                        cfg.to_string(),
+                    ));
+                }
+                if let Some(preview) = input_preview {
+                    attrs.push(KeyValue::new(
+                        "langfuse.observation.input",
+                        preview.clone(),
+                    ));
+                    // Trace-level input only for top-level runs (not nested subagents).
+                    if self.parent_for_root.is_none() {
+                        attrs.push(KeyValue::new("langfuse.trace.input", preview.clone()));
+                    }
                 }
                 attrs = Self::with_propagated(&state, attrs);
 
-                let span = self
+                let builder = self
                     .tracer
                     .span_builder(name)
                     .with_kind(SpanKind::Internal)
                     .with_start_time(ms_to_system_time(*ts_ms))
-                    .with_attributes(attrs)
-                    .start(&self.tracer);
+                    .with_attributes(attrs);
+                let span = if let Some(parent) = &self.parent_for_root {
+                    builder.start_with_context(&self.tracer, parent)
+                } else {
+                    builder.start(&self.tracer)
+                };
                 let cx = Context::current_with_span(span);
                 let tid = cx.span().span_context().trace_id().to_string();
                 state.otel_trace_id = Some(tid);
@@ -529,13 +629,19 @@ impl LangfuseTraceSink {
                     if let Some(n) = final_text_len {
                         span.set_attribute(KeyValue::new("final_text_len", *n as i64));
                     }
+                    // Aggregate usage as filterable metadata only — never gen_ai.usage
+                    // on the agent root (would look like a generation + double-count).
                     span.set_attribute(KeyValue::new(
-                        "gen_ai.usage.input_tokens",
+                        "langfuse.observation.metadata.input_tokens",
                         usage.input_tokens as i64,
                     ));
                     span.set_attribute(KeyValue::new(
-                        "gen_ai.usage.output_tokens",
+                        "langfuse.observation.metadata.output_tokens",
                         usage.output_tokens as i64,
+                    ));
+                    span.set_attribute(KeyValue::new(
+                        "langfuse.observation.metadata.total_tokens",
+                        usage.total() as i64,
                     ));
                     let output = if let Some(preview) = final_text_preview {
                         if error.is_some() {
@@ -578,6 +684,22 @@ impl LangfuseTraceSink {
                 tools_n,
                 last_prompt_tokens,
             } => {
+                // End previous turns so waterfall durations are per-turn, not
+                // stretched to RunEnd. Also close any stray tools/llms from prior turns.
+                let prior_turns: Vec<usize> = state
+                    .turns
+                    .keys()
+                    .copied()
+                    .filter(|t| *t < *turn)
+                    .collect();
+                for t in prior_turns {
+                    if let Some(cx) = state.turns.remove(&t) {
+                        cx.span().end_with_timestamp(ms_to_system_time(*ts_ms));
+                    }
+                }
+                // Fresh sample counter per turn (retries re-open generations within a turn).
+                state.llm_attempt = 0;
+
                 let parent = Self::parent_cx(&state, None);
                 let mut attrs = vec![
                     KeyValue::new("langfuse.observation.type", "chain"),
@@ -609,20 +731,45 @@ impl LangfuseTraceSink {
             } => {
                 let parent = Self::parent_cx(&state, Some(*turn));
                 let key = format!("{run_id}:{turn}");
+                // If a previous attempt left an open generation (shouldn't normally),
+                // close it before opening a new one for this sample.
+                if let Some(cx) = state.llms.remove(&key) {
+                    cx.span().end_with_timestamp(ms_to_system_time(*ts_ms));
+                }
+                state.llm_attempt = state.llm_attempt.saturating_add(1);
+                let attempt = state.llm_attempt;
+                let span_name = if attempt <= 1 {
+                    format!("llm-turn-{turn}")
+                } else {
+                    format!("llm-turn-{turn}-attempt-{attempt}")
+                };
                 let mut attrs = vec![
                     KeyValue::new("langfuse.observation.type", "generation"),
                     KeyValue::new("turn", *turn as i64),
+                    KeyValue::new("sample_attempt", attempt as i64),
                     KeyValue::new("message_count", *message_count as i64),
                     KeyValue::new("tools_n", *tools_n as i64),
                     KeyValue::new("system_prompt_len", *system_prompt_len as i64),
                 ];
+                // Set model early so Langfuse types this as a generation even if the
+                // response never arrives (timeout / abort mid-stream).
+                if let Some(m) = &state.model {
+                    attrs.push(KeyValue::new(
+                        "langfuse.observation.model.name",
+                        m.clone(),
+                    ));
+                    attrs.push(KeyValue::new("gen_ai.request.model", m.clone()));
+                }
+                if let Some(p) = &state.provider {
+                    attrs.push(KeyValue::new("gen_ai.system", p.clone()));
+                }
                 if let Some(preview) = input_preview {
                     attrs.push(KeyValue::new("langfuse.observation.input", preview.clone()));
                 }
                 attrs = Self::with_propagated(&state, attrs);
                 let span = self
                     .tracer
-                    .span_builder(format!("llm-turn-{turn}"))
+                    .span_builder(span_name)
                     .with_kind(SpanKind::Client)
                     .with_start_time(ms_to_system_time(*ts_ms))
                     .with_attributes(attrs)
@@ -643,6 +790,7 @@ impl LangfuseTraceSink {
                 provider,
                 model,
                 output_preview,
+                tool_calls,
             } => {
                 let key = format!("{run_id}:{turn}");
                 if let Some(cx) = state.llms.remove(&key) {
@@ -702,10 +850,49 @@ impl LangfuseTraceSink {
                     span.set_attribute(KeyValue::new("tool_calls_n", *tool_calls_n as i64));
                     span.set_attribute(KeyValue::new("text_len", *text_len as i64));
                     span.set_attribute(KeyValue::new("thinking_len", *thinking_len as i64));
+                    // Structured tool calls for Langfuse generation detail / filters.
+                    if !tool_calls.is_empty() {
+                        let tc_json = serde_json::to_string(tool_calls)
+                            .unwrap_or_else(|_| "[]".into());
+                        span.set_attribute(KeyValue::new(
+                            "langfuse.observation.metadata.tool_calls",
+                            tc_json.clone(),
+                        ));
+                        // Also expose a compact names list for quick filters.
+                        let names: Vec<&str> =
+                            tool_calls.iter().map(|c| c.name.as_str()).collect();
+                        span.set_attribute(KeyValue::new(
+                            "langfuse.observation.metadata.tool_names",
+                            names.join(","),
+                        ));
+                    }
                     if let Some(preview) = output_preview {
+                        // When the model only emitted tool calls, prefer structured JSON
+                        // so the UI shows id/name/args rather than a name list string.
+                        if preview.starts_with("tool_calls:") && !tool_calls.is_empty() {
+                            span.set_attribute(KeyValue::new(
+                                "langfuse.observation.output",
+                                json!({ "tool_calls": tool_calls }).to_string(),
+                            ));
+                        } else if !tool_calls.is_empty() {
+                            span.set_attribute(KeyValue::new(
+                                "langfuse.observation.output",
+                                json!({
+                                    "text": preview,
+                                    "tool_calls": tool_calls,
+                                })
+                                .to_string(),
+                            ));
+                        } else {
+                            span.set_attribute(KeyValue::new(
+                                "langfuse.observation.output",
+                                preview.clone(),
+                            ));
+                        }
+                    } else if !tool_calls.is_empty() {
                         span.set_attribute(KeyValue::new(
                             "langfuse.observation.output",
-                            preview.clone(),
+                            json!({ "tool_calls": tool_calls }).to_string(),
                         ));
                     } else {
                         span.set_attribute(KeyValue::new(
@@ -718,14 +905,21 @@ impl LangfuseTraceSink {
                             .to_string(),
                         ));
                     }
-                    span.set_status(Status::Ok);
+                    // Intermediate retry samples are warnings, not success.
+                    let is_retry = stop_reason == "empty_retry" || stop_reason == "provider_retry";
+                    if is_retry {
+                        span.set_attribute(KeyValue::new(
+                            "langfuse.observation.level",
+                            "WARNING",
+                        ));
+                        span.set_status(Status::error(stop_reason.clone()));
+                    } else {
+                        span.set_status(Status::Ok);
+                    }
                     span.end_with_timestamp(ms_to_system_time(*ts_ms));
                 }
-                // Close turn span end time after LLM (tools may still run under same turn)
-                if let Some(cx) = state.turns.get(turn) {
-                    // don't end yet if tools may follow — leave open until RunEnd or next turn
-                    let _ = cx;
-                }
+                // Turn stays open: tools may follow under the same turn span.
+                // Closed on next TurnStart or RunEnd.
             }
             TraceEvent::ToolStart {
                 ts_ms,
@@ -1113,25 +1307,60 @@ mod tests {
             session_id: Some("sess-abc".into()),
             user_id: Some("u1".into()),
             trace_full: false,
+            input_preview: Some("list files".into()),
         });
-        sink.record(TraceEvent::LlmRequest {
+        sink.record(TraceEvent::TurnStart {
             ts_ms: 2,
             run_id: "run_test".into(),
             turn: 0,
             message_count: 1,
             tools_n: 0,
+            last_prompt_tokens: None,
+        });
+        sink.record(TraceEvent::LlmRequest {
+            ts_ms: 3,
+            run_id: "run_test".into(),
+            turn: 0,
+            message_count: 1,
+            tools_n: 0,
             system_prompt_len: 10,
-            input_preview: None,
+            input_preview: Some("list files".into()),
+        });
+        // Intermediate empty retry — must not swallow the following success.
+        sink.record(TraceEvent::LlmResponse {
+            ts_ms: 20,
+            run_id: "run_test".into(),
+            turn: 0,
+            latency_ms: 17,
+            ttft_ms: None,
+            stop_reason: "empty_retry".into(),
+            tool_calls_n: 0,
+            text_len: 0,
+            thinking_len: 0,
+            usage: one_core::TokenUsage::default(),
+            provider: "mock".into(),
+            model: "m".into(),
+            output_preview: Some("empty response — retry 1/3".into()),
+            tool_calls: vec![],
+        });
+        sink.record(TraceEvent::LlmRequest {
+            ts_ms: 25,
+            run_id: "run_test".into(),
+            turn: 0,
+            message_count: 1,
+            tools_n: 0,
+            system_prompt_len: 10,
+            input_preview: Some("list files".into()),
         });
         sink.record(TraceEvent::LlmResponse {
             ts_ms: 50,
             run_id: "run_test".into(),
             turn: 0,
-            latency_ms: 48,
+            latency_ms: 25,
             ttft_ms: Some(5),
-            stop_reason: "end".into(),
-            tool_calls_n: 0,
-            text_len: 3,
+            stop_reason: "tool_use".into(),
+            tool_calls_n: 1,
+            text_len: 0,
             thinking_len: 0,
             usage: one_core::TokenUsage {
                 input_tokens: 1,
@@ -1140,24 +1369,74 @@ mod tests {
             },
             provider: "mock".into(),
             model: "m".into(),
-            output_preview: Some("hi".into()),
+            output_preview: Some("tool_calls: [bash]".into()),
+            tool_calls: vec![one_core::TraceToolCall {
+                id: "tc1".into(),
+                name: "bash".into(),
+                arguments: Some(json!({"command": "ls"})),
+            }],
+        });
+        sink.record(TraceEvent::TurnStart {
+            ts_ms: 51,
+            run_id: "run_test".into(),
+            turn: 1,
+            message_count: 2,
+            tools_n: 0,
+            last_prompt_tokens: Some(1),
+        });
+        sink.record(TraceEvent::LlmRequest {
+            ts_ms: 52,
+            run_id: "run_test".into(),
+            turn: 1,
+            message_count: 2,
+            tools_n: 0,
+            system_prompt_len: 10,
+            input_preview: None,
+        });
+        sink.record(TraceEvent::LlmResponse {
+            ts_ms: 55,
+            run_id: "run_test".into(),
+            turn: 1,
+            latency_ms: 3,
+            ttft_ms: Some(1),
+            stop_reason: "end".into(),
+            tool_calls_n: 0,
+            text_len: 2,
+            thinking_len: 0,
+            usage: one_core::TokenUsage {
+                input_tokens: 2,
+                output_tokens: 1,
+                ..Default::default()
+            },
+            provider: "mock".into(),
+            model: "m".into(),
+            output_preview: Some("ok".into()),
+            tool_calls: vec![],
         });
         sink.record(TraceEvent::RunEnd {
             ts_ms: 60,
             run_id: "run_test".into(),
             status: TraceRunStatus::Ok,
-            turns: 1,
+            turns: 2,
             wall_ms: 59,
             usage: one_core::TokenUsage {
-                input_tokens: 1,
-                output_tokens: 1,
+                input_tokens: 3,
+                output_tokens: 2,
                 ..Default::default()
             },
-            final_text_len: Some(3),
-            final_text_preview: Some("hi".into()),
+            final_text_len: Some(2),
+            final_text_preview: Some("ok".into()),
             error: None,
         });
-        assert_eq!(sink.events().len(), 4);
+        assert_eq!(sink.events().len(), 10);
+        // After multi-turn + retry, no open spans left.
+        {
+            let st = sink.state.lock().unwrap();
+            assert!(st.root.is_none());
+            assert!(st.turns.is_empty());
+            assert!(st.llms.is_empty());
+            assert!(st.tools.is_empty());
+        }
         sink.shutdown();
     }
 
@@ -1170,14 +1449,98 @@ mod tests {
             Some("0.1.0"),
             Some("mock"),
             Some("m"),
-            Some(&json!({"suite": "smoke"})),
             "one:kit-fix",
+            &[],
         );
         let keys: Vec<_> = attrs.iter().map(|a| a.key.as_str()).collect();
         assert!(keys.contains(&"langfuse.session.id"));
         assert!(keys.contains(&"langfuse.user.id"));
         assert!(keys.contains(&"langfuse.trace.tags"));
-        assert!(keys.contains(&"langfuse.trace.metadata.suite"));
         assert!(keys.contains(&"langfuse.trace.metadata.task_id"));
+        // Config is root-only — not on every span.
+        assert!(!keys.iter().any(|k| k.contains("suite")));
+    }
+
+    #[test]
+    fn fork_child_nests_under_parent() {
+        let parent = LangfuseTraceSink::memory_only(LangfuseConfig {
+            public_key: "pk".into(),
+            secret_key: "sk".into(),
+            base_url: "http://localhost".into(),
+        });
+        parent.record(TraceEvent::RunStart {
+            ts_ms: 1,
+            run_id: "parent_run".into(),
+            agent: "one".into(),
+            agent_version: Some("0.1.0".into()),
+            provider: Some("mock".into()),
+            model: Some("m".into()),
+            task_id: None,
+            config: None,
+            session_id: Some("sess".into()),
+            user_id: None,
+            trace_full: false,
+            input_preview: Some("delegate".into()),
+        });
+        parent.record(TraceEvent::ToolStart {
+            ts_ms: 2,
+            run_id: "parent_run".into(),
+            turn: 0,
+            call_id: "tool_task_1".into(),
+            name: "task".into(),
+            args_bytes: 10,
+            args_preview: Some(r#"{"prompt":"research"}"#.into()),
+        });
+        let tool_cx = parent
+            .context_for_tool("tool_task_1")
+            .expect("open tool span");
+        let child = parent.fork_child(tool_cx);
+        assert!(!child.owns_provider);
+        child.record(TraceEvent::RunStart {
+            ts_ms: 3,
+            run_id: "child_run".into(),
+            agent: "one".into(),
+            agent_version: Some("0.1.0".into()),
+            provider: Some("mock".into()),
+            model: Some("m".into()),
+            task_id: Some("subagent:explore".into()),
+            config: Some(json!({"depth": 1})),
+            session_id: Some("sess".into()),
+            user_id: None,
+            trace_full: false,
+            input_preview: Some("research".into()),
+        });
+        // Same OTEL trace id as parent tool / root.
+        let parent_tid = parent.state.lock().unwrap().otel_trace_id.clone();
+        let child_tid = child.state.lock().unwrap().otel_trace_id.clone();
+        assert_eq!(parent_tid, child_tid);
+        assert!(parent_tid.is_some());
+        child.record(TraceEvent::RunEnd {
+            ts_ms: 10,
+            run_id: "child_run".into(),
+            status: TraceRunStatus::Ok,
+            turns: 1,
+            wall_ms: 7,
+            usage: one_core::TokenUsage::default(),
+            final_text_len: Some(4),
+            final_text_preview: Some("done".into()),
+            error: None,
+        });
+        // Child shutdown must not take the shared provider.
+        child.shutdown();
+        assert!(parent.provider.lock().unwrap().is_some());
+        parent.record(TraceEvent::ToolEnd {
+            ts_ms: 11,
+            run_id: "parent_run".into(),
+            turn: 0,
+            call_id: "tool_task_1".into(),
+            name: "task".into(),
+            duration_ms: 9,
+            is_error: false,
+            output_bytes: 4,
+            gate: None,
+            output_preview: Some("done".into()),
+        });
+        parent.shutdown();
     }
 }

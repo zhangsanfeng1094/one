@@ -45,5 +45,30 @@ pub(super) fn build_path_policy(
     let skill_roots = skill_allowlist_roots(cwd, &resources.agent_dir, resources.all_skills());
     policy = policy.with_readable_roots(skill_roots);
 
+    // Memory package: only when feature `memory` is on (plus settings / env).
+    let features = crate::runtime::features::FeatureState::from_settings(settings)
+        .with_process_overrides(
+            false, // path policy does not re-apply --no-subagent
+            cli.no_memory || crate::runtime::features::env_no_memory(),
+        );
+    let mem_opts = crate::runtime::features::effective_memory_options(&features, settings);
+    if mem_opts.enabled {
+        let mem_roots = one_resources::memory_readable_roots(&resources.agent_dir, cwd);
+        policy = policy.with_readable_roots(mem_roots);
+
+        // M2: agent write path — grant write under global + project memory dirs.
+        if mem_opts.write_enabled {
+            let _ = std::fs::create_dir_all(
+                one_resources::memory_root(&resources.agent_dir).join("_global"),
+            );
+            let _ = std::fs::create_dir_all(one_resources::project_memory_dir(
+                &resources.agent_dir,
+                cwd,
+            ));
+            let writable = one_resources::memory_writable_roots(&resources.agent_dir, cwd);
+            policy = policy.with_additional_dirs(writable);
+        }
+    }
+
     policy
 }
