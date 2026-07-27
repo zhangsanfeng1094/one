@@ -866,41 +866,30 @@ impl LangfuseTraceSink {
                             names.join(","),
                         ));
                     }
+                    // Prefer structured assistant message from core (`role`/`content`/
+                    // `tool_calls`). Fall back only if preview was omitted.
                     if let Some(preview) = output_preview {
-                        // When the model only emitted tool calls, prefer structured JSON
-                        // so the UI shows id/name/args rather than a name list string.
-                        if preview.starts_with("tool_calls:") && !tool_calls.is_empty() {
-                            span.set_attribute(KeyValue::new(
-                                "langfuse.observation.output",
-                                json!({ "tool_calls": tool_calls }).to_string(),
-                            ));
-                        } else if !tool_calls.is_empty() {
-                            span.set_attribute(KeyValue::new(
-                                "langfuse.observation.output",
-                                json!({
-                                    "text": preview,
-                                    "tool_calls": tool_calls,
-                                })
-                                .to_string(),
-                            ));
-                        } else {
-                            span.set_attribute(KeyValue::new(
-                                "langfuse.observation.output",
-                                preview.clone(),
-                            ));
-                        }
+                        span.set_attribute(KeyValue::new(
+                            "langfuse.observation.output",
+                            preview.clone(),
+                        ));
                     } else if !tool_calls.is_empty() {
                         span.set_attribute(KeyValue::new(
                             "langfuse.observation.output",
-                            json!({ "tool_calls": tool_calls }).to_string(),
+                            json!({
+                                "role": "assistant",
+                                "content": null,
+                                "tool_calls": tool_calls,
+                            })
+                            .to_string(),
                         ));
                     } else {
                         span.set_attribute(KeyValue::new(
                             "langfuse.observation.output",
                             json!({
+                                "role": "assistant",
+                                "content": null,
                                 "stop_reason": stop_reason,
-                                "tool_calls_n": tool_calls_n,
-                                "text_len": text_len,
                             })
                             .to_string(),
                         ));
@@ -934,6 +923,8 @@ impl LangfuseTraceSink {
                 let mut attrs = vec![
                     KeyValue::new("langfuse.observation.type", "tool"),
                     KeyValue::new("tool.name", name.clone()),
+                    // Stable link to the generation tool_call that requested this run.
+                    KeyValue::new("tool_call_id", call_id.clone()),
                     KeyValue::new("call_id", call_id.clone()),
                     KeyValue::new("turn", *turn as i64),
                     KeyValue::new("args_bytes", *args_bytes as i64),
@@ -941,7 +932,23 @@ impl LangfuseTraceSink {
                 if let Some(p) = args_preview {
                     attrs.push(KeyValue::new(
                         "langfuse.observation.input",
-                        json!({"args_preview": p, "args_bytes": args_bytes}).to_string(),
+                        json!({
+                            "tool_call_id": call_id,
+                            "name": name,
+                            "arguments": p,
+                            "args_bytes": args_bytes,
+                        })
+                        .to_string(),
+                    ));
+                } else {
+                    attrs.push(KeyValue::new(
+                        "langfuse.observation.input",
+                        json!({
+                            "tool_call_id": call_id,
+                            "name": name,
+                            "args_bytes": args_bytes,
+                        })
+                        .to_string(),
                     ));
                 }
                 attrs = Self::with_propagated(&state, attrs);
@@ -972,6 +979,7 @@ impl LangfuseTraceSink {
                     let span = cx.span();
                     span.set_attribute(KeyValue::new("langfuse.observation.type", "tool"));
                     span.set_attribute(KeyValue::new("tool.name", name.clone()));
+                    span.set_attribute(KeyValue::new("tool_call_id", call_id.clone()));
                     span.set_attribute(KeyValue::new("duration_ms", *duration_ms as i64));
                     span.set_attribute(KeyValue::new("output_bytes", *output_bytes as i64));
                     span.set_attribute(KeyValue::new("is_error", *is_error));
@@ -982,12 +990,20 @@ impl LangfuseTraceSink {
                     if let Some(preview) = output_preview {
                         span.set_attribute(KeyValue::new(
                             "langfuse.observation.output",
-                            preview.clone(),
+                            json!({
+                                "tool_call_id": call_id,
+                                "name": name,
+                                "is_error": is_error,
+                                "content": preview,
+                            })
+                            .to_string(),
                         ));
                     } else {
                         span.set_attribute(KeyValue::new(
                             "langfuse.observation.output",
                             json!({
+                                "tool_call_id": call_id,
+                                "name": name,
                                 "is_error": is_error,
                                 "output_bytes": output_bytes,
                                 "gate": gate.as_ref().map(TraceGateDecision::as_str),
@@ -1369,7 +1385,18 @@ mod tests {
             },
             provider: "mock".into(),
             model: "m".into(),
-            output_preview: Some("tool_calls: [bash]".into()),
+            output_preview: Some(
+                json!({
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "tc1",
+                        "name": "bash",
+                        "arguments": {"command": "ls"}
+                    }]
+                })
+                .to_string(),
+            ),
             tool_calls: vec![one_core::TraceToolCall {
                 id: "tc1".into(),
                 name: "bash".into(),
@@ -1410,7 +1437,9 @@ mod tests {
             },
             provider: "mock".into(),
             model: "m".into(),
-            output_preview: Some("ok".into()),
+            output_preview: Some(
+                json!({"role": "assistant", "content": "ok"}).to_string(),
+            ),
             tool_calls: vec![],
         });
         sink.record(TraceEvent::RunEnd {

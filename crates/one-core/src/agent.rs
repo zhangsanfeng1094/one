@@ -436,6 +436,17 @@ impl Agent {
         }
     }
 
+    /// Budget for generation observation I/O (full messages + structured output).
+    /// Always large enough for multi-turn context; `--trace-full` raises further.
+    fn llm_preview_limit(&self) -> usize {
+        if self.trace_meta.trace_full {
+            // 4× full budget when the operator opted into verbose traces.
+            crate::trace::PREVIEW_FULL_CHARS.saturating_mul(4)
+        } else {
+            crate::trace::PREVIEW_LLM_CHARS
+        }
+    }
+
     /// Replace the notification queue (wire shared background-task registry).
     pub fn set_notification_queue(&mut self, queue: Arc<Mutex<Vec<String>>>) {
         self.notification_queue = queue;
@@ -637,16 +648,13 @@ impl Agent {
                 thinking_level: self.config.thinking_level,
             };
 
-            // Default: last user turn (short). --trace-full: system + recent messages.
-            let input_preview = if self.trace_meta.trace_full {
-                crate::trace::llm_input_preview(
-                    &request.system_prompt,
-                    &request.messages,
-                    self.preview_limit(),
-                )
-            } else {
-                crate::trace::last_user_preview(&request.messages, self.preview_limit())
-            };
+            // Always record the messages actually sent to the model (system +
+            // full conversation). Tool results are size-bounded inside the helper.
+            let input_preview = crate::trace::llm_input_preview(
+                &request.system_prompt,
+                &request.messages,
+                self.llm_preview_limit(),
+            );
             // Helper: open a generation span. Re-emitted after empty/provider retries so
             // Langfuse keeps a separate generation per sample attempt.
             let record_llm_request = |this: &Self, run_id: &str, turn: usize| {
@@ -854,13 +862,11 @@ impl Agent {
             let text = extract_text(&response.content);
             let text_len = text.len();
             let thinking_len = extract_thinking_len(&response.content);
-            // Always attach generation text (or tool-call summary) so Langfuse
-            // observation.output is readable without --trace-full.
-            // --trace-full only raises the preview budget (16k vs 240 chars).
+            // Structured assistant message JSON (role/content/tool_calls).
             let output_preview =
-                crate::trace::llm_output_preview(&text, &tool_calls, self.preview_limit());
+                crate::trace::llm_output_preview(&text, &tool_calls, self.llm_preview_limit());
             let tool_calls_trace =
-                crate::trace::trace_tool_calls(&tool_calls, self.preview_limit());
+                crate::trace::trace_tool_calls(&tool_calls, self.llm_preview_limit());
 
             self.record_trace(TraceEvent::LlmResponse {
                 ts_ms: now_ms(),

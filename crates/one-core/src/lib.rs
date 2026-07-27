@@ -41,5 +41,5 @@ pub use trace::{
     args_preview, last_user_preview, llm_input_preview, llm_output_preview, load_trace_file,
     new_run_id, text_preview, trace_tool_calls, JsonlTraceSink, MemoryTrace, NullTrace,
     ScoreCheckResult, SharedTrace, TraceEvent, TraceGateDecision, TraceRunStatus, TraceSink,
-    TraceStats, TraceToolCall, PREVIEW_DEFAULT_CHARS, PREVIEW_FULL_CHARS,
+    TraceStats, TraceToolCall, PREVIEW_DEFAULT_CHARS, PREVIEW_FULL_CHARS, PREVIEW_LLM_CHARS,
 };

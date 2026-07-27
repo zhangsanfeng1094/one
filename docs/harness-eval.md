@@ -139,12 +139,13 @@ Agent::run
 | `langfuse.trace.tags` 为 string[] | ✅ OTEL string array |
 | `sessionId` | ✅ One session header id / bench 每次独立 id |
 | `userId` | ✅ `LANGFUSE_USER_ID` / `ONE_USER_ID` / `USER` |
-| Generation I/O 文本 | ✅ 默认短预览（240 字：input=末条 user，output=回复文本）；`--trace-full` 至 16k |
+| Generation I/O | ✅ **input** = 实际发给模型的 messages 数组（system + 对话；工具输出截断）；**output** = 结构化 assistant message（`role/content/tool_calls`）；默认 16k，`--trace-full` 更大 |
 | Root agent I/O | ✅ `observation.input`（user 原文）+ `observation.output`（final）；**不**写 root `model`/`gen_ai.usage`（避免被当成 generation） |
 | Turn 时长 | ✅ 下一 turn 开始时 end 上一 turn；不再拖到 RunEnd |
 | Empty/provider retry | ✅ 每次 sample 独立 generation；成功样本不再被吞 |
 | Subagent 嵌套 | ✅ `task` 子 agent fork 到同一 OTEL trace，挂在 tool span 下 |
 | Generation tool_calls | ✅ 结构化 `id/name/arguments` → metadata + output JSON |
+| Tool `tool_call_id` | ✅ 与 generation 的 tool_calls[].id 对齐（input/output/attrs） |
 | Experiments dataset 属性 | ⚠️ 未接；bench 用 tags + harness scores |
 
 ## Trace 事件 → OTEL / Langfuse

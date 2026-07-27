@@ -20,6 +20,13 @@ use crate::message::{now_ms, AgentMessage, UserContent};
 pub const PREVIEW_DEFAULT_CHARS: usize = 240;
 /// Larger preview when `--trace-full` is set (chars).
 pub const PREVIEW_FULL_CHARS: usize = 16_384;
+/// Default budget for generation observation input/output (full messages).
+/// Large enough for multi-turn context; individual tool outputs are truncated first.
+pub const PREVIEW_LLM_CHARS: usize = 16_384;
+/// Per-tool-result content cap inside generation input (chars), before total budget.
+pub const PREVIEW_TOOL_RESULT_CHARS: usize = 2_048;
+/// System prompt cap inside generation input (chars).
+pub const PREVIEW_SYSTEM_CHARS: usize = 4_096;
 
 /// Where traces go. Implementations must be cheap and non-panicking.
 pub trait TraceSink: Send + Sync {
@@ -367,23 +374,60 @@ pub fn text_preview(s: &str, max_chars: usize) -> Option<String> {
     }
 }
 
-/// Generation observation output for Langfuse: assistant text, or a tool-call summary.
+/// Generation observation output: structured assistant message JSON.
+///
+/// Shape:
+/// ```json
+/// {"role":"assistant","content":"...","tool_calls":[{"id":"...","name":"...","arguments":{}}]}
+/// ```
 pub fn llm_output_preview(
     text: &str,
     tool_calls: &[crate::tool::ToolCall],
     max_chars: usize,
 ) -> Option<String> {
-    if !text.is_empty() {
-        return text_preview(text, max_chars);
-    }
-    if tool_calls.is_empty() {
+    if max_chars == 0 {
         return None;
     }
-    let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
-    text_preview(&format!("tool_calls: [{}]", names.join(", ")), max_chars)
+    let content = if text.is_empty() {
+        Value::Null
+    } else {
+        // Leave room for tool_calls + envelope; content is the main truncation target.
+        let content_budget = max_chars.saturating_sub(128).max(64);
+        Value::String(text_preview(text, content_budget).unwrap_or_default())
+    };
+    let mut msg = serde_json::Map::new();
+    msg.insert("role".into(), Value::String("assistant".into()));
+    msg.insert("content".into(), content);
+    if !tool_calls.is_empty() {
+        // Cap each arg blob so huge tool args don't blow the observation.
+        let arg_budget = (max_chars / tool_calls.len().max(1)).clamp(256, 4_096);
+        let tcs: Vec<Value> = tool_calls
+            .iter()
+            .map(|c| {
+                let arguments = {
+                    let raw = serde_json::to_string(&c.arguments).unwrap_or_else(|_| "{}".into());
+                    if raw.chars().count() <= arg_budget {
+                        c.arguments.clone()
+                    } else {
+                        text_preview(&raw, arg_budget)
+                            .map(Value::String)
+                            .unwrap_or(Value::String("…".into()))
+                    }
+                };
+                serde_json::json!({
+                    "id": c.id,
+                    "name": c.name,
+                    "arguments": arguments,
+                })
+            })
+            .collect();
+        msg.insert("tool_calls".into(), Value::Array(tcs));
+    }
+    let raw = serde_json::to_string(&Value::Object(msg)).ok()?;
+    text_preview(&raw, max_chars)
 }
 
-/// Short default generation input: last user message text only.
+/// Short root-agent / list preview: last user message text only.
 pub fn last_user_preview(messages: &[AgentMessage], max_chars: usize) -> Option<String> {
     if max_chars == 0 {
         return None;
@@ -407,7 +451,121 @@ pub fn last_user_preview(messages: &[AgentMessage], max_chars: usize) -> Option<
     None
 }
 
-/// Compact LLM input snapshot for `--trace-full` (system + recent messages).
+fn user_content_text(content: &UserContent) -> String {
+    match content {
+        UserContent::Text(text) => text.clone(),
+        UserContent::Blocks(blocks) => blocks
+            .iter()
+            .map(|b| match b {
+                crate::message::TextOrImage::Text { text } => text.as_str(),
+                crate::message::TextOrImage::Image { .. } => "[image]",
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
+
+fn text_or_image_join(blocks: &[crate::message::TextOrImage]) -> String {
+    blocks
+        .iter()
+        .map(|b| match b {
+            crate::message::TextOrImage::Text { text } => text.as_str(),
+            crate::message::TextOrImage::Image { .. } => "[image]",
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Serialize one conversation message into an OpenAI-style role object for traces.
+fn message_to_trace_value(
+    m: &AgentMessage,
+    tool_result_max: usize,
+    arg_max: usize,
+) -> Value {
+    match m {
+        AgentMessage::User(u) => {
+            serde_json::json!({
+                "role": "user",
+                "content": user_content_text(&u.content),
+            })
+        }
+        AgentMessage::Assistant(a) => {
+            let mut content_parts: Vec<String> = Vec::new();
+            let mut tool_calls: Vec<Value> = Vec::new();
+            for b in &a.content {
+                match b {
+                    crate::message::ContentBlock::Text { text } => {
+                        if !text.is_empty() {
+                            content_parts.push(text.clone());
+                        }
+                    }
+                    crate::message::ContentBlock::ToolCall {
+                        id,
+                        name,
+                        arguments,
+                    } => {
+                        let raw =
+                            serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into());
+                        let args = if raw.chars().count() <= arg_max {
+                            arguments.clone()
+                        } else {
+                            text_preview(&raw, arg_max)
+                                .map(Value::String)
+                                .unwrap_or(Value::String("…".into()))
+                        };
+                        tool_calls.push(serde_json::json!({
+                            "id": id,
+                            "name": name,
+                            "arguments": args,
+                        }));
+                    }
+                    crate::message::ContentBlock::Thinking { .. } => {
+                        // Omit thinking body from generation input (size + privacy).
+                    }
+                }
+            }
+            let content = if content_parts.is_empty() {
+                Value::Null
+            } else {
+                Value::String(content_parts.join("\n"))
+            };
+            let mut obj = serde_json::Map::new();
+            obj.insert("role".into(), Value::String("assistant".into()));
+            obj.insert("content".into(), content);
+            if !tool_calls.is_empty() {
+                obj.insert("tool_calls".into(), Value::Array(tool_calls));
+            }
+            Value::Object(obj)
+        }
+        AgentMessage::ToolResult(t) => {
+            let raw = text_or_image_join(&t.content);
+            let content = text_preview(&raw, tool_result_max).unwrap_or_default();
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": t.tool_call_id,
+                "name": t.tool_name,
+                "content": content,
+                "is_error": t.is_error,
+            })
+        }
+    }
+}
+
+/// Generation input: actual messages sent to the model (OpenAI-style array).
+///
+/// Always includes system + full conversation when budget allows. Large tool
+/// results are truncated first; if still over budget, oldest non-system
+/// messages are dropped from the front (keeping the latest context).
+///
+/// Example shape:
+/// ```json
+/// [
+///   {"role":"system","content":"..."},
+///   {"role":"user","content":"这个项目干啥的"},
+///   {"role":"assistant","content":null,"tool_calls":[{"id":"…","name":"ls","arguments":{}}]},
+///   {"role":"tool","tool_call_id":"…","name":"ls","content":"…"}
+/// ]
+/// ```
 pub fn llm_input_preview(
     system_prompt: &str,
     messages: &[AgentMessage],
@@ -416,69 +574,42 @@ pub fn llm_input_preview(
     if max_chars == 0 {
         return None;
     }
-    // Prefer the last few turns so the preview stays relevant under budget.
-    let recent: Vec<Value> = messages
-        .iter()
-        .rev()
-        .take(8)
-        .map(|m| match m {
-            AgentMessage::User(u) => {
-                let text = match &u.content {
-                    UserContent::Text(text) => text.clone(),
-                    UserContent::Blocks(blocks) => blocks
-                        .iter()
-                        .map(|b| match b {
-                            crate::message::TextOrImage::Text { text } => text.as_str(),
-                            crate::message::TextOrImage::Image { .. } => "[image]",
-                        })
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                };
-                serde_json::json!({"role": "user", "text": text})
-            }
-            AgentMessage::Assistant(a) => {
-                let text = a
-                    .content
-                    .iter()
-                    .filter_map(|b| match b {
-                        crate::message::ContentBlock::Text { text } => Some(text.as_str()),
-                        crate::message::ContentBlock::ToolCall { name, .. } => Some(name.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                serde_json::json!({"role": "assistant", "text": text})
-            }
-            AgentMessage::ToolResult(t) => {
-                let text = t
-                    .content
-                    .iter()
-                    .map(|b| match b {
-                        crate::message::TextOrImage::Text { text } => text.as_str(),
-                        crate::message::TextOrImage::Image { .. } => "[image]",
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                serde_json::json!({
-                    "role": "tool",
-                    "name": t.tool_name,
-                    "is_error": t.is_error,
-                    "text": text,
-                })
-            }
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect();
-    let payload = serde_json::json!({
-        "system_len": system_prompt.len(),
-        "system": text_preview(system_prompt, max_chars.min(2000)),
-        "messages": recent,
-        "message_count": messages.len(),
+
+    let system_cap = PREVIEW_SYSTEM_CHARS.min(max_chars.saturating_sub(64).max(64));
+    let tool_result_cap = PREVIEW_TOOL_RESULT_CHARS.min(max_chars / 4).max(256);
+    let arg_cap = 1_024usize.min(max_chars / 8).max(128);
+
+    let system_content = text_preview(system_prompt, system_cap).unwrap_or_default();
+    let system_msg = serde_json::json!({
+        "role": "system",
+        "content": system_content,
     });
-    let raw = serde_json::to_string(&payload).ok()?;
-    text_preview(&raw, max_chars)
+
+    // Build all messages, then drop oldest until under budget (keep system + tail).
+    let mut body: Vec<Value> = messages
+        .iter()
+        .map(|m| message_to_trace_value(m, tool_result_cap, arg_cap))
+        .collect();
+
+    loop {
+        let mut payload = Vec::with_capacity(1 + body.len());
+        payload.push(system_msg.clone());
+        payload.extend(body.iter().cloned());
+        let raw = match serde_json::to_string(&payload) {
+            Ok(s) => s,
+            Err(_) => return None,
+        };
+        if raw.chars().count() <= max_chars {
+            return Some(raw);
+        }
+        // Prefer dropping oldest conversation turns over aggressive global truncate.
+        if body.len() > 1 {
+            body.remove(0);
+            continue;
+        }
+        // Single remaining message (or empty): hard-cap the JSON string.
+        return text_preview(&raw, max_chars);
+    }
 }
 
 /// Load JSONL trace events from a file (skips blank / non-object lines).
@@ -828,20 +959,41 @@ mod tests {
     }
 
     #[test]
-    fn llm_output_preview_prefers_text() {
+    fn llm_output_preview_structured_text() {
         let p = llm_output_preview("你好！有什么我可以帮你的吗？", &[], 240).unwrap();
-        assert!(p.contains("你好"));
+        let v: Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["role"], "assistant");
+        assert!(v["content"].as_str().unwrap().contains("你好"));
+        assert!(v.get("tool_calls").is_none());
     }
 
     #[test]
-    fn llm_output_preview_tool_calls_when_no_text() {
+    fn llm_output_preview_structured_tool_calls() {
         let calls = vec![crate::tool::ToolCall {
             id: "1".into(),
             name: "bash".into(),
-            arguments: json!({}),
+            arguments: json!({"command": "ls"}),
         }];
-        let p = llm_output_preview("", &calls, 240).unwrap();
-        assert_eq!(p, "tool_calls: [bash]");
+        let p = llm_output_preview("", &calls, 1024).unwrap();
+        let v: Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["role"], "assistant");
+        assert!(v["content"].is_null());
+        assert_eq!(v["tool_calls"][0]["id"], "1");
+        assert_eq!(v["tool_calls"][0]["name"], "bash");
+        assert_eq!(v["tool_calls"][0]["arguments"]["command"], "ls");
+    }
+
+    #[test]
+    fn llm_output_preview_text_plus_tools() {
+        let calls = vec![crate::tool::ToolCall {
+            id: "tc".into(),
+            name: "read".into(),
+            arguments: json!({"path": "README.md"}),
+        }];
+        let p = llm_output_preview("先看 README", &calls, 1024).unwrap();
+        let v: Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["content"], "先看 README");
+        assert_eq!(v["tool_calls"].as_array().unwrap().len(), 1);
     }
 
     #[test]
@@ -858,5 +1010,102 @@ mod tests {
             }),
         ];
         assert_eq!(last_user_preview(&messages, 240).as_deref(), Some("second"));
+    }
+
+    #[test]
+    fn llm_input_preview_includes_full_conversation() {
+        use crate::message::{
+            AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
+            UserContent, UserMessage,
+        };
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text("这个项目干啥的".into()),
+                timestamp: 0,
+            }),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![
+                    ContentBlock::Text {
+                        text: "先看结构".into(),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "c1".into(),
+                        name: "ls".into(),
+                        arguments: json!({}),
+                    },
+                ],
+                provider: "mock".into(),
+                model: "m".into(),
+                stop_reason: StopReason::ToolUse,
+                citations: vec![],
+                timestamp: 1,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "c1".into(),
+                tool_name: "ls".into(),
+                content: vec![crate::message::TextOrImage::Text {
+                    text: "Cargo.toml\nREADME.md".into(),
+                }],
+                is_error: false,
+                timestamp: 2,
+            }),
+        ];
+        let p = llm_input_preview("you are one", &messages, PREVIEW_LLM_CHARS).unwrap();
+        let v: Value = serde_json::from_str(&p).unwrap();
+        let arr = v.as_array().expect("messages array");
+        assert_eq!(arr[0]["role"], "system");
+        assert_eq!(arr[0]["content"], "you are one");
+        assert_eq!(arr[1]["role"], "user");
+        assert_eq!(arr[1]["content"], "这个项目干啥的");
+        assert_eq!(arr[2]["role"], "assistant");
+        assert_eq!(arr[2]["content"], "先看结构");
+        assert_eq!(arr[2]["tool_calls"][0]["id"], "c1");
+        assert_eq!(arr[2]["tool_calls"][0]["name"], "ls");
+        assert_eq!(arr[3]["role"], "tool");
+        assert_eq!(arr[3]["tool_call_id"], "c1");
+        assert!(arr[3]["content"].as_str().unwrap().contains("Cargo.toml"));
+    }
+
+    #[test]
+    fn llm_input_preview_not_just_last_user() {
+        use crate::message::{AgentMessage, UserContent, UserMessage};
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text("turn0".into()),
+                timestamp: 0,
+            }),
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text("turn1".into()),
+                timestamp: 1,
+            }),
+        ];
+        let p = llm_input_preview("sys", &messages, 4096).unwrap();
+        assert!(p.contains("turn0"), "must keep earlier user turns: {p}");
+        assert!(p.contains("turn1"));
+        assert!(p.contains("\"role\":\"system\"") || p.contains("\"role\": \"system\""));
+    }
+
+    #[test]
+    fn llm_input_preview_truncates_huge_tool_results() {
+        use crate::message::{
+            AgentMessage, ToolResultMessage, UserContent, UserMessage,
+        };
+        let huge = "x".repeat(20_000);
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text("q".into()),
+                timestamp: 0,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "c1".into(),
+                tool_name: "read".into(),
+                content: vec![crate::message::TextOrImage::Text { text: huge }],
+                is_error: false,
+                timestamp: 1,
+            }),
+        ];
+        let p = llm_input_preview("sys", &messages, 8_192).unwrap();
+        assert!(p.chars().count() <= 8_192);
+        assert!(p.contains("tool_call_id"));
     }
 }
