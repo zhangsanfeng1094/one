@@ -241,6 +241,20 @@ impl TokenUsage {
             .saturating_add(other.cache_write_tokens);
     }
 
+    /// Per-field saturating subtraction (e.g. run usage = session total − baseline).
+    pub fn saturating_sub(&self, other: &TokenUsage) -> TokenUsage {
+        TokenUsage {
+            input_tokens: self.input_tokens.saturating_sub(other.input_tokens),
+            output_tokens: self.output_tokens.saturating_sub(other.output_tokens),
+            cache_read_tokens: self
+                .cache_read_tokens
+                .saturating_sub(other.cache_read_tokens),
+            cache_write_tokens: self
+                .cache_write_tokens
+                .saturating_sub(other.cache_write_tokens),
+        }
+    }
+
     pub fn is_zero(&self) -> bool {
         self.input_tokens == 0
             && self.output_tokens == 0
@@ -577,6 +591,9 @@ impl Agent {
         let run_id = new_run_id();
         let wall_start = Instant::now();
         let meta = self.trace_meta.clone();
+        // Session-lifetime cumulative; RunEnd reports delta so each Langfuse
+        // root observation is per-prompt, not inflated by prior turns.
+        let usage_at_run_start = self.token_usage;
 
         // Root observation input = last user message (trace list / agent graph preview).
         let run_input_preview =
@@ -608,7 +625,13 @@ impl Agent {
         for turn in 0..self.config.max_turns {
             if self.is_aborted() {
                 return self
-                    .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                    .finish_aborted(
+                        start_len,
+                        &run_id,
+                        wall_start,
+                        turns_done,
+                        usage_at_run_start,
+                    )
                     .await;
             }
 
@@ -757,7 +780,13 @@ impl Agent {
                                 .await
                             {
                                 return self
-                                    .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                                    .finish_aborted(
+                                        start_len,
+                                        &run_id,
+                                        wall_start,
+                                        turns_done,
+                                        usage_at_run_start,
+                                    )
                                     .await;
                             }
                             *ttft_ms.lock().expect("ttft") = None;
@@ -771,7 +800,7 @@ impl Agent {
                             status: TraceRunStatus::Error,
                             turns: turns_done,
                             wall_ms: wall_start.elapsed().as_millis() as u64,
-                            usage: self.token_usage,
+                            usage: self.token_usage.saturating_sub(&usage_at_run_start),
                             final_text_len: None,
                             final_text_preview: None,
                             error: Some(err.to_string()),
@@ -825,7 +854,13 @@ impl Agent {
                         .await
                     {
                         return self
-                            .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                            .finish_aborted(
+                                start_len,
+                                &run_id,
+                                wall_start,
+                                turns_done,
+                                usage_at_run_start,
+                            )
                             .await;
                     }
                     // Reset TTFT so the next sample can measure fresh.
@@ -844,7 +879,7 @@ impl Agent {
                     status: TraceRunStatus::Error,
                     turns: turns_done,
                     wall_ms: wall_start.elapsed().as_millis() as u64,
-                    usage: self.token_usage,
+                    usage: self.token_usage.saturating_sub(&usage_at_run_start),
                     final_text_len: None,
                     final_text_preview: None,
                     error: Some(err.to_string()),
@@ -862,9 +897,14 @@ impl Agent {
             let text = extract_text(&response.content);
             let text_len = text.len();
             let thinking_len = extract_thinking_len(&response.content);
-            // Structured assistant message JSON (role/content/tool_calls).
-            let output_preview =
-                crate::trace::llm_output_preview(&text, &tool_calls, self.llm_preview_limit());
+            let thinking = extract_thinking(&response.content);
+            // Structured assistant message JSON (role/content/thinking/tool_calls).
+            let output_preview = crate::trace::llm_output_preview(
+                &text,
+                &tool_calls,
+                thinking.as_deref(),
+                self.llm_preview_limit(),
+            );
             let tool_calls_trace =
                 crate::trace::trace_tool_calls(&tool_calls, self.llm_preview_limit());
 
@@ -906,7 +946,13 @@ impl Agent {
                 });
                 self.messages.push(assistant);
                 return self
-                    .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                    .finish_aborted(
+                        start_len,
+                        &run_id,
+                        wall_start,
+                        turns_done,
+                        usage_at_run_start,
+                    )
                     .await;
             }
 
@@ -953,7 +999,7 @@ impl Agent {
                     status: TraceRunStatus::Ok,
                     turns: turns_done,
                     wall_ms: wall_start.elapsed().as_millis() as u64,
-                    usage: self.token_usage,
+                    usage: self.token_usage.saturating_sub(&usage_at_run_start),
                     final_text_len: Some(final_text.len()),
                     final_text_preview,
                     error: None,
@@ -978,7 +1024,13 @@ impl Agent {
                         hooks.on_turn_end(turn).await;
                     }
                     return self
-                        .finish_aborted(start_len, &run_id, wall_start, turns_done)
+                        .finish_aborted(
+                            start_len,
+                            &run_id,
+                            wall_start,
+                            turns_done,
+                            usage_at_run_start,
+                        )
                         .await;
                 }
                 ToolBatchOutcome::Continue => {}
@@ -1004,7 +1056,7 @@ impl Agent {
             status: TraceRunStatus::MaxTurns,
             turns: turns_done,
             wall_ms: wall_start.elapsed().as_millis() as u64,
-            usage: self.token_usage,
+            usage: self.token_usage.saturating_sub(&usage_at_run_start),
             final_text_len: None,
             final_text_preview: None,
             error: Some(format!("max turns ({})", self.config.max_turns)),
@@ -1023,6 +1075,7 @@ impl Agent {
         run_id: &str,
         wall_start: Instant,
         turns: usize,
+        usage_at_run_start: TokenUsage,
     ) -> Result<String> {
         self.is_busy = false;
         self.emit(AgentEvent::AgentEnd {
@@ -1037,7 +1090,7 @@ impl Agent {
             status: TraceRunStatus::Aborted,
             turns,
             wall_ms: wall_start.elapsed().as_millis() as u64,
-            usage: self.token_usage,
+            usage: self.token_usage.saturating_sub(&usage_at_run_start),
             final_text_len: None,
             final_text_preview: None,
             error: Some("aborted".into()),
@@ -1871,6 +1924,24 @@ fn extract_thinking_len(content: &[ContentBlock]) -> usize {
         .sum()
 }
 
+/// Concatenate thinking blocks for generation observation output (may be truncated later).
+fn extract_thinking(content: &[ContentBlock]) -> Option<String> {
+    let parts: Vec<&str> = content
+        .iter()
+        .filter_map(|block| match block {
+            ContentBlock::Thinking { thinking, .. } if !thinking.is_empty() => {
+                Some(thinking.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n"))
+    }
+}
+
 fn stop_reason_label(reason: StopReason) -> &'static str {
     match reason {
         StopReason::Stop => "stop",
@@ -1924,6 +1995,96 @@ mod tests {
         assert_eq!(u.prompt_tokens_expanded(), 1800); // Anthropic-style only
                                                       // OpenAI-style: context size is input (cache already inside).
         assert_eq!(u.context_size_tokens(), 1000);
+    }
+
+    #[test]
+    fn token_usage_saturating_sub_for_run_delta() {
+        let baseline = TokenUsage {
+            input_tokens: 10_000,
+            output_tokens: 100,
+            cache_read_tokens: 50,
+            cache_write_tokens: 0,
+        };
+        let cumulative = TokenUsage {
+            input_tokens: 32_000,
+            output_tokens: 250,
+            cache_read_tokens: 80,
+            cache_write_tokens: 10,
+        };
+        let delta = cumulative.saturating_sub(&baseline);
+        assert_eq!(delta.input_tokens, 22_000);
+        assert_eq!(delta.output_tokens, 150);
+        assert_eq!(delta.cache_read_tokens, 30);
+        assert_eq!(delta.cache_write_tokens, 10);
+        // No underflow when baseline is higher (should not happen in practice).
+        assert!(baseline.saturating_sub(&cumulative).is_zero());
+    }
+
+    #[tokio::test]
+    async fn run_end_usage_is_per_run_not_session_cumulative() {
+        use crate::trace::MemoryTrace;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingProvider {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for CountingProvider {
+            fn name(&self) -> &str {
+                "count"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(CompletionResponse {
+                    provider: self.name().to_string(),
+                    model: self.model().to_string(),
+                    content: vec![ContentBlock::Text {
+                        text: format!("reply-{n}"),
+                    }],
+                    stop_reason: StopReason::Stop,
+                    usage: TokenUsage {
+                        // Distinct per call so cumulative vs delta is obvious.
+                        input_tokens: 100 * (n as u64 + 1),
+                        output_tokens: 10 * (n as u64 + 1),
+                        ..Default::default()
+                    },
+                    citations: Vec::new(),
+                })
+            }
+        }
+
+        let mem = Arc::new(MemoryTrace::new());
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_trace(Some(mem.clone()));
+        let provider = CountingProvider {
+            calls: AtomicUsize::new(0),
+        };
+
+        agent.prompt(&provider, "first").await.expect("run1");
+        agent.prompt(&provider, "second").await.expect("run2");
+
+        // Session total still accumulates for UI / RPC.
+        assert_eq!(agent.token_usage.input_tokens, 100 + 200);
+        assert_eq!(agent.token_usage.output_tokens, 10 + 20);
+
+        let run_ends: Vec<_> = mem
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                TraceEvent::RunEnd { usage, .. } => Some(usage),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(run_ends.len(), 2);
+        assert_eq!(run_ends[0].input_tokens, 100);
+        assert_eq!(run_ends[0].output_tokens, 10);
+        // Second RunEnd must be this run only — not 300/30 cumulative.
+        assert_eq!(run_ends[1].input_tokens, 200);
+        assert_eq!(run_ends[1].output_tokens, 20);
     }
 
     #[test]

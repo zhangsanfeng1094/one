@@ -378,26 +378,56 @@ pub fn text_preview(s: &str, max_chars: usize) -> Option<String> {
 ///
 /// Shape:
 /// ```json
-/// {"role":"assistant","content":"...","tool_calls":[{"id":"...","name":"...","arguments":{}}]}
+/// {"role":"assistant","content":"...","thinking":"...","tool_calls":[{"id":"...","name":"...","arguments":{}}]}
 /// ```
+///
+/// `thinking` is omitted when empty. Prefer keeping tool_calls intact; truncate
+/// thinking then content when over budget.
 pub fn llm_output_preview(
     text: &str,
     tool_calls: &[crate::tool::ToolCall],
+    thinking: Option<&str>,
     max_chars: usize,
 ) -> Option<String> {
     if max_chars == 0 {
         return None;
     }
+    // Reserve headroom for envelope + tool_calls; thinking/content share the rest.
+    let overhead = 128usize
+        + tool_calls
+            .iter()
+            .map(|c| {
+                serde_json::to_string(&c.arguments)
+                    .map(|s| s.len().min(4_096) + 64)
+                    .unwrap_or(128)
+            })
+            .sum::<usize>();
+    let body_budget = max_chars.saturating_sub(overhead).max(64);
+    let thinking_trimmed = thinking
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (thinking_budget, content_budget) = if thinking_trimmed.is_some() {
+        // Cap thinking so a long chain-of-thought does not wipe the final answer.
+        let t_budget = (body_budget / 2).clamp(64, 4_096);
+        let c_budget = body_budget.saturating_sub(t_budget).max(64);
+        (t_budget, c_budget)
+    } else {
+        (0, body_budget)
+    };
     let content = if text.is_empty() {
         Value::Null
     } else {
-        // Leave room for tool_calls + envelope; content is the main truncation target.
-        let content_budget = max_chars.saturating_sub(128).max(64);
         Value::String(text_preview(text, content_budget).unwrap_or_default())
     };
     let mut msg = serde_json::Map::new();
     msg.insert("role".into(), Value::String("assistant".into()));
     msg.insert("content".into(), content);
+    if let Some(t) = thinking_trimmed {
+        msg.insert(
+            "thinking".into(),
+            Value::String(text_preview(t, thinking_budget).unwrap_or_default()),
+        );
+    }
     if !tool_calls.is_empty() {
         // Cap each arg blob so huge tool args don't blow the observation.
         let arg_budget = (max_chars / tool_calls.len().max(1)).clamp(256, 4_096);
@@ -554,8 +584,9 @@ fn message_to_trace_value(
 /// Generation input: actual messages sent to the model (OpenAI-style array).
 ///
 /// Always includes system + full conversation when budget allows. Large tool
-/// results are truncated first; if still over budget, oldest non-system
-/// messages are dropped from the front (keeping the latest context).
+/// results are truncated first; if still over budget, **oldest turns** are
+/// dropped from the front (user + following assistant/tool messages), keeping
+/// tool_call / tool_result pairing intact. Never drops a single orphan tool.
 ///
 /// Example shape:
 /// ```json
@@ -585,16 +616,16 @@ pub fn llm_input_preview(
         "content": system_content,
     });
 
-    // Build all messages, then drop oldest until under budget (keep system + tail).
-    let mut body: Vec<Value> = messages
-        .iter()
-        .map(|m| message_to_trace_value(m, tool_result_cap, arg_cap))
-        .collect();
-
+    // Drop whole turns from the front until under budget (keep system + tail).
+    let mut keep_from = 0usize;
     loop {
+        let body: Vec<Value> = messages[keep_from..]
+            .iter()
+            .map(|m| message_to_trace_value(m, tool_result_cap, arg_cap))
+            .collect();
         let mut payload = Vec::with_capacity(1 + body.len());
         payload.push(system_msg.clone());
-        payload.extend(body.iter().cloned());
+        payload.extend(body);
         let raw = match serde_json::to_string(&payload) {
             Ok(s) => s,
             Err(_) => return None,
@@ -602,13 +633,58 @@ pub fn llm_input_preview(
         if raw.chars().count() <= max_chars {
             return Some(raw);
         }
-        // Prefer dropping oldest conversation turns over aggressive global truncate.
-        if body.len() > 1 {
-            body.remove(0);
+        let next = skip_oldest_turn(messages, keep_from);
+        if next > keep_from && next < messages.len() {
+            keep_from = next;
             continue;
         }
-        // Single remaining message (or empty): hard-cap the JSON string.
+        // Only one turn left (or empty): hard-cap the JSON string.
         return text_preview(&raw, max_chars);
+    }
+}
+
+/// Advance `from` past the oldest conversation turn so input previews stay paired.
+///
+/// - Starts at `User` → skip until the next `User` (assistant + tool results in between).
+/// - Starts at `Assistant` → skip that assistant and following `ToolResult`s.
+/// - Starts at orphan `ToolResult`s → skip the consecutive tool block.
+fn skip_oldest_turn(messages: &[AgentMessage], from: usize) -> usize {
+    if from >= messages.len() {
+        return from;
+    }
+    match &messages[from] {
+        AgentMessage::User(_) => {
+            let mut i = from + 1;
+            while i < messages.len() {
+                if matches!(&messages[i], AgentMessage::User(_)) {
+                    break;
+                }
+                i += 1;
+            }
+            i
+        }
+        AgentMessage::Assistant(_) => {
+            let mut i = from + 1;
+            while i < messages.len() {
+                if matches!(&messages[i], AgentMessage::ToolResult(_)) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            i
+        }
+        AgentMessage::ToolResult(_) => {
+            let mut i = from + 1;
+            while i < messages.len() {
+                if matches!(&messages[i], AgentMessage::ToolResult(_)) {
+                    i += 1;
+                } else {
+                    break;
+                }
+            }
+            i
+        }
     }
 }
 
@@ -960,11 +1036,21 @@ mod tests {
 
     #[test]
     fn llm_output_preview_structured_text() {
-        let p = llm_output_preview("你好！有什么我可以帮你的吗？", &[], 240).unwrap();
+        let p = llm_output_preview("你好！有什么我可以帮你的吗？", &[], None, 240).unwrap();
         let v: Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["role"], "assistant");
         assert!(v["content"].as_str().unwrap().contains("你好"));
         assert!(v.get("tool_calls").is_none());
+        assert!(v.get("thinking").is_none());
+    }
+
+    #[test]
+    fn llm_output_preview_includes_thinking() {
+        let p = llm_output_preview("final answer", &[], Some("let me reason step by step"), 1024)
+            .unwrap();
+        let v: Value = serde_json::from_str(&p).unwrap();
+        assert_eq!(v["content"], "final answer");
+        assert_eq!(v["thinking"], "let me reason step by step");
     }
 
     #[test]
@@ -974,7 +1060,7 @@ mod tests {
             name: "bash".into(),
             arguments: json!({"command": "ls"}),
         }];
-        let p = llm_output_preview("", &calls, 1024).unwrap();
+        let p = llm_output_preview("", &calls, None, 1024).unwrap();
         let v: Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["role"], "assistant");
         assert!(v["content"].is_null());
@@ -990,7 +1076,7 @@ mod tests {
             name: "read".into(),
             arguments: json!({"path": "README.md"}),
         }];
-        let p = llm_output_preview("先看 README", &calls, 1024).unwrap();
+        let p = llm_output_preview("先看 README", &calls, None, 1024).unwrap();
         let v: Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["content"], "先看 README");
         assert_eq!(v["tool_calls"].as_array().unwrap().len(), 1);
@@ -1107,5 +1193,82 @@ mod tests {
         let p = llm_input_preview("sys", &messages, 8_192).unwrap();
         assert!(p.chars().count() <= 8_192);
         assert!(p.contains("tool_call_id"));
+    }
+
+    #[test]
+    fn llm_input_preview_drops_whole_turns_not_orphan_tools() {
+        use crate::message::{
+            AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
+            UserContent, UserMessage,
+        };
+        // Old turn with a big tool result + new short turn. Tight budget forces
+        // dropping the old turn; tool result must not outlive its assistant.
+        let huge = "Z".repeat(3_000);
+        let messages = vec![
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text("old question".into()),
+                timestamp: 0,
+            }),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![
+                    ContentBlock::Text {
+                        text: "looking".into(),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "old-call".into(),
+                        name: "read".into(),
+                        arguments: json!({"path": "big.txt"}),
+                    },
+                ],
+                provider: "mock".into(),
+                model: "m".into(),
+                stop_reason: StopReason::ToolUse,
+                citations: vec![],
+                timestamp: 1,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "old-call".into(),
+                tool_name: "read".into(),
+                content: vec![crate::message::TextOrImage::Text { text: huge }],
+                is_error: false,
+                timestamp: 2,
+            }),
+            AgentMessage::User(UserMessage {
+                content: UserContent::Text("new question".into()),
+                timestamp: 3,
+            }),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![ContentBlock::Text {
+                    text: "done".into(),
+                }],
+                provider: "mock".into(),
+                model: "m".into(),
+                stop_reason: StopReason::Stop,
+                citations: vec![],
+                timestamp: 4,
+            }),
+        ];
+        // Budget fits system + new turn, but not the old tool-heavy turn.
+        // tool_result_cap is at least 256, so old turn alone is hundreds of chars.
+        let p = llm_input_preview("sys", &messages, 500).unwrap();
+        let v: Value = serde_json::from_str(&p).unwrap();
+        let arr = v.as_array().expect("messages array");
+        assert_eq!(arr[0]["role"], "system");
+        let roles: Vec<&str> = arr
+            .iter()
+            .skip(1)
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        // No orphan tool at the head of the conversation body.
+        assert!(
+            roles.first() != Some(&"tool"),
+            "must not start body with orphan tool: {roles:?} payload={p}"
+        );
+        assert!(
+            !p.contains("old-call"),
+            "old turn should be dropped as a unit: {p}"
+        );
+        assert!(p.contains("new question"), "must keep latest user: {p}");
+        assert!(p.contains("done"), "must keep latest assistant: {p}");
     }
 }

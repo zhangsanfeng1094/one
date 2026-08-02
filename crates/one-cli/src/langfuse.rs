@@ -930,12 +930,16 @@ impl LangfuseTraceSink {
                     KeyValue::new("args_bytes", *args_bytes as i64),
                 ];
                 if let Some(p) = args_preview {
+                    // Prefer a parsed object so Langfuse UI can expand fields;
+                    // fall back to the raw preview string when truncated / invalid.
+                    let arguments = serde_json::from_str::<serde_json::Value>(p)
+                        .unwrap_or_else(|_| serde_json::Value::String(p.clone()));
                     attrs.push(KeyValue::new(
                         "langfuse.observation.input",
                         json!({
                             "tool_call_id": call_id,
                             "name": name,
-                            "arguments": p,
+                            "arguments": arguments,
                             "args_bytes": args_bytes,
                         })
                         .to_string(),
