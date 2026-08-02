@@ -70,9 +70,9 @@ impl Tool for ReadTool {
             name: "read".to_string(),
             description: format!(
                 "Read a file from the filesystem (Claude Code Read-compatible). Always pass \
-                 `path` (or `file_path`). Text files return numbered lines; image files \
-                 (png/jpeg/gif/webp/bmp) return image content for vision models. Text output is \
-                 capped (~2000 lines / 50KB from the requested window; use offset/limit for slices). \
+                 `path` (or `file_path`). Text files return clean content (no line-number prefixes); \
+                 image files (png/jpeg/gif/webp/bmp) return image content for vision models. \
+                 Text output is capped (~2000 lines / 50KB from the requested window; use offset/limit for slices). \
                  Allowed: {scope}."
             ),
             parameters: json!({
@@ -157,15 +157,16 @@ impl Tool for ReadTool {
         let end = (start + max_window).min(lines.len());
         let slice = &lines[start..end];
 
-        let numbered = slice
-            .iter()
-            .enumerate()
-            .map(|(index, line)| format!("{}|{}", start + index + 1, line))
-            .collect::<Vec<_>>()
-            .join("\n");
+        // Clean output: no line-number prefixes (much cleaner for model + user)
+        // Numbering is still available in ToolOutput.details if needed.
+        let text = if slice.is_empty() {
+            String::new()
+        } else {
+            slice.join("\n")
+        };
 
         // Cap by lines/bytes; Claude-style PARTIAL view tells model how to continue.
-        let presented = crate::truncate::present_file_read(&numbered, lines.len(), offset);
+        let presented = crate::truncate::present_file_read(&text, lines.len(), offset);
         // Also note when the file continues past this window even if bytes fit.
         let mut text = presented.text;
         let more_in_file = end < lines.len();
@@ -289,7 +290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reads_text_with_line_numbers() {
+    async fn reads_text_cleanly() {
         let dir = tempfile_dir();
         let path = dir.join("a.txt");
         std::fs::write(&path, "hello\nworld\n").unwrap();
@@ -305,9 +306,35 @@ mod tests {
             .unwrap();
 
         let text = out.as_text();
-        assert!(text.contains("1|hello"), "{text}");
-        assert!(text.contains("2|world"), "{text}");
+        assert!(text.contains("hello"), "{text}");
+        assert!(text.contains("world"), "{text}");
         assert!(!out.has_images());
+    }
+
+    #[tokio::test]
+    async fn reads_text_without_line_numbers() {
+        let dir = tempfile_dir();
+        let path = dir.join("wide.txt");
+        // 12 lines → should output clean content (no prefixes).
+        let body: String = (1..=12).map(|i| format!("L{i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": "wide.txt" }),
+            })
+            .await
+            .unwrap();
+
+        let text = out.as_text();
+        assert!(
+            text.contains("L1") && text.contains("L9") && text.contains("L10"),
+            "should contain clean content without prefixes, got:\n{text}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

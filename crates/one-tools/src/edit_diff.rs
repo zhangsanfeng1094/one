@@ -2,7 +2,7 @@
 //!
 //! Pipeline:
 //! 1. Normalize line endings to LF for matching; restore original ending on write.
-//! 2. Strip read-tool line-number prefixes from old_string when present (`12|…`).
+//! 2. Strip read-tool line-number prefixes from old_string when present (`12|…` / `  9|…`).
 //! 3. Strategy waterfall (OpenCode-inspired): exact → trailing/unicode fuzzy →
 //!    line-trim → whitespace-normalize → indent-flexible → block-anchor.
 //! 4. Emit a real line-oriented unified diff of before/after content.
@@ -562,6 +562,10 @@ pub fn strip_line_number_prefixes(text: &str) -> String {
 fn strip_one_line_prefix(line: &str) -> Option<&str> {
     let bytes = line.as_bytes();
     let mut i = 0;
+    // Read tool right-pads with spaces (`  9|…` / ` 10|…`); tolerate that.
+    while i < bytes.len() && bytes[i] == b' ' {
+        i += 1;
+    }
     if i >= bytes.len() || !bytes[i].is_ascii_digit() {
         return None;
     }
@@ -1306,6 +1310,11 @@ mod tests {
         assert_eq!(
             strip_line_number_prefixes("10|fn main() {\n11|    ok\n12|}"),
             "fn main() {\n    ok\n}"
+        );
+        // Padded read-tool gutters (`  9|` / ` 10|`) still strip cleanly.
+        assert_eq!(
+            strip_line_number_prefixes("  9|alpha\n 10|beta"),
+            "alpha\nbeta"
         );
         // Not numbered → unchanged
         assert_eq!(strip_line_number_prefixes("fn main() {}"), "fn main() {}");
