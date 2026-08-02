@@ -47,7 +47,9 @@ impl Tool for ReadTool {
                 self.policy.cwd().display()
             )
         };
-        let mut properties = path_properties("File path (Claude Code alias: `file_path`)");
+        let mut properties = path_properties(
+            "Required file path. Prefer `path`; Claude `file_path` and OpenCode `filePath` are accepted.",
+        );
         if let Some(obj) = properties.as_object_mut() {
             obj.insert(
                 "offset".into(),
@@ -67,22 +69,28 @@ impl Tool for ReadTool {
         ToolDefinition {
             name: "read".to_string(),
             description: format!(
-                "Read a file from the filesystem (Claude Code Read-compatible). Text files return numbered lines; \
-                 image files (png/jpeg/gif/webp/bmp) return image content for vision models. \
-                 Text output is capped (~2000 lines / 50KB from the requested window; use offset/limit for slices). \
+                "Read a file from the filesystem (Claude Code Read-compatible). Always pass \
+                 `path` (or `file_path`). Text files return numbered lines; image files \
+                 (png/jpeg/gif/webp/bmp) return image content for vision models. Text output is \
+                 capped (~2000 lines / 50KB from the requested window; use offset/limit for slices). \
                  Allowed: {scope}."
             ),
             parameters: json!({
                 "type": "object",
                 "properties": properties,
-                "required": []
+                "required": ["path"]
             }),
         }
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = path_arg(&call.arguments)
-            .ok_or_else(|| invalid_args("read", "missing `path` or `file_path`"))?;
+        let path = path_arg(&call.arguments).ok_or_else(|| {
+            invalid_args(
+                "read",
+                "missing `path` (or Claude `file_path` / OpenCode `filePath`). \
+                 Every read call must include the file path.",
+            )
+        })?;
 
         let resolved = self
             .policy

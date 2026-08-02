@@ -33,8 +33,10 @@ impl Tool for WriteTool {
                 self.policy.cwd().display()
             )
         };
-        let mut properties =
-            path_properties("File path to create or overwrite (Claude Code alias: `file_path`)");
+        let mut properties = path_properties(
+            "Required path to create or overwrite. Prefer `path`; Claude `file_path` and \
+             OpenCode `filePath` are accepted.",
+        );
         if let Some(obj) = properties.as_object_mut() {
             obj.insert(
                 "content".into(),
@@ -48,21 +50,26 @@ impl Tool for WriteTool {
             name: "write".to_string(),
             description: format!(
                 "Create a new file or intentionally overwrite an entire file with `content` \
-                 (Claude Code Write-compatible). Prefer `edit` for small/localized changes — \
-                 do not rewrite a whole file when a unique string replace would suffice. \
-                 Allowed: {scope}."
+                 (Claude Code Write-compatible). Always pass `path` (or `file_path`). Prefer \
+                 `edit` for small/localized changes — do not rewrite a whole file when a unique \
+                 string replace would suffice. Allowed: {scope}."
             ),
             parameters: json!({
                 "type": "object",
                 "properties": properties,
-                "required": ["content"]
+                "required": ["path", "content"]
             }),
         }
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = path_arg(&call.arguments)
-            .ok_or_else(|| invalid_args("write", "missing `path` or `file_path`"))?;
+        let path = path_arg(&call.arguments).ok_or_else(|| {
+            invalid_args(
+                "write",
+                "missing `path` (or Claude `file_path` / OpenCode `filePath`). \
+                 Every write call must include the file path.",
+            )
+        })?;
         let content = call
             .arguments
             .get("content")

@@ -33,12 +33,12 @@ Tool choice (prefer specialized tools over bash — Claude Code style):
 - Never use bash echo (or similar) to talk to the user; reply in normal assistant text.
 - Do not assume host extras exist (`rg`, `tree`, `eza`, `fd`, …). The `grep` tool is built in (in-process, no host `rg` required) — prefer it over shell `rg`/`grep`.
 - You may request multiple independent tool calls in one turn; read-only tools (read/grep/find/ls/…) may run concurrently, while write/edit/bash and similar run serially.
-- Path args accept `path` or Claude-style `file_path` (also OpenCode `filePath`).
+- Path args: always pass `path` (required). Claude-style `file_path` and OpenCode `filePath` are accepted as aliases. When batching several `edit`/`write`/`read` calls, repeat the path on every call — siblings do not inherit it.
 - Prefer built-in tool names (`read`/`edit`/`write`/`bash`/`grep`/`find`/`ls`); common aliases like `read_file`/`search_replace` are mapped automatically.
 
 File changes:
-- Prefer `edit` for localized fixes. By default `old_string` must uniquely match once; set `replace_all=true` to replace every occurrence (e.g. renames).
-- Use `write` only for new files or intentional full-file rewrites — do not rewrite an entire file when a small edit would do.
+- Prefer `edit` for localized fixes. Every `edit` must include `path` + `old_string` + `new_string`. By default `old_string` must uniquely match once; set `replace_all=true` to replace every occurrence (e.g. renames).
+- Use `write` only for new files or intentional full-file rewrites — do not rewrite an entire file when a unique string replace would do. Always include `path`.
 - Read a file before editing it when you need its current contents.
 
 Search:

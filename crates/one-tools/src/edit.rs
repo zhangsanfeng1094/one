@@ -56,8 +56,12 @@ impl Tool for EditTool {
                 self.policy.cwd().display()
             )
         };
-        let mut properties =
-            path_properties("Existing file path (aliases: `file_path`, `filePath`)");
+        // Canonical required key is `path` (Grok Build requires path on every edit call).
+        // Runtime still accepts Claude `file_path` / OpenCode `filePath` via path_arg.
+        let mut properties = path_properties(
+            "Required path of the existing file to edit. Prefer `path`; Claude `file_path` and \
+             OpenCode `filePath` are accepted. Repeat on every edit call — batch siblings do not inherit path.",
+        );
         if let Some(obj) = properties.as_object_mut() {
             obj.insert(
                 "old_string".into(),
@@ -85,24 +89,31 @@ impl Tool for EditTool {
             name: "edit".to_string(),
             description: format!(
                 "Surgical in-place edit (Claude / OpenCode / Pi compatible): replace `old_string` \
-                 with `new_string` in an existing file. Prefer this over `write` for bugfixes and \
-                 localized changes. Matching: exact first, then fuzzy (trailing whitespace, smart \
-                 quotes/dashes). By default the match must be unique (fails if 0 or >1); set \
-                 `replace_all=true` to change every occurrence (e.g. rename). Include enough \
-                 surrounding context when not using replace_all. Read the file before editing when \
-                 you need current contents. Allowed: {scope}."
+                 with `new_string` in an existing file. Always pass `path` (or `file_path`) on \
+                 every call — never omit it when batching multiple edits. Prefer this over `write` \
+                 for bugfixes and localized changes. Matching: exact first, then fuzzy (trailing \
+                 whitespace, smart quotes/dashes). By default the match must be unique (fails if \
+                 0 or >1); set `replace_all=true` to change every occurrence (e.g. rename). Include \
+                 enough surrounding context when not using replace_all. Read the file before \
+                 editing when you need current contents. Allowed: {scope}."
             ),
             parameters: json!({
                 "type": "object",
                 "properties": properties,
-                "required": ["old_string", "new_string"]
+                "required": ["path", "old_string", "new_string"]
             }),
         }
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = path_arg(&call.arguments)
-            .ok_or_else(|| invalid_args("edit", "missing `path` / `file_path` / `filePath`"))?;
+        let path = path_arg(&call.arguments).ok_or_else(|| {
+            invalid_args(
+                "edit",
+                "missing `path` (or Claude `file_path` / OpenCode `filePath`). \
+                 Every edit call must include the file path — sibling tool calls in the same turn \
+                 do not share path; repeat it on each edit.",
+            )
+        })?;
         let old_string = old_string_arg(&call.arguments).ok_or_else(|| {
             invalid_args("edit", "missing `old_string` / `oldString` / `oldText`")
         })?;
@@ -197,6 +208,46 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn definition_requires_path() {
+        let tool = EditTool::new(temp_dir());
+        let def = tool.definition();
+        let required = def.parameters["required"]
+            .as_array()
+            .expect("required array");
+        let names: Vec<&str> = required.iter().filter_map(|v| v.as_str()).collect();
+        assert!(
+            names.contains(&"path"),
+            "path must be required so models include it on every call: {names:?}"
+        );
+        assert!(names.contains(&"old_string"));
+        assert!(names.contains(&"new_string"));
+    }
+
+    #[tokio::test]
+    async fn missing_path_error_mentions_batch_siblings() {
+        let dir = temp_dir();
+        let tool = EditTool::new(dir.clone());
+        let err = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "old_string": "a",
+                    "new_string": "b"
+                }),
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("path"), "{msg}");
+        assert!(
+            msg.contains("sibling") || msg.contains("Every edit"),
+            "{msg}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

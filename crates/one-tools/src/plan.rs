@@ -166,7 +166,10 @@ impl Tool for PlanEditTool {
             parameters: json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
+                    "path": {
+                        "type": "string",
+                        "description": "Required plan file path (aliases: file_path, filePath)"
+                    },
                     "file_path": { "type": "string" },
                     "filePath": { "type": "string" },
                     "old_string": { "type": "string" },
@@ -176,7 +179,7 @@ impl Tool for PlanEditTool {
                     "replace_all": { "type": "boolean" },
                     "replaceAll": { "type": "boolean" }
                 },
-                "required": ["old_string", "new_string"]
+                "required": ["path", "old_string", "new_string"]
             }),
         }
     }
@@ -188,8 +191,13 @@ impl Tool for PlanEditTool {
         };
         use crate::tool_args::{bool_arg_names, new_string_arg, old_string_arg, path_arg};
 
-        let path = path_arg(&call.arguments)
-            .ok_or_else(|| invalid_args("edit", "missing `path` / `file_path` / `filePath`"))?;
+        let path = path_arg(&call.arguments).ok_or_else(|| {
+            invalid_args(
+                "edit",
+                "missing `path` (or `file_path` / `filePath`). \
+                 Every edit call must include the plan file path.",
+            )
+        })?;
         let old_string = old_string_arg(&call.arguments).ok_or_else(|| {
             invalid_args("edit", "missing `old_string` / `oldString` / `oldText`")
         })?;

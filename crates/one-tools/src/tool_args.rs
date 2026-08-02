@@ -44,7 +44,11 @@ pub fn new_string_arg(args: &Value) -> Option<&str> {
     string_arg(args, &["new_string", "newString", "newText"])
 }
 
-/// JSON Schema fragment: `path` + Claude / OpenCode aliases.
+/// JSON Schema fragment: canonical `path` + Claude / OpenCode aliases.
+///
+/// Callers should list `"path"` in the tool's `required` array so models always
+/// emit a path (Grok Build / Claude-style). Runtime still accepts `file_path` /
+/// `filePath` via [`path_arg`] when a model uses those aliases instead of `path`.
 pub fn path_properties(path_description: &str) -> Value {
     serde_json::json!({
         "path": {
@@ -53,11 +57,11 @@ pub fn path_properties(path_description: &str) -> Value {
         },
         "file_path": {
             "type": "string",
-            "description": "Alias for `path` (Claude Code compatibility)"
+            "description": "Alias for `path` (Claude Code). Prefer `path` when possible."
         },
         "filePath": {
             "type": "string",
-            "description": "Alias for `path` (OpenCode compatibility)"
+            "description": "Alias for `path` (OpenCode). Prefer `path` when possible."
         }
     })
 }
