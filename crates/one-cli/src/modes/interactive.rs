@@ -1766,6 +1766,8 @@ async fn run_turn_streaming(
         .await;
 
     let mut before = agent.lock().await.messages.len();
+    runtime.begin_run_meta();
+    let usage_before = agent.lock().await.token_usage;
     let steering = runtime.steering_queue();
     let followup = runtime.followup_queue();
 
@@ -1788,7 +1790,7 @@ async fn run_turn_streaming(
         .run_busy(
             app,
             |app| {
-                drain_events(app, &events);
+                drain_events(app, &events, Some(runtime));
                 drain_hitl(app, &gate, &hitl);
                 refresh_mcp_chip(app, runtime);
                 refresh_bg_chip(app, runtime);
@@ -1874,7 +1876,7 @@ async fn run_turn_streaming(
                 .run_busy(
                     app,
                     |app| {
-                        drain_events(app, &events2);
+                        drain_events(app, &events2, Some(runtime));
                         drain_hitl(app, &gate2, &hitl2);
                         if app.take_abort() {
                             cancel_hitl(app, &gate2, &hitl2);
@@ -1908,6 +1910,7 @@ async fn run_turn_streaming(
     if let Err(e) = runtime.persist_extension_state().await {
         tracing::warn!(error = %e, "failed to persist extension state after turn");
     }
+    runtime.persist_run_meta(usage_before, before).await;
 
     let sources = {
         let guard = agent.lock().await;
@@ -1991,7 +1994,11 @@ fn tool_output_for_ui(output: &one_core::tool::ToolOutput) -> String {
     summary
 }
 
-fn drain_events(app: &mut App, events: &Arc<Mutex<Vec<AgentEvent>>>) {
+fn drain_events(
+    app: &mut App,
+    events: &Arc<Mutex<Vec<AgentEvent>>>,
+    mut runtime: Option<&mut AppRuntime>,
+) {
     let mut batch = events.lock().expect("events lock");
     for event in batch.drain(..) {
         match event {
@@ -2031,6 +2038,9 @@ fn drain_events(app: &mut App, events: &Arc<Mutex<Vec<AgentEvent>>>) {
                     other => other.to_string(),
                 };
                 app.push_tool_call(&tool_call.name, args);
+                if let Some(rt) = runtime.as_deref_mut() {
+                    rt.note_tool_start(&tool_call.id, &tool_call.name);
+                }
             }
             AgentEvent::ToolExecutionEnd {
                 is_error,
@@ -2046,6 +2056,9 @@ fn drain_events(app: &mut App, events: &Arc<Mutex<Vec<AgentEvent>>>) {
                     is_error,
                     if text.is_empty() { None } else { Some(text) },
                 );
+                if let Some(rt) = runtime.as_deref_mut() {
+                    rt.note_tool_end(&tool_call.id, &tool_call.name, is_error);
+                }
             }
             _ => {}
         }
@@ -2855,6 +2868,8 @@ async fn resolve_resume_target(
             name: None,
             preview: None,
             modified: chrono::Utc::now(),
+            usage_total: None,
+            model: None,
         }));
     }
 
@@ -2955,6 +2970,7 @@ async fn apply_rewind(
         .ok_or_else(|| format!("rewind: entry not a user prompt: {entry_id}"))?;
 
     session.rewind_before(entry_id)?;
+    let _ = session.write_summary();
 
     {
         let mut agent = runtime.agent.lock().await;
@@ -3304,7 +3320,7 @@ mod server_search_tests {
             },
         ]));
         let mut app = App::new("test");
-        drain_events(&mut app, &events);
+        drain_events(&mut app, &events, None);
         let tool = app
             .messages
             .iter()

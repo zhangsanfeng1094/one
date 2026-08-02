@@ -1,5 +1,6 @@
 //! Cold-start assembly of [`super::AppRuntime`].
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use one_core::agent::{Agent, AgentConfig, ThinkingLevel};
@@ -373,12 +374,19 @@ impl AppRuntime {
                     agent.config.thinking_level = tl;
                 }
             }
+            // Restore cumulative usage for UI (does not re-enter LLM context).
+            if let Some(total) = session.latest_usage_total() {
+                if agent.token_usage.is_zero() {
+                    agent.token_usage = total;
+                }
+            }
             load_extension_state(extensions.as_ref(), session);
             // Group multi-turn runs under one Langfuse session.
             agent.set_trace_session_id(Some(session.header().id.clone()));
         }
         if let (Some(session), Some(name)) = (&mut session, &cli.name) {
             session.append_session_info(name).await?;
+            let _ = session.write_summary();
         }
 
         let steering_queue = agent.steering_queue_handle();
@@ -427,10 +435,15 @@ impl AppRuntime {
             no_subagent_process,
             no_memory_process,
             hosted_search_capable: false,
+            prompt_index: 0,
+            tool_audit: Vec::new(),
+            tool_starts: HashMap::new(),
         };
 
         // Seed session id for task parent metadata.
         runtime.sync_task_session().await;
+        // Audit system prompt once for new/resumed sessions (Custom, not LLM context).
+        runtime.maybe_persist_prompt_snapshot("boot").await;
         // MCP/extension tools for child harness (tools.mcp / allow MCP names).
         runtime.refresh_task_dynamic_tools().await;
         // Materialize Act tools from main AgentSpec.tools (not a fixed coding bag).

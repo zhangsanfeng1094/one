@@ -97,6 +97,7 @@ impl AppRuntime {
                 self.apply_act_tools_and_prompt().await?;
             }
         }
+        self.maybe_persist_prompt_snapshot("reload").await;
         Ok(self.extensions.names())
     }
 
@@ -122,6 +123,7 @@ impl AppRuntime {
                 agent.config.system_prompt = self.base_system_prompt.clone();
             }
         }
+        self.maybe_persist_prompt_snapshot("skills_config").await;
         Ok(())
     }
 

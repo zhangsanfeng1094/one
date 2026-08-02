@@ -28,12 +28,14 @@ mod prompt_compose;
 pub mod provider_limit;
 mod reload;
 mod session;
+mod session_meta;
 mod subscribe;
 pub mod task_tool;
 pub mod tool_materialize;
 mod tools;
 pub mod worktree;
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -42,7 +44,7 @@ use one_core::agent::{Agent, LlmProvider};
 use one_ext::ExtensionRuntime;
 use one_mcp::McpManager;
 use one_resources::ResourceLoader;
-use one_session::SessionManager;
+use one_session::{SessionManager, ToolAuditItem};
 use one_tools::{
     AskUserHandler, BackgroundTaskRegistry, PathPolicy, PlanExitState, TodoListState,
 };
@@ -119,6 +121,12 @@ pub struct AppRuntime {
     /// (`provider.server_tools()` non-empty). Combined with feature
     /// `server_search` → request inject only (not response handling).
     hosted_search_capable: bool,
+    /// Monotonic user-prompt index for `one.usage` / `one.tool_audit` rows.
+    prompt_index: u64,
+    /// In-run tool lifecycle buffer (flushed after each prompt; not LLM context).
+    tool_audit: Vec<ToolAuditItem>,
+    /// tool_call_id → (name, started_at_ms) for duration calculation.
+    tool_starts: HashMap<String, (String, u64)>,
 }
 
 impl AppRuntime {

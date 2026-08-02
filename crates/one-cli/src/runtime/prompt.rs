@@ -48,6 +48,11 @@ impl AppRuntime {
             let agent = self.agent.lock().await;
             agent.messages.len()
         };
+        self.begin_run_meta();
+        let usage_before = {
+            let agent = self.agent.lock().await;
+            agent.token_usage
+        };
 
         let result: Result<String, Box<dyn std::error::Error>> = async {
             match {
@@ -93,6 +98,8 @@ impl AppRuntime {
         if let Err(e) = self.persist_extension_state().await {
             tracing::warn!(error = %e, "failed to persist extension state after prompt");
         }
+        // Usage / tool audit / summary sidecar (never enters LLM context).
+        self.persist_run_meta(usage_before, before).await;
 
         result
     }

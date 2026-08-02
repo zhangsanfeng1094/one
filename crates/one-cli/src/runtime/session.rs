@@ -54,6 +54,11 @@ impl AppRuntime {
         if switching {
             self.extensions.notify_session_start().await;
         }
+        self.prompt_index = 0;
+        self.tool_audit.clear();
+        self.tool_starts.clear();
+        self.maybe_persist_prompt_snapshot("new").await;
+        self.refresh_session_summary();
         Ok(())
     }
 
@@ -78,6 +83,12 @@ impl AppRuntime {
                 }
             }
             agent.set_trace_session_id(Some(session.header().id.clone()));
+            // Restore cumulative usage for UI after resume.
+            if let Some(total) = session.latest_usage_total() {
+                if agent.token_usage.is_zero() {
+                    agent.token_usage = total;
+                }
+            }
         }
         load_extension_state(self.extensions.as_ref(), &session);
         self.session = Some(session);
@@ -101,6 +112,18 @@ impl AppRuntime {
                 }
             }
         }
+        self.tool_audit.clear();
+        self.tool_starts.clear();
+        // prompt_index continues from latest usage row when present.
+        if let Some(session) = &self.session {
+            if let Some(meta) = session.latest_usage_meta() {
+                if let Some(idx) = meta.prompt_index {
+                    self.prompt_index = idx.saturating_add(1);
+                }
+            }
+        }
+        self.maybe_persist_prompt_snapshot("resume").await;
+        self.refresh_session_summary();
         Ok(())
     }
 
@@ -111,6 +134,7 @@ impl AppRuntime {
     pub async fn set_session_name(&mut self, name: &str) -> Result<(), Box<dyn std::error::Error>> {
         if let Some(session) = &mut self.session {
             session.append_session_info(name).await?;
+            let _ = session.write_summary();
         }
         Ok(())
     }
@@ -125,6 +149,7 @@ impl AppRuntime {
         }
         if let Some(session) = &mut self.session {
             session.append_thinking_level_change(level.as_str()).await?;
+            let _ = session.write_summary();
         }
         Ok(())
     }
