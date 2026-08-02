@@ -6,12 +6,19 @@ use one_core::message::AgentMessage;
 use tokio::fs::{self, OpenOptions};
 use tokio::io::AsyncWriteExt;
 
+use one_core::TokenUsage;
+
 use crate::context::{
     build_context_entries, build_session_context, first_kept_entry_id, SessionContext,
 };
 use crate::entries::{new_entry_base, new_session_header, SessionEntry, SessionHeader};
 use crate::error::{Result, SessionError};
+use crate::meta::{
+    PromptSnapshotMeta, ToolAuditMeta, UsageFields, UsageMeta, CUSTOM_PROMPT_SNAPSHOT,
+    CUSTOM_TOOL_AUDIT, CUSTOM_USAGE, PROMPT_INLINE_MAX_BYTES,
+};
 use crate::paths::session_dir_for_cwd;
+use crate::summary::{load_summary, system_prompt_path_for, write_summary_file, SessionSummary};
 
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -23,6 +30,10 @@ pub struct SessionInfo {
     /// First user message preview (Codex-style fallback when `name` is unset).
     pub preview: Option<String>,
     pub modified: chrono::DateTime<Utc>,
+    /// Latest cumulative usage when known (from summary sidecar or scan).
+    pub usage_total: Option<UsageFields>,
+    /// Last known model id for list UX.
+    pub model: Option<String>,
 }
 
 impl SessionInfo {
@@ -425,6 +436,200 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Persist per-run token usage as `one.usage` Custom (not LLM context).
+    pub async fn append_usage(&mut self, meta: &UsageMeta) -> Result<String> {
+        self.append_custom(CUSTOM_USAGE, meta.to_value()).await
+    }
+
+    /// Persist a system-prompt audit snapshot as `one.prompt_snapshot` Custom.
+    ///
+    /// Large prompts spill to `{session}.system_prompt.txt` when a session file
+    /// path is known; the Custom entry keeps hash + path only.
+    pub async fn append_prompt_snapshot(&mut self, mut meta: PromptSnapshotMeta) -> Result<String> {
+        if let Some(text) = meta.text.take() {
+            meta.byte_len = text.len();
+            if meta.hash.is_empty() {
+                meta.hash = crate::meta::prompt_hash(&text);
+            }
+            if text.len() > PROMPT_INLINE_MAX_BYTES {
+                if let Some(file) = &self.file {
+                    let spill = system_prompt_path_for(file);
+                    match tokio::fs::write(&spill, text.as_bytes()).await {
+                        Ok(()) => {
+                            meta.path = Some(spill.display().to_string());
+                        }
+                        Err(_) => {
+                            // Fall back to inline if spill fails and still under 2× limit.
+                            if text.len() <= PROMPT_INLINE_MAX_BYTES * 2 {
+                                meta.text = Some(text);
+                            }
+                        }
+                    }
+                } else {
+                    // In-memory session: keep a truncated inline copy for tests.
+                    let truncated: String = text.chars().take(PROMPT_INLINE_MAX_BYTES).collect();
+                    meta.text = Some(truncated);
+                }
+            } else {
+                meta.text = Some(text);
+            }
+        }
+        self.append_custom(CUSTOM_PROMPT_SNAPSHOT, meta.to_value())
+            .await
+    }
+
+    /// Persist batched tool lifecycle for one prompt run (`one.tool_audit`).
+    pub async fn append_tool_audit(&mut self, meta: &ToolAuditMeta) -> Result<String> {
+        if meta.tools.is_empty() {
+            return Ok(String::new());
+        }
+        self.append_custom(CUSTOM_TOOL_AUDIT, meta.to_value()).await
+    }
+
+    /// Latest absolute usage total from `one.usage` on the active leaf path.
+    pub fn latest_usage_total(&self) -> Option<TokenUsage> {
+        self.latest_usage_meta().map(|m| m.total.into())
+    }
+
+    /// Latest `one.usage` meta on the active leaf path (newest wins).
+    pub fn latest_usage_meta(&self) -> Option<UsageMeta> {
+        for entry in self.active_path_entries().into_iter().rev() {
+            if let SessionEntry::Custom {
+                custom_type, data, ..
+            } = entry
+            {
+                if custom_type == CUSTOM_USAGE {
+                    return UsageMeta::from_value(data);
+                }
+            }
+        }
+        None
+    }
+
+    /// Latest system prompt hash recorded on the active path.
+    pub fn latest_prompt_hash(&self) -> Option<String> {
+        for entry in self.active_path_entries().into_iter().rev() {
+            if let SessionEntry::Custom {
+                custom_type, data, ..
+            } = entry
+            {
+                if custom_type == CUSTOM_PROMPT_SNAPSHOT {
+                    return PromptSnapshotMeta::from_value(data).map(|m| m.hash);
+                }
+            }
+        }
+        None
+    }
+
+    /// Rebuild and write `{session}.summary.json` (best-effort no-op without a file).
+    pub fn write_summary(&self) -> Result<()> {
+        let Some(file) = &self.file else {
+            return Ok(());
+        };
+        let summary = self.build_summary();
+        write_summary_file(file, &summary).map_err(SessionError::Io)?;
+        Ok(())
+    }
+
+    /// Derived summary for list / resume UX (does not touch disk).
+    pub fn build_summary(&self) -> SessionSummary {
+        let ctx = self.build_session_context();
+        let mut summary = SessionSummary {
+            schema: crate::summary::SUMMARY_SCHEMA,
+            id: self.header.id.clone(),
+            cwd: self.header.cwd.clone(),
+            path: self.file.as_ref().map(|p| p.display().to_string()),
+            created_at: Some(self.header.timestamp),
+            updated_at: Utc::now(),
+            name: self.session_name(),
+            preview: self.first_user_preview(),
+            leaf_id: self.leaf_id.clone(),
+            entry_count: self.entries.len(),
+            message_count: ctx.messages.len(),
+            model: ctx.model_id.clone(),
+            provider: ctx.provider.clone(),
+            usage_total: None,
+            last_usage: None,
+            tool_call_count: 0,
+            tools_used: Vec::new(),
+            system_prompt_hash: self.latest_prompt_hash(),
+            prompt_index: None,
+        };
+
+        if let Some(usage) = self.latest_usage_meta() {
+            summary.usage_total = Some(usage.total);
+            summary.last_usage = Some(usage.delta);
+            summary.prompt_index = usage.prompt_index;
+            if summary.model.is_none() {
+                summary.model = usage.model;
+            }
+            if summary.provider.is_none() {
+                summary.provider = usage.provider;
+            }
+        }
+
+        // Prefer `one.tool_audit` on the path; fall back to counting toolResult messages.
+        let path = self.active_path_entries();
+        let mut tools_used: Vec<String> = Vec::new();
+        let mut tool_call_count = 0u64;
+        let mut saw_audit = false;
+        for entry in &path {
+            if let SessionEntry::Custom {
+                custom_type, data, ..
+            } = entry
+            {
+                if *custom_type == CUSTOM_TOOL_AUDIT {
+                    if let Some(audit) = ToolAuditMeta::from_value(data) {
+                        saw_audit = true;
+                        for t in audit.tools {
+                            tool_call_count += 1;
+                            if !tools_used.iter().any(|n| n == &t.name) {
+                                tools_used.push(t.name);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if !saw_audit {
+            for entry in &path {
+                if let SessionEntry::Message {
+                    message: AgentMessage::ToolResult(tr),
+                    ..
+                } = entry
+                {
+                    tool_call_count = tool_call_count.saturating_add(1);
+                    if !tools_used.iter().any(|n| n == &tr.tool_name) {
+                        tools_used.push(tr.tool_name.clone());
+                    }
+                }
+            }
+        }
+        summary.tool_call_count = tool_call_count;
+        summary.tools_used = tools_used;
+        summary
+    }
+
+    /// Entries from root → leaf on the active branch.
+    fn active_path_entries(&self) -> Vec<&SessionEntry> {
+        let Some(leaf) = self.leaf_id.as_deref() else {
+            return Vec::new();
+        };
+        let index: std::collections::HashMap<&str, &SessionEntry> =
+            self.entries.iter().map(|e| (e.id(), e)).collect();
+        let mut path = Vec::new();
+        let mut cur = Some(leaf);
+        while let Some(id) = cur {
+            let Some(entry) = index.get(id) else {
+                break;
+            };
+            path.push(*entry);
+            cur = entry.parent_id();
+        }
+        path.reverse();
+        path
+    }
+
     /// Message count on the active branch (for `/session` UX).
     pub fn message_count(&self) -> usize {
         self.build_session_context().messages.len()
@@ -534,7 +739,23 @@ fn list_sessions_sync(cwd: &Path) -> Vec<SessionInfo> {
 
 /// Prefix-scan a session JSONL for list metadata only — never materializes full
 /// `SessionEntry` trees or multi-MB tool payloads into the agent message model.
+///
+/// Prefers a valid `*.summary.json` sidecar when present (fast path); falls back
+/// to the JSONL prefix scan so old sessions keep working.
 fn scan_session_list_info(path: &Path, fs_modified: chrono::DateTime<Utc>) -> Option<SessionInfo> {
+    if let Some(summary) = load_summary(path) {
+        return Some(SessionInfo {
+            path: path.to_path_buf(),
+            id: summary.id,
+            cwd: summary.cwd,
+            name: summary.name,
+            preview: summary.preview,
+            modified: summary.updated_at.max(fs_modified),
+            usage_total: summary.usage_total,
+            model: summary.model,
+        });
+    }
+
     let file = std::fs::File::open(path).ok()?;
     let mut limited = file.take(LIST_SCAN_MAX_BYTES);
     let mut content = String::new();
@@ -617,6 +838,8 @@ fn scan_session_list_info(path: &Path, fs_modified: chrono::DateTime<Utc>) -> Op
         name,
         preview,
         modified: fs_modified,
+        usage_total: None,
+        model: None,
     })
 }
 
@@ -701,6 +924,7 @@ pub(crate) fn rehydrate_image_placeholders(
 mod tests {
     use super::*;
     use crate::entries::{new_entry_base, new_session_header, SessionEntry};
+    use crate::summary::summary_path_for;
     use one_core::message::AgentMessage;
 
     #[test]
@@ -712,6 +936,8 @@ mod tests {
             name: Some("  my task  ".into()),
             preview: Some("first prompt".into()),
             modified: Utc::now(),
+            usage_total: None,
+            model: None,
         };
         assert_eq!(info.display_label(), "my task");
 
@@ -820,6 +1046,96 @@ mod tests {
         sm.leaf_id = Some(base.id);
 
         assert_eq!(sm.first_user_preview().as_deref(), Some("hello"));
+    }
+
+    #[tokio::test]
+    async fn usage_custom_does_not_enter_llm_context() {
+        let mut sm = SessionManager::in_memory("/tmp/meta");
+        sm.append_message(AgentMessage::user_text("hi")).await.unwrap();
+        let usage = UsageMeta::new(
+            TokenUsage {
+                input_tokens: 11,
+                output_tokens: 3,
+                ..Default::default()
+            },
+            TokenUsage {
+                input_tokens: 11,
+                output_tokens: 3,
+                ..Default::default()
+            },
+            11,
+            Some("p".into()),
+            Some("m".into()),
+            Some(0),
+        );
+        sm.append_usage(&usage).await.unwrap();
+        sm.append_tool_audit(&ToolAuditMeta::new(
+            Some(0),
+            vec![crate::meta::ToolAuditItem {
+                tool_call_id: "call-1".into(),
+                name: "bash".into(),
+                duration_ms: Some(5),
+                is_error: false,
+                gate: None,
+                started_at_ms: None,
+                ended_at_ms: None,
+            }],
+        ))
+        .await
+        .unwrap();
+
+        let ctx = sm.build_session_context();
+        assert_eq!(ctx.messages.len(), 1, "meta customs must not enter LLM context");
+        assert_eq!(sm.latest_usage_total().unwrap().input_tokens, 11);
+        let summary = sm.build_summary();
+        assert_eq!(summary.tool_call_count, 1);
+        assert_eq!(summary.tools_used, vec!["bash".to_string()]);
+        assert_eq!(summary.usage_total.unwrap().input_tokens, 11);
+    }
+
+    #[tokio::test]
+    async fn summary_sidecar_roundtrip_and_list() {
+        let cwd = std::env::temp_dir().join(format!(
+            "one-session-summary-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let mut sm = SessionManager::create(&cwd).await.unwrap();
+        sm.append_message(AgentMessage::user_text("summary list probe"))
+            .await
+            .unwrap();
+        let usage = UsageMeta::new(
+            TokenUsage {
+                input_tokens: 42,
+                output_tokens: 7,
+                ..Default::default()
+            },
+            TokenUsage {
+                input_tokens: 42,
+                output_tokens: 7,
+                ..Default::default()
+            },
+            42,
+            None,
+            Some("grok-test".into()),
+            Some(0),
+        );
+        sm.append_usage(&usage).await.unwrap();
+        sm.write_summary().unwrap();
+
+        let path = sm.session_file().unwrap().to_path_buf();
+        assert!(summary_path_for(&path).is_file());
+        let list = SessionManager::list(&cwd).await.unwrap();
+        let hit = list.iter().find(|s| s.path == path).expect("listed");
+        assert_eq!(hit.usage_total.unwrap().input_tokens, 42);
+        assert_eq!(hit.model.as_deref(), Some("grok-test"));
+        assert!(hit.display_label().contains("summary list probe"));
+
+        // Clean session dir under ~/.one for this cwd encoding.
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
     }
 
     #[tokio::test]

@@ -2,10 +2,16 @@
 
 One 实现 JSONL session **v3 子集**，文件为 JSONL（每行一个 JSON 对象）。
 
+附加 **派生 sidecar**（`*.summary.json` 等）用于列表加速与可观测性；**不是**消息真源，缺失时行为与旧版一致。
+
 ## 文件位置
 
 ```
-~/.one/agent/sessions/--<cwd-path>--/<timestamp>_<uuid>.jsonl
+~/.one/agent/sessions/--<cwd-path>--/
+  <timestamp>_<uuid>.jsonl              # 权威会话树
+  <timestamp>_<uuid>.summary.json       # 派生索引（可选）
+  <timestamp>_<uuid>.system_prompt.txt  # 大 system prompt spill（可选）
+  prompt_history.jsonl                  # 跨 session 输入历史（非 session）
 ```
 
 `<cwd-path>` 为工作目录路径，将 `/` 替换为 `-`。
@@ -29,7 +35,7 @@ One 实现 JSONL session **v3 子集**，文件为 JSONL（每行一个 JSON 对
 | `message` | 用户/助手/工具结果消息 | ✅ |
 | `compaction` | 上下文压缩摘要 | ✅（作为摘要） |
 | `branch_summary` | 分支切换摘要 | ✅ |
-| `custom` | 扩展状态（不进入上下文） | ❌ |
+| `custom` | 扩展 / One 元数据（不进入上下文） | ❌ |
 | `custom_message` | 扩展注入消息 | ✅ |
 | `label` | 书签标记 | ❌ |
 | `model_change` | 模型切换记录 | 元数据 |
@@ -66,12 +72,58 @@ One 实现 JSONL session **v3 子集**，文件为 JSONL（每行一个 JSON 对
 
 `build_session_context(leaf_id)` 将 entries 转为 `AgentMessage` 列表供 LLM 使用。
 
+**`SessionEntry::Custom` 永不进入 LLM 上下文**（含下方 `one.*` 元数据）。
+
+## One 元数据 `custom_type`（`one.*`）
+
+均通过 `append_custom` / 专用 helper 写入；旧客户端打开时当作普通 Custom 忽略类型名即可。
+
+| custom_type | 写入时机 | data 要点 |
+|-------------|----------|-----------|
+| `one.usage` | 每次用户 prompt 跑完（含失败/中断） | `delta` / `total` TokenUsage、`context_size_tokens`、`provider`、`model`、`prompt_index` |
+| `one.tool_audit` | 同上（有工具时） | `tools[]`：`tool_call_id`、`name`、`duration_ms?`、`is_error`（**无** stdout 正文） |
+| `one.prompt_snapshot` | session 创建、`/new`、`/reload`、resume 且 system prompt hash 变化 | `hash`、`byte_len`、小文本 inline 或 `path` spill |
+
+Resume 时用最新 `one.usage.total` **恢复 UI 累计 token**（不写回消息列表）。
+
+### 示例：`one.usage`
+
+```json
+{
+  "type": "custom",
+  "id": "a1b2c3d4",
+  "parentId": "prev",
+  "timestamp": "2026-08-02T10:00:00Z",
+  "custom_type": "one.usage",
+  "data": {
+    "schema": 1,
+    "kind": "run",
+    "delta": { "input_tokens": 100, "output_tokens": 20, "cache_read_tokens": 0, "cache_write_tokens": 0 },
+    "total": { "input_tokens": 500, "output_tokens": 80, "cache_read_tokens": 0, "cache_write_tokens": 0 },
+    "context_size_tokens": 100,
+    "provider": "ziyong",
+    "model": "grok-4.5",
+    "prompt_index": 0
+  }
+}
+```
+
+## Sidecar：`*.summary.json`
+
+与 JSONL **同 stem**，例如 `20260802_….jsonl` → `20260802_….summary.json`。
+
+- **派生数据**：由 `SessionManager::write_summary` 从内存树重建
+- 字段：`id`、`cwd`、`name`、`preview`、`leaf_id`、`entry_count`、`message_count`、`model`、`provider`、`usage_total`、`tool_call_count`、`tools_used`、`system_prompt_hash` 等
+- `/resume` 列表**优先**读 sidecar；损坏或缺失则 **fallback** 到 JSONL 前缀扫描（旧 session 不受影响）
+- 写入失败只打日志，**不**影响对话
+
 ## 与官方 Pi 的差异
 
 - HTML export / Gist share 已实现（`--export` / `--share` / `/export`）
 - v1/v2 → v3 自动迁移已实现
 - `custom_message` / `label` 类型已有，CLI 尚未暴露完整 label 操作
 - 目录使用 `~/.one/agent/sessions/`（非 `~/.pi`）
+- 元数据 sidecar 与 `one.*` Custom 为 One 扩展（不进模型上下文）
 
 ## API 示例
 
@@ -92,4 +144,8 @@ sm.branch("a1b2c3d4")?;
 
 // 构建上下文
 let ctx = sm.build_session_context();
+
+// 元数据（不进上下文）
+sm.append_usage(&usage_meta).await?;
+sm.write_summary()?;
 ```

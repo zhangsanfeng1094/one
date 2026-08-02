@@ -85,7 +85,7 @@ flowchart TB
 | OS sandbox (bwrap) | ✅ | `one-tools/os_sandbox` | bash 可选 |
 | 沙箱提权（Codex 对齐） | ✅ | `sandbox_permissions` + `PermissionGate` | `require_escalated` / escalate_on_failure |
 | 权限门控 allow/deny/ask | ✅ | `one-cli/approval` + `ToolGate` | 规则 + 交互 |
-| Session JSONL 树 | ✅ | `one-session` | v3 子集 + 迁移 |
+| Session JSONL 树 | ✅ | `one-session` | v3 子集 + 迁移；`one.usage` / `one.tool_audit` / `one.prompt_snapshot` + `*.summary.json` sidecar（不进 LLM） |
 | Session UX（continue/resume/new/tree） | ✅ | runtime + TUI | export/share 有 |
 | AGENTS.md / CLAUDE.md | ✅ | `one-resources` | 向上发现（静态 L1） |
 | Skills progressive disclosure | ✅ | `one-resources/skills` | catalog + read |
