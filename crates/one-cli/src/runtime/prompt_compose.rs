@@ -19,6 +19,19 @@ existing id after `memory_search`. Do not use raw `write` under memory dirs unle
 `memory_write` is unavailable. New L2 index lines apply after `/reload` or a new session.
 ";
 
+/// Grok-style output guidance (always injected for high quality)
+pub const GROK_OUTPUT_GUIDE: &str = r#"
+
+## Grok Output Style (始终生效)
+
+- 写完整、专业、结构化的技术文章风格
+- 使用 **bold**、`inline code`、`### 标题`、`表格` 自然且丰富
+- 解释为什么这样做（而非只给出结果）
+- 保持简洁但信息丰富
+- 最终输出用清晰的 Markdown 格式
+- 优先使用 bullet lists 和 numbered lists
+"#;
+
 /// Inputs for composing the live system prompt.
 pub struct PromptComposeInput<'a> {
     pub features: &'a FeatureState,
@@ -74,6 +87,9 @@ pub fn compose_base_system_prompt(input: ComposeBaseInput<'_>) -> String {
         base.push('\n');
         base.push_str(MEMORY_WRITE_PROMPT_HINT);
     }
+
+    // Grok output style — always injected for high-quality responses
+    base.push_str(GROK_OUTPUT_GUIDE);
     base
 }
 
