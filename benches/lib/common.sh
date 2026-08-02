@@ -313,6 +313,42 @@ copy_task_meta() {
   return 0
 }
 
+# Shared harness constraints injected into every full-eval agent prompt.
+# Override path with ONE_BENCH_CONSTRAINTS=/path/to/file (empty = disable).
+bench_constraints_file() {
+  if [[ -n "${ONE_BENCH_CONSTRAINTS+x}" ]]; then
+    # Explicit empty disables injection.
+    if [[ -z "$ONE_BENCH_CONSTRAINTS" ]]; then
+      return 1
+    fi
+    [[ -f "$ONE_BENCH_CONSTRAINTS" ]] || return 1
+    echo "$ONE_BENCH_CONSTRAINTS"
+    return 0
+  fi
+  local f="$BENCH_DIR/lib/bench_constraints.md"
+  [[ -f "$f" ]] || return 1
+  echo "$f"
+}
+
+# Compose the user prompt for full runs: task prompt + optional suffix + constraints.
+# Usage: compose_agent_prompt <task_dir> [extra_suffix]
+# Prints full prompt on stdout.
+compose_agent_prompt() {
+  local tdir="${1:?task dir}"
+  local extra="${2:-}"
+  local body
+  body="$(cat "$tdir/prompt.md")"
+  printf '%s' "$body"
+  if [[ -n "$extra" ]]; then
+    printf '\n\n%s' "$extra"
+  fi
+  local cf
+  if cf="$(bench_constraints_file)"; then
+    printf '\n\n---\n\n%s' "$(cat "$cf")"
+  fi
+  printf '\n'
+}
+
 # Human-readable success criterion for prompts / logs.
 # Prints score command summary for the task.
 task_success_criterion() {

@@ -21,6 +21,16 @@ Must support castling (with rights), en passant, queen promotions.
 
 Size limits: **< 100,000** pairs and **< 10MB** total.
 
-Example input/output is in the original TB instruction; use `check.py` to self-test.
+Use `check.py` to self-test while developing. Scoring runs `python3 verify.py` in this
+workspace (needs `python-chess`).
 
-Scoring needs `python-chess` (`uv run --with chess python verify.py` if needed).
+If `chess` is missing under the sandbox, install **into the workspace** so verify can see it, e.g.:
+
+```bash
+PIP_CACHE_DIR=/tmp/pipcache pip3 install --target ./.pydeps chess
+PYTHONPATH=./.pydeps python3 check.py
+PYTHONPATH=./.pydeps python3 verify.py   # set a large timeout_secs; full suite is slow
+```
+
+Do **not** download Terminal-Bench / harbor official `solve.sh` or any pre-made `re.json`.
+Generate the regex pairs (or a generator that writes `re.json`) yourself in this workspace.

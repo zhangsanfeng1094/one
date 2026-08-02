@@ -43,11 +43,12 @@ EOF
   criterion="$(task_success_criterion "$tdir")"
 
   local prompt
-  prompt="$(cat "$tdir/prompt.md")
-
-Success criterion: in this directory, make the following command(s) succeed:
+  prompt="$(compose_agent_prompt "$tdir" "Success criterion: in this directory, make the following command(s) succeed:
   $criterion
-Do not delete or weaken tests. Prefer minimal correct fixes."
+Do not delete or weaken tests. Prefer minimal correct fixes.")"
+  printf '%s' "$prompt" >"$out/prompt.md"
+  printf '%s' "$prompt" >"$ws/BENCH_PROMPT.md" 2>/dev/null || true
+  cp "$tdir/prompt.md" "$out/prompt.task.md" 2>/dev/null || true
 
   local events_file="$out/codex-events.jsonl"
   local last_msg="$out/codex-last-message.txt"

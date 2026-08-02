@@ -44,15 +44,18 @@ cmd_full() {
   ws="$(prepare_workspace "$out" "$tdir")"
   copy_task_meta "$tdir" "$out"
 
-  # Keep prompt easy to re-open / paste if the TUI first turn is aborted.
-  cp "$tdir/prompt.md" "$out/prompt.md"
-  cp "$tdir/prompt.md" "$ws/BENCH_PROMPT.md" 2>/dev/null || true
-
   local criterion
   criterion="$(task_success_criterion "$tdir")"
 
+  # Task body + shared harness constraints (anti-oracle / workspace-only).
   local prompt
-  prompt="$(cat "$tdir/prompt.md")"
+  prompt="$(compose_agent_prompt "$tdir")"
+
+  # Keep prompt easy to re-open / paste if the TUI first turn is aborted.
+  # Write the *composed* prompt (constraints included) so resume/debug matches the run.
+  printf '%s' "$prompt" >"$out/prompt.md"
+  printf '%s' "$prompt" >"$ws/BENCH_PROMPT.md"
+  cp "$tdir/prompt.md" "$out/prompt.task.md" 2>/dev/null || true
 
   # TTY check: TUI needs a real terminal.
   if [[ "$ARG_UI" == "tui" ]]; then
@@ -85,6 +88,11 @@ cmd_full() {
   show_tui_settings || true
   echo "cwd:      $ws"
   echo "score:    $criterion"
+  if cf="$(bench_constraints_file 2>/dev/null)"; then
+    echo "prompt:   task + constraints ($cf)"
+  else
+    echo "prompt:   task only (constraints disabled)"
+  fi
   if [[ -n "${LANGFUSE_PUBLIC_KEY:-}" && -n "${LANGFUSE_SECRET_KEY:-}" ]]; then
     echo "trace:    langfuse (${LANGFUSE_BASE_URL:-${LANGFUSE_HOST:-https://cloud.langfuse.com}})"
   else

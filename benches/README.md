@@ -121,6 +121,11 @@ regex-chess 依赖 `python-chess`（verify 会尝试 `uv pip install chess`）�
 
 出处 / oracle：各任务目录下 `SOURCE.md`、`SOLUTIONS.md`（SOLUTIONS 不进 workspace）。
 
+**提示词约束（full 默认注入）**：`benches/lib/bench_constraints.md` 会拼进 One/Codex 的 user prompt  
+（workspace 边界、禁止读 SOLUTIONS/oracle、禁止下载官方 solve、自测与超时约定）。  
+关闭：`ONE_BENCH_CONSTRAINTS=`；自定义：`ONE_BENCH_CONSTRAINTS=/path/to.md`。  
+写出文件：`out/prompt.md`（含约束）、`out/prompt.task.md`（原始任务文）。
+
 ### edit 容错任务说明
 
 `edit-resilient` 故意让 **naive exact match** 容易失败（fixture 内含 trailing spaces、tab 缩进、CRLF 文件、smart quotes）。  
