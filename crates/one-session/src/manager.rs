@@ -154,6 +154,93 @@ impl SessionManager {
         .flatten()
     }
 
+    /// Resolve a session after the process has exited (`one resume <spec>` / `/resume <spec>`).
+    ///
+    /// `spec` may be:
+    /// - absolute/relative path to a `.jsonl` session file
+    /// - session id (full or prefix)
+    /// - exact `/name` title
+    /// - substring of name, first-user preview, or path
+    ///
+    /// When multiple sessions match a fuzzy query, returns [`SessionError::Ambiguous`]
+    /// with candidates (newest first). Empty `spec` → [`SessionError::InvalidFormat`].
+    pub async fn resolve(cwd: impl AsRef<Path>, spec: &str) -> Result<SessionInfo> {
+        let spec = spec.trim();
+        if spec.is_empty() {
+            return Err(SessionError::InvalidFormat(
+                "empty session spec (pass id, name, path, or substring)".into(),
+            ));
+        }
+
+        // Direct path (absolute, relative, or picker-selected JSONL path).
+        let as_path = Path::new(spec);
+        if as_path.is_file() {
+            if let Some(info) = Self::list_info(as_path).await {
+                return Ok(info);
+            }
+            // File exists but header unreadable — still openable later.
+            return Ok(SessionInfo {
+                path: as_path.to_path_buf(),
+                id: as_path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(spec)
+                    .to_string(),
+                cwd: cwd.as_ref().display().to_string(),
+                name: None,
+                preview: None,
+                modified: Utc::now(),
+                usage_total: None,
+                model: None,
+            });
+        }
+
+        let sessions = Self::list(cwd.as_ref()).await?;
+        if sessions.is_empty() {
+            return Err(SessionError::NoSessions);
+        }
+
+        let spec_lower = spec.to_ascii_lowercase();
+        let mut ranked: Vec<(i32, SessionInfo)> = Vec::new();
+        for s in sessions {
+            let score = session_match_score(&s, spec, &spec_lower);
+            if score > 0 {
+                ranked.push((score, s));
+            }
+        }
+        if ranked.is_empty() {
+            return Err(SessionError::NotFound(format!(
+                "no session matching `{spec}` for this project"
+            )));
+        }
+        // Higher score first; same score → already newest-first from list.
+        ranked.sort_by(|a, b| b.0.cmp(&a.0));
+        let best = ranked[0].0;
+        let top: Vec<SessionInfo> = ranked
+            .into_iter()
+            .take_while(|(sc, _)| *sc == best)
+            .map(|(_, s)| s)
+            .collect();
+        if top.len() == 1 {
+            return Ok(top.into_iter().next().expect("len 1"));
+        }
+        let candidates = top
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}  {}  {}",
+                    s.display_label(),
+                    s.id.chars().take(12).collect::<String>(),
+                    s.path.display()
+                )
+            })
+            .collect();
+        Err(SessionError::Ambiguous {
+            spec: spec.to_string(),
+            candidates,
+        })
+    }
+
     pub fn from_jsonl(content: &str) -> Result<Self> {
         let mut header = None;
         let mut entries = Vec::new();
@@ -691,6 +778,47 @@ fn first_line_preview(text: &str, max_chars: usize) -> String {
     out
 }
 
+/// Match score for [`SessionManager::resolve`] (higher = better). 0 = no match.
+fn session_match_score(s: &SessionInfo, spec: &str, spec_lower: &str) -> i32 {
+    if s.id == spec {
+        return 1000;
+    }
+    if s.id.starts_with(spec) {
+        return 900;
+    }
+    if s.name
+        .as_deref()
+        .is_some_and(|n| n.eq_ignore_ascii_case(spec))
+    {
+        return 800;
+    }
+    let path_s = s.path.to_string_lossy();
+    if path_s == spec || path_s.ends_with(spec) {
+        return 750;
+    }
+    if let Some(file) = s.path.file_name().and_then(|f| f.to_str()) {
+        if file == spec || file.starts_with(spec) {
+            return 700;
+        }
+    }
+    if s.name
+        .as_deref()
+        .is_some_and(|n| n.to_ascii_lowercase().contains(spec_lower))
+    {
+        return 500;
+    }
+    if s.preview
+        .as_deref()
+        .is_some_and(|p| p == spec || p.contains(spec))
+    {
+        return 400;
+    }
+    if path_s.contains(spec) {
+        return 300;
+    }
+    0
+}
+
 /// Max bytes to read from a session file when building the `/resume` list.
 /// First user turns (and almost all `/name` renames) sit near the head; tool
 /// dumps of multi-MB live later and must not be fully deserialized.
@@ -1176,6 +1304,17 @@ mod tests {
             list.iter().map(|s| s.modified).collect::<Vec<_>>()
         );
         // Labels come from lightweight scan.
+        // resolve by name / id prefix / preview
+        let by_name = SessionManager::resolve(&cwd, "named-new").await.unwrap();
+        assert_eq!(by_name.path, b.session_file().unwrap());
+        let id_prefix: String = b.header().id.chars().take(8).collect();
+        let by_id = SessionManager::resolve(&cwd, &id_prefix).await.unwrap();
+        assert_eq!(by_id.path, b.session_file().unwrap());
+        let by_preview = SessionManager::resolve(&cwd, "older prompt").await.unwrap();
+        assert_eq!(by_preview.path, a.session_file().unwrap());
+        let missing = SessionManager::resolve(&cwd, "definitely-not-a-session-zzz").await;
+        assert!(matches!(missing, Err(SessionError::NotFound(_))));
+
         let labels: Vec<_> = list.iter().map(|s| s.display_label()).collect();
         assert!(
             labels

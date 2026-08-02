@@ -18,12 +18,85 @@ use clap::{CommandFactory, FromArgMatches};
 use one_session::export_html;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Commands, RunMode};
+use crate::cli::{Cli, Commands, ResumeCli, RunMode};
 use crate::protocol::{RunResult, UsageSnapshot};
 use crate::provider::ProviderSet;
 use crate::runtime::AppRuntime;
+use one_session::{SessionError, SessionManager};
 use std::process::ExitCode;
 use std::time::Instant;
+
+/// Map `one resume [SPEC] [--list]` onto existing `--session` / `--resume` flags.
+async fn apply_resume_cli(cli: &mut Cli, resume: ResumeCli) -> Result<(), Box<dyn std::error::Error>> {
+    let cwd = cli.cwd.canonicalize().unwrap_or_else(|_| cli.cwd.clone());
+
+    if resume.list {
+        let sessions = SessionManager::list(&cwd).await?;
+        if sessions.is_empty() {
+            eprintln!("no sessions for {}", cwd.display());
+            std::process::exit(1);
+        }
+        println!(
+            "{:<12}  {:<20}  {:<36}  {}",
+            "modified", "id", "label", "path"
+        );
+        for s in sessions.iter().take(40) {
+            let id: String = s.id.chars().take(12).collect();
+            let label = s.display_label();
+            let label = if label.chars().count() > 36 {
+                format!("{}…", label.chars().take(35).collect::<String>())
+            } else {
+                label
+            };
+            println!(
+                "{}  {:<12}  {:<36}  {}",
+                s.modified.format("%Y-%m-%d %H:%M"),
+                id,
+                label,
+                s.path.display()
+            );
+        }
+        std::process::exit(0);
+    }
+
+    match resume.spec.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => {
+            // Same as `one -r`: TUI picker, or most-recent in print mode.
+            cli.resume = true;
+            cli.r#continue = false;
+            cli.session = None;
+            cli.no_session = false;
+        }
+        Some(spec) => match SessionManager::resolve(&cwd, spec).await {
+            Ok(info) => {
+                eprintln!(
+                    "resume: {} · {}",
+                    info.display_label(),
+                    info.path.display()
+                );
+                cli.session = Some(info.path);
+                cli.resume = false;
+                cli.r#continue = false;
+                cli.no_session = false;
+            }
+            Err(SessionError::Ambiguous { spec, candidates }) => {
+                eprintln!("error: ambiguous session `{spec}` — refine the query:");
+                for c in candidates {
+                    eprintln!("  · {c}");
+                }
+                std::process::exit(2);
+            }
+            Err(SessionError::NoSessions) => {
+                return Err(format!("no sessions for {}", cwd.display()).into());
+            }
+            Err(SessionError::NotFound(msg)) => {
+                return Err(msg.into());
+            }
+            Err(err) => return Err(err.into()),
+        },
+    }
+    Ok(())
+}
 
 /// Resolve run mode.
 ///
@@ -225,6 +298,12 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(Commands::Bench(bench)) = cli.command {
         bench_cmd::run_bench(bench).await?;
         return Ok(ExitCode::SUCCESS);
+    }
+    // `one resume …` rewrites into the normal agent path (session open + TUI/print).
+    if matches!(&cli.command, Some(Commands::Resume(_))) {
+        if let Some(Commands::Resume(resume)) = cli.command.take() {
+            apply_resume_cli(&mut cli, resume).await?;
+        }
     }
     // Take subcommand first so remaining `cli` can be borrowed (Agent/Run need global flags).
     if matches!(

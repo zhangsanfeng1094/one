@@ -19,6 +19,18 @@ pub enum SessionError {
     #[error("no sessions found for cwd")]
     NoSessions,
 
+    #[error("{0}")]
+    NotFound(String),
+
+    /// Multiple sessions matched a fuzzy `resume` / `/resume` query.
+    ///
+    /// `candidates` are short labels (name · id prefix · path) for CLI printing.
+    #[error("ambiguous session `{spec}` ({n} matches)", n = candidates.len())]
+    Ambiguous {
+        spec: String,
+        candidates: Vec<String>,
+    },
+
     #[error("share failed: {0}")]
     Share(String),
 }

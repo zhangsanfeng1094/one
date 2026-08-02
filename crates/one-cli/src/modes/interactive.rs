@@ -2185,10 +2185,16 @@ async fn handle_slash(
             // here with the full session path — never re-list all files for that).
             if parts.len() > 1 {
                 let spec = parts[1..].join(" ");
-                if let Some(info) = resolve_resume_target(runtime, &spec).await? {
-                    load_session_into_app(runtime, providers, app, &info).await?;
-                } else {
-                    app.set_notice(format!("session not found: {spec}"));
+                match resolve_resume_target(runtime, &spec).await {
+                    Ok(Some(info)) => {
+                        load_session_into_app(runtime, providers, app, &info).await?;
+                    }
+                    Ok(None) => {
+                        app.set_notice(format!("session not found: {spec}"));
+                    }
+                    Err(err) => {
+                        app.set_notice(err.to_string());
+                    }
                 }
                 return Ok(SlashAction::Consumed);
             }
@@ -2840,7 +2846,7 @@ async fn notify_plan_ready(app: &mut App, runtime: &AppRuntime) {
     app.set_notice(format!("plan ready · /act to implement · {path}"));
 }
 
-/// Resolve `/resume <spec>` without listing every session when `spec` is a path.
+/// Resolve `/resume <spec>` (shared ranking with `one resume <spec>`).
 async fn resolve_resume_target(
     runtime: &AppRuntime,
     spec: &str,
@@ -2849,40 +2855,23 @@ async fn resolve_resume_target(
     if spec.is_empty() {
         return Ok(None);
     }
-
-    // Picker selection passes the absolute JSONL path as the item id.
-    let as_path = std::path::Path::new(spec);
-    if as_path.is_file() {
-        if let Some(info) = one_session::SessionManager::list_info(as_path).await {
-            return Ok(Some(info));
+    match one_session::SessionManager::resolve(&runtime.cwd, spec).await {
+        Ok(info) => Ok(Some(info)),
+        Err(one_session::SessionError::NotFound(_))
+        | Err(one_session::SessionError::NoSessions) => Ok(None),
+        Err(one_session::SessionError::Ambiguous { candidates, .. }) => {
+            // Prefer newest of top-ranked ties (list is newest-first; resolve already
+            // groups equal scores). Surface as "not unique" via first candidate path
+            // is worse UX inside TUI — show notice with count.
+            Err(format!(
+                "ambiguous ({} matches); try a longer id or exact /name:\n  · {}",
+                candidates.len(),
+                candidates.into_iter().take(5).collect::<Vec<_>>().join("\n  · ")
+            )
+            .into())
         }
-        // File exists but header unreadable — still try open via synthetic info.
-        return Ok(Some(one_session::SessionInfo {
-            path: as_path.to_path_buf(),
-            id: as_path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(spec)
-                .to_string(),
-            cwd: runtime.cwd.display().to_string(),
-            name: None,
-            preview: None,
-            modified: chrono::Utc::now(),
-            usage_total: None,
-            model: None,
-        }));
+        Err(err) => Err(err.into()),
     }
-
-    // Fuzzy match against project sessions (id prefix / name / preview / path).
-    let sessions = runtime.list_sessions().await?;
-    Ok(sessions.into_iter().find(|s| {
-        s.path.to_string_lossy().contains(spec)
-            || s.id.starts_with(spec)
-            || s.name.as_deref().is_some_and(|n| n == spec)
-            || s.preview
-                .as_deref()
-                .is_some_and(|p| p == spec || p.contains(spec))
-    }))
 }
 
 /// Open a past session and mirror messages into the TUI transcript.

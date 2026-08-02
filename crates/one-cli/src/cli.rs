@@ -214,7 +214,7 @@ pub struct Cli {
     #[arg(long = "output-format", value_name = "FMT")]
     pub output_format: Option<String>,
 
-    /// Optional subcommands (`one mcp …` / `one bench` / `one agent` / `one run`).
+    /// Optional subcommands (`one mcp …` / `one bench` / `one agent` / `one run` / `one resume`).
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
@@ -233,6 +233,31 @@ pub enum Commands {
     Agent(AgentCli),
     /// Run harness with --preset or --spec (full AgentSpec JSON)
     Run(crate::agent_cmd::RunCli),
+    /// Resume a session after quitting (`one resume` / `one resume <id|name|path>`)
+    Resume(ResumeCli),
+}
+
+/// CLI: `one resume [SPEC]` — re-open a project session from the shell.
+///
+/// After you exit the TUI, sessions stay under `~/.one/agent/sessions/…`.
+/// This is the out-of-process counterpart of in-TUI `/resume`.
+///
+/// ```text
+/// one resume                 # interactive picker (same as `one -r`)
+/// one resume bench:task      # by /name, id prefix, preview substring, or path
+/// one resume --list          # print recent sessions for --cwd and exit
+/// one resume abc123 -p "…"   # headless continue on a matched session
+/// ```
+#[derive(Debug, Clone, clap::Args)]
+pub struct ResumeCli {
+    /// Session id (prefix ok), `/name` title, first-prompt substring, or session file path.
+    /// Omit to open the interactive picker (`one -r`).
+    #[arg(value_name = "SPEC")]
+    pub spec: Option<String>,
+
+    /// List recent sessions for this project (`--cwd`) and exit.
+    #[arg(long = "list", short = 'l')]
+    pub list: bool,
 }
 
 #[derive(Debug, Clone, clap::Args)]

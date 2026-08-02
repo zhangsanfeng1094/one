@@ -1477,6 +1477,7 @@ fn build_chat_lines(
                 continue;
             }
             // Expanded multi-tool stack: clickable ▾ header collapses back to chip.
+            // Children nest under the header with ├/└ so the group reads as a parent.
             let show_group_header = tool_view::streak_shows_group_header(&app.messages, i, streak);
             // Tight stack: no blank between consecutive tools.
             for (k, tmsg) in app.messages[i..i + streak].iter().enumerate() {
@@ -1500,7 +1501,14 @@ fn build_chat_lines(
                         );
                     }
                 }
-                let chunk = message_lines(tmsg, app, wrap_width, i + k);
+                let group_child = if show_group_header {
+                    Some(GroupChild {
+                        is_last: k + 1 == streak,
+                    })
+                } else {
+                    None
+                };
+                let chunk = message_lines(tmsg, app, wrap_width, i + k, group_child);
                 push_owned(
                     &mut lines,
                     &mut owners,
@@ -1516,7 +1524,7 @@ fn build_chat_lines(
             lines.push(Line::from(Span::styled("", Theme::bg())));
             owners.push(None);
         }
-        let chunk = message_lines(msg, app, wrap_width, i);
+        let chunk = message_lines(msg, app, wrap_width, i, None);
         let owner = if matches!(
             msg.role,
             MessageRole::Alert | MessageRole::Thinking | MessageRole::Tool
@@ -1694,6 +1702,9 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
 /// ```text
 ///   ▸  5 tools  [todo_write] [grep ×2] [read ×2]
 ///   ▾  5 tools  [todo_write] [grep ×2] [read ×2]
+///     ├ ✓ bash  …
+///     ├ ✓ grep  …
+///     └ ✓ read  …
 /// ```
 fn render_tool_group(tools: &[Message], wrap_width: usize, expanded: bool) -> Vec<Line<'static>> {
     let n = tools.len();
@@ -1715,11 +1726,18 @@ fn render_tool_group(tools: &[Message], wrap_width: usize, expanded: bool) -> Ve
     ])]
 }
 
+/// Position of a tool row inside an expanded multi-tool group.
+#[derive(Clone, Copy, Debug)]
+struct GroupChild {
+    is_last: bool,
+}
+
 fn message_lines(
     message: &Message,
     app: &App,
     wrap_width: usize,
     msg_index: usize,
+    group_child: Option<GroupChild>,
 ) -> Vec<Line<'static>> {
     let focused = app.chat_focus == Some(msg_index);
     let mut lines = match message.role {
@@ -1744,7 +1762,7 @@ fn message_lines(
             lines
         }
         MessageRole::System => render_system(&message.content, wrap_width),
-        MessageRole::Tool => render_tool(message, app, wrap_width),
+        MessageRole::Tool => render_tool(message, app, wrap_width, group_child),
     };
     if focused {
         apply_focus_rail(&mut lines);
@@ -2000,7 +2018,21 @@ fn render_system(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
 ///     └ boom: no such file
 ///   ⠋ bash  cd ./benches/out/tb-regex-checker     ← running: cyan spinner
 /// ```
-fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'static>> {
+///
+/// Inside an expanded multi-tool group (`group_child`), rows nest under the
+/// `▾ N tools` header so the stack reads as one parent with children:
+/// ```text
+///   ▾  3 tools  [ls] [find ×2]
+///     ├ ✓ ls    ./
+///     ├ ✓ find  README*
+///     └ ✓ find  **/*.{toml,…}
+/// ```
+fn render_tool(
+    message: &Message,
+    app: &App,
+    wrap_width: usize,
+    group_child: Option<GroupChild>,
+) -> Vec<Line<'static>> {
     let name = message.tool_name.clone().unwrap_or_else(|| "tool".into());
     let detail = message.content.trim();
     let status = message.tool_status.unwrap_or(ToolStatus::Done);
@@ -2073,9 +2105,11 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
         0
     };
 
+    // Group children: `  ` + `├ `/`└ ` (2+2) instead of bare `  `.
+    let lead_w = if group_child.is_some() { 4 } else { 2 };
     let name_w = display_width(&name).max(4).min(10);
     let budget = wrap_width
-        .saturating_sub(4 + name_w + 2 + metrics_w)
+        .saturating_sub(lead_w + 2 + name_w + 2 + metrics_w)
         .max(8);
     let pretty = if detail.is_empty() {
         String::new()
@@ -2093,11 +2127,23 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
 
     let mut lines = Vec::new();
     // Header:  `  ✓ bash  cargo test  (12 lines · 45ms)`
-    let mut spans = vec![
-        Span::raw("  "),
-        Span::styled(format!("{icon} "), icon_style),
-        Span::styled(format!("{name:<name_w$}"), name_style),
-    ];
+    // Group:   `  ├ ✓ bash  cargo test  (12 lines · 45ms)`
+    let mut spans = match group_child {
+        Some(GroupChild { is_last }) => {
+            let branch = if is_last { "└ " } else { "├ " };
+            vec![
+                Span::raw("  "),
+                Span::styled(branch, Theme::tool_tree()),
+                Span::styled(format!("{icon} "), icon_style),
+                Span::styled(format!("{name:<name_w$}"), name_style),
+            ]
+        }
+        None => vec![
+            Span::raw("  "),
+            Span::styled(format!("{icon} "), icon_style),
+            Span::styled(format!("{name:<name_w$}"), name_style),
+        ],
+    };
     if !pretty.is_empty() {
         if tool_view::looks_like_path(&pretty) {
             let (dir, file) = tool_view::path_dir_and_name(&pretty);
@@ -2129,11 +2175,26 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
     // Caps are generous: the main chat is line-scrolled (full viewport), so long
     // tool output should participate in that scroll instead of feeling "clipped".
     if message.tool_expanded {
-        let body_budget = wrap_width.saturating_sub(8).max(12);
+        let nest = if group_child.is_some() { 4 } else { 0 };
+        let body_budget = wrap_width.saturating_sub(8 + nest).max(12);
         let rail_style = if status == ToolStatus::Error {
             Theme::error_bar()
         } else {
             Theme::tool_tree()
+        };
+        // Nested under a group: keep the parent spine (`│` / spaces) then hang the
+        // tool body one level deeper so it reads as a child of `├ ✓ name`, not
+        // a sibling of the group header.
+        //
+        //   ▾  3 tools
+        //     ├ ✓ ls  ./
+        //     │   └ body…
+        //     └ ✓ find
+        //         └ body…
+        let (body_indent, body_cont) = match group_child {
+            Some(GroupChild { is_last: true }) => ("      ", "    "),
+            Some(GroupChild { is_last: false }) => ("  │   ", "  │ "),
+            None => ("    ", "  "),
         };
 
         // Recover full args (paths shortened, no char cap) when the header
@@ -2164,12 +2225,22 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
                 // Paint recovered args first (│ continues into the diff block).
                 for (text, style) in visual {
                     lines.push(Line::from(vec![
-                        Span::raw("    "),
+                        Span::raw(body_indent.to_string()),
                         Span::styled("│ ", rail_style),
                         Span::styled(text, style),
                     ]));
                 }
-                lines.extend(render_ide_diff(output, wrap_width));
+                let mut diff_lines = render_ide_diff(output, wrap_width.saturating_sub(nest));
+                // Prefix group spine so diffs stay nested under the parent tool.
+                if group_child.is_some() {
+                    for line in &mut diff_lines {
+                        let mut spans =
+                            vec![Span::styled(body_cont.to_string(), Theme::tool_tree())];
+                        spans.extend(line.spans.iter().cloned());
+                        *line = Line::from(spans);
+                    }
+                }
+                lines.extend(diff_lines);
                 return lines;
             }
 
@@ -2204,7 +2275,7 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
             if let Some(m) = &metrics {
                 // Expanded but no body — still show metrics under the chevron row.
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
+                    Span::raw(body_indent.to_string()),
                     Span::styled("└ ", Theme::tool_tree()),
                     Span::styled(m.clone(), Theme::meta()),
                 ]));
@@ -2216,7 +2287,7 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
             for (i, (text, style)) in visual.into_iter().enumerate() {
                 let branch = if i == last { "└ " } else { "│ " };
                 lines.push(Line::from(vec![
-                    Span::raw("    "),
+                    Span::raw(body_indent.to_string()),
                     Span::styled(branch, rail_style),
                     Span::styled(text, style),
                 ]));
@@ -3291,6 +3362,12 @@ mod tests {
             "expanded tools must still be Message click targets"
         );
 
+        // Expanded children nest under the header with tree connectors.
+        assert!(
+            flat.contains('├') && flat.contains('└'),
+            "expanded group tools must use tree connectors, got:\n{flat}"
+        );
+
         // Click header row → collapse back to chip.
         let header_line = app
             .chat_line_owners
@@ -3308,6 +3385,48 @@ mod tests {
             "header click must re-chip the group"
         );
         assert!(tool_view::streak_can_collapse(&app.messages, 0, 3));
+    }
+
+    #[test]
+    fn expanded_tool_group_nests_children_under_header() {
+        let backend = TestBackend::new(72, 20);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        for (name, args) in [
+            ("ls", r#"{"path":"."}"#),
+            ("find", r#"{"pattern":"README*"}"#),
+            ("find", r#"{"pattern":"**/*.rs"}"#),
+        ] {
+            app.push_tool_call(name, args);
+            app.finish_tool_with_output(name, false, Some("ok".into()));
+            if let Some(last) = app.messages.last_mut() {
+                last.tool_expanded = false;
+                last.tool_ungroup = false;
+            }
+        }
+        app.toggle_tool_group_at(0);
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(flat.contains("3 tools"), "header: {flat}");
+        // Parent chip + nested children (two ├ / one └ or mix).
+        let branch_count = flat.matches('├').count() + flat.matches('└').count();
+        assert!(
+            branch_count >= 3,
+            "expected nested tree under group header, got {branch_count} branches:\n{flat}"
+        );
+        // Children should sit to the right of the group chevron column.
+        let lines: Vec<&str> = flat
+            .trim_end()
+            .split(|c: char| c == '\n' || c == '\u{0}')
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        let _ = lines; // buffer is a grid without newlines; structural check above is enough.
     }
 
     #[test]

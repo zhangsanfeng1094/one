@@ -9,6 +9,9 @@ one --tui -p "fix the bug"  # TUI + 首条消息自动发出（监督/评测）
 one --mode interactive -p "…"  # 同上（显式 mode）
 one --continue / -c          # 继续最近 session
 one --resume / -r            # 交互：打开 session 选择器；非交互：最近 session
+one resume                   # 退出后恢复：同 `one -r`（TUI 选择器）
+one resume <id|name|path>    # 退出后恢复：按 id 前缀 / 名称 / 预览 / 路径匹配
+one resume --list            # 列出本项目近期 session
 one --session PATH           # 打开指定 session 文件
 one --no-session             # 不持久化
 one --read-only              # 只启用 read/grep/find/ls
@@ -718,7 +721,7 @@ Slash 命令：
 |------|------|
 | `/help` | 显示帮助 |
 | `/session` | 当前 session 路径 / 名称 / 消息数 |
-| `/resume [id\|name\|file]` | 列出或打开历史 session（无名称时显示首条用户消息） |
+| `/resume [id\|name\|file]` | 列出或打开历史 session（无名称时显示首条用户消息）。进程外等价：`one resume …` |
 | `/new` | 新建 session |
 | `/name <title>` | 设置 session 显示名（优先于首条消息预览） |
 | `/tree` / `/tree <id>` | 列出或切换分支 |
