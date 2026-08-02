@@ -593,6 +593,34 @@ impl SessionManager {
         None
     }
 
+    /// Map `tool_call_id → duration_ms` from all `one.tool_audit` rows on the
+    /// active branch (for TUI resume / rebuild).
+    ///
+    /// Later audits overwrite earlier ones for the same id. Missing durations
+    /// are omitted (caller should leave UI duration empty rather than fake 0ms).
+    pub fn tool_duration_by_call_id(&self) -> std::collections::HashMap<String, u64> {
+        let mut map = std::collections::HashMap::new();
+        for entry in self.active_path_entries() {
+            if let SessionEntry::Custom {
+                custom_type, data, ..
+            } = entry
+            {
+                if *custom_type != CUSTOM_TOOL_AUDIT {
+                    continue;
+                }
+                let Some(audit) = ToolAuditMeta::from_value(data) else {
+                    continue;
+                };
+                for t in audit.tools {
+                    if let Some(ms) = t.duration_ms {
+                        map.insert(t.tool_call_id, ms);
+                    }
+                }
+            }
+        }
+        map
+    }
+
     /// Latest system prompt hash recorded on the active path.
     pub fn latest_prompt_hash(&self) -> Option<String> {
         for entry in self.active_path_entries().into_iter().rev() {
