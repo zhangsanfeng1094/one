@@ -423,13 +423,32 @@ pub fn write_preview_from_args(args: &str) -> Option<String> {
     Some(out.trim_end().to_string())
 }
 
-/// Detect if output looks like a unified / line-based diff.
+/// Detect if output looks like a unified / line-based diff (edit/write patches).
+///
+/// Prefer real unified-diff headers. Bare `+`/`-` counting alone is too aggressive
+/// for ordinary text (e.g. Markdown bullet lists under `read`) and must not drive
+/// the IDE diff UI outside edit/write tools.
 pub fn looks_like_diff(text: &str) -> bool {
     let mut plus = 0;
     let mut minus = 0;
-    for line in text.lines().take(40) {
-        if line.starts_with("+++ ") || line.starts_with("--- ") || line.starts_with("@@ ") {
-            return true;
+    let mut saw_header = false;
+    for line in text.lines().take(80) {
+        if line.starts_with("+++ ")
+            || line.starts_with("--- ")
+            || line.starts_with("@@ ")
+            || line.starts_with("diff --git ")
+            || line.starts_with("Updated ")
+            || line.starts_with("Wrote ")
+        {
+            saw_header = true;
+            // Header alone is enough for synthetic write previews / real patches.
+            if line.starts_with("+++ ")
+                || line.starts_with("--- ")
+                || line.starts_with("@@ ")
+                || line.starts_with("diff --git ")
+            {
+                return true;
+            }
         }
         if line.starts_with('+') && !line.starts_with("+++") {
             plus += 1;
@@ -438,7 +457,8 @@ pub fn looks_like_diff(text: &str) -> bool {
             minus += 1;
         }
     }
-    plus + minus >= 2
+    // "Wrote …" / "Updated …" previews: need both body markers.
+    saw_header && plus + minus >= 1
 }
 
 /// Classify a single output line for coloring.
@@ -1090,7 +1110,7 @@ mod tests {
 
     #[test]
     fn read_summary_is_metrics_only() {
-        let (s, _, _) = summarize_tool_special(
+        let (s, expand, better) = summarize_tool_special(
             "read",
             r#"{"path":"/abs/foo.rs"}"#,
             "line1\nline2\n",
@@ -1099,6 +1119,48 @@ mod tests {
         .unwrap();
         assert_eq!(s, "2 lines");
         assert!(!s.contains('/'), "{s}");
+        assert!(!expand);
+        assert!(better.is_none());
+    }
+
+    #[test]
+    fn looks_like_diff_rejects_plain_markdown_and_read_bodies() {
+        // Markdown bullets must never drive the IDE edit UI for read output.
+        let md = "\
+# One\n\
+\n\
+## Features\n\
+- **minimal core**\n\
+- **built-in tools**\n\
+- item three\n";
+        assert!(
+            !looks_like_diff(md),
+            "plain markdown should not look like a diff:\n{md}"
+        );
+
+        let numbered = "1|# One\n2|\n3|- bullet\n4|+ plusish\n";
+        assert!(
+            !looks_like_diff(numbered),
+            "read-style numbered body is not a patch:\n{numbered}"
+        );
+    }
+
+    #[test]
+    fn looks_like_diff_accepts_unified_and_write_preview() {
+        let unified = "\
+--- a/src/a.rs\n\
++++ b/src/a.rs\n\
+@@ -1,2 +1,2 @@\n\
+-old\n\
++new\n";
+        assert!(looks_like_diff(unified));
+
+        let write_preview = "\
+Wrote 12 bytes → foo.txt (2 lines)\n\
++++ b/foo.txt\n\
++hello\n\
++world\n";
+        assert!(looks_like_diff(write_preview));
     }
 
     #[test]

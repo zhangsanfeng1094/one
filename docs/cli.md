@@ -784,9 +784,10 @@ Slash 命令：
 
 1. `one-tools`：`format_edit_success` 生成 summary + unified patch；`patch_for_details` 在体积 ≤ **100 KiB** 时写入 `details.patch`（更大则省略 patch，摘要仍有）。
 2. `one-cli` interactive：`tool_output_for_ui` 优先拼接 summary + `details.patch` 作为 TUI 预览文本。
-3. `one-tui`：展开 tool 行时，`looks_like_diff` 识别 patch → `render_ide_diff` 渲染。
+3. `one-tui`：展开 **edit/write** tool 行时，`looks_like_diff` 识别 patch → `render_ide_diff` 渲染。
+   **`read` / `grep` / `bash` 等永远走普通纯文本树形详情**，不会进入红绿 gutter 修改界面（Markdown 列表等含 `+/-` 的正文也不会被误判）。
 
-**IDE 风格（默认展开成功 diff）**
+**IDE 风格（仅 edit/write；默认展开小 diff）**
 
 - 形态类似 Cursor / VS Code inline diff：左侧 **色条 + 行号 gutter + `│` 分隔** + 代码正文，**不**再显示 unified 的 `+`/`-` 前缀与 `---`/`+++`/`@@` 头。
 - **删除行**：柔和红底 + 行首 `┃`；相邻 del→add 配对时，**词级**更亮红底（`Theme::diff_del` / `diff_del_word`）。

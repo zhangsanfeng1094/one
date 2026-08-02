@@ -2219,7 +2219,11 @@ fn render_tool(
         }
 
         if let Some(output) = message.tool_output.as_deref() {
-            let is_diff = tool_view::looks_like_diff(output);
+            // IDE red/green gutter is only for edit/write patches. `read` / grep / bash
+            // / etc. always render as ordinary plain text — never the modification UI
+            // (markdown bullets and other `+/-` lines used to false-trigger looks_like_diff).
+            let is_edit_write = matches!(name.as_str(), "edit" | "write" | "search_replace");
+            let is_diff = is_edit_write && tool_view::looks_like_diff(output);
             // Edit/write: Cursor-style numbered red/green rows (no unified +/- chrome).
             if is_diff && status != ToolStatus::Error {
                 // Paint recovered args first (│ continues into the diff block).
