@@ -1370,6 +1370,16 @@ pub async fn run_interactive(
         ));
     }
 
+    // `--continue` / boot-time resume already loaded agent messages — paint them
+    // into the transcript (including tool results) so history is not a blank UI.
+    {
+        let msgs = runtime.agent.lock().await.messages.clone();
+        if !msgs.is_empty() {
+            let durations = session_tool_durations(runtime);
+            rebuild_tui_from_agent(&mut app, &msgs, &durations);
+        }
+    }
+
     let mut terminal = TerminalSession::enter().map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
     // `-r` → open session picker immediately.
@@ -1420,6 +1430,7 @@ pub async fn run_interactive(
                 terminal
                     .leave()
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                print_resume_hint(runtime);
                 return Ok(());
             }
         }
@@ -1620,7 +1631,67 @@ pub async fn run_interactive(
     terminal
         .leave()
         .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+    print_resume_hint(runtime);
     Ok(())
+}
+
+/// After the alternate screen is gone, print a copy-paste `one resume …` line.
+fn print_resume_hint(runtime: &AppRuntime) {
+    let Some(session) = runtime.session.as_ref() else {
+        return;
+    };
+    let id = session.header().id.as_str();
+    if id.is_empty() {
+        return;
+    }
+    let short: String = id.chars().take(12).collect();
+
+    // If the process cwd differs from the session project root, include `--cwd`.
+    let session_cwd = std::path::PathBuf::from(&session.header().cwd);
+    let cwd_flag = match std::env::current_dir() {
+        Ok(cwd) if cwd != session_cwd => {
+            format!(" --cwd {}", shell_quote_path(&session_cwd))
+        }
+        _ => String::new(),
+    };
+
+    eprintln!();
+    if let Some(name) = session
+        .session_name()
+        .filter(|n| !n.trim().is_empty())
+    {
+        let name = name.trim();
+        if name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':' | '/'))
+        {
+            eprintln!("resume:  one resume{cwd_flag} {short}   # or: one resume{cwd_flag} {name}");
+        } else {
+            eprintln!("resume:  one resume{cwd_flag} {short}");
+            eprintln!(
+                "     or: one resume{cwd_flag} {}",
+                shell_quote_arg(name)
+            );
+        }
+    } else {
+        eprintln!("resume:  one resume{cwd_flag} {short}");
+    }
+}
+
+fn shell_quote_path(path: &std::path::Path) -> String {
+    shell_quote_arg(&path.display().to_string())
+}
+
+fn shell_quote_arg(s: &str) -> String {
+    if s.is_empty() {
+        return "''".into();
+    }
+    if s.chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ':' | ',' | '@' | '+' | '='))
+    {
+        return s.to_string();
+    }
+    format!("'{}'", s.replace('\'', "'\\''"))
 }
 
 async fn refresh_usage(app: &mut App, runtime: &AppRuntime) {
@@ -2536,7 +2607,8 @@ async fn handle_slash(
                         let mut agent = runtime.agent.lock().await;
                         agent.messages.clear();
                         session.load_messages_into(&mut agent.messages);
-                        rebuild_tui_from_agent(app, &agent.messages);
+                        let durations = session.tool_duration_by_call_id();
+                        rebuild_tui_from_agent(app, &agent.messages, &durations);
                         app.set_notice(format!("branched to {id}"));
                         refresh_usage(app, runtime).await;
                     }
@@ -2917,7 +2989,8 @@ async fn load_session_into_app(
         runtime.maybe_compact(providers.as_llm(), false).await?;
     }
     let msgs = runtime.agent.lock().await.messages.clone();
-    rebuild_tui_from_agent(app, &msgs);
+    let durations = session_tool_durations(runtime);
+    rebuild_tui_from_agent(app, &msgs, &durations);
     // ↑ history is project-scoped (loaded at startup); do not re-append on resume.
     app.set_thinking_level(runtime.thinking_level().await.as_str());
     app.set_agent_label(runtime.mode().label());
@@ -2965,7 +3038,8 @@ async fn apply_rewind(
         let mut agent = runtime.agent.lock().await;
         agent.messages.clear();
         session.load_messages_into(&mut agent.messages);
-        rebuild_tui_from_agent(app, &agent.messages);
+        let durations = session.tool_duration_by_call_id();
+        rebuild_tui_from_agent(app, &agent.messages, &durations);
     }
 
     app.set_input_for_edit_with_images(prompt_text, images);
@@ -2981,12 +3055,35 @@ async fn apply_rewind(
     Ok(())
 }
 
-/// Rebuild on-screen transcript from agent messages (user / thinking / assistant text).
-fn rebuild_tui_from_agent(app: &mut App, messages: &[AgentMessage]) {
+/// Rebuild on-screen transcript from agent messages (user / thinking / assistant / tools).
+///
+/// Tool rows rehydrate from matching [`AgentMessage::ToolResult`] by
+/// `tool_call_id` (same idea as Grok Build's ConversationItem restore). Without
+/// this, resume only paints ToolCall shells and summarizes empty output as
+/// `0 lines` / `no matches` / `0ms`.
+///
+/// `tool_durations` is optional `tool_call_id → duration_ms` from
+/// `one.tool_audit` (via [`one_session::SessionManager::tool_duration_by_call_id`]).
+fn rebuild_tui_from_agent(
+    app: &mut App,
+    messages: &[AgentMessage],
+    tool_durations: &std::collections::HashMap<String, u64>,
+) {
     app.messages.clear();
     app.chat_scroll = 0;
     app.stream_buffer.clear();
     app.thinking_buffer.clear();
+
+    // Index results first so multi-tool rounds with the same name stay paired
+    // correctly (finish-by-name alone would match the newest Running row).
+    let mut results: std::collections::HashMap<&str, &one_core::ToolResultMessage> =
+        std::collections::HashMap::new();
+    for m in messages {
+        if let AgentMessage::ToolResult(tr) = m {
+            results.insert(tr.tool_call_id.as_str(), tr);
+        }
+    }
+
     for m in messages {
         match m {
             AgentMessage::User(u) => {
@@ -3010,14 +3107,42 @@ fn rebuild_tui_from_agent(app: &mut App, messages: &[AgentMessage]) {
                             }
                         }
                         one_core::message::ContentBlock::ToolCall {
-                            name, arguments, ..
+                            id,
+                            name,
+                            arguments,
                         } => {
                             let args = match arguments {
                                 serde_json::Value::String(s) => s.clone(),
                                 other => other.to_string(),
                             };
                             app.push_tool_call(name, args);
-                            app.finish_tool_with_output(name, false, None);
+                            if let Some(tr) = results.get(id.as_str()) {
+                                let text = tool_result_ui_text(&tr.content);
+                                app.finish_tool_with_output(name, tr.is_error, Some(text));
+                            } else {
+                                // Dangling call (crash / incomplete turn) — mark
+                                // failed rather than inventing a success with empty body.
+                                app.finish_tool_with_output(
+                                    name,
+                                    true,
+                                    Some("interrupted · no tool result in session".into()),
+                                );
+                            }
+                            // Override seal_duration (~0ms from Instant::now at rebuild).
+                            if let Some(msg) = app
+                                .messages
+                                .iter_mut()
+                                .rev()
+                                .find(|m| m.role == one_tui::message::MessageRole::Tool)
+                            {
+                                if let Some(&ms) = tool_durations.get(id) {
+                                    msg.duration_ms = Some(ms);
+                                } else {
+                                    // Prefer no duration over a fake 0ms.
+                                    msg.duration_ms = None;
+                                    msg.started_at = None;
+                                }
+                            }
                         }
                     }
                 }
@@ -3034,9 +3159,28 @@ fn rebuild_tui_from_agent(app: &mut App, messages: &[AgentMessage]) {
                     }
                 }
             }
-            _ => {}
+            // Consumed via the pre-index when the matching ToolCall is painted.
+            AgentMessage::ToolResult(_) => {}
         }
     }
+}
+
+/// Flatten tool-result content blocks for TUI preview (text + image labels).
+fn tool_result_ui_text(content: &[one_core::message::TextOrImage]) -> String {
+    content
+        .iter()
+        .map(one_core::message::TextOrImage::as_display_text)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Durations for TUI rebuild from the active session's `one.tool_audit` rows.
+fn session_tool_durations(runtime: &AppRuntime) -> std::collections::HashMap<String, u64> {
+    runtime
+        .session
+        .as_ref()
+        .map(|s| s.tool_duration_by_call_id())
+        .unwrap_or_default()
 }
 
 fn format_sources(citations: &[one_core::Citation]) -> String {
@@ -3282,7 +3426,8 @@ mod server_search_tests {
             end_index: 6,
         });
         let mut app = App::new("test");
-        rebuild_tui_from_agent(&mut app, &[message]);
+        let empty = std::collections::HashMap::new();
+        rebuild_tui_from_agent(&mut app, &[message], &empty);
         let assistant = app
             .messages
             .iter()
@@ -3291,6 +3436,170 @@ mod server_search_tests {
         assert_eq!(
             assistant.content,
             "answer\n\nSources:\n- Example — https://example.com\n"
+        );
+    }
+
+    #[test]
+    fn rebuild_restores_tool_result_summary_and_duration() {
+        use one_core::message::{
+            AssistantMessage, ContentBlock, StopReason, TextOrImage, ToolResultMessage,
+        };
+
+        let call_id = "call-read-1".to_string();
+        let body = (0..12)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let messages = vec![
+            AgentMessage::user_text("read it"),
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![ContentBlock::ToolCall {
+                    id: call_id.clone(),
+                    name: "read".into(),
+                    arguments: serde_json::json!({"path": "./README.md"}),
+                }],
+                provider: "mock".into(),
+                model: "m".into(),
+                stop_reason: StopReason::ToolUse,
+                citations: Vec::new(),
+                timestamp: 0,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: call_id.clone(),
+                tool_name: "read".into(),
+                content: vec![TextOrImage::Text { text: body }],
+                is_error: false,
+                timestamp: 0,
+            }),
+            AgentMessage::assistant_text("mock", "m", "done"),
+        ];
+        let mut durations = std::collections::HashMap::new();
+        durations.insert(call_id, 42);
+        let mut app = App::new("test");
+        rebuild_tui_from_agent(&mut app, &messages, &durations);
+
+        let tools: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(tools.len(), 1, "expected one tool row");
+        let tool = tools[0];
+        assert_eq!(tool.tool_name.as_deref(), Some("read"));
+        assert_eq!(tool.tool_status, Some(ToolStatus::Done));
+        assert_eq!(
+            tool.tool_summary.as_deref(),
+            Some("12 lines"),
+            "summary should derive from restored tool result body"
+        );
+        assert_eq!(tool.duration_ms, Some(42));
+        assert!(
+            tool.tool_output
+                .as_deref()
+                .is_some_and(|o| o.contains("line 0")),
+            "tool_output should keep result preview"
+        );
+    }
+
+    #[test]
+    fn rebuild_pairs_same_name_tools_by_call_id() {
+        use one_core::message::{
+            AssistantMessage, ContentBlock, StopReason, TextOrImage, ToolResultMessage,
+        };
+
+        let messages = vec![
+            AgentMessage::Assistant(AssistantMessage {
+                content: vec![
+                    ContentBlock::ToolCall {
+                        id: "a".into(),
+                        name: "ls".into(),
+                        arguments: serde_json::json!({"path": "./crates"}),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "b".into(),
+                        name: "ls".into(),
+                        arguments: serde_json::json!({"path": "./docs"}),
+                    },
+                ],
+                provider: "mock".into(),
+                model: "m".into(),
+                stop_reason: StopReason::ToolUse,
+                citations: Vec::new(),
+                timestamp: 0,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "a".into(),
+                tool_name: "ls".into(),
+                content: vec![TextOrImage::Text {
+                    text: "one-cli\none-core".into(),
+                }],
+                is_error: false,
+                timestamp: 0,
+            }),
+            AgentMessage::ToolResult(ToolResultMessage {
+                tool_call_id: "b".into(),
+                tool_name: "ls".into(),
+                content: vec![TextOrImage::Text {
+                    text: "architecture.md".into(),
+                }],
+                is_error: false,
+                timestamp: 0,
+            }),
+        ];
+        let empty = std::collections::HashMap::new();
+        let mut app = App::new("test");
+        rebuild_tui_from_agent(&mut app, &messages, &empty);
+        let tools: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].tool_summary.as_deref(), Some("2 lines"));
+        assert_eq!(tools[1].tool_summary.as_deref(), Some("1 lines"));
+        assert!(tools[0]
+            .tool_output
+            .as_deref()
+            .is_some_and(|o| o.contains("one-cli")));
+        assert!(tools[1]
+            .tool_output
+            .as_deref()
+            .is_some_and(|o| o.contains("architecture.md")));
+        // No audit durations → leave empty, not a fake 0ms.
+        assert_eq!(tools[0].duration_ms, None);
+        assert_eq!(tools[1].duration_ms, None);
+    }
+
+    #[test]
+    fn rebuild_marks_dangling_tool_call_as_error() {
+        use one_core::message::{AssistantMessage, ContentBlock, StopReason};
+
+        let messages = vec![AgentMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall {
+                id: "orphan".into(),
+                name: "bash".into(),
+                arguments: serde_json::json!({"command": "sleep 99"}),
+            }],
+            provider: "mock".into(),
+            model: "m".into(),
+            stop_reason: StopReason::ToolUse,
+            citations: Vec::new(),
+            timestamp: 0,
+        })];
+        let empty = std::collections::HashMap::new();
+        let mut app = App::new("test");
+        rebuild_tui_from_agent(&mut app, &messages, &empty);
+        let tool = app
+            .messages
+            .iter()
+            .find(|m| m.role == MessageRole::Tool)
+            .expect("tool row");
+        assert_eq!(tool.tool_status, Some(ToolStatus::Error));
+        assert!(
+            tool.tool_output
+                .as_deref()
+                .is_some_and(|o| o.contains("interrupted")),
+            "dangling call should surface interruption notice"
         );
     }
 

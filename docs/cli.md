@@ -12,6 +12,8 @@ one --resume / -r            # 交互：打开 session 选择器；非交互：�
 one resume                   # 退出后恢复：同 `one -r`（TUI 选择器）
 one resume <id|name|path>    # 退出后恢复：按 id 前缀 / 名称 / 预览 / 路径匹配
 one resume --list            # 列出本项目近期 session
+# TUI 正常退出后会在终端打印一行可复制命令，例如：
+#   resume:  one resume 6f5cad03-12a
 one --session PATH           # 打开指定 session 文件
 one --no-session             # 不持久化
 one --read-only              # 只启用 read/grep/find/ls
