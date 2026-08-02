@@ -3,7 +3,8 @@
 use std::time::{Duration, Instant};
 
 use crate::message::{
-    summarize_tool_output, truncate_tool_output_for_ui, Message, MessageRole, ToolStatus,
+    summarize_tool_output, truncate_tool_output_for_ui, ChatLineTarget, Message, MessageRole,
+    ToolStatus,
 };
 use crate::state::RunOutcome;
 use crate::tool_view;
@@ -86,6 +87,7 @@ impl super::App {
         };
         let apply = |msg: &mut Message| {
             msg.tool_status = Some(status);
+            msg.seal_duration();
             let args = msg.content.clone();
             let tool_name = msg.tool_name.clone().unwrap_or_else(|| name.to_string());
             // Preserve / recover job_id from tool output for post-run reopen.
@@ -260,6 +262,7 @@ impl super::App {
         if let Some(msg) = self.messages.get_mut(msg_index) {
             msg.tool_expanded = !msg.tool_expanded;
         }
+        self.chat_focus = Some(msg_index);
     }
 
     /// Attach / refresh live job metadata on a running `task` tool row.
@@ -300,6 +303,76 @@ impl super::App {
                 msg.thinking_expanded = !msg.thinking_expanded;
             }
         }
+        self.chat_focus = Some(msg_index);
+    }
+
+    /// Interactive transcript rows (tools + finished thinking) for j/k focus.
+    pub fn focusable_message_indices(&self) -> Vec<usize> {
+        self.messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| match m.role {
+                MessageRole::Tool => true,
+                MessageRole::Thinking if !m.streaming => true,
+                _ => false,
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
+    /// Move chat focus by `delta` among focusable rows. Enters browse mode.
+    pub fn move_chat_focus(&mut self, delta: i32) {
+        let targets = self.focusable_message_indices();
+        if targets.is_empty() {
+            return;
+        }
+        let cur = self
+            .chat_focus
+            .and_then(|f| targets.iter().position(|&i| i == f))
+            .unwrap_or(if delta >= 0 {
+                targets.len().saturating_sub(1)
+            } else {
+                0
+            });
+        let next = if delta >= 0 {
+            (cur + 1).min(targets.len() - 1)
+        } else {
+            cur.saturating_sub(1)
+        };
+        self.chat_focus = Some(targets[next]);
+        self.follow_bottom = false;
+        // Nudge scroll so the focused row stays discoverable (best-effort).
+        // Exact line mapping is recomputed on next draw from chat_line_owners.
+        if let Some(owner_line) = self
+            .chat_line_owners
+            .iter()
+            .position(|o| matches!(o, Some(ChatLineTarget::Message(i)) if *i == targets[next]))
+        {
+            let view_h = self.chat_view_height.max(1);
+            if owner_line < self.chat_view_start {
+                self.chat_scroll = owner_line;
+            } else if owner_line >= self.chat_view_start + view_h {
+                self.chat_scroll = owner_line.saturating_sub(view_h.saturating_sub(1));
+            }
+        }
+    }
+
+    /// Toggle expand on the focused chat row (or last tool when none).
+    pub fn toggle_focused_or_last(&mut self) -> bool {
+        if let Some(idx) = self.chat_focus {
+            match self.messages.get(idx).map(|m| m.role) {
+                Some(MessageRole::Thinking) => {
+                    self.toggle_thinking_at(idx);
+                    return true;
+                }
+                Some(MessageRole::Tool) => {
+                    self.toggle_tool_at(idx);
+                    return true;
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     pub fn append_stream(&mut self, delta: &str) {
@@ -373,6 +446,7 @@ impl super::App {
             {
                 msg.streaming = false;
                 msg.thinking_expanded = self.show_thinking;
+                msg.seal_duration();
             }
             return;
         }
@@ -385,6 +459,7 @@ impl super::App {
         {
             msg.streaming = false;
             msg.thinking_expanded = self.show_thinking;
+            msg.seal_duration();
         }
         self.thinking_buffer.clear();
     }
@@ -428,6 +503,7 @@ impl super::App {
         for msg in self.messages.iter_mut() {
             if msg.role == MessageRole::Tool && msg.tool_status == Some(ToolStatus::Running) {
                 msg.tool_status = Some(ToolStatus::Done);
+                msg.seal_duration();
             }
         }
     }

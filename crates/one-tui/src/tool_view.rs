@@ -1,5 +1,8 @@
 //! Tool transcript helpers: grouping, edit/write previews, diff line paint.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use crate::message::{Message, MessageRole, ToolStatus};
 
 /// Max tools shown as a single collapsed “N tools” chip before forcing expand.
@@ -75,7 +78,7 @@ pub fn streak_shows_group_header(messages: &[Message], start: usize, len: usize)
 /// Short label for a tool in a group header: `bash` / `edit:path`.
 pub fn tool_short_label(msg: &Message) -> String {
     let name = msg.tool_name.as_deref().unwrap_or("tool");
-    let detail = pretty_path_or_cmd(&msg.content);
+    let detail = pretty_path_or_cmd(&msg.content, None);
     if detail.is_empty() {
         name.to_string()
     } else {
@@ -90,14 +93,229 @@ pub fn tool_short_label(msg: &Message) -> String {
     }
 }
 
-fn pretty_path_or_cmd(args: &str) -> String {
+/// Aggregate tool names for collapsed chips: `[todo_write] [grep x2] [read x2]`.
+pub fn aggregate_tool_names(names: &[String]) -> String {
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for n in names {
+        let key = if n.is_empty() {
+            "tool".to_string()
+        } else {
+            n.clone()
+        };
+        if !counts.contains_key(&key) {
+            order.push(key.clone());
+        }
+        *counts.entry(key).or_insert(0) += 1;
+    }
+    order
+        .iter()
+        .map(|n| {
+            let c = counts.get(n).copied().unwrap_or(1);
+            if c > 1 {
+                format!("[{n} ×{c}]")
+            } else {
+                format!("[{n}]")
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Collapse multi-line / escaped newlines into a single-line preview (`↵` separators).
+///
+/// Does **not** aggressively end-truncate long paths — callers should apply
+/// [`truncate_middle`] / display-width middle truncate so filenames survive.
+pub fn single_line_preview(s: &str, max_chars: usize) -> String {
+    let flat = s
+        .split(|c| c == '\n' || c == '\r')
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ↵ ");
+    // Also flatten literal `\n` that leaked from unparsed JSON.
+    let flat = flat.replace("\\n", " ↵ ");
+    truncate_middle(&flat, max_chars)
+}
+
+/// Middle-truncate by **char count**, keeping head + tail (filenames / destinations).
+///
+/// Prefer this over end-ellipsis when the important token is at the end of a path
+/// or command line.
+pub fn truncate_middle(s: &str, max_chars: usize) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.len() <= max_chars {
+        return s.to_string();
+    }
+    if max_chars <= 1 {
+        return "…".into();
+    }
+    if max_chars <= 3 {
+        let t: String = chars.into_iter().take(max_chars.saturating_sub(1)).collect();
+        return format!("{t}…");
+    }
+    // ~40% head / ~60% tail so destinations & file names win over argv0.
+    let inner = max_chars - 1; // room for …
+    let head_n = (inner * 2) / 5;
+    let tail_n = inner - head_n;
+    let head: String = chars.iter().take(head_n).collect();
+    let tail: String = chars[chars.len() - tail_n..].iter().collect();
+    format!("{head}…{tail}")
+}
+
+/// Shorten an absolute path for transcript display.
+///
+/// - Under `cwd` → `./relative/path`
+/// - Under `$HOME` → `~/…`
+/// - Otherwise unchanged
+pub fn shorten_display_path(path: &str, cwd: Option<&Path>) -> String {
+    let path = path.trim();
+    if path.is_empty() {
+        return String::new();
+    }
+    // Prefer real Path strip_prefix, then string prefix (symlink / non-canonical cwd).
+    if let Some(cwd) = cwd {
+        let p = Path::new(path);
+        if let Ok(rel) = p.strip_prefix(cwd) {
+            let s = rel.to_string_lossy();
+            return if s.is_empty() {
+                "./".into()
+            } else {
+                format!("./{s}")
+            };
+        }
+        let cwd_s = cwd.to_string_lossy();
+        let cwd_trim = cwd_s.trim_end_matches('/');
+        if path == cwd_trim {
+            return "./".into();
+        }
+        let prefix = format!("{cwd_trim}/");
+        if let Some(rest) = path.strip_prefix(&prefix) {
+            return format!("./{rest}");
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim_end_matches('/');
+        if path == home {
+            return "~/".into();
+        }
+        let prefix = format!("{home}/");
+        if let Some(rest) = path.strip_prefix(&prefix) {
+            return format!("~/{rest}");
+        }
+    }
+    path.to_string()
+}
+
+/// Replace absolute workspace / home prefixes inside free-form text (bash cmds, etc.).
+///
+/// `cd /home/…/tools/one/benches/foo` → `cd ./benches/foo`
+pub fn shorten_paths_in_text(s: &str, cwd: Option<&Path>) -> String {
+    let trimmed = s.trim();
+    if looks_like_path(trimmed) {
+        return shorten_display_path(trimmed, cwd);
+    }
+    let mut out = s.to_string();
+    if let Some(cwd) = cwd {
+        let cwd_s = cwd.to_string_lossy();
+        let cwd_trim = cwd_s.trim_end_matches('/');
+        if !cwd_trim.is_empty() && out.contains(cwd_trim) {
+            // Prefer `./rest` over `./rest` double-slash: replace `cwd/` first.
+            let with_slash = format!("{cwd_trim}/");
+            if out.contains(&with_slash) {
+                out = out.replace(&with_slash, "./");
+            }
+            // Bare exact path token remaining (e.g. `cd /proj` with no trailing slash use).
+            if out.contains(cwd_trim) {
+                out = out.replace(cwd_trim, ".");
+            }
+        }
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        let home = home.trim_end_matches('/');
+        if !home.is_empty() && out.contains(home) {
+            let with_slash = format!("{home}/");
+            if out.contains(&with_slash) {
+                out = out.replace(&with_slash, "~/");
+            }
+            if out.contains(home) {
+                out = out.replace(home, "~");
+            }
+        }
+    }
+    out
+}
+
+/// Split a display path into `(dir_with_slash, file_name)` for dim/highlight paint.
+pub fn path_dir_and_name(path: &str) -> (String, String) {
+    if let Some(pos) = path.rfind('/') {
+        (path[..=pos].to_string(), path[pos + 1..].to_string())
+    } else {
+        (String::new(), path.to_string())
+    }
+}
+
+/// Whether `s` looks like a filesystem path (not a shell command / URL query).
+pub fn looks_like_path(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.contains(' ') || s.contains('\n') {
+        return false;
+    }
+    s.starts_with('/')
+        || s.starts_with("./")
+        || s.starts_with("~/")
+        || s.starts_with("../")
+        || (s.contains('/') && !s.contains("://"))
+}
+
+fn pretty_path_or_cmd(args: &str, cwd: Option<&Path>) -> String {
     let t = args.trim();
     if !(t.starts_with('{') && t.ends_with('}')) {
-        return t.chars().take(40).collect();
+        // Generous cap: the header still width-truncates; keep head+tail for paths.
+        return single_line_preview(&shorten_paths_in_text(t, cwd), 240);
     }
-    for key in ["path", "file_path", "command", "pattern", "query", "url"] {
+    for key in ["path", "file_path", "filePath", "command", "pattern", "query", "url"] {
         if let Some(v) = json_field(t, key) {
-            return v;
+            if key == "command" || key == "pattern" || key == "query" {
+                // Paths inside shell commands → relative; leave room for UI middle-trunc.
+                let short = shorten_paths_in_text(&v, cwd);
+                return single_line_preview(&short, 240);
+            }
+            if key == "url" {
+                return single_line_preview(&v, 96);
+            }
+            return shorten_display_path(&v, cwd);
+        }
+    }
+    String::new()
+}
+
+/// Pretty one-line tool args for headers (path shortened, newlines → `↵`).
+pub fn pretty_tool_detail(args: &str, cwd: Option<&Path>) -> String {
+    pretty_path_or_cmd(args, cwd)
+}
+
+/// Full multi-line tool args for expanded body — paths shortened, **no char cap**.
+///
+/// Collapsed headers middle-truncate long bash/heredocs; expand must recover the
+/// middle so transcript history is not permanently cropped.
+pub fn pretty_tool_detail_full(args: &str, cwd: Option<&Path>) -> String {
+    let t = args.trim();
+    if t.is_empty() {
+        return String::new();
+    }
+    if !(t.starts_with('{') && t.ends_with('}')) {
+        return shorten_paths_in_text(t, cwd);
+    }
+    for key in ["path", "file_path", "filePath", "command", "pattern", "query", "url"] {
+        if let Some(v) = json_field(t, key) {
+            if key == "command" || key == "pattern" || key == "query" {
+                return shorten_paths_in_text(&v, cwd);
+            }
+            if key == "url" {
+                return v;
+            }
+            return shorten_display_path(&v, cwd);
         }
     }
     String::new()
@@ -494,7 +712,6 @@ pub fn summarize_tool_special(
             if is_error {
                 return None;
             }
-            let path = json_field(args, "path").unwrap_or_else(|| "file".into());
             let better = if looks_like_diff(output) {
                 None
             } else {
@@ -502,24 +719,25 @@ pub fn summarize_tool_special(
             };
             let body = better.as_deref().unwrap_or(output);
             let (adds, dels) = count_diff_stats(body);
+            // Path lives on the header; summary is stats only (less noise).
             let summary = if adds + dels > 0 {
-                format!("edited {path} · +{adds} −{dels}")
+                format!("+{adds} −{dels}")
             } else {
-                format!("edited {path}")
+                "edited".into()
             };
             // Auto-expand small edits so the diff is visible.
             let expand = adds + dels > 0 && adds + dels <= 24;
             Some((summary, expand, better))
         }
         "write" => {
-            let path = json_field(args, "path").unwrap_or_else(|| "file".into());
             let better = if looks_like_diff(output) {
                 None
             } else {
                 write_preview_from_args(args)
             };
             let bytes = json_field(args, "content").map(|c| c.len()).unwrap_or(0);
-            let summary = format!("wrote {path} · {bytes} B");
+            // Path on header; summary is size only.
+            let summary = format!("wrote {bytes} B");
             Some((summary, false, better))
         }
         "task" => {
@@ -582,12 +800,12 @@ pub fn summarize_tool_special(
             let failed = is_error
                 || matches!(code, Some(c) if c != 0)
                 || code.is_none() && output.starts_with("exit signal");
+            // Success: metrics only (no redundant "exit 0" — ✓ already means ok).
+            // Failure: keep exit code front-and-center.
             let summary = match code {
-                Some(0) if !is_error && body_lines == 0 => "exit 0".into(),
-                Some(0) if !is_error && body_lines == 1 => {
-                    format!("exit 0 · {}", truncate(body.trim(), 40))
-                }
-                Some(0) if !is_error => format!("exit 0 · {body_lines} lines"),
+                Some(0) if !is_error && body_lines == 0 => String::new(),
+                Some(0) if !is_error && body_lines == 1 => truncate(body.trim(), 40),
+                Some(0) if !is_error => format!("{body_lines} lines"),
                 Some(c) if body_lines == 0 => format!("exit {c}"),
                 Some(c) => format!("exit {c} · {body_lines} lines"),
                 None if failed => {
@@ -598,10 +816,9 @@ pub fn summarize_tool_special(
                         .unwrap_or("failed");
                     format!("error · {}", truncate(first, 48))
                 }
-                None if body_lines <= 1 => {
-                    format!("ok · {}", truncate(output.trim(), 40))
-                }
-                None => format!("ok · {body_lines} lines"),
+                None if body_lines == 0 => String::new(),
+                None if body_lines == 1 => truncate(output.trim(), 40),
+                None => format!("{body_lines} lines"),
             };
             // Failures auto-expand so stderr is visible mid-transcript.
             let _ = args;
@@ -657,14 +874,23 @@ pub fn summarize_tool_special(
             Some((format!("killed · {task_id}"), true, None))
         }
         "read" => {
-            let path = json_field(args, "path")
-                .or_else(|| json_field(args, "file_path"))
-                .unwrap_or_else(|| "file".into());
+            // Path is on the tool header — summary only carries result metrics.
             if output.contains("[image") {
-                return Some((format!("read {path} · image"), true, None));
+                return Some(("image".into(), true, None));
             }
             let lines = output.lines().count();
-            Some((format!("read {path} · {lines} lines"), false, None))
+            Some((format!("{lines} lines"), false, None))
+        }
+        "grep" | "find" | "ls" => {
+            if is_error {
+                return None;
+            }
+            let lines = output.lines().filter(|l| !l.trim().is_empty()).count();
+            if lines == 0 {
+                Some(("no matches".into(), false, None))
+            } else {
+                Some((format!("{lines} lines"), false, None))
+            }
         }
         _ => None,
     }
@@ -796,16 +1022,107 @@ mod tests {
     }
 
     #[test]
+    fn shorten_display_path_relative_and_home() {
+        let cwd = Path::new("/home/fxh/tools/one");
+        assert_eq!(
+            shorten_display_path("/home/fxh/tools/one/crates/one-tools/src/bash.rs", Some(cwd)),
+            "./crates/one-tools/src/bash.rs"
+        );
+        assert_eq!(shorten_display_path("/home/fxh/tools/one", Some(cwd)), "./");
+        // Outside cwd still may become ~/ when HOME matches.
+        std::env::set_var("HOME", "/home/fxh");
+        assert_eq!(
+            shorten_display_path("/home/fxh/.config/foo", Some(cwd)),
+            "~/.config/foo"
+        );
+    }
+
+    #[test]
+    fn single_line_preview_flattens_newlines() {
+        assert_eq!(single_line_preview("a\nb\nc", 40), "a ↵ b ↵ c");
+        assert_eq!(single_line_preview("bg id\\n# how", 40), "bg id ↵ # how");
+    }
+
+    #[test]
+    fn truncate_middle_keeps_tail() {
+        let s = "cd /home/fxh/tools/one/benches/out/tb-regex-checker";
+        let t = truncate_middle(s, 28);
+        assert!(t.contains('…'), "{t}");
+        assert!(
+            t.ends_with("checker") || t.contains("regex"),
+            "tail (filename) must survive: {t}"
+        );
+        assert!(!t.ends_with('…'), "must not end-ellipsis only: {t}");
+    }
+
+    #[test]
+    fn shorten_paths_in_text_rewrites_cwd_inside_command() {
+        let cwd = Path::new("/home/fxh/tools/one");
+        let cmd = "cd /home/fxh/tools/one/benches/out/tb-regex-checker && ls";
+        let s = shorten_paths_in_text(cmd, Some(cwd));
+        assert!(s.contains("./benches/out/tb-regex-checker"), "{s}");
+        assert!(!s.contains("/home/fxh/tools/one/benches"), "{s}");
+    }
+
+    #[test]
+    fn pretty_tool_detail_shortens_bash_command_paths() {
+        let cwd = Path::new("/home/fxh/tools/one");
+        let args = r#"{"command":"cp /home/fxh/tools/one/benches/out/tb-regex-checker/a /tmp/b"}"#;
+        let d = pretty_tool_detail(args, Some(cwd));
+        assert!(d.contains("./benches/out/tb-regex-checker"), "{d}");
+        assert!(!d.contains("/home/fxh/tools/one/"), "{d}");
+    }
+
+    #[test]
+    fn aggregate_tool_names_counts_dupes() {
+        let names = vec![
+            "todo_write".into(),
+            "grep".into(),
+            "grep".into(),
+            "read".into(),
+            "read".into(),
+        ];
+        assert_eq!(
+            aggregate_tool_names(&names),
+            "[todo_write] [grep ×2] [read ×2]"
+        );
+    }
+
+    #[test]
+    fn read_summary_is_metrics_only() {
+        let (s, _, _) = summarize_tool_special(
+            "read",
+            r#"{"path":"/abs/foo.rs"}"#,
+            "line1\nline2\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(s, "2 lines");
+        assert!(!s.contains('/'), "{s}");
+    }
+
+    #[test]
     fn bash_exit_summary() {
         let (s, expand, _) =
             summarize_tool_special("bash", r#"{"command":"false"}"#, "exit 1\nboom", true).unwrap();
         assert!(s.contains("exit 1"), "{s}");
         assert!(expand);
 
+        // Success: no redundant "exit 0" — ✓ already signals ok.
         let (s0, expand0, _) =
             summarize_tool_special("bash", r#"{"command":"true"}"#, "exit 0", false).unwrap();
-        assert!(s0.contains("exit 0"), "{s0}");
+        assert!(!s0.contains("exit 0"), "{s0}");
+        assert!(s0.is_empty(), "empty metrics when no output: {s0}");
         assert!(!expand0);
+
+        let (s_lines, _, _) = summarize_tool_special(
+            "bash",
+            r#"{"command":"ls"}"#,
+            "exit 0\na\nb\nc\n",
+            false,
+        )
+        .unwrap();
+        assert_eq!(s_lines, "3 lines");
     }
 
     #[test]

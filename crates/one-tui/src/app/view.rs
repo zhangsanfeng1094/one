@@ -45,7 +45,10 @@ impl super::App {
         };
         if let Some(Some(target)) = self.chat_line_owners.get(line).copied() {
             match target {
-                ChatLineTarget::ToolGroup(start) => self.toggle_tool_group_at(start),
+                ChatLineTarget::ToolGroup(start) => {
+                    self.chat_focus = Some(start);
+                    self.toggle_tool_group_at(start);
+                }
                 ChatLineTarget::Message(msg_i) => match self.messages.get(msg_i).map(|m| m.role) {
                     Some(MessageRole::Thinking) => self.toggle_thinking_at(msg_i),
                     Some(MessageRole::Tool) => self.toggle_tool_at(msg_i),

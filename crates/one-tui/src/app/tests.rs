@@ -1468,8 +1468,9 @@ fn edit_tool_gets_diff_summary() {
     let last = app.messages.last().unwrap();
     assert_eq!(last.tool_status, Some(ToolStatus::Done));
     let summary = last.tool_summary.as_deref().unwrap_or("");
+    // Path lives on the header; summary is diff stats only.
     assert!(
-        summary.contains("edited") || summary.contains("a.rs"),
+        summary.contains('+') || summary.contains('−') || summary.contains("edited"),
         "{summary}"
     );
     let out = last.tool_output.as_deref().unwrap_or("");

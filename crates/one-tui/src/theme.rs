@@ -18,14 +18,16 @@ impl Theme {
     pub const FG: Color = Color::Rgb(0xee, 0xee, 0xee); // darkStep12
 
     // Accents (OpenCode defaults)
-    pub const PRIMARY: Color = Color::Rgb(0xfa, 0xb2, 0x83); // peach — agent / user bar
-    pub const SECONDARY: Color = Color::Rgb(0x5c, 0x9c, 0xf5); // blue
+    pub const PRIMARY: Color = Color::Rgb(0xfa, 0xb2, 0x83); // peach — user bubble / prompt caret
+    pub const SECONDARY: Color = Color::Rgb(0x5c, 0x9c, 0xf5); // blue — chat focus rail (j/k)
     pub const ACCENT: Color = Color::Rgb(0x9d, 0x7c, 0xd8); // purple
     pub const SUCCESS: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
     pub const ERROR: Color = Color::Rgb(0xe0, 0x6c, 0x75);
     pub const WARNING: Color = Color::Rgb(0xf5, 0xa7, 0x42);
     pub const INFO: Color = Color::Rgb(0x56, 0xb6, 0xc2);
     pub const CODE: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
+    /// Warm elevated fill for user bubbles — distinct from neutral ELEMENT focus wash.
+    pub const USER_BG: Color = Color::Rgb(0x2c, 0x26, 0x22);
 
     pub fn bg() -> Style {
         Style::default().bg(Self::BG).fg(Self::FG)
@@ -333,17 +335,31 @@ impl Theme {
         Style::default().fg(Self::ELEMENT).bg(Self::ELEMENT)
     }
 
+    /// User bubble left rail — peach identity. Not shared with chat focus.
     pub fn user_bar() -> Style {
-        Style::default().fg(Self::PRIMARY)
+        Style::default().fg(Self::PRIMARY).bg(Self::USER_BG)
     }
 
     pub fn user_body() -> Style {
-        // Slightly elevated panel so the bubble lifts off pure BG.
-        Style::default().fg(Self::FG).bg(Self::ELEMENT)
+        // Warm elevated card + bold so user turns read louder than tools/focus.
+        Style::default()
+            .fg(Self::FG)
+            .bg(Self::USER_BG)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn user_pad() -> Style {
-        Style::default().bg(Self::ELEMENT)
+        Style::default().bg(Self::USER_BG)
+    }
+
+    /// j/k transcript focus rail — blue, deliberately *not* user peach.
+    pub fn focus_rail() -> Style {
+        Style::default().fg(Self::SECONDARY)
+    }
+
+    /// Soft wash under a focused tool/thinking row (neutral, not user-warm).
+    pub fn focus_wash_bg() -> Color {
+        Self::ELEMENT
     }
 
     pub fn assistant_body() -> Style {
@@ -359,6 +375,13 @@ impl Theme {
         Style::default()
             .fg(Self::ACCENT)
             .add_modifier(Modifier::DIM)
+    }
+
+    /// Badge form: `[Thinking 3.7s]` — brighter than body so it reads as a chip.
+    pub fn thinking_badge() -> Style {
+        Style::default()
+            .fg(Self::ACCENT)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn thinking_meta() -> Style {
@@ -441,8 +464,10 @@ impl Theme {
         Style::default().fg(Self::BORDER_ACTIVE)
     }
 
+    /// Running tools use cyan/info — not user peach (PRIMARY) and not focus blue
+    /// (SECONDARY), so busy / selected / user stay three distinct signals.
     pub fn tool_icon_running() -> Style {
-        Style::default().fg(Self::PRIMARY)
+        Style::default().fg(Self::INFO)
     }
 
     pub fn tool_icon_done() -> Style {
@@ -467,7 +492,7 @@ impl Theme {
 
     pub fn tool_name_running() -> Style {
         Style::default()
-            .fg(Self::PRIMARY)
+            .fg(Self::INFO)
             .add_modifier(Modifier::BOLD)
     }
 

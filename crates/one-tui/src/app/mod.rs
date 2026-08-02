@@ -97,6 +97,9 @@ pub struct App {
     /// Parallel to display lines: click target for each transcript line.
     /// `None` = spacer / non-interactive.
     pub chat_line_owners: Vec<Option<ChatLineTarget>>,
+    /// Keyboard/mouse focus on a transcript message index (tool / thinking).
+    /// Painted as a left rail; navigable with j/k when the prompt is empty.
+    pub chat_focus: Option<usize>,
     /// Top of chat viewport in the full line list (updated each draw).
     pub chat_view_start: usize,
     /// Blank rows painted above short transcripts (bottom-pin). Clicks skip these.
@@ -262,7 +265,8 @@ pub struct App {
     history_persist_path: Option<PathBuf>,
     /// Optional callback-less persist via path — CLI sets this after load.
     /// When set, `push_prompt_history` also appends a JSON line.
-    history_cwd: Option<PathBuf>,
+    /// Workspace cwd used for prompt-history paths and relative path display.
+    pub(crate) history_cwd: Option<PathBuf>,
     /// Interactive tool approval overlay (while busy) — metadata for gate id.
     approval: Option<ApprovalPrompt>,
     /// Choice taken by the user for the current approval.
@@ -309,6 +313,7 @@ impl App {
             chat_view_height: 0,
             chat_total_lines: 0,
             chat_line_owners: Vec::new(),
+            chat_focus: None,
             chat_view_start: 0,
             chat_top_pad: 0,
             mouse_capture: true,

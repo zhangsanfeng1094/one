@@ -12,6 +12,8 @@
 //! | System | rare meta lines | only if agent also has it (usually no) |
 //! | Alert | turn / tool errors, UI cards | **never** — display only |
 
+use std::time::Instant;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
     User,
@@ -73,6 +75,10 @@ pub struct Message {
     pub alert_level: Option<AlertLevel>,
     /// Live subagent job id for `task` — click opens `/tasks` detail (not `/ps`).
     pub tool_job_id: Option<String>,
+    /// When the tool/thinking row started (UI timing only).
+    pub started_at: Option<Instant>,
+    /// Wall duration once finished (`ms` for compact chrome).
+    pub duration_ms: Option<u64>,
 }
 
 fn blank_message(role: MessageRole, content: String) -> Message {
@@ -90,6 +96,8 @@ fn blank_message(role: MessageRole, content: String) -> Message {
         thinking_expanded: false,
         alert_level: None,
         tool_job_id: None,
+        started_at: None,
+        duration_ms: None,
     }
 }
 
@@ -110,6 +118,7 @@ impl Message {
         let mut m = blank_message(MessageRole::Thinking, content.into());
         m.streaming = true;
         m.thinking_expanded = true; // show live stream while arriving
+        m.started_at = Some(Instant::now());
         m
     }
 
@@ -123,7 +132,20 @@ impl Message {
         let mut m = blank_message(MessageRole::Tool, detail);
         m.tool_status = Some(status);
         m.tool_name = Some(name);
+        if status == ToolStatus::Running {
+            m.started_at = Some(Instant::now());
+        }
         m
+    }
+
+    /// Seal wall-clock duration from `started_at` (no-op if already set).
+    pub fn seal_duration(&mut self) {
+        if self.duration_ms.is_some() {
+            return;
+        }
+        if let Some(start) = self.started_at {
+            self.duration_ms = Some(start.elapsed().as_millis() as u64);
+        }
     }
 
     /// UI-only card in the transcript (errors, warnings). Not agent context.

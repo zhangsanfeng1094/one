@@ -1,6 +1,7 @@
 //! OpenCode-faithful chat chrome (dark `opencode` theme).
 //!
-//! - User: left peach rail + panel fill, no role tag
+//! - User: peach rail + warm elevated bubble (bold) — strongest content signal
+//! - Chat focus (j/k): blue rail + neutral wash — separate from user peach
 //! - Assistant: markdown body (headings, lists, code, tables), turn footer
 //! - Tool: `⚙ name detail` inline row (running / muted / error)
 //! - Prompt: left-border only + agent/model meta strip
@@ -1499,7 +1500,7 @@ fn build_chat_lines(
                         );
                     }
                 }
-                let chunk = message_lines(tmsg, app, wrap_width);
+                let chunk = message_lines(tmsg, app, wrap_width, i + k);
                 push_owned(
                     &mut lines,
                     &mut owners,
@@ -1515,7 +1516,7 @@ fn build_chat_lines(
             lines.push(Line::from(Span::styled("", Theme::bg())));
             owners.push(None);
         }
-        let chunk = message_lines(msg, app, wrap_width);
+        let chunk = message_lines(msg, app, wrap_width, i);
         let owner = if matches!(
             msg.role,
             MessageRole::Alert | MessageRole::Thinking | MessageRole::Tool
@@ -1529,6 +1530,8 @@ fn build_chat_lines(
     }
 
     // Spinner while waiting for first token, or while only thinking has started.
+    // Running tools already show their own cyan spinners — keep this row neutral
+    // so it doesn't collide with blue focus or peach user chrome.
     if app.busy && app.stream_buffer.is_empty() && app.thinking_buffer.is_empty() {
         let show = app.messages.last().map(|m| !m.streaming).unwrap_or(true);
         if show {
@@ -1537,14 +1540,26 @@ fn build_chat_lines(
                 owners.push(None);
             }
             let spin = SPINNER[app.spinner_frame % SPINNER.len()];
-            let label = if app.thinking_level != "off" {
-                "Thinking…"
+            let running_n = app
+                .messages
+                .iter()
+                .filter(|m| m.tool_status == Some(ToolStatus::Running))
+                .count();
+            let label = if running_n > 0 {
+                if running_n == 1 {
+                    "Running…".into()
+                } else {
+                    format!("Running ({running_n})…")
+                }
+            } else if app.thinking_level != "off" {
+                "Thinking…".into()
             } else {
-                "Working…"
+                "Working…".into()
             };
+            // Cyan spinner family — same as running tools (not focus blue / user peach).
             lines.push(Line::from(vec![
                 Span::raw("  "),
-                Span::styled(format!("{spin} "), Theme::prompt_bar()),
+                Span::styled(format!("{spin} "), Theme::tool_icon_running()),
                 Span::styled(label, Theme::busy()),
             ]));
             owners.push(None);
@@ -1677,25 +1692,19 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
 /// Multi-tool group chip / expanded stack header.
 ///
 /// ```text
-///   ▸  3 tools   read · bash · edit   ↵   (collapsed chip)
-///   ▾  3 tools   read · bash · edit   ↵   (expanded — click collapses)
+///   ▸  5 tools  [todo_write] [grep ×2] [read ×2]
+///   ▾  5 tools  [todo_write] [grep ×2] [read ×2]
 /// ```
 fn render_tool_group(tools: &[Message], wrap_width: usize, expanded: bool) -> Vec<Line<'static>> {
     let n = tools.len();
-    let mut labels: Vec<String> = tools
+    let names: Vec<String> = tools
         .iter()
         .map(|t| t.tool_name.clone().unwrap_or_else(|| "tool".into()))
         .collect();
+    let mut joined = tool_view::aggregate_tool_names(&names);
     let budget = wrap_width.saturating_sub(16).max(12);
-    let mut joined = labels.join("  ·  ");
     if display_width(&joined) > budget {
-        while labels.len() > 1 && display_width(&joined) > budget {
-            labels.pop();
-            joined = format!("{}  ·  +{}", labels.join("  ·  "), n - labels.len());
-        }
-        if display_width(&joined) > budget {
-            joined = truncate_display(&joined, budget);
-        }
+        joined = truncate_display(&joined, budget);
     }
     let chevron = if expanded { "▾" } else { "▸" };
     vec![Line::from(vec![
@@ -1703,12 +1712,17 @@ fn render_tool_group(tools: &[Message], wrap_width: usize, expanded: bool) -> Ve
         Span::styled(chevron, Theme::tool_icon_done()),
         Span::styled(format!("  {n} tools  "), Theme::tool_group_title()),
         Span::styled(joined, Theme::tool_group()),
-        Span::styled("   ↵", Theme::meta()),
     ])]
 }
 
-fn message_lines(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'static>> {
-    match message.role {
+fn message_lines(
+    message: &Message,
+    app: &App,
+    wrap_width: usize,
+    msg_index: usize,
+) -> Vec<Line<'static>> {
+    let focused = app.chat_focus == Some(msg_index);
+    let mut lines = match message.role {
         MessageRole::User => render_user(&message.content, wrap_width),
         MessageRole::Alert => render_alert(message, wrap_width),
         MessageRole::Thinking => render_thinking(message, app, wrap_width),
@@ -1731,7 +1745,37 @@ fn message_lines(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'s
         }
         MessageRole::System => render_system(&message.content, wrap_width),
         MessageRole::Tool => render_tool(message, app, wrap_width),
+    };
+    if focused {
+        apply_focus_rail(&mut lines);
     }
+    lines
+}
+
+/// Left focus rail on the first visual line of a focused transcript row.
+///
+/// Blue rail + neutral wash — must not reuse user peach/warm bubble styles.
+fn apply_focus_rail(lines: &mut [Line<'static>]) {
+    let Some(first) = lines.first_mut() else {
+        return;
+    };
+    let wash = Theme::focus_wash_bg();
+    if let Some(span0) = first.spans.first_mut() {
+        let content = span0.content.as_ref();
+        if content == "  " {
+            *span0 = Span::styled("▌ ", Theme::focus_rail());
+            for span in first.spans.iter_mut().skip(1) {
+                span.style = span.style.bg(wash);
+            }
+            return;
+        }
+    }
+    let mut spans = vec![Span::styled("▌ ", Theme::focus_rail())];
+    spans.extend(first.spans.iter().cloned());
+    for span in spans.iter_mut().skip(1) {
+        span.style = span.style.bg(wash);
+    }
+    *first = Line::from(spans);
 }
 
 /// Live assistant footer while tokens are still arriving.
@@ -1766,47 +1810,45 @@ const THINKING_STREAM_TAIL_LINES: usize = 3;
 /// Thinking / reasoning block — collapsible, muted.
 ///
 /// ```text
-///   ▸ thinking · 128 chars   ↵/click   (finished, default collapsed)
-///   ▾ thinking ⠋                       (streaming: spinner + last 3 lines)
+///   ▸ [Thinking 1.2s]  Analyzing message…   (finished, default collapsed)
+///   ▾ [Thinking] ⠋                          (streaming: spinner + last 3 lines)
 ///     …
-///   ▾ thinking · 128 chars             (expanded full body)
+///   ▾ [Thinking 1.2s]                       (expanded full body)
 ///     …
 /// ```
+///
+/// Collapsed previews fill the remaining line width and **end-truncate** so
+/// history does not look mid-cropped (`The user wants me …l next positions`).
 fn render_thinking(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'static>> {
-    let chars = message.content.chars().count();
     // Live stream always shows a short tail; finished blocks honor per-message
-    // expand (click/↵) or the global Ctrl+T default (`show_thinking`).
+    // expand (click) or the global Ctrl+T default (`show_thinking`).
     let expanded = message.streaming || message.thinking_expanded;
     let chevron = if expanded { "▾" } else { "▸" };
     let mut lines = Vec::new();
+    let dur = duration_label(message);
+    let badge = if message.streaming {
+        let spin = SPINNER[app.spinner_frame % SPINNER.len()];
+        format!("[Thinking {spin}]")
+    } else if let Some(d) = &dur {
+        format!("[Thinking {d}]")
+    } else {
+        "[Thinking]".into()
+    };
 
     if expanded {
-        let spin = SPINNER[app.spinner_frame % SPINNER.len()];
-        lines.push(Line::from(vec![
+        let header = vec![
             Span::raw("  "),
             Span::styled(chevron, Theme::thinking_chevron()),
-            Span::styled(" thinking", Theme::thinking_title()),
-            if message.streaming {
-                // Same braille family as tools / Working — not an input caret.
-                Span::styled(format!(" {spin}"), Theme::thinking_meta())
-            } else {
-                Span::styled(format!(" · {chars} chars"), Theme::thinking_meta())
-            },
-            // Expanded finished blocks: hint how to collapse again.
-            if !message.streaming {
-                Span::styled("   ↵/click", Theme::meta())
-            } else {
-                Span::raw("")
-            },
-        ]));
+            Span::raw(" "),
+            Span::styled(badge, Theme::thinking_badge()),
+        ];
+        lines.push(Line::from(header));
         let budget = wrap_width.saturating_sub(4).max(8);
         let mut body = wrap_paragraphs(&message.content, budget);
         // Live stream: rolling window of the last few lines only.
         if message.streaming && body.len() > THINKING_STREAM_TAIL_LINES {
             body = body[body.len() - THINKING_STREAM_TAIL_LINES..].to_vec();
         }
-        // Body is pure text — activity lives on the header spinner, not a
-        // trailing caret that collides with the prompt typewriter.
         for line in body {
             lines.push(Line::from(vec![
                 Span::raw("    "),
@@ -1814,18 +1856,60 @@ fn render_thinking(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<
             ]));
         }
     } else {
-        lines.push(Line::from(vec![
+        // "  ▸ " + badge + "  " + preview  — use leftover cols so wide terminals
+        // show a full sentence instead of a 48-char mid-ellipsis stub.
+        let prefix_w = 2 + display_width(chevron) + 1 + display_width(&badge) + 2;
+        let preview_budget = wrap_width.saturating_sub(prefix_w).max(16);
+        let preview = thinking_preview(&message.content, preview_budget);
+        let mut spans = vec![
             Span::raw("  "),
             Span::styled(chevron, Theme::thinking_chevron()),
-            Span::styled(" thinking", Theme::thinking_title()),
-            Span::styled(format!(" · {chars} chars"), Theme::thinking_meta()),
-            Span::styled("   ↵/click", Theme::meta()),
-        ]));
+            Span::raw(" "),
+            Span::styled(badge, Theme::thinking_badge()),
+        ];
+        if !preview.is_empty() {
+            // Quoted-ish preview: italic muted body, distinct from the badge.
+            spans.push(Span::styled(
+                format!("  {preview}"),
+                Theme::thinking_body(),
+            ));
+        }
+        lines.push(Line::from(spans));
     }
     lines
 }
 
-/// User: peach left rail + soft panel fill (tight, no empty pad rows).
+/// First words of a thinking block for collapsed headers.
+///
+/// Uses **display-width end-ellipsis** (not middle-truncate): natural language
+/// should read from the start. `max_cols` is the remaining line budget.
+fn thinking_preview(content: &str, max_cols: usize) -> String {
+    let flat = content
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if flat.is_empty() {
+        return String::new();
+    }
+    truncate_display(&flat, max_cols)
+}
+
+fn duration_label(message: &Message) -> Option<String> {
+    message.duration_ms.map(|ms| {
+        if ms < 1000 {
+            format!("{ms}ms")
+        } else if ms < 60_000 {
+            format!("{:.1}s", ms as f64 / 1000.0)
+        } else {
+            let m = ms / 60_000;
+            let s = (ms % 60_000) as f64 / 1000.0;
+            format!("{m}m{s:.0}s")
+        }
+    })
+}
+
+/// User: peach left rail + warm elevated bubble, bold body (tight, no empty pad rows).
+/// Visually louder than tools and distinct from the blue j/k focus rail.
 fn render_user(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
     let budget = wrap_width.saturating_sub(3).max(8);
     let wrapped = wrap_paragraphs(content, budget);
@@ -1909,17 +1993,19 @@ fn render_system(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
 
 /// Tool row — OpenCode-ish hierarchy with clear tree + status color.
 ///
+/// Success collapses to one line (✓ already means ok — no `exit 0` child):
 /// ```text
-///   ✓ bash  cargo test
-///     └ exit 0 · 12 lines
-///   ✗ bash  false
-///     ├ exit 1
-///     └ boom
+///   ✓ bash  cp ./benches/out/…/tb-regex-checker  (25 lines · 190ms)
+///   ✗ bash  cat ./missing                        exit 1 · 0.5s
+///     └ boom: no such file
+///   ⠋ bash  cd ./benches/out/tb-regex-checker     ← running: cyan spinner
 /// ```
 fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'static>> {
     let name = message.tool_name.clone().unwrap_or_else(|| "tool".into());
     let detail = message.content.trim();
     let status = message.tool_status.unwrap_or(ToolStatus::Done);
+    let cwd = app.history_cwd.as_deref();
+    let is_error = status == ToolStatus::Error;
 
     let (icon, icon_style) = match status {
         ToolStatus::Running => {
@@ -1930,7 +2016,8 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
         ToolStatus::Error => ("✗".into(), Theme::tool_icon_error()),
     };
 
-    // Kind-colored name when done; peach when running; red when error.
+    // Kind-colored name when done; cyan spinner when running (not focus blue / user peach);
+    // red when error.
     let name_style = match status {
         ToolStatus::Running => Theme::tool_name_running(),
         ToolStatus::Error => Theme::tool_name_error(),
@@ -1941,105 +2028,198 @@ fn render_tool(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'sta
         ToolStatus::Error => Theme::tool_text_error(),
         ToolStatus::Done => Theme::tool_detail_done(),
     };
+    let path_dir_style = Theme::meta(); // dim directory prefix
+    let path_name_style = match status {
+        ToolStatus::Done => Theme::tool_detail_done().add_modifier(Modifier::BOLD),
+        _ => detail_style,
+    };
+
+    // Metrics suffix for collapsed success / failure: `(42 lines · 2.1s)` or `exit 1 · 0.5s`.
+    let summary_raw = message.tool_summary.as_deref().unwrap_or("");
+    let summary_clean = if summary_raw.is_empty() {
+        String::new()
+    } else {
+        tool_view::single_line_preview(
+            &tool_view::shorten_paths_in_text(summary_raw, cwd),
+            48,
+        )
+    };
+    let dur = duration_label(message);
+    let metrics = {
+        let mut parts: Vec<String> = Vec::new();
+        if !summary_clean.is_empty() {
+            parts.push(summary_clean.clone());
+        }
+        if let Some(d) = &dur {
+            parts.push(d.clone());
+        }
+        if parts.is_empty() {
+            None
+        } else {
+            Some(parts.join(" · "))
+        }
+    };
+
+    // Collapse success to one line; failures / expanded keep a child row when useful.
+    let inline_metrics = matches!(status, ToolStatus::Done | ToolStatus::Running)
+        && !message.tool_expanded
+        && !is_error;
+    let metrics_w = if inline_metrics {
+        metrics
+            .as_ref()
+            .map(|m| display_width(m) + 3) // "  (…)"
+            .unwrap_or(0)
+    } else {
+        0
+    };
 
     let name_w = display_width(&name).max(4).min(10);
-    let budget = wrap_width.saturating_sub(4 + name_w + 2).max(8);
+    let budget = wrap_width
+        .saturating_sub(4 + name_w + 2 + metrics_w)
+        .max(8);
     let pretty = if detail.is_empty() {
         String::new()
     } else {
-        truncate_display(&pretty_tool_args(detail), budget)
+        // Paths: middle-truncate so `…/tb-regex-checker` survives.
+        // Free-form commands: end-truncate so the start of a script stays readable
+        // (full text recovers on expand — see below).
+        let raw = pretty_tool_args(detail, cwd);
+        if tool_view::looks_like_path(&raw) {
+            truncate_display_middle(&raw, budget)
+        } else {
+            truncate_display(&raw, budget)
+        }
     };
 
     let mut lines = Vec::new();
-    // Header:  `  ✓ bash  cargo test`
+    // Header:  `  ✓ bash  cargo test  (12 lines · 45ms)`
     let mut spans = vec![
         Span::raw("  "),
         Span::styled(format!("{icon} "), icon_style),
         Span::styled(format!("{name:<name_w$}"), name_style),
     ];
     if !pretty.is_empty() {
-        spans.push(Span::styled(format!("  {pretty}"), detail_style));
+        if tool_view::looks_like_path(&pretty) {
+            let (dir, file) = tool_view::path_dir_and_name(&pretty);
+            spans.push(Span::raw("  "));
+            if !dir.is_empty() {
+                spans.push(Span::styled(dir, path_dir_style));
+            }
+            spans.push(Span::styled(file, path_name_style));
+        } else {
+            spans.push(Span::styled(format!("  {pretty}"), detail_style));
+        }
+    }
+    if inline_metrics {
+        if let Some(m) = &metrics {
+            spans.push(Span::styled(format!("  ({m})"), Theme::meta()));
+        }
+    } else if is_error && !message.tool_expanded {
+        // Failure header carries exit code / duration inline; detail body below if expanded.
+        if let Some(m) = &metrics {
+            spans.push(Span::styled(format!("  {m}"), Theme::tool_summary_err()));
+        }
     }
     lines.push(Line::from(spans));
 
-    let show_summary = message
-        .tool_summary
-        .as_ref()
-        .is_some_and(|_s| !message.tool_expanded || message.tool_output.is_none());
-    if show_summary {
-        if let Some(summary) = message.tool_summary.as_deref() {
-            let sum_style = if status == ToolStatus::Error {
-                Theme::tool_summary_err()
-            } else if summary.starts_with("exit 0") || summary.starts_with("ok") {
-                Theme::tool_summary_ok()
-            } else {
-                Theme::tool_detail_done()
-            };
-            lines.push(Line::from(vec![
-                Span::raw("    "),
-                Span::styled("└ ", Theme::tool_tree()),
-                Span::styled(
-                    truncate_display(summary, wrap_width.saturating_sub(8)),
-                    sum_style,
-                ),
-            ]));
-        }
-    }
+    // Collapsed success/error: metrics stay on the header only (no second └ row).
+    // Expanded body is rendered below when `tool_expanded`.
 
     // Expanded body with proper tree rails (├ / └), not a floating │ dump.
     // Caps are generous: the main chat is line-scrolled (full viewport), so long
     // tool output should participate in that scroll instead of feeling "clipped".
     if message.tool_expanded {
+        let body_budget = wrap_width.saturating_sub(8).max(12);
+        let rail_style = if status == ToolStatus::Error {
+            Theme::error_bar()
+        } else {
+            Theme::tool_tree()
+        };
+
+        // Recover full args (paths shortened, no char cap) when the header
+        // truncated a long bash/heredoc — otherwise history looks permanently cropped.
+        let full_args = if detail.is_empty() {
+            String::new()
+        } else {
+            tool_view::pretty_tool_detail_full(detail, cwd)
+        };
+        let show_full_args = !full_args.is_empty()
+            && (pretty.contains('…')
+                || full_args.lines().count() > 1
+                || display_width(&full_args) > budget);
+
+        let mut visual: Vec<(String, Style)> = Vec::new();
+        if show_full_args {
+            for line in full_args.lines() {
+                for wrapped in wrap_str(line, body_budget) {
+                    visual.push((wrapped, Theme::tool_detail_done()));
+                }
+            }
+        }
+
         if let Some(output) = message.tool_output.as_deref() {
             let is_diff = tool_view::looks_like_diff(output);
             // Edit/write: Cursor-style numbered red/green rows (no unified +/- chrome).
             if is_diff && status != ToolStatus::Error {
-                lines.extend(render_ide_diff(output, wrap_width));
-            } else {
-                let body_budget = wrap_width.saturating_sub(8).max(12);
-                let max_lines = if status == ToolStatus::Error { 40 } else { 60 };
-                let default_style = if status == ToolStatus::Error {
-                    Theme::error_body()
-                } else {
-                    Theme::tool_detail_done()
-                };
-                let rail_style = if status == ToolStatus::Error {
-                    Theme::error_bar()
-                } else {
-                    Theme::tool_tree()
-                };
-
-                // Flatten wrapped lines first so tree tips land on the true last visual row.
-                let mut visual: Vec<(String, Style)> = Vec::new();
-                let raw_lines: Vec<&str> = output.lines().collect();
-                let total_raw = raw_lines.len();
-                for line in raw_lines.iter().take(max_lines) {
-                    let style = if status == ToolStatus::Error {
-                        Theme::error_body()
-                    } else if line.starts_with("exit 0") {
-                        Theme::tool_summary_ok()
-                    } else if line.starts_with("exit ") {
-                        Theme::tool_summary_err()
-                    } else {
-                        default_style
-                    };
-                    for wrapped in wrap_str(line, body_budget) {
-                        visual.push((wrapped, style));
-                    }
-                }
-                if total_raw > max_lines {
-                    visual.push((format!("… +{} lines", total_raw - max_lines), Theme::meta()));
-                }
-
-                let last = visual.len().saturating_sub(1);
-                for (i, (text, style)) in visual.into_iter().enumerate() {
-                    let branch = if i == last { "└ " } else { "│ " };
+                // Paint recovered args first (│ continues into the diff block).
+                for (text, style) in visual {
                     lines.push(Line::from(vec![
                         Span::raw("    "),
-                        Span::styled(branch, rail_style),
+                        Span::styled("│ ", rail_style),
                         Span::styled(text, style),
                     ]));
                 }
+                lines.extend(render_ide_diff(output, wrap_width));
+                return lines;
+            }
+
+            let max_lines = if status == ToolStatus::Error { 40 } else { 60 };
+            let default_style = if status == ToolStatus::Error {
+                Theme::error_body()
+            } else {
+                Theme::tool_detail_done()
+            };
+
+            // Flatten wrapped lines first so tree tips land on the true last visual row.
+            let raw_lines: Vec<&str> = output.lines().collect();
+            let total_raw = raw_lines.len();
+            for line in raw_lines.iter().take(max_lines) {
+                let style = if status == ToolStatus::Error {
+                    Theme::error_body()
+                } else if line.starts_with("exit 0") {
+                    Theme::tool_summary_ok()
+                } else if line.starts_with("exit ") {
+                    Theme::tool_summary_err()
+                } else {
+                    default_style
+                };
+                for wrapped in wrap_str(line, body_budget) {
+                    visual.push((wrapped, style));
+                }
+            }
+            if total_raw > max_lines {
+                visual.push((format!("… +{} lines", total_raw - max_lines), Theme::meta()));
+            }
+        } else if !show_full_args {
+            if let Some(m) = &metrics {
+                // Expanded but no body — still show metrics under the chevron row.
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled("└ ", Theme::tool_tree()),
+                    Span::styled(m.clone(), Theme::meta()),
+                ]));
+            }
+        }
+
+        if !visual.is_empty() {
+            let last = visual.len().saturating_sub(1);
+            for (i, (text, style)) in visual.into_iter().enumerate() {
+                let branch = if i == last { "└ " } else { "│ " };
+                lines.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(branch, rail_style),
+                    Span::styled(text, style),
+                ]));
             }
         }
     }
@@ -2316,7 +2496,7 @@ fn render_alert(message: &Message, wrap_width: usize) -> Vec<Line<'static>> {
     out
 }
 
-/// Truncate by **display width** (CJK-safe), append … if needed.
+/// Truncate by **display width** (CJK-safe), append … if needed (end ellipsis).
 fn truncate_display(s: &str, max_cols: usize) -> String {
     if display_width(s) <= max_cols {
         return s.to_string();
@@ -2336,48 +2516,60 @@ fn truncate_display(s: &str, max_cols: usize) -> String {
     out
 }
 
-/// Soften `{"path":"foo"}` → `foo` for common tools.
-fn pretty_tool_args(s: &str) -> String {
-    let t = s.trim();
-    if t.starts_with('{') && t.ends_with('}') {
-        // Try to pull "path" / "command" / "pattern" / "file_path" values.
-        for key in ["path", "file_path", "command", "pattern", "query", "url"] {
-            let needle = format!("\"{key}\"");
-            if let Some(idx) = t.find(&needle) {
-                let after = &t[idx + needle.len()..];
-                if let Some(colon) = after.find(':') {
-                    let rest = after[colon + 1..].trim();
-                    if let Some(val) = json_string_value(rest) {
-                        return val;
-                    }
-                }
-            }
-        }
+/// Middle-truncate by **display width**, keeping head + tail.
+///
+/// Critical for tool rows: absolute/relative paths are long at the front;
+/// the useful bit is usually the destination filename at the end.
+///
+/// ```text
+/// cd ./benches/out/tb-regex-checker/file.rs
+/// cd ./benches…/tb-regex-checker/file.rs
+/// ```
+fn truncate_display_middle(s: &str, max_cols: usize) -> String {
+    if display_width(s) <= max_cols {
+        return s.to_string();
     }
-    t.to_string()
+    if max_cols <= 1 {
+        return "…".into();
+    }
+    if max_cols <= 3 {
+        return truncate_display(s, max_cols);
+    }
+    let ellipsis_w = 1; // …
+    let inner = max_cols - ellipsis_w;
+    // ~40% head (cmd / leading dirs), ~60% tail (filename / destination).
+    let head_budget = (inner * 2) / 5;
+    let tail_budget = inner - head_budget;
+
+    let mut head = String::new();
+    let mut hw = 0usize;
+    for ch in s.chars() {
+        let cw = char_width(ch);
+        if hw + cw > head_budget {
+            break;
+        }
+        head.push(ch);
+        hw += cw;
+    }
+
+    let mut tail_chars: Vec<char> = Vec::new();
+    let mut tw = 0usize;
+    for ch in s.chars().rev() {
+        let cw = char_width(ch);
+        if tw + cw > tail_budget {
+            break;
+        }
+        tail_chars.push(ch);
+        tw += cw;
+    }
+    tail_chars.reverse();
+    let tail: String = tail_chars.into_iter().collect();
+    format!("{head}…{tail}")
 }
 
-fn json_string_value(s: &str) -> Option<String> {
-    // Keep in sync with tool_view::json_string_value — must decode `\n` etc.
-    let s = s.trim();
-    if !s.starts_with('"') {
-        return None;
-    }
-    let bytes = s.as_bytes();
-    let mut i = 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => {
-                i = i.saturating_add(2);
-            }
-            b'"' => {
-                let literal = s.get(..=i)?;
-                return serde_json::from_str(literal).ok();
-            }
-            _ => i += 1,
-        }
-    }
-    None
+/// Soften `{"path":"foo"}` → shortened path / single-line command for common tools.
+fn pretty_tool_args(s: &str, cwd: Option<&std::path::Path>) -> String {
+    tool_view::pretty_tool_detail(s, cwd)
 }
 
 fn wrap_paragraphs(content: &str, width: usize) -> Vec<String> {
@@ -2490,8 +2682,11 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     // Keep placeholder quiet — keybindings live on the sparse status strip / Alt+H help.
+    // Busy: light steer hint only; Esc/Ctrl+C live on the status row (avoid wall-of-text).
     let placeholder = if app.busy {
         "steer or follow-up…"
+    } else if app.chat_focus.is_some() && app.input.is_empty() {
+        "type to return to input · j/k navigate history"
     } else {
         "Message…"
     };
@@ -2590,7 +2785,7 @@ fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 /// Prompt meta strip under the input box.
 ///
-/// Left:  `Build  deepseek-v4-flash  sensenova`
+/// Left:  `Build · grok-4.5 · ziyong`  (mode · model · provider, separated)
 /// Right: `MCP 3/3  bg:1 · top…  running`  (ops only — never think/tokens)
 fn draw_prompt_meta(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let agent = if app.agent_label.is_empty() {
@@ -2607,18 +2802,19 @@ fn draw_prompt_meta(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let provider = app.current_provider.clone();
 
-    // —— left: session identity ——
+    // —— left: session identity with clear separators ——
+    let sep = || Span::styled(" · ", Theme::status_faint());
     let mut left = vec![
         Span::styled("  ", Theme::bg()),
         // Copper identity tag — PRIMARY reserved for caret / list selection.
         Span::styled(agent, Theme::mode_label()),
     ];
     if !model.is_empty() {
-        left.push(Span::styled("  ", Theme::bg()));
+        left.push(sep());
         left.push(Span::styled(model, Theme::meta()));
     }
     if !provider.is_empty() {
-        left.push(Span::styled("  ", Theme::bg()));
+        left.push(sep());
         left.push(Span::styled(provider, Theme::status_faint()));
     }
 
@@ -3340,7 +3536,7 @@ mod tests {
         let meta_row: String = cells[(h - 2) * w..(h - 1) * w].concat();
         let status_row: String = cells[(h - 1) * w..h * w].concat();
 
-        // Meta: agent + model + provider (identity).
+        // Meta: agent + model + provider (identity), with ` · ` separators.
         assert!(meta_row.contains("Build"), "agent on meta: {meta_row}");
         assert!(
             meta_row.contains("deepseek-v4-flash"),
@@ -3351,8 +3547,12 @@ mod tests {
             "provider on meta: {meta_row}"
         );
         assert!(
-            !meta_row.contains("completions") && !meta_row.contains(" · "),
-            "meta must not dump api/host or middle-dot soup: {meta_row}"
+            meta_row.contains(" · "),
+            "mode · model · provider separators: {meta_row}"
+        );
+        assert!(
+            !meta_row.contains("completions") && !meta_row.contains("http"),
+            "meta must not dump api/host: {meta_row}"
         );
 
         // Status: sparse core keys only (full catalog via Alt+H help).
@@ -3451,6 +3651,255 @@ mod tests {
             "MCP chip must appear exactly once: meta={meta_row} status={status_row}"
         );
     }
+
+    #[test]
+    fn tool_paths_render_relative_to_cwd() {
+        let backend = TestBackend::new(100, 16);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.history_cwd = Some(std::path::PathBuf::from("/home/fxh/tools/one"));
+        app.push_tool_call(
+            "read",
+            r#"{"path":"/home/fxh/tools/one/crates/one-tools/src/bash.rs"}"#,
+        );
+        app.finish_tool_with_output(
+            "read",
+            false,
+            Some((0..66).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")),
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            flat.contains("./crates/one-tools/src/bash.rs") || flat.contains("bash.rs"),
+            "expected relative path, got:\n{flat}"
+        );
+        assert!(
+            !flat.contains("/home/fxh/tools/one/crates"),
+            "absolute workspace path must be shortened:\n{flat}"
+        );
+        // Summary is metrics only — no repeated "read path".
+        assert!(
+            flat.contains("66 lines") || flat.contains("lines"),
+            "expected line count summary:\n{flat}"
+        );
+        assert!(
+            !flat.contains("↵/click"),
+            "inline expand hints must not appear:\n{flat}"
+        );
+        // Success is single-line: no tree child for metrics.
+        assert!(
+            !flat.contains('└') || flat.matches('└').count() == 0,
+            "success tool should not use └ summary row:\n{flat}"
+        );
+    }
+
+    #[test]
+    fn bash_command_paths_shorten_and_middle_truncate() {
+        let backend = TestBackend::new(72, 12);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.history_cwd = Some(std::path::PathBuf::from("/home/fxh/tools/one"));
+        app.push_tool_call(
+            "bash",
+            r#"{"command":"cd /home/fxh/tools/one/benches/out/tb-regex-checker && ls"}"#,
+        );
+        app.finish_tool_with_output(
+            "bash",
+            false,
+            Some("exit 0\na\nb\nc\nd\ne\n".into()),
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            !flat.contains("/home/fxh/tools/one/benches"),
+            "absolute cwd path must be rewritten:\n{flat}"
+        );
+        // Filename / destination should survive middle truncate on a narrow width.
+        assert!(
+            flat.contains("regex") || flat.contains("checker") || flat.contains("./benches"),
+            "tail of path should remain visible:\n{flat}"
+        );
+        assert!(
+            flat.contains("5 lines") || flat.contains("lines"),
+            "line metrics inline: {flat}"
+        );
+        assert!(
+            !flat.contains("exit 0"),
+            "success must not show exit 0: {flat}"
+        );
+    }
+
+    #[test]
+    fn thinking_header_has_no_inline_click_hint() {
+        let backend = TestBackend::new(80, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.messages
+            .push(crate::message::Message::thinking("Analyzing bash command flags carefully"));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(!flat.contains("↵/click"), "no inline click hint: {flat}");
+        assert!(
+            flat.contains("[Thinking]") || flat.contains("Thinking"),
+            "badge form: {flat}"
+        );
+        assert!(
+            flat.contains("Analyzing") || flat.contains("flags"),
+            "should show preview: {flat}"
+        );
+    }
+
+    #[test]
+    fn thinking_collapsed_uses_full_width_end_truncate() {
+        // Wide terminal: collapsed preview must fill the line from the *start*
+        // (end-ellipsis), not a 48-char middle-crop that looks like history was cut.
+        let backend = TestBackend::new(120, 8);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        let body = "The user wants me to produce all legal next positions. \
+                    I will explore the workspace and understand the Regex Chess task, \
+                    then generate re.json myself and self-test with the local checkers.";
+        app.messages
+            .push(crate::message::Message::thinking(body));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            flat.contains("The user wants me to produce"),
+            "preview must keep the sentence start, not mid-crop:\n{flat}"
+        );
+        // Middle-truncate pattern like "me …uce" / "me...uce" must not appear.
+        assert!(
+            !flat.contains("me …uce")
+                && !flat.contains("me...uce")
+                && !flat.contains("wants me …"),
+            "must not middle-truncate natural language:\n{flat}"
+        );
+        // On a 120-col terminal the start should not be clipped to ~20 chars only.
+        assert!(
+            flat.contains("legal next") || flat.contains("produce all"),
+            "wide terminal should show more than a stub:\n{flat}"
+        );
+    }
+
+    #[test]
+    fn expanded_bash_recovers_full_command_history() {
+        // Long heredoc: collapsed header truncates; expand must show the middle again.
+        let backend = TestBackend::new(72, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.history_cwd = Some(std::path::PathBuf::from("/home/fxh/tools/one"));
+        let cmd = "PYTHONPATH=./.pydeps python3 - <<'PY'\nimport chess\n\
+                   UNIQUE_MARKER_MID_COMMAND = 42\nprint(chess.__version__)\nPY";
+        let args = serde_json::json!({ "command": cmd }).to_string();
+        app.push_tool_call("bash", &args);
+        app.finish_tool_with_output("bash", false, Some("exit 0\n1.0\n".into()));
+        // Expand the tool row.
+        if let Some(msg) = app.messages.last_mut() {
+            msg.tool_expanded = true;
+        }
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(
+            flat.contains("UNIQUE_MARKER_MID_COMMAND"),
+            "expanded tool must recover full command (not permanently cropped):\n{flat}"
+        );
+    }
+
+    #[test]
+    fn prompt_meta_separates_mode_model_provider() {
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.agent_label = "Build".into();
+        app.current_model = "grok-4.5".into();
+        app.current_provider = "ziyong".into();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(flat.contains("Build"), "{flat}");
+        assert!(flat.contains("grok-4.5"), "{flat}");
+        assert!(flat.contains("ziyong"), "{flat}");
+        assert!(
+            flat.contains('·') || flat.contains(" · "),
+            "mode/model/provider need separators: {flat}"
+        );
+    }
+
+    #[test]
+    fn chat_focus_rail_and_status_nav_hints() {
+        let backend = TestBackend::new(90, 14);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new("test");
+        app.push_tool_call("read", r#"{"path":"a.rs"}"#);
+        app.finish_tool_with_output("read", false, Some("one\ntwo".into()));
+        app.chat_focus = Some(0);
+        app.input.clear();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let flat: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol().to_string())
+            .collect();
+        assert!(flat.contains('▌'), "focus rail: {flat}");
+        assert!(
+            flat.contains("j/k") || flat.contains("nav"),
+            "browse status keys when focused: {flat}"
+        );
+    }
+
+    #[test]
+    fn tool_group_aggregates_duplicate_names() {
+        let tools = vec![
+            crate::message::Message::tool("grep", "{}", crate::message::ToolStatus::Done),
+            crate::message::Message::tool("grep", "{}", crate::message::ToolStatus::Done),
+            crate::message::Message::tool("read", "{}", crate::message::ToolStatus::Done),
+        ];
+        let lines = render_tool_group(&tools, 80, false);
+        let text: String = lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
+            .collect();
+        assert!(text.contains("[grep ×2]"), "{text}");
+        assert!(text.contains("[read]"), "{text}");
+        assert!(!text.contains("  ↵") && !text.contains("↵"), "{text}");
+    }
 }
 
 fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
@@ -3525,13 +3974,23 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     }
 
     // Idle: core chrome only — full catalog is Alt+H help float.
-    // Unified Ctrl+/Alt+ notation (matches tips / help float; never mix with ^).
+    // When chat focus is active (empty prompt browse), surface expand/nav keys.
     let mut left = vec![Span::raw("  ")];
-    left.extend(pair("Ctrl+G", " settings"));
-    left.push(Span::styled("  │  ", Theme::status_faint()));
-    left.extend(pair("Ctrl+L", " model"));
-    left.push(Span::styled("  │  ", Theme::status_faint()));
-    left.extend(pair("Alt+H", " help"));
+    if app.chat_focus.is_some() && app.input.is_empty() {
+        left.extend(pair("j/k", " nav  "));
+        left.extend(pair("↵", " expand  "));
+        left.extend(pair("click", " toggle  "));
+        left.push(Span::styled(" │  ", Theme::status_faint()));
+        left.extend(pair("Ctrl+O", " last tool"));
+    } else {
+        left.extend(pair("Ctrl+G", " settings"));
+        left.push(Span::styled("  │  ", Theme::status_faint()));
+        left.extend(pair("Ctrl+L", " model"));
+        left.push(Span::styled("  │  ", Theme::status_faint()));
+        left.extend(pair("Alt+H", " help"));
+        left.push(Span::styled("  │  ", Theme::status_faint()));
+        left.extend(pair("click", " expand"));
+    }
 
     (left, status_stats_spans(app))
 }

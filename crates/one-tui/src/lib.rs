@@ -1,7 +1,8 @@
 //! Interactive terminal UI for One, built on [Ratatui](https://ratatui.rs/).
 //!
 //! Visual language follows OpenCode-style soft chrome:
-//! user turns get a left accent rail (no `you>` tags), assistant is plain body text,
+//! user turns get a peach left rail + warm elevated bubble (no `you>` tags),
+//! j/k focus uses a separate blue rail, assistant is plain body text,
 //! tools render as compact `◇ name · args` rows.
 //!
 //! Architecture:

@@ -164,6 +164,12 @@ impl super::App {
                     self.input.clear();
                     return RunOutcome::OpenMcpPanel;
                 }
+                // Empty prompt + chat focus → toggle expand (transcript browse).
+                if t.is_empty() && self.chat_focus.is_some() {
+                    if self.toggle_focused_or_last() {
+                        return RunOutcome::Noop;
+                    }
+                }
                 self.submit_prompt()
             }
             // Shift+Tab (BackTab) → cycle Plan / Build. Plain Tab remains completion.
@@ -245,6 +251,25 @@ impl super::App {
                     self.clear_notice();
                     return self.submit_prompt();
                 }
+                RunOutcome::Noop
+            }
+            // j/k: navigate transcript focus when the prompt is empty (vim-style browse).
+            KeyCode::Char('j')
+                if self.input.is_empty()
+                    && !self.busy
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.move_chat_focus(1);
+                RunOutcome::Noop
+            }
+            KeyCode::Char('k')
+                if self.input.is_empty()
+                    && !self.busy
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.move_chat_focus(-1);
                 RunOutcome::Noop
             }
             KeyCode::Char(ch)
