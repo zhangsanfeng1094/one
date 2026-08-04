@@ -37,13 +37,22 @@ impl super::App {
     }
 
     pub fn push_tool_call(&mut self, name: impl Into<String>, args: impl Into<String>) {
+        self.push_tool_call_with_id(name, args, None);
+    }
+
+    pub fn push_tool_call_with_id(
+        &mut self,
+        name: impl Into<String>,
+        args: impl Into<String>,
+        call_id: Option<String>,
+    ) {
         // Close thinking + assistant bubbles so tool rows sit between
         // completed segments, and the next tool-round thinking starts clean
         // (otherwise deltas keep appending into the same buffer and the next
         // bubble re-shows the previous segment's full text).
         self.seal_stream_segment();
         self.messages
-            .push(Message::tool(name, args, ToolStatus::Running));
+            .push(Message::tool_with_id(name, args, ToolStatus::Running, call_id));
     }
 
     /// Finalize in-progress thinking / assistant stream bubbles and reset
@@ -80,6 +89,17 @@ impl super::App {
     }
 
     pub fn finish_tool_with_output(&mut self, name: &str, error: bool, output: Option<String>) {
+        self.finish_tool_with_output_id(name, error, output, None);
+    }
+
+    /// Prefer matching by `call_id` so parallel same-name tools finish the right row.
+    pub fn finish_tool_with_output_id(
+        &mut self,
+        name: &str,
+        error: bool,
+        output: Option<String>,
+        call_id: Option<&str>,
+    ) {
         let status = if error {
             ToolStatus::Error
         } else {
@@ -138,7 +158,23 @@ impl super::App {
             }
         };
 
-        for msg in self.messages.iter_mut().rev() {
+        // 1) Exact call_id match (correct for parallel batches / duplicate names).
+        if let Some(id) = call_id {
+            if !id.is_empty() {
+                for msg in self.messages.iter_mut().rev() {
+                    if msg.role == MessageRole::Tool
+                        && msg.tool_status == Some(ToolStatus::Running)
+                        && msg.tool_call_id.as_deref() == Some(id)
+                    {
+                        apply(msg);
+                        return;
+                    }
+                }
+            }
+        }
+        // 2) Name match among running tools (oldest first for same-name sequences
+        //    when ends arrive in call order without ids).
+        for msg in self.messages.iter_mut() {
             if msg.role == MessageRole::Tool
                 && msg.tool_status == Some(ToolStatus::Running)
                 && msg.tool_name.as_deref() == Some(name)
@@ -147,7 +183,7 @@ impl super::App {
                 return;
             }
         }
-        // Fallback: mark any last running tool.
+        // 3) Fallback: mark any last running tool.
         for msg in self.messages.iter_mut().rev() {
             if msg.role == MessageRole::Tool && msg.tool_status == Some(ToolStatus::Running) {
                 apply(msg);
@@ -155,7 +191,12 @@ impl super::App {
             }
         }
         if error {
-            let mut msg = Message::tool(name, "failed", ToolStatus::Error);
+            let mut msg = Message::tool_with_id(
+                name,
+                "failed",
+                ToolStatus::Error,
+                call_id.map(|s| s.to_string()),
+            );
             if let Some(raw) = output {
                 let stored = truncate_tool_output_for_ui(&raw, 4_000);
                 let (summary, expand) = summarize_tool_output(&stored, true);

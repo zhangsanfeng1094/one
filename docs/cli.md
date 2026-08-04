@@ -312,11 +312,18 @@ one --list-models
   "sandbox": "workspace-write",
   "additional_directories": [],
   "empty_response_retries": 2,
+  "enabledModels": ["deepseek:deepseek-chat", "openai:gpt-4o"],
   "features": {
     "subagent": true
   }
 }
 ```
+
+**Ctrl+L 展示哪些模型**（`enabledModels`）：在 **Settings → Providers → \<provider\> → Models** 列表里用 **Space** 勾选。  
+- 缺省 / 空 / `"all"` → Ctrl+L 展示全部  
+- 非空 → Ctrl+L 只展示勾选的 `provider:id`（**当前会话模型始终可见**）  
+- 列表行：`[x]` = 出现在 Ctrl+L，`[ ]` = 不出现；**Enter** 仍进模型详情  
+也可：`/settings enabled_models openai:gpt-4o,mock:mock-v1`
 
 **Features**（能力包）：关闭后对应工具 + system prompt section 一并过滤。V1 仅 `subagent`（`task` / `job_*` + 提示词策略），默认 **on**。  
 改上下文的 feature 在已有消息时只写入 settings 并 **pending**，需 **`/new`**（或冷启动）后才应用到当前 agent。
@@ -649,11 +656,12 @@ Settings
 
 返回上一级：**Esc** / **←** / 空搜索时 **Backspace**。  
 切换当前会话模型仍用 **Ctrl+L**（输入框上方 select）。  
-配置写入 `~/.one/agent/models.json`（首次保存设 `includeDefaults: false`）。
+配置写入 `~/.one/agent/models.json`（首次保存设 `includeDefaults: false`）。  
+**Ctrl+L 展示哪些模型**：Settings → Providers → Models，**Space** 勾选；写入 `settings.json` 的 `enabledModels`。Ctrl+L 本身只负责切换当前模型。
 
 快捷键：
 
-- **Ctrl+L** — 切换 active model（输入框上方）
+- **Ctrl+L** — 切换 active model（输入框上方；列表受 `enabledModels` 过滤）
 - **Ctrl+G** — Settings 居中面板
 - **Ctrl+F** — 在 Provider 详情 / Models 列表：调用 OpenAI 兼容 `GET {baseUrl}/models` 拉取后**批量写入** `models.json`（Enter 选「Fetch & import remote models」等价；若终端占用 Ctrl+F，用菜单项）
 - **Esc / ←** — Settings 内返回上一级；根级关闭

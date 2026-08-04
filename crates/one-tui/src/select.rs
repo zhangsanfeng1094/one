@@ -82,6 +82,9 @@ pub struct SelectPrompt {
     pub type_on_ids: HashSet<String>,
     /// Shortcut: Ctrl+O selects this option id immediately (permission always-approve).
     pub ctrl_o_id: Option<String>,
+    /// Multi mode: allow Enter with zero checks (empty `ids`) instead of
+    /// falling back to the focused row.
+    pub allow_empty: bool,
 }
 
 impl SelectPrompt {
@@ -103,6 +106,7 @@ impl SelectPrompt {
             footer_hint: String::new(),
             type_on_ids: HashSet::new(),
             ctrl_o_id: None,
+            allow_empty: false,
         }
     }
 
@@ -458,8 +462,9 @@ impl SelectPrompt {
                     .iter()
                     .filter_map(|i| self.options.get(*i).map(|o| o.id.clone()))
                     .collect();
-                // If nothing checked, treat focused option as selection when on a real option.
-                if ids.is_empty() {
+                // If nothing checked, treat focused option as selection when on a real option
+                // (unless `allow_empty` — e.g. "clear filter" means show all models).
+                if ids.is_empty() && !self.allow_empty {
                     if let Some(o) = self.options.get(self.selected) {
                         ids.push(o.id.clone());
                     }

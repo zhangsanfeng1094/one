@@ -596,7 +596,7 @@ harness 在 run 开始时根据 `AgentSpec.tools` **物化** 出列表，并应�
     "mcp": true
   },
   "model": { "inherit": false, "thinking": null },
-  "max_turns": 32,
+  "max_turns": 64,
   "permission_mode": "default",
   "sandbox": "workspace-write",
   "skills": { "enabled": true, "catalog": true, "preload": [] },

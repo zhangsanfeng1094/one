@@ -63,6 +63,23 @@ impl super::App {
         self.model_catalog = catalog;
     }
 
+    /// Specs (`provider:id`) shown in Ctrl+L. `None` / empty = all catalog models.
+    pub fn set_enabled_models(&mut self, specs: Option<Vec<String>>) {
+        self.enabled_models = match specs {
+            Some(mut v) => {
+                v.retain(|s| !s.trim().is_empty());
+                v.sort();
+                v.dedup();
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v)
+                }
+            }
+            None => None,
+        };
+    }
+
     pub fn set_current_model(&mut self, provider: impl Into<String>, model: impl Into<String>) {
         self.current_provider = provider.into();
         self.current_model = model.into();
@@ -237,8 +254,16 @@ impl super::App {
     }
 
     /// Popup rows for current input (commands or models grouped by provider).
+    ///
+    /// Model rows respect the Ctrl+L filter ([`Self::enabled_models`]).
     pub fn popup_rows(&self) -> Vec<PopupRow> {
-        slash::popup_rows(&self.input, &self.model_catalog)
+        let filtered: Vec<ModelChoice> = self
+            .model_catalog
+            .iter()
+            .filter(|m| self.model_visible_in_switcher(m))
+            .cloned()
+            .collect();
+        slash::popup_rows(&self.input, &filtered)
     }
 
     pub fn slash_menu_visible(&self) -> bool {

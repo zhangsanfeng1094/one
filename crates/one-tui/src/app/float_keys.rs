@@ -181,6 +181,26 @@ impl super::App {
             {
                 self.background_or_subagent_kill_selection()
             }
+            // Provider → Models: Space toggles whether the model appears in Ctrl+L
+            // (does not open detail, does not type-to-filter).
+            KeyCode::Char(' ')
+                if !editing
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && self
+                        .float
+                        .as_ref()
+                        .is_some_and(|f| f.kind == FloatKind::SettingsModels) =>
+            {
+                let id = self
+                    .float
+                    .as_ref()
+                    .and_then(|f| f.filtered_entries().get(f.selected).map(|e| e.item.id.clone()));
+                match id.as_deref() {
+                    Some(id) if id.starts_with("m:") => self.toggle_model_ctrl_l_visibility(id),
+                    _ => RunOutcome::Noop,
+                }
+            }
             // Detail log viewers — no type-to-filter.
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)

@@ -165,7 +165,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-            max_turns: 32,
+            max_turns: 64,
             thinking_level: ThinkingLevel::Off,
             server_search: false,
             empty_response_retries: DEFAULT_EMPTY_RESPONSE_RETRIES,
@@ -1230,6 +1230,7 @@ impl Agent {
                         is_error: true,
                         gate,
                         duration_ms: 0,
+                        ui_emitted: false,
                     });
                 }
             }
@@ -1243,11 +1244,13 @@ impl Agent {
         ToolBatchOutcome::Continue
     }
 
-    /// Execute pending slots, then emit ToolEnd / ToolResult in original order.
+    /// Execute pending slots. UI/trace `ToolEnd` fires as each tool finishes;
+    /// agent `ToolResult` messages are recorded in original call order at the end.
     ///
     /// **Parallelism policy:** consecutive read-only tools (`read`/`grep`/`find`/…)
-    /// run via `join_all`. Side-effecting tools (`write`/`edit`/`bash`/MCP/…) run
-    /// one at a time so they cannot race on the same files or shell state.
+    /// run via `FuturesUnordered` (each completion updates the UI immediately).
+    /// Side-effecting tools (`write`/`edit`/`bash`/MCP/…) run one at a time so
+    /// they cannot race on the same files or shell state.
     async fn execute_slots(
         &mut self,
         slots: &mut Vec<ToolSlot>,
@@ -1258,8 +1261,9 @@ impl Agent {
         let n = slots.len();
         let mut i = 0;
         while i < n {
-            // Already finished (e.g. gate deny).
+            // Already finished (e.g. gate deny) — notify UI now, record later.
             if matches!(&slots[i], ToolSlot::Done { .. }) {
+                self.emit_slot_tool_end(slots, i, turn, run_id);
                 i += 1;
                 continue;
             }
@@ -1271,6 +1275,7 @@ impl Agent {
 
             if side_effect {
                 self.run_pending_at(slots, i).await;
+                self.emit_slot_tool_end(slots, i, turn, run_id);
                 i += 1;
                 continue;
             }
@@ -1286,7 +1291,9 @@ impl Agent {
                     }
                     ToolSlot::Pending { .. } => break, // write/bash/MCP — stop before it
                     ToolSlot::Done { .. } => {
-                        k += 1; // skip denials; keep collecting later reads
+                        // Denial sitting between reads: notify UI now.
+                        self.emit_slot_tool_end(slots, k, turn, run_id);
+                        k += 1;
                     }
                 }
             }
@@ -1297,10 +1304,11 @@ impl Agent {
                 continue;
             }
 
-            self.run_pending_batch(slots, &batch).await;
+            self.run_pending_batch(slots, &batch, turn, run_id).await;
             i = k;
         }
 
+        // Record ToolResult messages in original tool-call order (providers match by id).
         for slot in std::mem::take(slots) {
             match slot {
                 ToolSlot::Done {
@@ -1309,19 +1317,19 @@ impl Agent {
                     is_error,
                     gate,
                     duration_ms,
+                    ui_emitted,
                 } => {
-                    self.finish_tool_result(
-                        &original,
-                        turn,
-                        run_id,
-                        ToolExecutionResult {
-                            output,
-                            is_error,
-                            gate_decision: gate,
-                            duration_ms,
-                        },
-                        tool_results,
-                    );
+                    let execution = ToolExecutionResult {
+                        output,
+                        is_error,
+                        gate_decision: gate,
+                        duration_ms,
+                    };
+                    // Safety net: if emit was skipped, still fire UI end before recording.
+                    if !ui_emitted {
+                        self.emit_tool_end(&original, turn, run_id, &execution);
+                    }
+                    self.record_tool_result(&original, execution, tool_results);
                 }
                 ToolSlot::Pending { original, .. } => {
                     self.finish_tool_result(
@@ -1338,6 +1346,40 @@ impl Agent {
                     );
                 }
             }
+        }
+    }
+
+    /// Fire UI/trace ToolEnd for a Done slot (no-op if already emitted or still Pending).
+    fn emit_slot_tool_end(
+        &mut self,
+        slots: &mut [ToolSlot],
+        index: usize,
+        turn: usize,
+        run_id: &str,
+    ) {
+        let Some(slot) = slots.get_mut(index) else {
+            return;
+        };
+        match slot {
+            ToolSlot::Done {
+                original,
+                output,
+                is_error,
+                gate,
+                duration_ms,
+                ui_emitted,
+            } if !*ui_emitted => {
+                let execution = ToolExecutionResult {
+                    output: output.clone(),
+                    is_error: *is_error,
+                    gate_decision: gate.clone(),
+                    duration_ms: *duration_ms,
+                };
+                let call = original.clone();
+                *ui_emitted = true;
+                self.emit_tool_end(&call, turn, run_id, &execution);
+            }
+            _ => {}
         }
     }
 
@@ -1363,6 +1405,7 @@ impl Agent {
                 is_error: true,
                 gate,
                 duration_ms: 0,
+                ui_emitted: false,
             };
             return;
         }
@@ -1406,15 +1449,24 @@ impl Agent {
             is_error,
             gate,
             duration_ms,
+            ui_emitted: false,
         };
     }
 
-    async fn run_pending_batch(&mut self, slots: &mut [ToolSlot], indices: &[usize]) {
+    /// Run consecutive parallel-safe tools concurrently; emit UI ToolEnd as each finishes.
+    async fn run_pending_batch(
+        &mut self,
+        slots: &mut [ToolSlot],
+        indices: &[usize],
+        turn: usize,
+        run_id: &str,
+    ) {
         if indices.is_empty() {
             return;
         }
         if indices.len() == 1 {
             self.run_pending_at(slots, indices[0]).await;
+            self.emit_slot_tool_end(slots, indices[0], turn, run_id);
             return;
         }
 
@@ -1437,31 +1489,38 @@ impl Agent {
             }
         }
 
-        let start = Instant::now();
         let abort = self.abort_flag.clone();
-        let futs: Vec<_> = jobs
-            .iter()
-            .map(|(_, _, effective, _, tool)| {
-                let tool = Arc::clone(tool);
-                let effective = effective.clone();
-                let abort = abort.clone();
-                async move {
-                    match crate::streaming::race_abort(
-                        tool.execute(&effective),
-                        Some(abort.as_ref()),
-                    )
-                    .await
-                    {
-                        Ok(res) => res,
-                        Err(()) => Err(OneError::Aborted),
-                    }
-                }
-            })
-            .collect();
-        let results = futures::future::join_all(futs).await;
-        let elapsed = start.elapsed().as_millis() as u64;
+        let mut futs = futures::stream::FuturesUnordered::new();
+        for (i, _original, effective, _gate, tool) in &jobs {
+            let tool = Arc::clone(tool);
+            let effective = effective.clone();
+            let abort = abort.clone();
+            let idx = *i;
+            futs.push(async move {
+                let start = Instant::now();
+                let res = match crate::streaming::race_abort(
+                    tool.execute(&effective),
+                    Some(abort.as_ref()),
+                )
+                .await
+                {
+                    Ok(res) => res,
+                    Err(()) => Err(OneError::Aborted),
+                };
+                (idx, res, start.elapsed().as_millis() as u64)
+            });
+        }
 
-        for ((i, original, effective, gate, _tool), res) in jobs.into_iter().zip(results) {
+        // Map slot index → job metadata for after_tool / Done construction.
+        let mut by_index: std::collections::HashMap<usize, (ToolCall, ToolCall, Option<TraceGateDecision>)> =
+            jobs.into_iter()
+                .map(|(i, original, effective, gate, _)| (i, (original, effective, gate)))
+                .collect();
+
+        while let Some((i, res, duration_ms)) = futs.next().await {
+            let Some((original, effective, gate)) = by_index.remove(&i) else {
+                continue;
+            };
             let (output, is_error) = match res {
                 Ok(output) => {
                     let failed = tool_output_indicates_error(&original.name, &output);
@@ -1490,8 +1549,12 @@ impl Agent {
                 output,
                 is_error,
                 gate,
-                duration_ms: elapsed,
+                duration_ms,
+                ui_emitted: false,
             };
+            // UI flips this row to Done as soon as *this* tool finishes — not when
+            // the whole parallel group drains.
+            self.emit_slot_tool_end(slots, i, turn, run_id);
         }
     }
 
@@ -1609,21 +1672,15 @@ impl Agent {
         );
     }
 
-    fn finish_tool_result(
+    /// Trace + UI event for a finished tool (does not push agent ToolResult yet).
+    fn emit_tool_end(
         &mut self,
         call: &ToolCall,
         turn: usize,
         run_id: &str,
-        execution: ToolExecutionResult,
-        tool_results: &mut Vec<AgentMessage>,
+        execution: &ToolExecutionResult,
     ) {
-        let ToolExecutionResult {
-            output,
-            is_error,
-            gate_decision,
-            duration_ms,
-        } = execution;
-        let output_text = output.as_text();
+        let output_text = execution.output.as_text();
         let output_bytes = output_text.len();
         // Same as generation: short preview by default; --trace-full expands budget.
         let output_preview = crate::trace::text_preview(&output_text, self.preview_limit());
@@ -1633,26 +1690,48 @@ impl Agent {
             turn,
             call_id: call.id.clone(),
             name: call.name.clone(),
-            duration_ms,
-            is_error,
+            duration_ms: execution.duration_ms,
+            is_error: execution.is_error,
             output_bytes,
-            gate: gate_decision,
+            gate: execution.gate_decision.clone(),
             output_preview,
         });
         self.emit(AgentEvent::ToolExecutionEnd {
             tool_call: call.clone(),
-            output: output.clone(),
-            is_error,
+            output: execution.output.clone(),
+            is_error: execution.is_error,
         });
+    }
+
+    /// Push ToolResult into agent messages / turn results (call order preserved by caller).
+    fn record_tool_result(
+        &mut self,
+        call: &ToolCall,
+        execution: ToolExecutionResult,
+        tool_results: &mut Vec<AgentMessage>,
+    ) {
         let result = AgentMessage::ToolResult(ToolResultMessage {
             tool_call_id: call.id.clone(),
             tool_name: call.name.clone(),
-            content: output.content.clone(),
-            is_error,
+            content: execution.output.content.clone(),
+            is_error: execution.is_error,
             timestamp: crate::message::now_ms(),
         });
         self.messages.push(result.clone());
         tool_results.push(result);
+    }
+
+    /// Emit UI/trace end and record ToolResult (synthetic skips, error paths).
+    fn finish_tool_result(
+        &mut self,
+        call: &ToolCall,
+        turn: usize,
+        run_id: &str,
+        execution: ToolExecutionResult,
+        tool_results: &mut Vec<AgentMessage>,
+    ) {
+        self.emit_tool_end(call, turn, run_id, &execution);
+        self.record_tool_result(call, execution, tool_results);
     }
 
     fn emit(&mut self, event: AgentEvent) {
@@ -1715,6 +1794,10 @@ enum ToolSlot {
         is_error: bool,
         gate: Option<TraceGateDecision>,
         duration_ms: u64,
+        /// Whether [`AgentEvent::ToolExecutionEnd`] / trace ToolEnd already fired.
+        /// UI emits as soon as the tool finishes; agent ToolResult is recorded later
+        /// in original call order.
+        ui_emitted: bool,
     },
 }
 
@@ -1997,6 +2080,147 @@ mod tests {
         assert!(!is_parallel_safe_tool("ask_user"));
         assert!(!is_parallel_safe_tool("mcp_something"));
         assert!(!is_parallel_safe_tool("exit_plan_mode"));
+    }
+
+    /// Fast + slow parallel-safe tools must each emit ToolExecutionEnd when *they*
+    /// finish — not only after the whole batch drains (UI spinner bug).
+    #[tokio::test]
+    async fn parallel_tools_emit_end_as_each_finishes() {
+        use crate::tool::{Tool, ToolDefinition};
+        use std::time::Duration;
+
+        struct DelayTool {
+            name: String,
+            delay: Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for DelayTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: self.name.clone(),
+                    description: "delayed".into(),
+                    parameters: serde_json::json!({"type":"object","properties":{}}),
+                }
+            }
+
+            async fn execute(&self, _call: &ToolCall) -> Result<ToolOutput> {
+                tokio::time::sleep(self.delay).await;
+                Ok(ToolOutput::text(format!("{}-ok", self.name)))
+            }
+        }
+
+        struct TwoToolsProvider {
+            calls: AtomicU64,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for TwoToolsProvider {
+            fn name(&self) -> &str {
+                "parallel-end-test"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                unreachable!()
+            }
+            async fn complete_streaming(
+                &self,
+                _request: CompletionRequest,
+                _on_event: &mut (dyn FnMut(crate::streaming::StreamEvent) + Send),
+                _abort: Option<&AtomicBool>,
+            ) -> Result<CompletionResponse> {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().to_string(),
+                        model: self.model().to_string(),
+                        content: vec![
+                            ContentBlock::ToolCall {
+                                id: "fast".into(),
+                                name: "ls".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                            ContentBlock::ToolCall {
+                                id: "slow".into(),
+                                name: "find".into(),
+                                arguments: serde_json::json!({}),
+                            },
+                        ],
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        provider: self.name().to_string(),
+                        model: self.model().to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let ends: Arc<Mutex<Vec<(String, std::time::Instant)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ends_l = ends.clone();
+        let mut agent = Agent::new(
+            AgentConfig::default(),
+            vec![
+                Arc::new(DelayTool {
+                    name: "ls".into(),
+                    delay: Duration::from_millis(20),
+                }),
+                Arc::new(DelayTool {
+                    name: "find".into(),
+                    delay: Duration::from_millis(200),
+                }),
+            ],
+        );
+        agent.subscribe(Box::new(move |ev| {
+            if let AgentEvent::ToolExecutionEnd { tool_call, .. } = ev {
+                ends_l
+                    .lock()
+                    .expect("ends")
+                    .push((tool_call.id.clone(), std::time::Instant::now()));
+            }
+        }));
+
+        let t0 = std::time::Instant::now();
+        agent
+            .prompt(
+                &TwoToolsProvider {
+                    calls: AtomicU64::new(0),
+                },
+                "go",
+            )
+            .await
+            .expect("prompt ok");
+
+        let recorded = ends.lock().expect("ends").clone();
+        assert_eq!(recorded.len(), 2, "both tools should emit ToolExecutionEnd");
+        assert_eq!(recorded[0].0, "fast", "fast tool should finish first");
+        assert_eq!(recorded[1].0, "slow");
+        // Fast end must arrive well before slow (not batched at join_all).
+        let fast_at = recorded[0].1.duration_since(t0);
+        let slow_at = recorded[1].1.duration_since(t0);
+        assert!(
+            fast_at < Duration::from_millis(100),
+            "fast ToolEnd should fire early, got {fast_at:?}"
+        );
+        assert!(
+            slow_at >= Duration::from_millis(150),
+            "slow ToolEnd should wait for its own work, got {slow_at:?}"
+        );
+        assert!(
+            slow_at.saturating_sub(fast_at) >= Duration::from_millis(80),
+            "ends must not be batched: fast={fast_at:?} slow={slow_at:?}"
+        );
     }
 
     #[test]

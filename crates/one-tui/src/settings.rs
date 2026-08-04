@@ -447,13 +447,111 @@ impl App {
     }
 
     /// Models for the focused provider (second level under provider detail).
+    ///
+    /// Each model shows `[x]`/`[ ]` for whether it appears in **Ctrl+L**.
+    /// Space toggles visibility; Enter opens model detail.
     pub fn open_settings_models_for_provider(&mut self, provider: &str) {
         self.settings_provider_focus = provider.to_string();
-        self.float = Some(FloatMenu::settings_models_for_provider(
-            provider,
-            &self.settings_model_rows,
-        ));
+        let rows = self.provider_model_rows_with_ctrl_l(provider);
+        self.float = Some(FloatMenu::settings_models_for_provider(provider, &rows));
         self.clear_notice();
+    }
+
+    /// Rebuild Models list after a Ctrl+L visibility toggle (keep selection).
+    pub fn reopen_settings_models_for_provider(&mut self) {
+        let provider = self.settings_provider_focus.clone();
+        if provider.is_empty() {
+            self.open_settings_providers(&self.settings_provider_rows.clone());
+            return;
+        }
+        let previous = self
+            .float
+            .as_ref()
+            .filter(|f| f.kind == FloatKind::SettingsModels)
+            .map(|f| f.selected)
+            .unwrap_or(0);
+        self.open_settings_models_for_provider(&provider);
+        if let Some(f) = self.float.as_mut() {
+            let max = f.filtered_entries().len().saturating_sub(1);
+            f.selected = previous.min(max);
+        }
+    }
+
+    /// `(spec, detail, in_ctrl_l)` for one provider's models.
+    fn provider_model_rows_with_ctrl_l(&self, provider: &str) -> Vec<(String, String, bool)> {
+        let prefix = format!("{provider}:");
+        self.settings_model_rows
+            .iter()
+            .filter(|(spec, _)| spec == provider || spec.starts_with(&prefix))
+            .map(|(spec, detail)| {
+                let in_ctrl_l = self.spec_visible_in_switcher(spec);
+                (spec.clone(), detail.clone(), in_ctrl_l)
+            })
+            .collect()
+    }
+
+    /// Whether `provider:id` is included in the Ctrl+L list.
+    /// Missing / empty `enabled_models` means all models are visible.
+    fn spec_visible_in_switcher(&self, spec: &str) -> bool {
+        match &self.enabled_models {
+            None => true,
+            Some(specs) if specs.is_empty() => true,
+            Some(specs) => specs.iter().any(|s| s == spec),
+        }
+    }
+
+    /// Space on a model row in Settings → Models: toggle Ctrl+L visibility.
+    pub(crate) fn toggle_model_ctrl_l_visibility(&mut self, id: &str) -> RunOutcome {
+        let Some(spec) = id.strip_prefix("m:") else {
+            return RunOutcome::Noop;
+        };
+        let spec = spec.to_string();
+        let catalog_specs: Vec<String> = if !self.model_catalog.is_empty() {
+            self.model_catalog
+                .iter()
+                .map(|m| format!("{}:{}", m.provider, m.id))
+                .collect()
+        } else {
+            // Fall back to settings rows when catalog not yet filled.
+            self.settings_model_rows
+                .iter()
+                .map(|(s, _)| s.clone())
+                .collect()
+        };
+        if catalog_specs.is_empty() {
+            return RunOutcome::Noop;
+        }
+        let filter_active = self
+            .enabled_models
+            .as_ref()
+            .map(|v| !v.is_empty())
+            .unwrap_or(false);
+        let mut set: std::collections::HashSet<String> = if filter_active {
+            self.enabled_models
+                .as_ref()
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .collect()
+        } else {
+            catalog_specs.iter().cloned().collect()
+        };
+        if !set.remove(&spec) {
+            set.insert(spec.clone());
+        }
+        let clear = set.is_empty() || set.len() >= catalog_specs.len();
+        let (value, stored) = if clear {
+            (String::new(), None)
+        } else {
+            let mut v: Vec<String> = set.into_iter().collect();
+            v.sort();
+            (v.join(","), Some(v))
+        };
+        self.enabled_models = stored;
+        RunOutcome::ConfigOp(ConfigOp::SettingSet {
+            key: "enabled_models".into(),
+            value,
+        })
     }
 
     pub fn open_settings_provider_detail(&mut self, id: &str, detail: &str) {

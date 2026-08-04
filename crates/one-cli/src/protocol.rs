@@ -414,7 +414,7 @@ impl Default for AgentSpec {
                 inherit: false,
                 ..Default::default()
             },
-            max_turns: Some(32),
+            max_turns: Some(64),
             permission_mode: Some("default".into()),
             sandbox: Some("workspace-write".into()),
             cwd: None,

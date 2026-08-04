@@ -366,6 +366,8 @@ pub enum SelectKind {
     AskUser { id: u64 },
     /// Model switcher docked above the input (Ctrl+L).
     Model,
+    /// Multi-select which catalog models appear in the Ctrl+L switcher.
+    EnabledModels,
 }
 
 /// User choice for an approval prompt.

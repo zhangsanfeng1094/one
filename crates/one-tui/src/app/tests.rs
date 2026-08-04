@@ -1429,6 +1429,30 @@ fn tool_lifecycle() {
 }
 
 #[test]
+fn finish_tool_matches_by_call_id_not_only_name() {
+    let mut app = App::new("test");
+    // Parallel batch of same-named tools — finish the first id while later ones still run.
+    app.push_tool_call_with_id("find", r#"{"path":"a"}"#, Some("c1".into()));
+    app.push_tool_call_with_id("find", r#"{"path":"b"}"#, Some("c2".into()));
+    app.push_tool_call_with_id("ls", r#"{"path":"."}"#, Some("c3".into()));
+
+    app.finish_tool_with_output_id("find", false, Some("a-files".into()), Some("c1"));
+    assert_eq!(app.messages[0].tool_status, Some(ToolStatus::Done));
+    assert_eq!(app.messages[0].tool_output.as_deref(), Some("a-files"));
+    assert_eq!(app.messages[1].tool_status, Some(ToolStatus::Running));
+    assert_eq!(app.messages[2].tool_status, Some(ToolStatus::Running));
+
+    // Out-of-order: finish ls before the second find.
+    app.finish_tool_with_output_id("ls", false, Some("listing".into()), Some("c3"));
+    assert_eq!(app.messages[2].tool_status, Some(ToolStatus::Done));
+    assert_eq!(app.messages[1].tool_status, Some(ToolStatus::Running));
+
+    app.finish_tool_with_output_id("find", false, Some("b-files".into()), Some("c2"));
+    assert_eq!(app.messages[1].tool_status, Some(ToolStatus::Done));
+    assert_eq!(app.messages[1].tool_output.as_deref(), Some("b-files"));
+}
+
+#[test]
 fn tool_error_auto_expands_output() {
     let mut app = App::new("test");
     app.push_tool_call("bash", "cargo test");
@@ -1556,4 +1580,103 @@ fn three_done_tools_form_collapsible_group() {
     assert!(app.messages.iter().all(|m| m.tool_ungroup));
     app.toggle_last_tool_expand();
     assert!(tool_view::streak_can_collapse(&app.messages, 0, 3));
+}
+
+#[test]
+fn ctrl_l_model_select_respects_enabled_models_filter() {
+    use crate::slash::ModelChoice;
+
+    let mut app = App::new("test");
+    app.set_model_catalog(vec![
+        ModelChoice {
+            provider: "openai".into(),
+            id: "gpt-4o".into(),
+            name: "GPT-4o".into(),
+        },
+        ModelChoice {
+            provider: "mock".into(),
+            id: "mock-v1".into(),
+            name: "Mock".into(),
+        },
+        ModelChoice {
+            provider: "xai".into(),
+            id: "grok-4.5".into(),
+            name: "Grok".into(),
+        },
+    ]);
+    app.set_current_model("openai", "gpt-4o");
+    app.set_enabled_models(Some(vec!["mock:mock-v1".into()]));
+
+    app.open_model_select();
+    let prompt = app.select_prompt().expect("model select open");
+    let ids: Vec<_> = prompt.options.iter().map(|o| o.id.as_str()).collect();
+    // Current model always visible + enabled mock.
+    assert!(ids.contains(&"openai:gpt-4o"));
+    assert!(ids.contains(&"mock:mock-v1"));
+    assert!(!ids.contains(&"xai:grok-4.5"));
+    assert_eq!(ids.len(), 2);
+}
+
+#[test]
+fn provider_models_space_toggles_ctrl_l_visibility() {
+    use crate::slash::ModelChoice;
+
+    let mut app = App::new("test");
+    app.set_model_catalog(vec![
+        ModelChoice {
+            provider: "openai".into(),
+            id: "gpt-4o".into(),
+            name: "GPT-4o".into(),
+        },
+        ModelChoice {
+            provider: "openai".into(),
+            id: "o3".into(),
+            name: "o3".into(),
+        },
+    ]);
+    app.set_settings_catalog(
+        vec![("openai".into(), "2 models".into())],
+        vec![
+            ("openai:gpt-4o".into(), "GPT-4o".into()),
+            ("openai:o3".into(), "o3".into()),
+        ],
+        vec![],
+    );
+    app.set_current_model("openai", "gpt-4o");
+    app.open_settings_models_for_provider("openai");
+    {
+        let f = app.float.as_ref().expect("models float");
+        assert_eq!(f.kind, FloatKind::SettingsModels);
+        // Model rows start with [x] when no filter is set.
+        let labels: Vec<_> = f
+            .sections
+            .iter()
+            .flat_map(|s| s.items.iter())
+            .filter(|i| i.id.starts_with("m:"))
+            .map(|i| i.label.clone())
+            .collect();
+        assert!(labels.iter().all(|l| l.starts_with("[x]")), "{labels:?}");
+    }
+
+    // Focus first model (after fetch action row at index 0).
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+    // Space toggles Ctrl+L visibility — not search.
+    match app.handle_key(key(KeyCode::Char(' '), KeyModifiers::NONE)) {
+        RunOutcome::ConfigOp(ConfigOp::SettingSet { key, value }) => {
+            assert_eq!(key, "enabled_models");
+            assert_eq!(value, "openai:o3");
+        }
+        other => panic!("expected SettingSet from Space toggle, got {other:?}"),
+    }
+    assert!(
+        app.float
+            .as_ref()
+            .map(|f| f.search.is_empty())
+            .unwrap_or(true),
+        "Space must not enter float search"
+    );
+    assert_eq!(
+        app.enabled_models.as_ref().map(|v| v.as_slice()),
+        Some(["openai:o3".to_string()].as_slice())
+    );
 }

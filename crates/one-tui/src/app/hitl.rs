@@ -145,6 +145,7 @@ impl super::App {
                     }
                 }
             },
+            SelectKind::EnabledModels => None,
         }
     }
 
@@ -167,12 +168,17 @@ impl super::App {
     }
 
     /// Open model switcher as docked select (Ctrl+L / `/model`).
+    ///
+    /// Only models in [`Self::enabled_models`] appear when that list is set;
+    /// the active model is always included so you can see (and leave) it.
     pub fn open_model_select(&mut self) {
         use crate::select::{SelectOption, SelectPrompt};
         self.close_float();
+        let current_spec = format!("{}:{}", self.current_provider, self.current_model);
         let options: Vec<SelectOption> = self
             .model_catalog
             .iter()
+            .filter(|m| self.model_visible_in_switcher(m))
             .map(|m| {
                 let id = format!("{}:{}", m.provider, m.id);
                 let label = if m.provider == self.current_provider && m.id == self.current_model {
@@ -192,7 +198,6 @@ impl super::App {
             self.set_notice("no models in catalog");
             return;
         }
-        let current_spec = format!("{}:{}", self.current_provider, self.current_model);
         let selected = options
             .iter()
             .position(|o| o.id == current_spec)
@@ -205,4 +210,21 @@ impl super::App {
         self.select_result = None;
         self.clear_notice();
     }
+
+    /// Whether a catalog model should appear in the Ctrl+L switcher.
+    pub(crate) fn model_visible_in_switcher(&self, m: &crate::slash::ModelChoice) -> bool {
+        let is_current = m.provider == self.current_provider && m.id == self.current_model;
+        if is_current {
+            return true;
+        }
+        match &self.enabled_models {
+            None => true,
+            Some(specs) if specs.is_empty() => true,
+            Some(specs) => {
+                let id = format!("{}:{}", m.provider, m.id);
+                specs.iter().any(|s| s == &id)
+            }
+        }
+    }
+
 }

@@ -247,6 +247,17 @@ pub struct Settings {
     /// `0` disables automatic retries. Override with env
     /// `ONE_EMPTY_RESPONSE_RETRIES` when set.
     pub empty_response_retries: Option<usize>,
+    /// Models shown in the Ctrl+L / `/model` switcher (`provider:id` specs).
+    ///
+    /// Missing / empty / omitted → show **all** catalog models (no filter).
+    /// When set, only these specs appear (current model is always included).
+    #[serde(
+        default,
+        rename = "enabledModels",
+        alias = "enabled_models",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub enabled_models: Option<Vec<String>>,
 }
 
 impl Settings {
@@ -420,6 +431,31 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
         }
         "model" => {
             settings.model = Some(value.trim().to_string());
+        }
+        "enabled_models" | "enabled-models" | "enabledmodels" => {
+            // Empty / "all" / "*" clears the filter (show every catalog model).
+            let v = value.trim();
+            if v.is_empty()
+                || matches!(
+                    v.to_ascii_lowercase().as_str(),
+                    "all" | "*" | "none" | "clear" | "default"
+                )
+            {
+                settings.enabled_models = None;
+            } else {
+                let mut specs: Vec<String> = v
+                    .split([',', '\n', ';'])
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                specs.sort();
+                specs.dedup();
+                settings.enabled_models = if specs.is_empty() {
+                    None
+                } else {
+                    Some(specs)
+                };
+            }
         }
         "thinking" => {
             let v = value.trim().to_ascii_lowercase();
@@ -936,10 +972,34 @@ mod tests {
                 archive_compaction: Some(true),
             }),
             empty_response_retries: Some(3),
+            enabled_models: Some(vec![
+                "openai:gpt-4o".into(),
+                "anthropic:claude-sonnet-4-20250514".into(),
+            ]),
         };
         let json = serde_json::to_string(&s).unwrap();
+        assert!(json.contains("enabledModels"));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn set_key_enabled_models() {
+        let mut s = Settings::default();
+        set_key(&mut s, "enabled_models", "openai:gpt-4o, mock:mock-v1").unwrap();
+        assert_eq!(
+            s.enabled_models.as_ref().map(|v| v.as_slice()),
+            Some(["mock:mock-v1".to_string(), "openai:gpt-4o".to_string()].as_slice())
+        );
+        set_key(&mut s, "enabled_models", "all").unwrap();
+        assert!(s.enabled_models.is_none());
+        set_key(&mut s, "enabledModels", "xai:grok-4.5").unwrap();
+        // key is matched after to_ascii_lowercase in set_key match arms via aliases
+        // — "enabledModels" lowercases to "enabledmodels"
+        assert_eq!(
+            s.enabled_models,
+            Some(vec!["xai:grok-4.5".into()])
+        );
     }
 
     #[test]

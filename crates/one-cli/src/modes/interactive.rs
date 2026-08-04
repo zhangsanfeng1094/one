@@ -1171,6 +1171,7 @@ async fn apply_config_op(
                     app.set_tool_output_limits(lim.max_lines, lim.max_bytes);
                     sync_compaction_settings(app, &s);
                     sync_execution_settings(app, &s);
+                    app.set_enabled_models(s.enabled_models.clone());
                     if key.eq_ignore_ascii_case("empty_response_retries")
                         || key.eq_ignore_ascii_case("empty-response-retries")
                         || key.eq_ignore_ascii_case("empty_retries")
@@ -1180,8 +1181,19 @@ async fn apply_config_op(
                             .set_empty_response_retries(s.empty_response_retries())
                             .await;
                     }
+                    let is_enabled_models = matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "enabled_models" | "enabled-models" | "enabledmodels"
+                    );
                     let notice = if matches!(key.as_str(), "auto_approve" | "sandbox") {
                         format!("settings.{key} = {apply_value} · applies next session")
+                    } else if is_enabled_models {
+                        match s.enabled_models.as_ref() {
+                            Some(v) if !v.is_empty() => {
+                                format!("Ctrl+L shows {} model(s)", v.len())
+                            }
+                            _ => "Ctrl+L shows all models".into(),
+                        }
                     } else {
                         format!("settings.{key} = {apply_value}")
                     };
@@ -1189,6 +1201,9 @@ async fn apply_config_op(
                         app.open_settings_tool_output();
                     } else if key.contains("compaction") {
                         app.open_settings_compaction();
+                    } else if is_enabled_models {
+                        // Stay on Provider → Models after toggling Ctrl+L visibility.
+                        app.reopen_settings_models_for_provider();
                     } else {
                         app.reopen_settings_float();
                     }
@@ -1321,6 +1336,7 @@ pub async fn run_interactive(
         let s = crate::settings::load();
         sync_compaction_settings(&mut app, &s);
         sync_execution_settings(&mut app, &s);
+        app.set_enabled_models(s.enabled_models.clone());
     }
     let ctx = providers.context_window();
     app.set_context_window(ctx);
@@ -2108,7 +2124,12 @@ fn drain_events(
                     serde_json::Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                app.push_tool_call(&tool_call.name, args);
+                let call_id = if tool_call.id.is_empty() {
+                    None
+                } else {
+                    Some(tool_call.id.clone())
+                };
+                app.push_tool_call_with_id(&tool_call.name, args, call_id);
                 if let Some(rt) = runtime.as_deref_mut() {
                     rt.note_tool_start(&tool_call.id, &tool_call.name);
                 }
@@ -2122,10 +2143,16 @@ fn drain_events(
                 // `details` (e.g. edit patch) is UI-only and never entered the LLM.
                 // Prefer details.patch for edit/write-style diffs when present.
                 let text = tool_output_for_ui(&output);
-                app.finish_tool_with_output(
+                let call_id = if tool_call.id.is_empty() {
+                    None
+                } else {
+                    Some(tool_call.id.as_str())
+                };
+                app.finish_tool_with_output_id(
                     &tool_call.name,
                     is_error,
                     if text.is_empty() { None } else { Some(text) },
+                    call_id,
                 );
                 if let Some(rt) = runtime.as_deref_mut() {
                     rt.note_tool_end(&tool_call.id, &tool_call.name, is_error);
@@ -3115,17 +3142,28 @@ fn rebuild_tui_from_agent(
                                 serde_json::Value::String(s) => s.clone(),
                                 other => other.to_string(),
                             };
-                            app.push_tool_call(name, args);
+                            let call_id = if id.is_empty() {
+                                None
+                            } else {
+                                Some(id.clone())
+                            };
+                            app.push_tool_call_with_id(name, args, call_id);
                             if let Some(tr) = results.get(id.as_str()) {
                                 let text = tool_result_ui_text(&tr.content);
-                                app.finish_tool_with_output(name, tr.is_error, Some(text));
+                                app.finish_tool_with_output_id(
+                                    name,
+                                    tr.is_error,
+                                    Some(text),
+                                    Some(id.as_str()),
+                                );
                             } else {
                                 // Dangling call (crash / incomplete turn) — mark
                                 // failed rather than inventing a success with empty body.
-                                app.finish_tool_with_output(
+                                app.finish_tool_with_output_id(
                                     name,
                                     true,
                                     Some("interrupted · no tool result in session".into()),
+                                    Some(id.as_str()),
                                 );
                             }
                             // Override seal_duration (~0ms from Instant::now at rebuild).

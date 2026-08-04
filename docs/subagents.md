@@ -422,7 +422,7 @@ pub enum TaskExitStatus {
 
 | 参数 | 默认 | 说明 |
 |------|------|------|
-| 子 `max_turns` | 16（低于主 32） | 可 settings `subagent.max_turns` |
+| 子 `max_turns` | 16（低于主 64） | 可 settings `subagent.max_turns` |
 | 子 summary 进主上下文 | 50KB / 2000 行（复用 truncate） | 防撑爆主 session |
 | 并发 task 上限 | 4 | 超出串行或 deny |
 | 总 wall time | 可选 300s | 超时 abort 子 run |

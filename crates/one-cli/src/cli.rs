@@ -206,8 +206,8 @@ pub struct Cli {
     #[arg(long = "trace-full")]
     pub trace_full: bool,
 
-    /// Max agent turns per user prompt (tool-call loops). Default 32.
-    #[arg(long = "max-turns", default_value_t = 32)]
+    /// Max agent turns per user prompt (tool-call loops). Default 64.
+    #[arg(long = "max-turns", default_value_t = 64)]
     pub max_turns: usize,
 
     /// Machine-readable result: `text` | `json` (RunResult envelope). See docs/protocol.md.

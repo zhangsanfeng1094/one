@@ -131,6 +131,8 @@ pub struct App {
     pub slash_selected: usize,
     /// Models from registry / models.json for `/model` picker.
     pub model_catalog: Vec<ModelChoice>,
+    /// Specs (`provider:id`) that appear in Ctrl+L. `None` / empty = all models.
+    pub enabled_models: Option<Vec<String>>,
     /// Provider rows for Settings → Providers (`id`, detail).
     pub settings_provider_rows: Vec<(String, String)>,
     /// Provider field rows for Settings → Provider detail (`provider:key`, display value).
@@ -330,6 +332,7 @@ impl App {
             retry_wait: None,
             slash_selected: 0,
             model_catalog: Vec::new(),
+            enabled_models: None,
             settings_provider_rows: Vec::new(),
             settings_provider_field_rows: Vec::new(),
             settings_model_rows: Vec::new(),

@@ -61,6 +61,8 @@ pub struct Message {
     pub tool_status: Option<ToolStatus>,
     /// Tool name when role is Tool (parsed or explicit).
     pub tool_name: Option<String>,
+    /// Provider/agent tool call id — preferred match key when finishing a row.
+    pub tool_call_id: Option<String>,
     /// Tool result text for TUI (truncated). Full text still lives on agent `ToolResult`.
     pub tool_output: Option<String>,
     /// One-line summary under the tool header (`ok · 12 lines`, `exit error`, …).
@@ -89,6 +91,7 @@ fn blank_message(role: MessageRole, content: String) -> Message {
         footer: None,
         tool_status: None,
         tool_name: None,
+        tool_call_id: None,
         tool_output: None,
         tool_summary: None,
         tool_expanded: false,
@@ -127,11 +130,21 @@ impl Message {
     }
 
     pub fn tool(name: impl Into<String>, detail: impl Into<String>, status: ToolStatus) -> Self {
+        Self::tool_with_id(name, detail, status, None)
+    }
+
+    pub fn tool_with_id(
+        name: impl Into<String>,
+        detail: impl Into<String>,
+        status: ToolStatus,
+        call_id: Option<String>,
+    ) -> Self {
         let name = name.into();
         let detail = detail.into();
         let mut m = blank_message(MessageRole::Tool, detail);
         m.tool_status = Some(status);
         m.tool_name = Some(name);
+        m.tool_call_id = call_id;
         if status == ToolStatus::Running {
             m.started_at = Some(Instant::now());
         }

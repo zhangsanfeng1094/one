@@ -1517,7 +1517,14 @@ impl FloatMenu {
     }
 
     /// Models for **one** provider (second level under Provider detail).
-    pub fn settings_models_for_provider(provider: &str, rows: &[(String, String)]) -> Self {
+    ///
+    /// `rows` are `(spec, detail, in_ctrl_l)` where `in_ctrl_l` is whether the
+    /// model appears in the Ctrl+L switcher. Space toggles that flag; Enter
+    /// opens model detail.
+    pub fn settings_models_for_provider(
+        provider: &str,
+        rows: &[(String, String, bool)],
+    ) -> Self {
         let prefix = format!("{provider}:");
         let mut items: Vec<FloatItem> = vec![action_item(
             "fetch_models",
@@ -1527,22 +1534,33 @@ impl FloatMenu {
         )];
         let model_items: Vec<FloatItem> = rows
             .iter()
-            .filter(|(spec, _)| spec == provider || spec.starts_with(&prefix))
-            .map(|(spec, detail)| {
-                let label = spec
+            .filter(|(spec, _, _)| spec == provider || spec.starts_with(&prefix))
+            .map(|(spec, detail, in_ctrl_l)| {
+                let id_only = spec
                     .strip_prefix(&prefix)
                     .unwrap_or(spec.as_str())
                     .to_string();
+                let mark = if *in_ctrl_l { "[x]" } else { "[ ]" };
                 FloatItem {
                     id: format!("m:{spec}"),
-                    label,
+                    label: format!("{mark}  {id_only}"),
                     detail: detail.clone(),
-                    hint: "→".into(),
+                    hint: if *in_ctrl_l {
+                        "Ctrl+L · Space off · ↵".into()
+                    } else {
+                        "hidden · Space on · ↵".into()
+                    },
                     style: FloatItemStyle::Normal,
                 }
             })
             .collect();
         let n = model_items.len();
+        let n_on = rows
+            .iter()
+            .filter(|(spec, _, on)| {
+                (spec == provider || spec.starts_with(&prefix)) && *on
+            })
+            .count();
         items.extend(model_items);
         items.push(item(
             "add_model",
@@ -1555,7 +1573,9 @@ impl FloatMenu {
             title: format!("Models · {provider}"),
             search: String::new(),
             sections: vec![FloatSection {
-                title: format!("{n} · Ctrl+F import all · Esc/← back"),
+                title: format!(
+                    "{n_on}/{n} in Ctrl+L · Space toggle · Enter detail · Esc/← back"
+                ),
                 items,
             }],
             selected: 0,
