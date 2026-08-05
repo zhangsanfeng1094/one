@@ -82,9 +82,33 @@ One 实现 JSONL session **v3 子集**，文件为 JSONL（每行一个 JSON 对
 |-------------|----------|-----------|
 | `one.usage` | 每次用户 prompt 跑完（含失败/中断） | `delta` / `total` TokenUsage、`context_size_tokens`、`provider`、`model`、`prompt_index` |
 | `one.tool_audit` | 同上（有工具时） | `tools[]`：`tool_call_id`、`name`、`duration_ms?`、`is_error`（**无** stdout 正文） |
+| `one.error` | 该轮 agent **终端失败**（EmptyResponse / provider / abort / max_turns…） | `kind`、`message`、`stop_reason`（`error`\|`aborted`）、`prompt_index`、可选 `provider`/`model` |
 | `one.prompt_snapshot` | session 创建、`/new`、`/reload`、resume 且 system prompt hash 变化 | `hash`、`byte_len`、小文本 inline 或 `path` spill |
 
 Resume 时用最新 `one.usage.total` **恢复 UI 累计 token**（不写回消息列表）。
+
+`one.error` 对齐 **Grok Build**：失败写在 session 旁路（Grok 的 `updates.jsonl` / `turn_completed stop_reason:error`），**不**注入下一轮模型的 chat history，避免 conversation pollution。
+
+### 示例：`one.error`
+
+```json
+{
+  "type": "custom",
+  "id": "e1f2a3b4",
+  "parentId": "prev",
+  "timestamp": "2026-08-04T13:13:19Z",
+  "custom_type": "one.error",
+  "data": {
+    "schema": 1,
+    "kind": "empty_response",
+    "message": "empty model response (no text or tool calls) after 11 attempt(s)",
+    "stop_reason": "error",
+    "prompt_index": 1,
+    "provider": "ziyong-gpt",
+    "model": "gpt-5.6-luna"
+  }
+}
+```
 
 ### 示例：`one.usage`
 

@@ -707,7 +707,12 @@ mod tests {
                     "{}",
                     req.reason
                 );
-                assert!(req.summary.contains("outside sandbox"), "{}", req.summary);
+                assert!(
+                    req.summary.contains("without OS bwrap")
+                        || req.summary.contains("outside sandbox"),
+                    "{}",
+                    req.summary
+                );
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;

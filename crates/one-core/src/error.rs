@@ -37,3 +37,29 @@ pub enum OneError {
     #[error("json error: {0}")]
     Json(#[from] serde_json::Error),
 }
+
+impl OneError {
+    /// Stable kind string for session sidecar / telemetry (Grok Build–style
+    /// `error_type`, not free-form Display text).
+    pub fn error_kind(&self) -> &'static str {
+        match self {
+            Self::Provider(_) => "provider",
+            Self::Tool { .. } => "tool",
+            Self::InvalidToolArgs { .. } => "invalid_tool_args",
+            Self::MaxTurns { .. } => "max_turns",
+            Self::Aborted => "aborted",
+            Self::EmptyResponse { .. } => "empty_response",
+            Self::ContextOverflow(_) => "context_overflow",
+            Self::Io(_) => "io",
+            Self::Json(_) => "json",
+        }
+    }
+
+    /// Grok-style turn stop label: `error` | `aborted`.
+    pub fn stop_reason_label(&self) -> &'static str {
+        match self {
+            Self::Aborted => "aborted",
+            _ => "error",
+        }
+    }
+}

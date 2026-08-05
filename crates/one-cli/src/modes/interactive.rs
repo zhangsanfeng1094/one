@@ -2033,14 +2033,18 @@ async fn run_turn_streaming(
             }
         }
         Err(OneError::Aborted) => {
+            // Grok Build: turn_ended outcome cancelled/error — durable, not model history.
+            runtime.persist_run_error_one(&OneError::Aborted).await;
             app.finish_stream_with_interrupted(true);
             app.set_notice("interrupted");
             let _ = runtime.take_plan_exit_request();
         }
         Err(err) => {
-            // Mid-transcript alert (UI only). Short notice remains for status strip.
+            // Persist for resume/debug (one.error Custom; not LLM context). UI still
+            // shows an alert like Grok SessionEvent::TurnFailed.
+            runtime.persist_run_error_one(&err).await;
             app.push_error_alert(format!("{err}"));
-            app.set_notice("error · see transcript".to_string());
+            app.set_notice("error · saved to session".to_string());
             let _ = runtime.take_plan_exit_request();
         }
     }

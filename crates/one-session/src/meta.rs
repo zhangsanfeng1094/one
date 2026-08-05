@@ -13,6 +13,11 @@ pub const CUSTOM_USAGE: &str = "one.usage";
 pub const CUSTOM_PROMPT_SNAPSHOT: &str = "one.prompt_snapshot";
 /// Batched tool lifecycle for one prompt run (no stdout bodies).
 pub const CUSTOM_TOOL_AUDIT: &str = "one.tool_audit";
+/// Terminal failure for one prompt run (Grok Build–style; not LLM context).
+///
+/// Mirrors Grok `turn_completed` / `retry_state` durability: error is on disk for
+/// resume/debug, but never rebuilt into model messages (see `entry_produces_message`).
+pub const CUSTOM_ERROR: &str = "one.error";
 
 pub const META_SCHEMA: u32 = 1;
 
@@ -189,6 +194,59 @@ impl ToolAuditMeta {
     }
 }
 
+/// Terminal agent-run failure (EmptyResponse, provider, abort, …).
+///
+/// Grok Build keeps these on the session update stream (`stop_reason: error`,
+/// `agent_result`) without injecting them into `chat_history` for the next
+/// model turn. One stores the same idea as `one.error` Custom.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ErrorMeta {
+    #[serde(default = "meta_schema")]
+    pub schema: u32,
+    /// Stable classifier: `empty_response` | `provider` | `aborted` | …
+    pub kind: String,
+    /// Human-readable error (Display of [`one_core::OneError`] or equivalent).
+    pub message: String,
+    /// Grok-style turn stop label: `error` | `aborted`.
+    #[serde(default = "default_stop_reason")]
+    pub stop_reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_index: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+}
+
+impl ErrorMeta {
+    pub fn new(
+        kind: impl Into<String>,
+        message: impl Into<String>,
+        stop_reason: impl Into<String>,
+        prompt_index: Option<u64>,
+        provider: Option<String>,
+        model: Option<String>,
+    ) -> Self {
+        Self {
+            schema: META_SCHEMA,
+            kind: kind.into(),
+            message: message.into(),
+            stop_reason: stop_reason.into(),
+            prompt_index,
+            provider,
+            model,
+        }
+    }
+
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    pub fn from_value(data: &Value) -> Option<Self> {
+        serde_json::from_value(data.clone()).ok()
+    }
+}
+
 /// SHA-256 hex digest of system prompt bytes, prefixed with `sha256:`.
 pub fn prompt_hash(text: &str) -> String {
     use std::collections::hash_map::DefaultHasher;
@@ -217,6 +275,10 @@ fn meta_schema() -> u32 {
 
 fn default_usage_kind() -> String {
     "run".into()
+}
+
+fn default_stop_reason() -> String {
+    "error".into()
 }
 
 fn is_zero_u64(v: &u64) -> bool {
@@ -258,5 +320,22 @@ mod tests {
     fn prompt_hash_stable() {
         assert_eq!(prompt_hash("hello"), prompt_hash("hello"));
         assert_ne!(prompt_hash("hello"), prompt_hash("hellp"));
+    }
+
+    #[test]
+    fn error_meta_roundtrip_value() {
+        let meta = ErrorMeta::new(
+            "empty_response",
+            "empty model response (no text or tool calls) after 3 attempt(s)",
+            "error",
+            Some(1),
+            Some("ziyong-gpt".into()),
+            Some("gpt-5.6-luna".into()),
+        );
+        let back = ErrorMeta::from_value(&meta.to_value()).unwrap();
+        assert_eq!(back.kind, "empty_response");
+        assert_eq!(back.prompt_index, Some(1));
+        assert_eq!(back.stop_reason, "error");
+        assert!(back.message.contains("empty model response"));
     }
 }

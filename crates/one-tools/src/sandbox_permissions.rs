@@ -72,27 +72,35 @@ pub fn requires_escalation(call: &ToolCall) -> bool {
     )
 }
 
-/// Heuristic: sandboxed run failed in a way that often means the sandbox
-/// blocked a legitimate host action (Codex `escalate_on_failure` analogue).
+/// Heuristic: sandboxed run failed in a way that often means the **OS** sandbox
+/// (bubblewrap) blocked a legitimate host action (Codex `escalate_on_failure`).
 ///
-/// We intentionally do **not** escalate on ordinary non-zero exits (tests,
-/// grep no-match, etc.).
+/// This is **not** the workspace PathPolicy. Ordinary non-zero exits (tests,
+/// `cargo fmt --check` diffs, grep no-match) must **not** match.
+///
+/// Markers are OS-error phrases only. Bare substrings like `"sandbox"` used to
+/// false-positive on rustc/fmt diffs and tests that mention sandbox in source
+/// (e.g. `SandboxEscalate`, `sandbox_permissions.rs`) and then pop a useless
+/// "run outside bwrap?" prompt.
 pub fn looks_like_sandbox_denial(exit_code: Option<i32>, combined_output: &str) -> bool {
     // bwrap / seccomp often kills the process with a signal (no exit code).
     if exit_code.is_none() {
         return true;
     }
     let lower = combined_output.to_ascii_lowercase();
+    // Prefer full OS / bwrap phrases over single tokens. Avoid:
+    // - "sandbox" (source/docs/test names)
+    // - bare "eperm"/"erofs" (identifiers, hex dumps)
+    // - bare "not permitted" (docs prose without OS error context)
     const MARKERS: &[&str] = &[
         "operation not permitted",
         "permission denied",
         "read-only file system",
         "readonly file system",
+        "read-only filesystem",
+        "readonly filesystem",
         "cannot kill pid",
-        "not permitted",
-        "eperm",
-        "erofs",
-        "sandbox",
+        // bwrap emits errors as `bwrap: …`
         "bwrap:",
         // Toolchain resolution failures that historically meant incomplete mounts
         // (Codex-style full-disk RO root usually avoids these).
@@ -100,7 +108,30 @@ pub fn looks_like_sandbox_denial(exit_code: Option<i32>, combined_output: &str) 
         "linker 'cc' not found",
         "linker cc not found",
     ];
-    MARKERS.iter().any(|m| lower.contains(m))
+    if MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    // Whole-word EPERM / EROFS (errno names), not substrings inside identifiers.
+    contains_errno_token(&lower, "eperm") || contains_errno_token(&lower, "erofs")
+}
+
+/// True when `token` appears as its own word (not inside `eperm_helper` etc.).
+fn contains_errno_token(haystack_lower: &str, token: &str) -> bool {
+    let bytes = haystack_lower.as_bytes();
+    let t = token.as_bytes();
+    let is_ident = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut start = 0usize;
+    while let Some(rel) = haystack_lower[start..].find(token) {
+        let i = start + rel;
+        let before_ok = i == 0 || !is_ident(bytes[i - 1]);
+        let after = i + t.len();
+        let after_ok = after >= bytes.len() || !is_ident(bytes[after]);
+        if before_ok && after_ok {
+            return true;
+        }
+        start = i + t.len();
+    }
+    false
 }
 
 #[cfg(test)]
@@ -139,8 +170,64 @@ mod tests {
             Some(1),
             "kill: Operation not permitted"
         ));
+        assert!(looks_like_sandbox_denial(
+            Some(1),
+            "bash: /root/secret: Permission denied"
+        ));
+        assert!(looks_like_sandbox_denial(
+            Some(1),
+            "touch: cannot touch '/home/x/.cache/x': Read-only file system"
+        ));
+        assert!(looks_like_sandbox_denial(Some(1), "bwrap: loopback: …"));
+        assert!(looks_like_sandbox_denial(
+            Some(1),
+            "error: linking with `cc` failed: exit status: 1\n  = note: linker `cc` not found"
+        ));
+        // Whole-word errno only.
+        assert!(looks_like_sandbox_denial(Some(1), "open failed: EPERM"));
+        assert!(!looks_like_sandbox_denial(
+            Some(1),
+            "fn eperm_helper() {}" // identifier, not errno
+        ));
         assert!(!looks_like_sandbox_denial(Some(1), "grep: no matches"));
         assert!(!looks_like_sandbox_denial(Some(0), "ok"));
+    }
+
+    #[test]
+    fn denial_heuristic_ignores_source_mentions_of_sandbox() {
+        // Regression: cargo fmt --check / cargo test print project sources and
+        // test names that contain "sandbox" / "SandboxEscalate" / path
+        // `sandbox_permissions.rs`. Those must not trigger escalate_on_failure.
+        let fmt_like = r#"
+Diff in /home/fxh/tools/one/crates/one-cli/src/approval.rs:244:
+                 PendingKind::Standard | PendingKind::SandboxEscalate => {
+-                    let escalate =
+-                        matches!(pending.kind, PendingKind::SandboxEscalate);
++                    let escalate = matches!(pending.kind, PendingKind::SandboxEscalate);
+Diff in /home/fxh/tools/one/crates/one-tools/src/sandbox_permissions.rs:1:
+ //! Per-command sandbox override (Codex-aligned).
+"#;
+        assert!(
+            !looks_like_sandbox_denial(Some(1), fmt_like),
+            "fmt diffs mentioning sandbox must not look like OS denial"
+        );
+
+        let test_like = r#"
+running 12 tests
+test sandbox_mode_workspace_write ... ok
+test require_escalated_can_write_outside_workspace ... ok
+test result: FAILED. 11 passed; 1 failed
+"#;
+        assert!(
+            !looks_like_sandbox_denial(Some(101), test_like),
+            "test names with sandbox must not look like OS denial"
+        );
+
+        // Prose without a real OS error phrase.
+        assert!(!looks_like_sandbox_denial(
+            Some(1),
+            "this action is not permitted by policy"
+        ));
     }
 
     #[test]

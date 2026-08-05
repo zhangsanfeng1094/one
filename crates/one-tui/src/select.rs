@@ -160,16 +160,17 @@ impl SelectPrompt {
 
         let mut options = if escalate {
             // Safer default first (Codex "Yes, proceed" is the primary action).
+            // "Outside sandbox" here means OS bwrap off — not workspace path escape.
             vec![
                 SelectOption::new(
                     "once",
-                    "Yes, run outside sandbox (this command only)",
-                    "Disable bubblewrap for this single command",
+                    "Yes, run without OS bwrap (this command only)",
+                    "Turn off bubblewrap for this command only; workspace path boundary stays on",
                 ),
                 SelectOption::new(
                     "session",
                     "Yes, and don't ask again for this command",
-                    "Remember escalate for this exact command until one exits",
+                    "Remember OS-bwrap escalate for this exact command until one exits",
                 ),
             ]
         } else {
@@ -191,7 +192,7 @@ impl SelectPrompt {
                 format!("Yes, and don't ask again for commands starting with `{pfx}`")
             };
             let desc: &str = if escalate {
-                "Session allow for this command family outside the sandbox only"
+                "Session allow for this command family without OS bwrap only"
             } else {
                 "Session allow for this command family (word-boundary prefix match)"
             };
@@ -206,8 +207,8 @@ impl SelectPrompt {
             ));
             options.push(SelectOption::new(
                 "deny",
-                "No, keep sandboxed",
-                "Do not escalate; optional message is sent to the model",
+                "No, keep OS sandboxed",
+                "Do not turn off bwrap; optional message is sent to the model",
             ));
         } else {
             options.push(SelectOption::new(
@@ -223,7 +224,8 @@ impl SelectPrompt {
         }
 
         let title = if escalate {
-            "Run outside sandbox?"
+            // Not "outside workspace" — only OS bubblewrap for this bash call.
+            "Run without OS bwrap?"
         } else {
             "Permission required"
         };
@@ -298,14 +300,15 @@ fn format_escalate_body(tool: &str, summary: &str, reason: &str) -> String {
         .strip_prefix("sandbox escalation:")
         .unwrap_or(reason)
         .trim();
-    // summary is often `[outside sandbox] <cmd>` or a description — peel prefix.
+    // summary is often `[without OS bwrap] <cmd>` (legacy: `[outside sandbox]`).
     let cmd = summary
-        .strip_prefix("[outside sandbox]")
+        .strip_prefix("[without OS bwrap]")
+        .or_else(|| summary.strip_prefix("[outside sandbox]"))
         .unwrap_or(summary)
         .trim();
     let cmd_preview = truncate_cmd_preview(cmd, 100);
     format!(
-        "{tool} · leave bubblewrap for this command\n\
+        "{tool} · turn off OS bubblewrap for this command (workspace path boundary stays on)\n\
          Why: {why}\n\
          $ {cmd_preview}"
     )
@@ -774,18 +777,23 @@ mod tests {
     }
 
     #[test]
-    fn sandbox_escalation_uses_outside_sandbox_labels() {
+    fn sandbox_escalation_uses_os_bwrap_labels() {
         let p = SelectPrompt::permission(
             "bash",
-            "[outside sandbox] kill 1 && ps aux | grep auggie | head -20 | something very long",
+            "[without OS bwrap] kill 1 && ps aux | grep auggie | head -20 | something very long",
             "sandbox escalation: cleanup host process",
         );
-        assert_eq!(p.title, "Run outside sandbox?");
+        assert_eq!(p.title, "Run without OS bwrap?");
         // Safer default: "once" is first and focused.
         assert_eq!(p.options[0].id, "once");
         assert_eq!(p.selected, 0);
         assert_eq!(p.focused_option_id(), Some("once"));
         assert!(p.body.contains("Why: cleanup host process"), "{}", p.body);
+        assert!(
+            p.body.contains("workspace path boundary stays on"),
+            "{}",
+            p.body
+        );
         assert!(p.body.contains("$ "), "{}", p.body);
         // Long command is truncated for the dock.
         assert!(
@@ -801,7 +809,14 @@ mod tests {
         assert!(p
             .options
             .iter()
-            .any(|o| o.label.contains("run outside sandbox")));
+            .any(|o| o.label.contains("without OS bwrap")));
+        // Legacy summary prefix still peels for the command preview.
+        let legacy = SelectPrompt::permission(
+            "bash",
+            "[outside sandbox] kill 1",
+            "sandbox escalation: cleanup",
+        );
+        assert!(legacy.body.contains("$ kill 1"), "{}", legacy.body);
     }
 
     #[test]

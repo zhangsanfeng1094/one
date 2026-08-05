@@ -5,10 +5,11 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use one_core::error::OneError;
 use one_core::message::AgentMessage;
 use one_core::TokenUsage;
 use one_session::{
-    prompt_hash, PromptSnapshotMeta, ToolAuditItem, ToolAuditMeta, UsageMeta,
+    prompt_hash, ErrorMeta, PromptSnapshotMeta, ToolAuditItem, ToolAuditMeta, UsageMeta,
 };
 
 use super::AppRuntime;
@@ -133,6 +134,56 @@ impl AppRuntime {
         if let Err(e) = session.write_summary() {
             tracing::warn!(error = %e, "failed to write session summary sidecar");
         }
+    }
+
+    /// Persist a terminal run failure as `one.error` (Grok Build–style).
+    ///
+    /// Call **after** [`Self::persist_run_meta`] so `prompt_index` matches the
+    /// usage/audit row for the finished run (`prompt_index` was already advanced).
+    /// Does **not** enter LLM context (`SessionEntry::Custom`).
+    pub async fn persist_run_error(
+        &mut self,
+        kind: &str,
+        message: &str,
+        stop_reason: &str,
+    ) {
+        let (provider, model) = {
+            let agent = self.agent.lock().await;
+            let provider = agent.messages.iter().rev().find_map(|m| match m {
+                AgentMessage::Assistant(a) => Some(a.provider.clone()),
+                _ => None,
+            });
+            let model = agent.messages.iter().rev().find_map(|m| match m {
+                AgentMessage::Assistant(a) => Some(a.model.clone()),
+                _ => None,
+            });
+            (provider, model)
+        };
+        // Finished run index = last value handed out by persist_run_meta.
+        let prompt_index = self.prompt_index.saturating_sub(1);
+        let meta = ErrorMeta::new(
+            kind,
+            message,
+            stop_reason,
+            Some(prompt_index),
+            provider,
+            model,
+        );
+        let Some(session) = &mut self.session else {
+            return;
+        };
+        if let Err(e) = session.append_error(&meta).await {
+            tracing::warn!(error = %e, "failed to append one.error");
+        }
+        if let Err(e) = session.write_summary() {
+            tracing::warn!(error = %e, "failed to write session summary after one.error");
+        }
+    }
+
+    /// Classify and persist [`OneError`] after a failed prompt run.
+    pub async fn persist_run_error_one(&mut self, err: &OneError) {
+        self.persist_run_error(err.error_kind(), &err.to_string(), err.stop_reason_label())
+            .await;
     }
 
     /// Snapshot the live system prompt when it changes (create / reload / new).

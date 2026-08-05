@@ -227,16 +227,18 @@ one --full-access
 | `sandbox_permissions` | `require_escalated` | 请求**本次**在沙箱外执行 |
 | `justification` | 字符串 | 展示在审批 UI 里的原因（`require_escalated` 时建议填写） |
 
-交互会话下会弹出 **Run outside sandbox?**（默认焦点在「仅本次」）：
+交互会话下会弹出 **Run without OS bwrap?**（默认焦点在「仅本次」；**不是**放开 workspace 路径边界）：
 
-1. **Yes, run outside sandbox (this command only)** ← 默认选中  
+1. **Yes, run without OS bwrap (this command only)** ← 默认选中  
 2. Yes, and don't ask again for this command  
 3. Yes, and don't ask again for anything  
-4. No, keep sandboxed  
+4. No, keep OS sandboxed  
 
-正文优先展示 **Why:**（justification）+ 截断后的 `$ command`，不再把整行超长命令塞进对话框。
+正文优先展示 **Why:**（justification）+ 截断后的 `$ command`，并说明 workspace path boundary 仍生效。
 
-另外：沙箱内命令若以 **signal 退出** 或输出含 `Permission denied` / `Operation not permitted` 等，one 会尝试 **escalate_on_failure**——再弹一次提权审批，通过后用同一命令在沙箱外重跑。
+另外：沙箱内命令若以 **signal 退出**，或输出含明确的 **OS 权限错误短语**（`Permission denied` / `Operation not permitted` / `Read-only file system` / `bwrap:` 等），one 会尝试 **escalate_on_failure**——再弹一次提权审批，通过后用同一命令在 **无 bwrap** 下重跑。
+
+> 这与「超出 workspace 路径边界」不是一回事：提权只关掉 **OS bubblewrap**，`read`/`write`/`edit` 的 PathPolicy 仍按 `workspace-write` 生效。普通失败（`cargo fmt --check` 有 diff、测试失败）**不会**因输出里碰巧出现 “sandbox” 字样而提权。
 
 | 模式 | `require_escalated` / 失败提权 |
 |------|--------------------------------|

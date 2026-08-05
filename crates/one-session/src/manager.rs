@@ -14,8 +14,8 @@ use crate::context::{
 use crate::entries::{new_entry_base, new_session_header, SessionEntry, SessionHeader};
 use crate::error::{Result, SessionError};
 use crate::meta::{
-    PromptSnapshotMeta, ToolAuditMeta, UsageFields, UsageMeta, CUSTOM_PROMPT_SNAPSHOT,
-    CUSTOM_TOOL_AUDIT, CUSTOM_USAGE, PROMPT_INLINE_MAX_BYTES,
+    ErrorMeta, PromptSnapshotMeta, ToolAuditMeta, UsageFields, UsageMeta, CUSTOM_ERROR,
+    CUSTOM_PROMPT_SNAPSHOT, CUSTOM_TOOL_AUDIT, CUSTOM_USAGE, PROMPT_INLINE_MAX_BYTES,
 };
 use crate::paths::session_dir_for_cwd;
 use crate::summary::{load_summary, system_prompt_path_for, write_summary_file, SessionSummary};
@@ -571,6 +571,29 @@ impl SessionManager {
             return Ok(String::new());
         }
         self.append_custom(CUSTOM_TOOL_AUDIT, meta.to_value()).await
+    }
+
+    /// Persist a terminal run failure as `one.error` Custom (not LLM context).
+    ///
+    /// Grok Build writes the same idea to `updates.jsonl` (`stop_reason: error`,
+    /// `agent_result`) without polluting model-facing chat history.
+    pub async fn append_error(&mut self, meta: &ErrorMeta) -> Result<String> {
+        self.append_custom(CUSTOM_ERROR, meta.to_value()).await
+    }
+
+    /// Latest `one.error` on the active leaf path (newest wins).
+    pub fn latest_error_meta(&self) -> Option<ErrorMeta> {
+        for entry in self.active_path_entries().into_iter().rev() {
+            if let SessionEntry::Custom {
+                custom_type, data, ..
+            } = entry
+            {
+                if custom_type == CUSTOM_ERROR {
+                    return ErrorMeta::from_value(data);
+                }
+            }
+        }
+        None
     }
 
     /// Latest absolute usage total from `one.usage` on the active leaf path.
@@ -1239,10 +1262,23 @@ mod tests {
         ))
         .await
         .unwrap();
+        sm.append_error(&ErrorMeta::new(
+            "empty_response",
+            "empty model response after 3 attempt(s)",
+            "error",
+            Some(0),
+            Some("p".into()),
+            Some("m".into()),
+        ))
+        .await
+        .unwrap();
 
         let ctx = sm.build_session_context();
         assert_eq!(ctx.messages.len(), 1, "meta customs must not enter LLM context");
         assert_eq!(sm.latest_usage_total().unwrap().input_tokens, 11);
+        let err = sm.latest_error_meta().expect("one.error");
+        assert_eq!(err.kind, "empty_response");
+        assert_eq!(err.stop_reason, "error");
         let summary = sm.build_summary();
         assert_eq!(summary.tool_call_count, 1);
         assert_eq!(summary.tools_used, vec!["bash".to_string()]);

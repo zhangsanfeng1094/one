@@ -20,8 +20,9 @@ pub use error::{Result, SessionError};
 pub use export::export_html;
 pub use manager::{SessionInfo, SessionManager};
 pub use meta::{
-    prompt_hash, PromptSnapshotMeta, ToolAuditItem, ToolAuditMeta, UsageFields, UsageMeta,
-    CUSTOM_PROMPT_SNAPSHOT, CUSTOM_TOOL_AUDIT, CUSTOM_USAGE, PROMPT_INLINE_MAX_BYTES,
+    prompt_hash, ErrorMeta, PromptSnapshotMeta, ToolAuditItem, ToolAuditMeta, UsageFields,
+    UsageMeta, CUSTOM_ERROR, CUSTOM_PROMPT_SNAPSHOT, CUSTOM_TOOL_AUDIT, CUSTOM_USAGE,
+    PROMPT_INLINE_MAX_BYTES,
 };
 pub use migrate::migrate_jsonl;
 pub use paths::{agent_dir, session_dir_for_cwd};

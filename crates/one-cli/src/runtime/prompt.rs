@@ -5,6 +5,7 @@ use one_core::compaction::{
     compact_messages, prune_old_tool_outputs, should_compact_tokens, should_prefire_prune,
     split_for_compaction, summarization_prompt, tokens_for_compaction, CompactionConfig,
 };
+use one_core::error::OneError;
 use one_core::message::AgentMessage;
 use one_ext::ExtensionEvent;
 
@@ -100,6 +101,16 @@ impl AppRuntime {
         }
         // Usage / tool audit / summary sidecar (never enters LLM context).
         self.persist_run_meta(usage_before, before).await;
+
+        // Grok Build–style: durable turn failure without polluting chat history.
+        if let Err(ref err) = result {
+            if let Some(one) = err.downcast_ref::<OneError>() {
+                self.persist_run_error_one(one).await;
+            } else {
+                self.persist_run_error("unknown", &err.to_string(), "error")
+                    .await;
+            }
+        }
 
         result
     }

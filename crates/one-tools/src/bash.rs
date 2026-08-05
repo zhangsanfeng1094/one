@@ -105,9 +105,11 @@ impl BashTool {
 
     fn sandbox_banner(&self, sandbox: &OsSandbox, escalated: bool) -> (bool, String) {
         let sandboxed = sandbox.enabled && OsSandbox::bwrap_available();
+        // Wording: "OS bwrap off" ≠ "outside workspace". PathPolicy for file
+        // tools is unchanged when bash runs without bubblewrap.
         let line = if escalated && !sandboxed {
             format!(
-                "sandbox: escalated (outside bwrap) · mode was {}",
+                "sandbox: OS bwrap off for this command (path boundary still {})",
                 self.sandbox_mode.as_str()
             )
         } else if sandboxed {
@@ -187,7 +189,10 @@ impl BashTool {
         };
         let mut output = format!("{status_line}\n{sandbox_line}");
         if escalated_on_failure {
-            output.push_str("\nnote: re-ran outside sandbox after sandboxed attempt failed (user approved escalate)");
+            output.push_str(
+                "\nnote: re-ran without OS bwrap after a sandbox-like denial (user approved); \
+path boundary / workspace mode unchanged",
+            );
         }
         let mut truncated = false;
         let mut spill_path: Option<String> = None;
@@ -334,7 +339,8 @@ impl BashTool {
             obj.insert(
                 "justification".into(),
                 json!(format!(
-                    "sandboxed run failed (exit {code_label}); re-run outside sandbox"
+                    "sandboxed run failed (exit {code_label}); re-run without OS bwrap \
+(workspace path boundary unchanged)"
                 )),
             );
         }
@@ -477,7 +483,7 @@ over limit → full spill under ~/.one/agent/tool-outputs/ + preview + path for 
                 .map_err(|err| tool_error("bash", err))?;
 
             let sb_note = if escalated {
-                "sandbox: escalated (outside bwrap) for this background task"
+                "sandbox: OS bwrap off for this background task (path boundary unchanged)"
             } else if sandbox.enabled && OsSandbox::bwrap_available() {
                 "sandbox: bwrap (workspace-write)"
             } else {
@@ -574,8 +580,8 @@ over limit → full spill under ~/.one/agent/tool-outputs/ + preview + path for 
                 false,
                 false,
             );
-            let hint = "\n\n[sandbox] Command failed under the OS sandbox. \
-To retry outside the sandbox, re-call bash with \
+            let hint = "\n\n[sandbox] Command failed under the OS bubblewrap sandbox \
+(this is not the workspace path boundary). To retry without bwrap, re-call bash with \
 sandbox_permissions=\"require_escalated\" and a short justification \
 (the user will be prompted to approve).";
             let details = out.details.clone().unwrap_or_else(|| json!({}));
@@ -892,8 +898,8 @@ mod tests {
             .expect("bash ok");
         let text = out.as_text();
         assert!(
-            text.contains("escalated") || text.contains("sandbox: off"),
-            "expected escalated banner, got:\n{text}"
+            text.contains("OS bwrap off") || text.contains("sandbox: off"),
+            "expected escalated (OS bwrap off) banner, got:\n{text}"
         );
         assert!(
             outside.exists(),

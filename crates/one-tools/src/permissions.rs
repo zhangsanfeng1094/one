@@ -372,8 +372,9 @@ pub fn call_summary(call: &ToolCall) -> String {
             let core = desc.unwrap_or(cmd);
             if crate::sandbox_permissions::requires_escalation(call) {
                 // Prefer command for escalate preview (user should see what runs).
-                // Still prefix so the UI can detect escalate-shaped summaries.
-                format!("[outside sandbox] {cmd}")
+                // Prefix is peeled by TUI format_escalate_body; means OS bwrap off,
+                // not workspace path escape.
+                format!("[without OS bwrap] {cmd}")
             } else {
                 core.to_string()
             }
