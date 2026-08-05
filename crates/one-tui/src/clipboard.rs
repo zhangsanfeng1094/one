@@ -514,14 +514,29 @@ mod tests {
 
     #[test]
     fn image_bytes_png_ok() {
+        // Media store must be under /tmp so agent bwrap workspace-write tests pass.
+        let dir = std::env::temp_dir().join(format!(
+            "one-clipboard-media-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = one_core::image::set_media_dir_override(Some(dir.clone()));
         // 1×1 PNG
         let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
         let bytes = one_core::image::decode_base64(b64).unwrap();
-        let (mime, path, name) = image_bytes_to_pasted(&bytes, "clipboard").unwrap();
+        let result = image_bytes_to_pasted(&bytes, "clipboard");
+        one_core::image::set_media_dir_override(prev);
+        let (mime, path, name) = result.unwrap();
         assert_eq!(mime, "image/png");
         assert!(path.is_file(), "{path:?}");
+        assert!(path.starts_with(&dir), "{path:?}");
         assert_eq!(name, "clipboard.png");
         let on_disk = std::fs::read(&path).unwrap();
         assert_eq!(on_disk, bytes);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

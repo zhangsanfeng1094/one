@@ -1,5 +1,7 @@
 //! Unit tests for [`App`] behavior (input, keys, streaming, settings hooks).
 
+use std::path::Path;
+use std::sync::Mutex;
 use std::time::Instant;
 
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -13,6 +15,30 @@ use crate::state::{
     display_col_to_caret, ConfigOp, RunOutcome, SelectKind, SelectPos, WELCOME_TRY_PROMPTS,
 };
 use crate::tool_view;
+
+/// Serialize media-dir override so parallel tests do not clobber each other.
+static MEDIA_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+/// Run `f` with image media store under a unique `/tmp` dir (bwrap-writable).
+fn with_temp_media<T>(f: impl FnOnce(&Path) -> T) -> T {
+    let _guard = MEDIA_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!(
+        "one-tui-media-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let prev = one_core::image::set_media_dir_override(Some(dir.clone()));
+    let out = f(&dir);
+    one_core::image::set_media_dir_override(prev);
+    let _ = std::fs::remove_dir_all(&dir);
+    out
+}
 
 fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
     KeyEvent {
@@ -833,73 +859,79 @@ fn drain_image_jobs(app: &mut App) {
 
 #[test]
 fn paste_data_uri_inserts_image_token() {
-    let mut app = App::new("test");
-    let uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    app.handle_paste(uri);
-    // Chip appears immediately (loading).
-    assert!(
-        app.input.contains(one_core::image::IMAGE_TOKEN),
-        "input={}",
-        app.input
-    );
-    drain_image_jobs(&mut app);
-    assert_eq!(app.pending_images.len(), 1);
-    assert_eq!(app.pending_images[0].mime_type, "image/png");
-    assert!(!app.pending_images[0].loading);
-    let taken = app.take_pending_images();
-    assert_eq!(taken.len(), 1);
+    with_temp_media(|_| {
+        let mut app = App::new("test");
+        let uri = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        app.handle_paste(uri);
+        // Chip appears immediately (loading).
+        assert!(
+            app.input.contains(one_core::image::IMAGE_TOKEN),
+            "input={}",
+            app.input
+        );
+        drain_image_jobs(&mut app);
+        assert_eq!(app.pending_images.len(), 1);
+        assert_eq!(app.pending_images[0].mime_type, "image/png");
+        assert!(!app.pending_images[0].loading);
+        let taken = app.take_pending_images();
+        assert_eq!(taken.len(), 1);
+    });
 }
 
 #[test]
 fn set_input_for_edit_with_images_restores_chips() {
-    let mut app = App::new("test");
-    let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    let (path, mime) = one_core::image::store_image_base64(b64, Some("image/png")).unwrap();
-    let token = one_core::image::image_token(1);
-    app.set_input_for_edit_with_images(
-        format!("这个是什么 {token} "),
-        vec![(mime.clone(), path.display().to_string())],
-    );
-    assert!(app.input.contains(&token));
-    assert_eq!(app.pending_images.len(), 1);
-    assert_eq!(app.pending_images[0].mime_type, "image/png");
-    let taken = app.take_pending_images();
-    assert_eq!(taken.len(), 1);
-    // Simulate submit path: chips present → committed on submit_prompt.
-    app.set_input_for_edit_with_images(
-        format!("再看 {token}"),
-        vec![(mime, path.display().to_string())],
-    );
-    let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-    match outcome {
-        RunOutcome::Prompt(p) => {
-            assert!(p.contains("再看"), "{p}");
-            // Image tokens stripped for agent text; bytes go via take_pending_images.
-            assert!(!p.contains("[image ·"), "{p}");
+    with_temp_media(|_| {
+        let mut app = App::new("test");
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let (path, mime) = one_core::image::store_image_base64(b64, Some("image/png")).unwrap();
+        let token = one_core::image::image_token(1);
+        app.set_input_for_edit_with_images(
+            format!("这个是什么 {token} "),
+            vec![(mime.clone(), path.display().to_string())],
+        );
+        assert!(app.input.contains(&token));
+        assert_eq!(app.pending_images.len(), 1);
+        assert_eq!(app.pending_images[0].mime_type, "image/png");
+        let taken = app.take_pending_images();
+        assert_eq!(taken.len(), 1);
+        // Simulate submit path: chips present → committed on submit_prompt.
+        app.set_input_for_edit_with_images(
+            format!("再看 {token}"),
+            vec![(mime, path.display().to_string())],
+        );
+        let outcome = app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        match outcome {
+            RunOutcome::Prompt(p) => {
+                assert!(p.contains("再看"), "{p}");
+                // Image tokens stripped for agent text; bytes go via take_pending_images.
+                assert!(!p.contains("[image ·"), "{p}");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
         }
-        other => panic!("expected Prompt, got {other:?}"),
-    }
-    let imgs = app.take_pending_images();
-    assert_eq!(imgs.len(), 1);
+        let imgs = app.take_pending_images();
+        assert_eq!(imgs.len(), 1);
+    });
 }
 
 #[test]
 fn paste_image_path_file_attaches() {
-    let dir = std::env::temp_dir().join(format!("one-tui-img-{}", std::process::id()));
-    let _ = std::fs::create_dir_all(&dir);
-    let path = dir.join("dot.png");
-    let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    let bytes = one_core::image::decode_base64(b64).unwrap();
-    std::fs::write(&path, &bytes).unwrap();
+    with_temp_media(|_| {
+        let dir = std::env::temp_dir().join(format!("one-tui-img-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = dir.join("dot.png");
+        let b64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        let bytes = one_core::image::decode_base64(b64).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
 
-    let mut app = App::new("test");
-    app.handle_paste(path.to_str().unwrap());
-    assert!(app.input.contains(one_core::image::IMAGE_TOKEN));
-    drain_image_jobs(&mut app);
-    assert_eq!(app.pending_images.len(), 1);
-    assert_eq!(app.pending_images[0].mime_type, "image/png");
-    assert!(!app.pending_images[0].loading);
-    let _ = std::fs::remove_dir_all(&dir);
+        let mut app = App::new("test");
+        app.handle_paste(path.to_str().unwrap());
+        assert!(app.input.contains(one_core::image::IMAGE_TOKEN));
+        drain_image_jobs(&mut app);
+        assert_eq!(app.pending_images.len(), 1);
+        assert_eq!(app.pending_images[0].mime_type, "image/png");
+        assert!(!app.pending_images[0].loading);
+        let _ = std::fs::remove_dir_all(&dir);
+    });
 }
 
 #[test]
@@ -943,29 +975,33 @@ fn submit_blocked_while_image_loading() {
 
 #[test]
 fn deleting_image_token_detaches() {
-    let mut app = App::new("test");
-    let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    app.attach_image("image/png".into(), tiny.into(), "shot.png".into());
-    assert_eq!(app.pending_images.len(), 1);
-    // User deletes the whole token from input.
-    app.input = "hello only".into();
-    app.sync_pending_images();
-    assert!(app.pending_images.is_empty());
+    with_temp_media(|_| {
+        let mut app = App::new("test");
+        let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        app.attach_image("image/png".into(), tiny.into(), "shot.png".into());
+        assert_eq!(app.pending_images.len(), 1);
+        // User deletes the whole token from input.
+        app.input = "hello only".into();
+        app.sync_pending_images();
+        assert!(app.pending_images.is_empty());
+    });
 }
 
 #[test]
 fn backspace_removes_image_token_atomically() {
-    let mut app = App::new("test");
-    app.input = "hello".into();
-    let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    app.attach_image("image/png".into(), tiny.into(), "shot.png".into());
-    // input is "hello [图片.img] "
-    assert!(app.input.contains(one_core::image::IMAGE_TOKEN));
-    assert_eq!(app.pending_images.len(), 1);
-    // One Backspace wipes the whole token (+ spaces), not char-by-char.
-    app.pop_input();
-    assert_eq!(app.input, "hello");
-    assert!(app.pending_images.is_empty());
+    with_temp_media(|_| {
+        let mut app = App::new("test");
+        app.input = "hello".into();
+        let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        app.attach_image("image/png".into(), tiny.into(), "shot.png".into());
+        // input is "hello [图片.img] "
+        assert!(app.input.contains(one_core::image::IMAGE_TOKEN));
+        assert_eq!(app.pending_images.len(), 1);
+        // One Backspace wipes the whole token (+ spaces), not char-by-char.
+        app.pop_input();
+        assert_eq!(app.input, "hello");
+        assert!(app.pending_images.is_empty());
+    });
 }
 
 #[test]
@@ -1010,22 +1046,24 @@ fn submit_expands_text_chip_for_agent() {
 
 #[test]
 fn submit_image_only_prompt() {
-    let mut app = App::new("test");
-    let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
-    app.attach_image("image/png".into(), tiny.into(), "shot.png".into());
-    match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
-        RunOutcome::Prompt(t) => assert!(t.is_empty(), "token should be stripped, got {t}"),
-        other => panic!("unexpected {other:?}"),
-    }
-    // Staged for CLI take.
-    let taken = app.take_pending_images();
-    assert_eq!(taken.len(), 1);
-    assert!(app
-        .messages
-        .last()
-        .unwrap()
-        .content
-        .contains(one_core::image::IMAGE_TOKEN));
+    with_temp_media(|_| {
+        let mut app = App::new("test");
+        let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+        app.attach_image("image/png".into(), tiny.into(), "shot.png".into());
+        match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+            RunOutcome::Prompt(t) => assert!(t.is_empty(), "token should be stripped, got {t}"),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Staged for CLI take.
+        let taken = app.take_pending_images();
+        assert_eq!(taken.len(), 1);
+        assert!(app
+            .messages
+            .last()
+            .unwrap()
+            .content
+            .contains(one_core::image::IMAGE_TOKEN));
+    });
 }
 
 #[test]

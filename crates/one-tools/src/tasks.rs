@@ -225,6 +225,10 @@ impl BackgroundTaskRegistry {
             .current_dir(&cwd)
             .stdin(std::process::Stdio::null())
             .kill_on_drop(false);
+        cmd.env("NO_COLOR", "1");
+        cmd.env("CLICOLOR", "0");
+        cmd.env_remove("CLICOLOR_FORCE");
+        cmd.env_remove("FORCE_COLOR");
         // Codex-aligned: piped stdio + process group for kill-on-timeout.
         configure_shell_stdio(&mut cmd);
 

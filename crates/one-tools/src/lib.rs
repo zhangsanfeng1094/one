@@ -75,7 +75,9 @@ pub use todo::{TodoItem, TodoListState, TodoStatus, TodoWriteTool};
 pub use truncate::{
     apply_head_default, apply_tail_default, cleanup_tool_outputs, cleanup_tool_outputs_before,
     format_size, present_file_read, present_tool_output, present_tool_output_with,
-    set_tool_output_limits, spill_full_output, tool_output_limits, tool_outputs_root,
+    strip_ansi_escapes,
+    set_tool_output_limits, set_tool_outputs_root_override, spill_full_output, tool_output_limits,
+    tool_outputs_root,
     truncate_head, truncate_line, truncate_tail, CleanupReport, PresentedOutput, PreviewStyle,
     ToolOutputLimits, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH,
     TOOL_OUTPUT_RETENTION_DAYS,

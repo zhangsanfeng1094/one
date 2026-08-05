@@ -6,13 +6,46 @@
 
 use base64::Engine;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Hard cap for raw image bytes accepted into agent context.
 pub const MAX_IMAGE_BYTES: usize = 5 * 1024 * 1024;
 
+fn media_dir_override() -> &'static Mutex<Option<PathBuf>> {
+    static CELL: OnceLock<Mutex<Option<PathBuf>>> = OnceLock::new();
+    CELL.get_or_init(|| Mutex::new(None))
+}
+
+/// Override media store root (tests / custom layouts).
+///
+/// Pass `None` to clear. Returns the previous override (not the env/default path).
+/// Prefer this over mutating `HOME` so unit tests stay sandbox-friendly (`/tmp`).
+pub fn set_media_dir_override(path: Option<PathBuf>) -> Option<PathBuf> {
+    let mut g = media_dir_override()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::replace(&mut *g, path)
+}
+
 /// `~/.one/agent/media` — durable store for pasted / clipboard images.
+///
+/// Resolution order:
+/// 1. [`set_media_dir_override`]
+/// 2. `ONE_MEDIA_DIR` env
+/// 3. `$HOME/.one/agent/media`
 pub fn media_dir() -> PathBuf {
+    if let Ok(g) = media_dir_override().lock() {
+        if let Some(ref p) = *g {
+            return p.clone();
+        }
+    }
+    if let Ok(p) = std::env::var("ONE_MEDIA_DIR") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -551,10 +584,39 @@ mod tests {
     // 1×1 PNG
     const TINY_PNG_B64: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
 
+    /// Point media store at a unique temp dir for the duration of `f`.
+    fn with_temp_media<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let dir = std::env::temp_dir().join(format!(
+            "one-media-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let prev = set_media_dir_override(Some(dir.clone()));
+        let out = f(&dir);
+        set_media_dir_override(prev);
+        let _ = std::fs::remove_dir_all(&dir);
+        out
+    }
+
     #[test]
     fn sniff_png() {
         let bytes = decode_base64(TINY_PNG_B64).unwrap();
         assert_eq!(mime_from_bytes(&bytes), Some("image/png"));
+    }
+
+    #[test]
+    fn store_image_bytes_writes_under_media_dir() {
+        with_temp_media(|dir| {
+            let bytes = decode_base64(TINY_PNG_B64).unwrap();
+            let (path, mime) = store_image_bytes(&bytes, None).unwrap();
+            assert_eq!(mime, "image/png");
+            assert!(path.starts_with(dir), "{path:?} not under {dir:?}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        });
     }
 
     #[test]

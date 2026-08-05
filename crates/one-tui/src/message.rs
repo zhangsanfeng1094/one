@@ -239,9 +239,88 @@ fn truncate_chars(s: &str, max: usize) -> String {
     out
 }
 
+/// Strip ANSI / CSI / OSC escapes and other C0 controls that break Ratatui
+/// layout when tool output (e.g. `cargo fmt --check`, colored diffs) is painted
+/// as plain spans. Keeps `\n` and `\t`.
+pub fn strip_ansi_for_ui(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            // ESC …
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    // CSI: ESC [ params intermediate final
+                    i += 1;
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    // OSC: ESC ] … BEL or ESC \
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => {
+                    // Character-set designation: ESC ( B etc.
+                    i += 1;
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    // Other single-char escapes (ESC c, ESC 7, …)
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        // Drop other C0 controls (incl. SI/SO 0x0e/0x0f from alt charset noise)
+        // and DEL; keep tab + newline for layout.
+        if b < 0x20 && b != b'\n' && b != b'\t' {
+            i += 1;
+            continue;
+        }
+        if b == 0x7f {
+            i += 1;
+            continue;
+        }
+        // Copy one UTF-8 char starting at i.
+        let ch = input[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 /// Cap stored tool output for the TUI (agent still has the full result).
+///
+/// Strips ANSI first so colored CLI output (rustfmt, cargo, grep --color) does
+/// not inject ESC sequences into the Ratatui buffer (which looks like garbled
+/// overlapping red/green text and stray `31m` fragments).
 pub fn truncate_tool_output_for_ui(output: &str, max_chars: usize) -> String {
-    let trimmed = output.trim();
+    let cleaned = strip_ansi_for_ui(output);
+    let trimmed = cleaned.trim();
     if trimmed.len() <= max_chars {
         return trimmed.to_string();
     }

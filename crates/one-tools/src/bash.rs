@@ -137,6 +137,12 @@ impl BashTool {
         let (prog, args) = sandbox.command_line(command);
         let mut cmd = Command::new(&prog);
         cmd.args(&args).current_dir(&self.cwd).kill_on_drop(true);
+        // Prefer plain text from CLIs (rustfmt/cargo/grep). Ratatui cannot host
+        // raw SGR; residual escapes are still stripped in present_tool_output.
+        cmd.env("NO_COLOR", "1");
+        cmd.env("CLICOLOR", "0");
+        cmd.env_remove("CLICOLOR_FORCE");
+        cmd.env_remove("FORCE_COLOR");
         // Codex-aligned: piped stdio + process group for kill-on-timeout.
         configure_shell_stdio(&mut cmd);
         let child = cmd

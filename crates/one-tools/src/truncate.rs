@@ -69,6 +69,73 @@ fn env_usize(key: &str) -> Option<usize> {
         .filter(|&n| n >= 1)
 }
 
+/// Strip ANSI / CSI / OSC and other C0 controls (keep `\n` / `\t`).
+///
+/// Colored CLI output (rustfmt, cargo, grep --color) otherwise injects ESC
+/// into tool results and corrupts the Ratatui screen when painted as spans.
+pub fn strip_ansi_escapes(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = String::with_capacity(input.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == 0x1b {
+            i += 1;
+            if i >= bytes.len() {
+                break;
+            }
+            match bytes[i] {
+                b'[' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        let c = bytes[i];
+                        i += 1;
+                        if (0x40..=0x7e).contains(&c) {
+                            break;
+                        }
+                    }
+                }
+                b']' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => {
+                    i += 1;
+                    if i < bytes.len() {
+                        i += 1;
+                    }
+                }
+                _ => {
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if b < 0x20 && b != b'\n' && b != b'\t' {
+            i += 1;
+            continue;
+        }
+        if b == 0x7f {
+            i += 1;
+            continue;
+        }
+        let ch = input[i..].chars().next().unwrap_or('\u{fffd}');
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
 fn limits_cell() -> &'static RwLock<ToolOutputLimits> {
     static CELL: OnceLock<RwLock<ToolOutputLimits>> = OnceLock::new();
     CELL.get_or_init(|| RwLock::new(ToolOutputLimits::from_env_and_overrides(None, None)))
@@ -369,8 +436,38 @@ pub struct PresentedOutput {
 /// Retention for spilled tool outputs (OpenCode-aligned).
 pub const TOOL_OUTPUT_RETENTION_DAYS: u64 = 7;
 
+fn tool_outputs_root_override() -> &'static RwLock<Option<PathBuf>> {
+    static CELL: OnceLock<RwLock<Option<PathBuf>>> = OnceLock::new();
+    CELL.get_or_init(|| RwLock::new(None))
+}
+
+/// Override spill root (tests). Pass `None` to clear. Returns previous override.
+///
+/// Default production path is `$HOME/.one/agent/tool-outputs`, which is **not**
+/// writable under bash bwrap. Unit tests must point this at `/tmp` (or another
+/// sandbox-writable dir) so spill can succeed without escalating the OS sandbox.
+pub fn set_tool_outputs_root_override(path: Option<PathBuf>) -> Option<PathBuf> {
+    let mut g = tool_outputs_root_override()
+        .write()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::replace(&mut *g, path)
+}
+
 /// Root directory for all spill files: `~/.one/agent/tool-outputs/`.
+///
+/// Resolution: [`set_tool_outputs_root_override`] → `ONE_TOOL_OUTPUTS_DIR` → default.
 pub fn tool_outputs_root() -> PathBuf {
+    if let Ok(g) = tool_outputs_root_override().read() {
+        if let Some(ref p) = *g {
+            return p.clone();
+        }
+    }
+    if let Ok(p) = std::env::var("ONE_TOOL_OUTPUTS_DIR") {
+        let p = p.trim();
+        if !p.is_empty() {
+            return PathBuf::from(p);
+        }
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));
@@ -506,7 +603,10 @@ pub fn present_tool_output_with(
     style: PreviewStyle,
     overrides: Option<ToolOutputLimits>,
 ) -> PresentedOutput {
-    let content = content.trim_end();
+    // Strip ANSI so model + TUI never see ESC noise from colored CLIs
+    // (rustfmt --check, cargo, grep --color). Spill keeps the cleaned text.
+    let cleaned = strip_ansi_escapes(content);
+    let content = cleaned.trim_end();
     let total_bytes = content.len();
     let total_chars = content.chars().count();
     let lim = overrides.unwrap_or_else(tool_output_limits);
@@ -615,6 +715,15 @@ mod tests {
     use super::*;
 
     #[test]
+    fn strip_ansi_removes_sgr_and_keeps_text() {
+        let raw = "\x1b[31m-old\x1b[0m\n\x1b[32m+new\x1b[m\x0f";
+        let clean = strip_ansi_escapes(raw);
+        assert_eq!(clean, "-old\n+new");
+        assert!(!clean.contains("31m"));
+        assert!(!clean.contains('\u{1b}'));
+    }
+
+    #[test]
     fn head_no_truncation() {
         let r = truncate_head("a\nb\nc", 10, 1000);
         assert!(!r.truncated);
@@ -678,64 +787,94 @@ mod tests {
         assert!(t.ends_with("... [truncated]"));
     }
 
-    #[test]
-    fn spill_when_over_line_limit() {
-        let dir = std::env::temp_dir().join(format!(
-            "one-spill-test-{}-{}",
+    /// Point spill root at a unique `/tmp` dir (writable under agent bwrap).
+    fn with_temp_spill_root<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let root = std::env::temp_dir().join(format!(
+            "one-spill-root-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map(|d| d.as_nanos())
                 .unwrap_or(0)
         ));
-        let _ = std::fs::create_dir_all(&dir);
-        let big = (0..100)
-            .map(|i| format!("line{i}"))
-            .collect::<Vec<_>>()
-            .join("\n");
-        let presented = present_tool_output_with(
-            &big,
-            "bash",
-            &dir,
-            PreviewStyle::Head,
-            Some(ToolOutputLimits {
-                max_lines: 10,
-                max_bytes: 1_000_000,
-            }),
-        );
+        let _ = std::fs::create_dir_all(&root);
+        let prev = set_tool_outputs_root_override(Some(root.clone()));
+        let out = f(&root);
+        set_tool_outputs_root_override(prev);
+        let _ = std::fs::remove_dir_all(&root);
+        out
+    }
 
-        assert!(presented.truncated);
-        assert!(presented.spill_path.is_some());
-        let path = presented.spill_path.unwrap();
-        assert!(path.exists());
-        let on_disk = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(on_disk, big.trim_end());
-        assert!(presented.text.contains("Full output saved to:"));
-        assert!(presented.text.contains("lines truncated"));
-        assert!(presented.text.contains("line0"));
-        assert!(!presented.text.contains("line99") || presented.text.contains("saved to"));
-        let _ = std::fs::remove_file(&path);
-        let _ = std::fs::remove_dir_all(&dir);
+    #[test]
+    fn spill_when_over_line_limit() {
+        with_temp_spill_root(|root| {
+            // cwd only affects the project slug under the spill root — not the
+            // root itself. Without root override, spill goes to ~/.one/... and
+            // fails under bwrap (Read-only file system).
+            let dir = std::env::temp_dir().join(format!(
+                "one-spill-cwd-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            let big = (0..100)
+                .map(|i| format!("line{i}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let presented = present_tool_output_with(
+                &big,
+                "bash",
+                &dir,
+                PreviewStyle::Head,
+                Some(ToolOutputLimits {
+                    max_lines: 10,
+                    max_bytes: 1_000_000,
+                }),
+            );
+
+            assert!(presented.truncated);
+            assert!(
+                presented.spill_path.is_some(),
+                "spill failed (root={root:?}): {}",
+                presented.text
+            );
+            let path = presented.spill_path.unwrap();
+            assert!(path.starts_with(root), "spill outside override root: {path:?}");
+            assert!(path.exists());
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(on_disk, big.trim_end());
+            assert!(presented.text.contains("Full output saved to:"));
+            assert!(presented.text.contains("lines truncated"));
+            assert!(presented.text.contains("line0"));
+            assert!(!presented.text.contains("line99") || presented.text.contains("saved to"));
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]
     fn under_limit_no_spill() {
-        let dir = std::env::temp_dir().join(format!("one-nospill-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        let presented = present_tool_output_with(
-            "a\nb\nc",
-            "grep",
-            &dir,
-            PreviewStyle::Head,
-            Some(ToolOutputLimits {
-                max_lines: 100,
-                max_bytes: 10_000,
-            }),
-        );
-        assert!(!presented.truncated);
-        assert!(presented.spill_path.is_none());
-        assert_eq!(presented.text, "a\nb\nc");
-        let _ = std::fs::remove_dir_all(&dir);
+        with_temp_spill_root(|_| {
+            let dir = std::env::temp_dir().join(format!("one-nospill-{}", std::process::id()));
+            let _ = std::fs::create_dir_all(&dir);
+            let presented = present_tool_output_with(
+                "a\nb\nc",
+                "grep",
+                &dir,
+                PreviewStyle::Head,
+                Some(ToolOutputLimits {
+                    max_lines: 100,
+                    max_bytes: 10_000,
+                }),
+            );
+            assert!(!presented.truncated);
+            assert!(presented.spill_path.is_none());
+            assert_eq!(presented.text, "a\nb\nc");
+            let _ = std::fs::remove_dir_all(&dir);
+        });
     }
 
     #[test]

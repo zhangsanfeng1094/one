@@ -48,7 +48,8 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let placeholder = if app.busy {
         "steer or follow-up…"
     } else if app.transcript_browse_focused() {
-        "type to return to input · j/k navigate history"
+        // Short: keys live on the status strip; avoid a long dual-hint soup.
+        "type to edit…"
     } else {
         "Message…"
     };

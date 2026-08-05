@@ -1015,7 +1015,7 @@ fn chat_focus_rail_and_status_nav_hints() {
     // Blue focus rail on the tool row still uses ▌; prompt caret must not.
     assert!(flat.contains('▌'), "focus rail: {flat}");
     assert!(
-        flat.contains("type to return") || flat.contains("navigate history"),
+        flat.contains("type to edit") || flat.contains("j/k"),
         "browse placeholder, not Message… + blinking caret: {flat}"
     );
     assert!(
