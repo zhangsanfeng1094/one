@@ -699,6 +699,32 @@ fn paste_into_float_edit_does_not_touch_main_input() {
 }
 
 #[test]
+fn transcript_browse_unfocuses_prompt_caret_until_typing() {
+    // Grok-style: j/k browse owns focus — no blinking prompt caret.
+    let mut app = App::new("test");
+    assert!(app.prompt_focused());
+    assert!(!app.transcript_browse_focused());
+
+    app.chat_focus = Some(0);
+    app.input.clear();
+    assert!(app.transcript_browse_focused());
+    assert!(!app.prompt_focused());
+
+    // Blink tick while unfocused must not leave caret mid-off.
+    app.cursor_on = false;
+    app.toggle_cursor();
+    assert!(app.cursor_on, "unfocused blink keeps caret ready for refocus");
+    assert!(!app.prompt_focused());
+
+    // Typing returns to the composer and clears row focus.
+    app.insert_input_char('h');
+    assert_eq!(app.input, "h");
+    assert!(app.chat_focus.is_none());
+    assert!(app.prompt_focused());
+    assert!(!app.transcript_browse_focused());
+}
+
+#[test]
 fn main_input_left_right_moves_cursor_and_inserts_mid() {
     let mut app = App::new("test");
     for ch in "hello".chars() {

@@ -178,6 +178,12 @@ impl Theme {
         Style::default().fg(Self::PRIMARY)
     }
 
+    /// Prompt rail when another pane owns focus (float / select / j/k browse).
+    /// Muted so the composer does not look editable (Grok-style hide-caret + dim).
+    pub fn prompt_bar_unfocused() -> Style {
+        Style::default().fg(Self::BORDER)
+    }
+
     pub fn prompt_bar_busy() -> Style {
         Style::default().fg(Self::WARNING)
     }

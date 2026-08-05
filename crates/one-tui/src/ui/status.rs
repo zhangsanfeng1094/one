@@ -84,7 +84,7 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     // Idle: core chrome only — full catalog is Alt+H help float.
     // When chat focus is active (empty prompt browse), surface expand/nav keys.
     let mut left = vec![Span::raw("  ")];
-    if app.chat_focus.is_some() && app.input.is_empty() {
+    if app.transcript_browse_focused() {
         left.extend(pair("j/k", " nav  "));
         left.extend(pair("↵", " expand  "));
         left.extend(pair("click", " toggle  "));

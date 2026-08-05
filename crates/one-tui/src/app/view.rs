@@ -371,7 +371,15 @@ impl super::App {
     }
 
     pub fn toggle_cursor(&mut self) {
-        self.cursor_on = !self.cursor_on;
+        // Blink only while the main prompt owns focus. Elsewhere keep
+        // `cursor_on = true` so the caret is immediately visible when focus
+        // returns (no mid-off phase), and do not advance the blink phase
+        // during float / select / j/k transcript browse.
+        if self.prompt_focused() {
+            self.cursor_on = !self.cursor_on;
+        } else {
+            self.cursor_on = true;
+        }
         if self.busy {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
         }

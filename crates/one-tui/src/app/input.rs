@@ -93,6 +93,7 @@ impl super::App {
         if ch.is_control() && ch != '\n' {
             return;
         }
+        self.clear_chat_focus();
         self.clamp_input_cursor();
         let idx = self.input_byte_at_cursor();
         self.input.insert(idx, ch);
@@ -109,6 +110,7 @@ impl super::App {
         if cleaned.is_empty() {
             return;
         }
+        self.clear_chat_focus();
         self.clamp_input_cursor();
         let idx = self.input_byte_at_cursor();
         let n = cleaned.chars().count();
@@ -119,6 +121,7 @@ impl super::App {
 
     pub(crate) fn insert_chip_token(&mut self, token: &str) {
         // Prefer a leading space when inserting mid-buffer after non-whitespace.
+        self.clear_chat_focus();
         self.clamp_input_cursor();
         let idx = self.input_byte_at_cursor();
         let need_lead = idx > 0
@@ -471,9 +474,28 @@ impl super::App {
         self.clear_notice();
     }
 
-    /// Main prompt caret is only active when no overlay owns keyboard focus.
+    /// Whether the main prompt owns interaction focus (and thus the blinking caret).
+    ///
+    /// Matches Grok / common TUI practice: caret only while the composer is the
+    /// active pane. Hidden when:
+    /// - a float modal or select dock owns the keyboard, or
+    /// - empty-prompt j/k transcript browse (`chat_focus`) owns visual focus
+    ///   (blue rail on a history row — typing returns to the prompt).
     pub fn prompt_focused(&self) -> bool {
-        self.select.is_none() && !self.float_open()
+        self.select.is_none()
+            && !self.float_open()
+            && !self.transcript_browse_focused()
+    }
+
+    /// Empty-prompt transcript browse (j/k / click focus rail). Keys like j/k
+    /// navigate history; printable keys re-enter the composer.
+    pub fn transcript_browse_focused(&self) -> bool {
+        self.chat_focus.is_some() && self.input.is_empty()
+    }
+
+    /// Clear transcript row focus when the user returns to typing in the prompt.
+    pub(crate) fn clear_chat_focus(&mut self) {
+        self.chat_focus = None;
     }
 
     /// How many visual lines the prompt input currently needs (capped).

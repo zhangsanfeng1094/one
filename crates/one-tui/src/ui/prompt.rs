@@ -31,17 +31,23 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let box_area = rows[0];
     let meta_area = rows[1];
 
+    // Left rail + caret track real interaction focus (not just "no modal").
+    // Busy always keeps the busy rail; otherwise dim when float/select/j/k browse
+    // owns focus so a blinking peach caret cannot fake "prompt focused".
+    let prompt_focused = app.prompt_focused();
     let bar_style = if app.busy {
         Theme::prompt_bar_busy()
-    } else {
+    } else if prompt_focused {
         Theme::prompt_bar()
+    } else {
+        Theme::prompt_bar_unfocused()
     };
 
     // Keep placeholder quiet — keybindings live on the sparse status strip / Alt+H help.
     // Busy: light steer hint only; Esc/Ctrl+C live on the status row (avoid wall-of-text).
     let placeholder = if app.busy {
         "steer or follow-up…"
-    } else if app.chat_focus.is_some() && app.input.is_empty() {
+    } else if app.transcript_browse_focused() {
         "type to return to input · j/k navigate history"
     } else {
         "Message…"
@@ -51,9 +57,8 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Software caret (▌) so the typewriter is visible even when the hardware
     // I-beam is hidden by the emulator / tmux / mouse reporting.
-    // Hidden entirely while a float modal or select dock owns focus — paste/keys
-    // go there, so the main prompt must not look editable.
-    let prompt_focused = app.prompt_focused();
+    // Hidden while float / select / empty-prompt transcript browse owns focus
+    // (Grok: inactive pane hides caret so focus is unambiguous).
     let caret = if prompt_focused && app.cursor_on {
         Span::styled("▌", Theme::input_cursor_on())
     } else if prompt_focused {

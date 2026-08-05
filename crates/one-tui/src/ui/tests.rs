@@ -1002,6 +1002,8 @@ fn chat_focus_rail_and_status_nav_hints() {
     app.finish_tool_with_output("read", false, Some("one\ntwo".into()));
     app.chat_focus = Some(0);
     app.input.clear();
+    app.cursor_on = true;
+    assert!(!app.prompt_focused(), "browse must unfocus the composer");
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let flat: String = terminal
         .backend()
@@ -1010,7 +1012,12 @@ fn chat_focus_rail_and_status_nav_hints() {
         .iter()
         .map(|c| c.symbol().to_string())
         .collect();
+    // Blue focus rail on the tool row still uses ▌; prompt caret must not.
     assert!(flat.contains('▌'), "focus rail: {flat}");
+    assert!(
+        flat.contains("type to return") || flat.contains("navigate history"),
+        "browse placeholder, not Message… + blinking caret: {flat}"
+    );
     assert!(
         flat.contains("j/k") || flat.contains("nav"),
         "browse status keys when focused: {flat}"
