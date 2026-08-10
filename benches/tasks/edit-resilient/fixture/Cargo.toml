@@ -1,3 +1,7 @@
+# Standalone eval fixture — not part of the One monorepo workspace.
+# Empty [workspace] stops Cargo from treating benches/out/... as a parent member.
+[workspace]
+
 [package]
 name = "edit_resilient_fixture"
 version = "0.1.0"
@@ -6,6 +10,3 @@ edition = "2021"
 [lib]
 name = "edit_resilient_fixture"
 path = "src/lib.rs"
-
-# Standalone when copied to benches/out; ignore parent monorepo workspace.
-[workspace]

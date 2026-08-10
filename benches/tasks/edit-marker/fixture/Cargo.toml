@@ -1,3 +1,7 @@
+# Standalone eval fixture — not part of the One monorepo workspace.
+# Empty [workspace] stops Cargo from treating benches/out/... as a parent member.
+[workspace]
+
 [package]
 name = "edit_marker_fixture"
 version = "0.1.0"

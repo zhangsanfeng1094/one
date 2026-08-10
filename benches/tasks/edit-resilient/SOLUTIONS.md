@@ -29,7 +29,7 @@ Measure **edit-tool resilience**, not algorithmic difficulty:
 |--------|-------|-----------|
 | **OpenCode** | Multi-strategy replace + CRLF restore | **Format + LSP diagnostics** appended to tool result |
 | **Pi** | Exact → fuzzy (trailing WS / unicode quotes-dashes) + mutation queue + unified patch | **Diff only** — no format/LSP loop |
-| **One (after Phase A/B)** | Exact → fuzzy → line-trim → whitespace → indent → block-anchor; CRLF; line-number strip; tool-name aliases | Unified diff + `strategy` in details — **no** format/LSP yet |
+| **One (after Phase A/B + matching tighten)** | Exact → fuzzy → line-trim → whitespace → indent → block-anchor; **multi-match fails immediately** (no looser fallback); block-anchor needs strong anchors + similarity margin; CRLF; line-number strip; tool-name aliases | Unified diff + `strategy` in details — **no** format/LSP yet |
 
 ## How to run
 
