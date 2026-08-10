@@ -19,10 +19,10 @@ existing id after `memory_search`. Do not use raw `write` under memory dirs unle
 `memory_write` is unavailable. New L2 index lines apply after `/reload` or a new session.
 ";
 
-/// Grok-style output guidance (always injected for high quality)
-pub const GROK_OUTPUT_GUIDE: &str = r#"
+/// One-style output guidance (always injected for high quality)
+pub const ONE_OUTPUT_GUIDE: &str = r#"
 
-## Grok Output Style (始终生效)
+## One Output Style (始终生效)
 
 - 写完整、专业、结构化的技术文章风格
 - 使用 **bold**、`inline code`、`### 标题`、`表格` 自然且丰富
@@ -88,8 +88,8 @@ pub fn compose_base_system_prompt(input: ComposeBaseInput<'_>) -> String {
         base.push_str(MEMORY_WRITE_PROMPT_HINT);
     }
 
-    // Grok output style — always injected for high-quality responses
-    base.push_str(GROK_OUTPUT_GUIDE);
+    // One output style — always injected for high-quality responses
+    base.push_str(ONE_OUTPUT_GUIDE);
     base
 }
 
