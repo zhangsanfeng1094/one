@@ -5,7 +5,12 @@
 //! 2. Strip read-tool line-number prefixes from old_string when present (`12|…` / `  9|…`).
 //! 3. Strategy waterfall (OpenCode-inspired): exact → trailing/unicode fuzzy →
 //!    line-trim → whitespace-normalize → indent-flexible → block-anchor.
-//! 4. Emit a real line-oriented unified diff of before/after content.
+//! 4. **Ambiguity fail-fast**: if the current strategy finds multiple candidates
+//!    (and `replace_all` is false), return [`EditApplyError::Multiple`] immediately.
+//!    Looser strategies must not paper over earlier ambiguity.
+//! 5. Emit a real line-oriented unified diff of before/after content.
+//!
+//! See `docs/edit-matching-requirements.md` for the full policy.
 
 use std::fmt;
 
@@ -324,9 +329,53 @@ pub fn find_whitespace_normalized_matches(content: &str, needle: &str) -> Vec<Ma
     out
 }
 
-const BLOCK_ANCHOR_SIMILARITY: f64 = 0.65;
+/// Minimum middle-content similarity for a block-anchor match.
+const BLOCK_ANCHOR_SIMILARITY: f64 = 0.80;
+/// When multiple block-anchor candidates exist, best must beat second by this margin.
+const BLOCK_ANCHOR_MIN_MARGIN: f64 = 0.10;
+/// Anchors shorter than this (trimmed chars) are too weak to locate a block.
+const BLOCK_ANCHOR_MIN_ANCHOR_CHARS: usize = 3;
+
+/// True when a first/last block-anchor line is too generic to locate uniquely.
+fn is_weak_block_anchor(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return true;
+    }
+    if t.chars().count() < BLOCK_ANCHOR_MIN_ANCHOR_CHARS {
+        return true;
+    }
+    // Pure punctuation / braces / operators — common in every language.
+    if t.chars().all(|c| !c.is_alphanumeric()) {
+        return true;
+    }
+    // Frequent single-statement closers that appear many times in one file.
+    matches!(
+        t,
+        "return;"
+            | "return"
+            | "break;"
+            | "break"
+            | "continue;"
+            | "continue"
+            | "pass"
+            | "else:"
+            | "else {"
+            | "else{"
+            | "done"
+            | "end"
+            | "fi"
+            | "esac"
+    )
+}
 
 /// OpenCode BlockAnchorReplacer: first/last line anchors + middle similarity.
+///
+/// Safety guards (see `docs/edit-matching-requirements.md`):
+/// - needle must be ≥3 lines;
+/// - first/last anchors must differ, not be short, and not be weak closers;
+/// - middle similarity ≥ [`BLOCK_ANCHOR_SIMILARITY`];
+/// - with multiple candidates, best must lead second by ≥ [`BLOCK_ANCHOR_MIN_MARGIN`].
 pub fn find_block_anchor_matches(content: &str, needle: &str) -> Vec<MatchSpan> {
     let needle_lines = needle_content_lines(needle);
     if needle_lines.len() < 3 {
@@ -339,6 +388,11 @@ pub fn find_block_anchor_matches(content: &str, needle: &str) -> Vec<MatchSpan> 
 
     let first = needle_lines[0].trim();
     let last = needle_lines[needle_lines.len() - 1].trim();
+    // Identical or weak anchors cannot uniquely locate a block.
+    if first == last || is_weak_block_anchor(first) || is_weak_block_anchor(last) {
+        return Vec::new();
+    }
+
     let search_block = needle_lines.len();
     let max_delta = (search_block as f64 * 0.25).floor().max(1.0) as usize;
 
@@ -371,6 +425,7 @@ pub fn find_block_anchor_matches(content: &str, needle: &str) -> Vec<MatchSpan> 
             return 1.0;
         }
         let mut sim = 0.0;
+        let mut counted = 0usize;
         for k in 1..=lines_to_check {
             let a = content_lines[start + k].text.trim();
             let b = needle_lines[k].trim();
@@ -380,44 +435,42 @@ pub fn find_block_anchor_matches(content: &str, needle: &str) -> Vec<MatchSpan> 
             }
             let dist = levenshtein(a, b);
             sim += 1.0 - (dist as f64 / max_len as f64);
+            counted += 1;
         }
-        sim / lines_to_check as f64
+        if counted == 0 {
+            1.0
+        } else {
+            sim / counted as f64
+        }
     };
 
-    let mut out = Vec::new();
-    if candidates.len() == 1 {
-        let (s, e) = candidates[0];
-        if score(s, e) >= BLOCK_ANCHOR_SIMILARITY {
-            out.push(span_for_window(
-                content,
-                &content_lines,
-                s,
-                e - s + 1,
-                needle.ends_with('\n'),
-            ));
+    // Score all candidates; keep those meeting the similarity floor.
+    let mut scored: Vec<(usize, usize, f64)> = candidates
+        .into_iter()
+        .map(|(s, e)| (s, e, score(s, e)))
+        .filter(|(_, _, sc)| *sc >= BLOCK_ANCHOR_SIMILARITY)
+        .collect();
+    if scored.is_empty() {
+        return Vec::new();
+    }
+    scored.sort_by(|a, b| b.2.partial_cmp(&a.2).unwrap_or(std::cmp::Ordering::Equal));
+
+    let (s, e, best_sc) = scored[0];
+    if scored.len() > 1 {
+        let second_sc = scored[1].2;
+        if best_sc - second_sc < BLOCK_ANCHOR_MIN_MARGIN {
+            // Near-tie: refuse to guess which twin the model meant.
+            return Vec::new();
         }
-        return out;
     }
 
-    let mut best: Option<(usize, usize, f64)> = None;
-    for (s, e) in candidates {
-        let sc = score(s, e);
-        if best.map(|(_, _, b)| sc > b).unwrap_or(true) {
-            best = Some((s, e, sc));
-        }
-    }
-    if let Some((s, e, sc)) = best {
-        if sc >= BLOCK_ANCHOR_SIMILARITY {
-            out.push(span_for_window(
-                content,
-                &content_lines,
-                s,
-                e - s + 1,
-                needle.ends_with('\n'),
-            ));
-        }
-    }
-    out
+    vec![span_for_window(
+        content,
+        &content_lines,
+        s,
+        e - s + 1,
+        needle.ends_with('\n'),
+    )]
 }
 
 fn find_line_window_matches(
@@ -662,10 +715,14 @@ pub fn apply_edit_lf(
         (MatchStrategy::BlockAnchor, find_block_anchor_matches),
     ];
 
-    let mut multi_count = 0usize;
     let mut saw_disproportionate = false;
 
     for &(strategy, finder) in strategies {
+        // Block-anchor ranks by similarity — never bulk-replace "looks like" blocks.
+        if replace_all && strategy == MatchStrategy::BlockAnchor {
+            continue;
+        }
+
         let matches = finder(content_lf, old_use);
         if matches.is_empty() {
             continue;
@@ -685,18 +742,14 @@ pub fn apply_edit_lf(
             continue;
         }
 
+        // Ambiguity fail-fast: do not let a looser strategy paper over multi-match.
         if !replace_all && safe.len() > 1 {
-            multi_count = multi_count.max(safe.len());
-            // OpenCode: try next strategy for a unique match.
-            continue;
+            return Err(EditApplyError::Multiple { count: safe.len() });
         }
 
         return apply_spans(content_lf, &safe, new_use, replace_all, strategy);
     }
 
-    if multi_count > 1 {
-        return Err(EditApplyError::Multiple { count: multi_count });
-    }
     if saw_disproportionate {
         return Err(EditApplyError::Disproportionate);
     }
@@ -1287,13 +1340,152 @@ mod tests {
 
     #[test]
     fn block_anchor_tolerates_middle_typo() {
-        let content = "fn run() {\n    let x = 1;\n    let y = 2;\n    done();\n}\n";
+        // Last line must be a strong anchor (not bare `}`).
+        let content =
+            "fn run() {\n    let x = 1;\n    let y = 2;\n    finish_run();\n}\n";
         // Middle line slightly wrong (model typo) but anchors match.
-        let old = "fn run() {\n    let x = 999;\n    let y = 2;\n    done();\n}";
-        let new = "fn run() {\n    let x = 1;\n    let y = 2;\n    done();\n    ok();\n}";
+        let old = "fn run() {\n    let x = 999;\n    let y = 2;\n    finish_run();";
+        let new =
+            "fn run() {\n    let x = 1;\n    let y = 2;\n    finish_run();\n    ok();";
         let r = apply_edit_lf(content, old, new, false).unwrap();
         assert_eq!(r.strategy, MatchStrategy::BlockAnchor);
         assert!(r.content_lf.contains("ok();"), "{}", r.content_lf);
+    }
+
+    /// Ambiguity leak: LineTrimmed finds two candidates; a looser strategy must
+    /// not collapse them into a single match and silently edit.
+    #[test]
+    fn multi_match_does_not_fall_through_to_looser_strategy() {
+        // Two identical trimmed blocks at different indents — LineTrimmed sees 2.
+        // WhitespaceNormalized / IndentationFlexible would also see multiples or
+        // a unique collapsed form; either way we must fail at first multi hit.
+        let content = "\
+fn a() {
+    return value;
+}
+fn b() {
+        return value;
+}
+";
+        let old = "return value;";
+        let err = apply_edit_lf(content, old, "return value + 1;", false).unwrap_err();
+        assert!(
+            matches!(err, EditApplyError::Multiple { count: c } if c >= 2),
+            "expected Multiple, got {err:?}"
+        );
+        // File would be unchanged by the tool layer; content still has both.
+        assert_eq!(content.matches("return value;").count(), 2);
+    }
+
+    /// Near-twin blocks: block-anchor must refuse when best/second margin is thin.
+    #[test]
+    fn block_anchor_near_tie_refuses() {
+        let content = "\
+start_marker {
+    let x = 1;
+    let y = 2;
+    end_marker
+}
+start_marker {
+    let x = 1;
+    let y = 3;
+    end_marker
+}
+";
+        let old = "start_marker {\n    let x = 1;\n    let y = 9;\n    end_marker";
+        // Finder itself must return no span (near-tie / refuse to guess).
+        assert!(
+            find_block_anchor_matches(content, old).is_empty(),
+            "near-tie block-anchor must yield no match"
+        );
+        let err = apply_edit_lf(content, old, "start_marker {\n    fixed\n    end_marker", false)
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EditApplyError::NotFound | EditApplyError::Multiple { .. }
+            ),
+            "expected refuse, got {err:?}"
+        );
+        assert!(content.contains("let y = 2;"));
+        assert!(content.contains("let y = 3;"));
+    }
+
+    /// Weak closers like `}` … `}` must not drive a block-anchor edit.
+    #[test]
+    fn block_anchor_rejects_weak_anchors() {
+        let content = "\
+fn a() {
+    do_a();
+}
+fn b() {
+    do_b();
+}
+";
+        let old = "}\n    do_a();\n}";
+        assert!(
+            find_block_anchor_matches(content, old).is_empty(),
+            "pure `}}` anchors are weak"
+        );
+        let err = apply_edit_lf(content, old, "}\n    do_a();\n    ok();\n}", false).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                EditApplyError::NotFound | EditApplyError::Multiple { .. }
+            ),
+            "weak anchors must not edit, got {err:?}"
+        );
+        assert!(!content.contains("ok();"));
+    }
+
+    #[test]
+    fn block_anchor_rejects_identical_or_return_anchors() {
+        // Identical first/last (`return;`) are weak and must not locate a block.
+        let content = "return;\n    foo();\nreturn;\nother();\nreturn;\n    bar();\nreturn;\n";
+        let old = "return;\n    foo();\nreturn;";
+        assert!(find_block_anchor_matches(content, old).is_empty());
+        assert!(is_weak_block_anchor("return;"));
+        assert!(is_weak_block_anchor("}"));
+        assert!(is_weak_block_anchor(");"));
+        assert!(!is_weak_block_anchor("fn run() {"));
+    }
+
+    /// replace_all must never bulk-apply similarity-ranked block-anchor hits.
+    #[test]
+    fn replace_all_skips_block_anchor() {
+        let content = "\
+start_block {
+    let a = 1;
+    let b = 2;
+    end_block
+}
+start_block {
+    let a = 9;
+    let b = 8;
+    end_block
+}
+";
+        // No exact/fuzzy/trim unique equality across both; block-anchor would
+        // be the only multi-hit path — it must not run under replace_all.
+        let old = "start_block {\n    let a = 0;\n    let b = 0;\n    end_block";
+        let err = apply_edit_lf(content, old, "start_block {\n    fixed\n    end_block", true)
+            .unwrap_err();
+        assert!(
+            matches!(err, EditApplyError::NotFound),
+            "replace_all + block-anchor must not apply, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn empty_old_string_and_no_change_do_not_apply() {
+        assert!(matches!(
+            apply_edit_lf("x\n", "", "y", false),
+            Err(EditApplyError::EmptyOldString)
+        ));
+        assert!(matches!(
+            apply_edit_lf("x\n", "x", "x", false),
+            Err(EditApplyError::NoChange)
+        ));
     }
 
     #[test]

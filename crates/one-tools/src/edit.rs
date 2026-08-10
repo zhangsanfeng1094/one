@@ -91,11 +91,14 @@ impl Tool for EditTool {
                 "Surgical in-place edit (Claude / OpenCode / Pi compatible): replace `old_string` \
                  with `new_string` in an existing file. Always pass `path` (or `file_path`) on \
                  every call — never omit it when batching multiple edits. Prefer this over `write` \
-                 for bugfixes and localized changes. Matching: exact first, then fuzzy (trailing \
-                 whitespace, smart quotes/dashes). By default the match must be unique (fails if \
-                 0 or >1); set `replace_all=true` to change every occurrence (e.g. rename). Include \
-                 enough surrounding context when not using replace_all. Read the file before \
-                 editing when you need current contents. Allowed: {scope}."
+                 for bugfixes and localized changes. Matching: exact first, then low-risk fuzzy \
+                 (trailing whitespace, smart quotes/dashes), then stricter multi-line fallbacks. \
+                 If any strategy finds multiple candidates the edit fails — looser strategies do \
+                 not guess past ambiguity. By default the match must be unique (fails if 0 or >1); \
+                 set `replace_all=true` only for clear bulk renames (exact/normalized equality; \
+                 never similarity-ranked blocks). Include enough surrounding context when not \
+                 using replace_all. Read the file before editing when you need current contents. \
+                 Allowed: {scope}."
             ),
             parameters: json!({
                 "type": "object",
