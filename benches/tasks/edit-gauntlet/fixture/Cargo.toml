@@ -1,0 +1,11 @@
+# Standalone eval fixture — not part of the One monorepo workspace.
+# Empty [workspace] stops Cargo from treating benches/out/... as a parent member.
+[workspace]
+
+[package]
+name = "edit-gauntlet"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "src/lib.rs"

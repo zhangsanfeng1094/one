@@ -1,0 +1,71 @@
+{
+  "checks": [
+    {
+      "type": "file_contains",
+      "path": "src/twins.rs",
+      "text": "ONLY ALPHA"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/twins.rs",
+      "text": "ONLY BETA"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/crowded.rs",
+      "text": "TARGET_SITE_9"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/rename_me.rs",
+      "text": "CanonicalWidget"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/unicode.rs",
+      "text": "“gauntlet”"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/near_twins.rs",
+      "text": "NEAR_TWIN_PRIMARY_MID"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/bait.rs",
+      "text": "DO_NOT_EDIT_COMMENT: result = left + right"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/sandwich.rs",
+      "text": "SANDWICH_MID"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/expr.rs",
+      "text": "EXPR_MIXED_TARGET"
+    },
+    {
+      "type": "file_contains",
+      "path": "src/shadow.rs",
+      "text": "INNER_FIX"
+    },
+    {
+      "type": "command",
+      "cmd": "cargo test --quiet",
+      "exit_code": 0
+    },
+    {
+      "type": "trace_has_tool",
+      "name": "edit"
+    },
+    {
+      "type": "max_turns",
+      "n": 36
+    },
+    {
+      "type": "max_tool_errors",
+      "n": 8
+    }
+  ]
+}
