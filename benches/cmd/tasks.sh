@@ -23,8 +23,9 @@ Then run:
   ./benches/run.sh full                 # interactive pick (full suite)
   ./benches/run.sh full kit-fix-ledger # explicit id
   ./benches/run.sh full --pick          # force menu
+  ./benches/run.sh grok edit-gauntlet
   ./benches/run.sh codex
-  ./benches/run.sh compare
+  ./benches/run.sh compare --vs grok
 EOF
         return 0 ;;
       *) die "usage: run.sh tasks [smoke|full|all]" ;;
@@ -39,7 +40,9 @@ EOF
   echo "  ./benches/run.sh full                 # menu (suite=full)"
   echo "  ./benches/run.sh full kit-fix-all"
   echo "  ./benches/run.sh full --suite all --pick"
+  echo "  ./benches/run.sh grok edit-gauntlet"
   echo "  ./benches/run.sh codex kit-fix-discount"
+  echo "  ./benches/run.sh compare kit-fix-ledger --vs grok"
 }
 
 cmd_list() { cmd_tasks "$@"; }

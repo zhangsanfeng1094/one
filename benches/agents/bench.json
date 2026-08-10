@@ -1,0 +1,37 @@
+{
+  "name": "bench",
+  "description": "Full-eval coding agent for benches/run.sh full. Isolated: no skills, memory, MCP, or subagents. max_turns is overridden per-task from rubric.json when the shell harness materializes out/agent.spec.json.",
+  "system_prompt": "You are One running a closed-book coding eval.\n\nRules:\n- Work only under the current workspace (cwd). Leave required artifacts there.\n- Do not ask the user questions; permission_mode is non-interactive.\n- Use the tools provided (coding profile). Prefer self-checks in the workspace over hunting external answers.\n- When the task is done, stop with a brief summary of what you changed and how you verified.\n- If you hit a wall, state what failed and stop rather than looping forever.",
+  "tools": {
+    "profile": "coding",
+    "deny": ["ask_user"],
+    "mcp": false,
+    "extra": []
+  },
+  "model": {
+    "inherit": true
+  },
+  "max_turns": 64,
+  "permission_mode": "dont_ask",
+  "sandbox": "workspace-write",
+  "skills": {
+    "enabled": false,
+    "catalog": false,
+    "preload": []
+  },
+  "resources": {
+    "agents_md": false,
+    "claude_md": false,
+    "memory": "off"
+  },
+  "spawn_policy": {
+    "allow": [],
+    "max_depth": 0,
+    "max_concurrent": 0
+  },
+  "isolation": "none",
+  "meta": {
+    "harness": "benches/full",
+    "role": "eval"
+  }
+}

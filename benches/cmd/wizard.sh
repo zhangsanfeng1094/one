@@ -74,9 +74,12 @@ cmd_go() {
   echo "【2/2】选跑谁"
   local who
   who="$(_pick_menu "跑哪个 agent？" \
-    "两边都跑（One → Codex，对比）" \
     "只跑 One（你的 agent）" \
-    "只跑 Codex")"
+    "只跑 Grok Build" \
+    "只跑 Codex" \
+    "对比 One → Grok" \
+    "对比 One → Codex" \
+    "三方 One + Codex + Grok")"
 
   echo ""
   echo "将执行:"
@@ -90,15 +93,23 @@ cmd_go() {
 
   echo ""
   case "$who" in
-    "两边都跑（One → Codex，对比）")
-      # skip second pick: pass task explicitly
-      cmd_compare "$task"
-      ;;
     "只跑 One（你的 agent）")
       cmd_full "$task"
       ;;
+    "只跑 Grok Build")
+      cmd_grok "$task"
+      ;;
     "只跑 Codex")
       cmd_codex "$task"
+      ;;
+    "对比 One → Grok")
+      cmd_compare --vs grok "$task"
+      ;;
+    "对比 One → Codex")
+      cmd_compare --vs codex "$task"
+      ;;
+    "三方 One + Codex + Grok")
+      cmd_compare --vs all "$task"
       ;;
     *)
       die "internal: unknown mode $who"

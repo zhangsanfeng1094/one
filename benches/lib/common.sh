@@ -26,9 +26,116 @@ need_cmd() {
   command -v "$1" >/dev/null 2>&1 || die "required command not found: $1"
 }
 
-# cargo run wrapper (from repo root)
+# Prefer prebuilt binary (ONE_BIN, release, then debug); else cargo run.
+resolve_one_bin() {
+  if [[ -n "${ONE_BIN:-}" && -x "$ONE_BIN" ]]; then
+    echo "$ONE_BIN"
+    return 0
+  fi
+  local cand
+  for cand in "$ROOT/target/release/one" "$ROOT/target/debug/one"; do
+    if [[ -x "$cand" ]]; then
+      echo "$cand"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Run one-cli from repo root (or ONE_BIN).
 run_one() {
-  (cd "$ROOT" && echo "+ cargo run -p one-cli -- $*" >&2 && "${ONE[@]}" "$@")
+  local bin
+  if bin="$(resolve_one_bin)"; then
+    echo "+ $bin $*" >&2
+    (cd "$ROOT" && "$bin" "$@")
+  else
+    echo "+ cargo run -p one-cli -- $*" >&2
+    (cd "$ROOT" && "${ONE[@]}" "$@")
+  fi
+}
+
+# Default AgentSpec for full eval (overridable via ONE_BENCH_AGENT).
+bench_agent_template() {
+  if [[ -n "${ONE_BENCH_AGENT:-}" && -f "$ONE_BENCH_AGENT" ]]; then
+    echo "$ONE_BENCH_AGENT"
+    return 0
+  fi
+  local f="$BENCH_DIR/agents/bench.json"
+  [[ -f "$f" ]] || die "missing bench agent template: $f"
+  echo "$f"
+}
+
+# Read max_turns from rubric.json (type: max_turns). Default 64.
+# Override: ONE_BENCH_MAX_TURNS=N
+task_max_turns() {
+  local tdir="${1:?task dir}"
+  if [[ -n "${ONE_BENCH_MAX_TURNS:-}" ]]; then
+    echo "$ONE_BENCH_MAX_TURNS"
+    return 0
+  fi
+  python3 - "$tdir" <<'PY' 2>/dev/null || echo 64
+import json, sys
+from pathlib import Path
+rubric = {}
+p = Path(sys.argv[1]) / "rubric.json"
+if p.is_file():
+    rubric = json.loads(p.read_text())
+n = 64
+for c in rubric.get("checks") or []:
+    if isinstance(c, dict) and c.get("type") == "max_turns":
+        try:
+            n = int(c.get("n") or n)
+        except (TypeError, ValueError):
+            pass
+print(n)
+PY
+}
+
+# Prefer tasks/<id>/agent.json, else benches/agents/bench.json.
+# Materialize out/agent.spec.json with max_turns (and optional model) injected.
+# Prints path to the materialized spec.
+materialize_bench_agent() {
+  local tdir="${1:?task dir}"
+  local out="${2:?out dir}"
+  local max_turns="${3:-}"
+  local model="${4:-}"
+  local base task_agent dest
+  task_agent="$tdir/agent.json"
+  if [[ -f "$task_agent" ]]; then
+    base="$task_agent"
+  else
+    base="$(bench_agent_template)"
+  fi
+  if [[ -z "$max_turns" ]]; then
+    max_turns="$(task_max_turns "$tdir")"
+  fi
+  dest="$out/agent.spec.json"
+  python3 - "$base" "$dest" "$max_turns" "$model" <<'PY'
+import json, sys
+base_path, dest, max_turns, model = sys.argv[1:5]
+with open(base_path, encoding="utf-8") as f:
+    spec = json.load(f)
+try:
+    spec["max_turns"] = int(max_turns)
+except ValueError:
+    spec["max_turns"] = 64
+if model:
+    m = spec.get("model") if isinstance(spec.get("model"), dict) else {}
+    m = dict(m)
+    m["id"] = model
+    # Explicit model on the run; still allow provider from CLI.
+    m["inherit"] = bool(m.get("inherit", True))
+    spec["model"] = m
+meta = spec.get("meta") if isinstance(spec.get("meta"), dict) else {}
+meta = dict(meta)
+meta["source_agent"] = base_path
+meta["materialized_max_turns"] = spec["max_turns"]
+spec["meta"] = meta
+with open(dest, "w", encoding="utf-8") as f:
+    json.dump(spec, f, indent=2)
+    f.write("\n")
+print(dest)
+PY
 }
 
 now_ts() { date +%Y%m%d-%H%M%S; }
@@ -212,7 +319,32 @@ prepare_workspace() {
     (cd "$ws" && ./prepare_fixture.sh) || die "prepare_fixture.sh failed in $ws"
   fi
 
+  # Eval crates live under benches/out/... inside the One monorepo. Without a
+  # root [workspace] table, Cargo treats them as illegal parent-workspace
+  # members. Prefer declaring [workspace] in the fixture; inject if missing.
+  ensure_standalone_cargo_workspace "$ws"
+
   echo "$ws"
+}
+
+# If $ws/Cargo.toml is a package without [workspace], prepend an empty table
+# so cargo test works under benches/out (nested under the One workspace root).
+ensure_standalone_cargo_workspace() {
+  local ws="${1:?workspace}"
+  local toml="$ws/Cargo.toml"
+  [[ -f "$toml" ]] || return 0
+  if grep -qE '^\[workspace\]' "$toml" 2>/dev/null; then
+    return 0
+  fi
+  local tmp
+  tmp="$(mktemp)"
+  {
+    echo "# Injected by prepare_workspace: standalone eval crate (not One monorepo)."
+    echo "[workspace]"
+    echo
+    cat "$toml"
+  } >"$tmp"
+  mv "$tmp" "$toml"
 }
 
 # Ensure workspace is a git repo (Codex wants this unless --skip-git-repo-check).
@@ -495,14 +627,15 @@ pick_task() {
 # Sets: ARG_TASK ARG_PROVIDER ARG_MODEL ARG_SUITE ARG_PICK ARG_UI ARG_YES
 # If no task id: interactive pick (or die in non-TTY).
 # Default suite filter for pick: full (smoke tasks hidden unless --suite smoke|all)
-# Default UI: tui (supervise). Override with --headless for CI print mode.
+# Default UI: tui (supervise). Override with --headless for CI / AgentSpec harness.
 parse_agent_args() {
   ARG_PROVIDER="${PROVIDER:-${ONE_PROVIDER:-}}"
   ARG_MODEL="${ONE_MODEL:-}"
   ARG_TASK=""
   ARG_SUITE="full"   # default pick filter: real-model tasks
   ARG_PICK=0
-  # tui | headless — env ONE_BENCH_UI overrides default
+  # headless | tui — env ONE_BENCH_UI overrides default.
+  # Default tui: interactive supervise. Use --headless for AgentSpec harness (`one run --spec`).
   ARG_UI="${ONE_BENCH_UI:-tui}"
   # 1 = pass -y to one (default on so bash high-risk is not blocked mid-bench)
   ARG_YES=1

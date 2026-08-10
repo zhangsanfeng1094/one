@@ -80,13 +80,16 @@ one bench --suite all --out ./benches/out/manual
 `suite=full` 的任务（如 `edit-marker`、`edit-resilient`）需要真实模型才能过；当前 `one bench` 默认仍走 **MockProvider**。对 full 任务请用 shell harness：
 
 ```bash
-# 推荐：TUI 监督（首条消息=prompt，/quit 后自动打分）
+# 默认：AgentSpec harness（benches/agents/bench.json → out/agent.spec.json）
 ./benches/run.sh full edit-resilient
 ./benches/run.sh full edit-resilient --provider <real>
-./benches/run.sh full edit-resilient --headless   # CI print 模式
 
-# 手动等价：
-one --tui -y --no-mcp --no-skills --cwd /path/to/ws \
+# 可选 TUI 监督（主会话，不是 AgentSpec）
+./benches/run.sh full edit-resilient --tui
+
+# 手动等价（AgentSpec）：
+one --cwd /path/to/ws -y --trace run \
+  --spec benches/agents/bench.json \
   -p "$(cat benches/tasks/edit-resilient/prompt.md)"
 ```
 
