@@ -2,13 +2,14 @@
 
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use clap::{Args, Subcommand};
 
 use crate::cli::Cli;
 use crate::protocol::{AgentRef, RunRequest, SessionMode};
 use crate::provider::ProviderSet;
-use crate::runtime::harness::{self, HarnessOptions};
+use crate::runtime::harness::{self, HarnessOptions, RunControl};
 use crate::runtime::presets;
 
 #[derive(Debug, Clone, Subcommand)]
@@ -198,7 +199,16 @@ async fn execute_run(
     opts.auto_approve = global.auto_approve
         || std::env::var_os("ONE_AUTO_APPROVE").is_some_and(|v| v != "0" && v != "false");
 
-    let result = harness::run(req, providers.as_llm(), &opts).await;
+    // Optional Langfuse on the same path as main agent / nested task (control.trace).
+    let mut control = RunControl::default();
+    let langfuse_handle = attach_run_trace(global, &req, &opts, &mut control);
+
+    let result = harness::run_with_control(req, providers.as_llm(), &opts, control).await;
+
+    // Drain OTLP before process exit (short-lived CLI).
+    if let Some(sink) = langfuse_handle {
+        sink.shutdown();
+    }
 
     match output_format {
         "json" => {
@@ -225,4 +235,58 @@ async fn execute_run(
     } else {
         ExitCode::from(1)
     })
+}
+
+fn run_trace_enabled(cli: &Cli) -> bool {
+    if cli.trace {
+        return true;
+    }
+    std::env::var_os("ONE_TRACE").is_some_and(|v| {
+        let s = v.to_string_lossy();
+        s == "1" || s.eq_ignore_ascii_case("true") || s.eq_ignore_ascii_case("yes")
+    })
+}
+
+/// Wire Langfuse into [`RunControl`] when `--trace` / `ONE_TRACE` and keys are set.
+fn attach_run_trace(
+    global: &Cli,
+    req: &RunRequest,
+    opts: &HarnessOptions,
+    control: &mut RunControl,
+) -> Option<Arc<crate::langfuse::LangfuseTraceSink>> {
+    if !run_trace_enabled(global) {
+        return None;
+    }
+    let Some(cfg) = crate::langfuse::LangfuseConfig::from_env() else {
+        eprintln!(
+            "trace: requested but Langfuse keys missing — set LANGFUSE_PUBLIC_KEY and LANGFUSE_SECRET_KEY"
+        );
+        return None;
+    };
+    let host = cfg.project_url_hint();
+    tracing::info!(%host, "langfuse tracing enabled (one run harness)");
+    let sink = crate::langfuse::LangfuseTraceSink::start(cfg);
+    let max_turns = req.agent.max_turns.unwrap_or(16);
+    control.trace = Some(sink.clone());
+    control.trace_meta = Some(one_core::TraceRunMeta {
+        agent_version: Some(env!("CARGO_PKG_VERSION").into()),
+        config: Some(serde_json::json!({
+            "max_turns": max_turns,
+            "auto_approve": opts.auto_approve,
+            "cwd": opts.cwd.display().to_string(),
+            "trace_full": global.trace_full,
+            "backend": "langfuse",
+            "harness": "one-run",
+            "agent": req.agent.display_name(),
+        })),
+        task_id: req.agent.name.clone(),
+        session_id: Some(format!("run:{}", uuid::Uuid::new_v4().simple())),
+        user_id: crate::langfuse::user_id_from_env(),
+        trace_full: global.trace_full,
+    });
+    eprintln!("trace: langfuse otel ({host}/api/public/otel/v1/traces)");
+    if global.trace_full {
+        eprintln!("trace: full I/O previews enabled (--trace-full)");
+    }
+    Some(sink)
 }
