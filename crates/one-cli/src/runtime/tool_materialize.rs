@@ -55,14 +55,18 @@ pub fn materialize_tools(
     let mut names = resolve_names(spec, prefer_explore_for_read_only);
     if spec.mcp {
         // Append MCP tools already registered on the registry (dynamic instances).
+        // Includes deferred meta tools (`search_tool` / `use_tool`) and direct
+        // `server__tool` names.
         for known in registry.known_names() {
-            if is_mcp_tool_name(&known) && !names.iter().any(|n| n == &known) {
+            if (is_mcp_tool_name(&known) || is_mcp_meta_tool(&known))
+                && !names.iter().any(|n| n == &known)
+            {
                 names.push(known);
             }
         }
         names = filter_mcp_allow(names, &spec.mcp_allow);
     } else {
-        names.retain(|n| !is_mcp_tool_name(n));
+        names.retain(|n| !is_mcp_tool_name(n) && !is_mcp_meta_tool(n));
     }
 
     // Plan tools (plan / exit_plan_mode) are only available when registered as
@@ -95,6 +99,10 @@ fn is_mcp_tool_name(name: &str) -> bool {
     name.starts_with("mcp__") || name.contains("__")
 }
 
+fn is_mcp_meta_tool(name: &str) -> bool {
+    one_mcp::is_mcp_meta_tool(name)
+}
+
 fn filter_mcp_allow(names: Vec<String>, mcp_allow: &[String]) -> Vec<String> {
     if mcp_allow.is_empty() {
         return names;
@@ -102,6 +110,10 @@ fn filter_mcp_allow(names: Vec<String>, mcp_allow: &[String]) -> Vec<String> {
     names
         .into_iter()
         .filter(|n| {
+            // Meta tools always available when tools.mcp is true.
+            if is_mcp_meta_tool(n) {
+                return true;
+            }
             if !is_mcp_tool_name(n) {
                 return true;
             }
@@ -190,5 +202,87 @@ mod tests {
                 assert!(err.message.contains("not_a_real_tool"));
             }
         }
+    }
+
+    #[test]
+    fn mcp_true_includes_meta_tools_when_registered() {
+        use async_trait::async_trait;
+        use one_core::tool::{Tool, ToolCall, ToolDefinition, ToolOutput};
+        use one_core::Result as CoreResult;
+        use std::sync::Arc;
+
+        struct StubMeta {
+            name: &'static str,
+        }
+        #[async_trait]
+        impl Tool for StubMeta {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: self.name.into(),
+                    description: "stub".into(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            async fn execute(&self, _call: &ToolCall) -> CoreResult<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+
+        let mut reg = harness_registry();
+        reg.register_instances(vec![
+            Arc::new(StubMeta {
+                name: "search_tool",
+            }) as Arc<dyn Tool>,
+            Arc::new(StubMeta { name: "use_tool" }) as Arc<dyn Tool>,
+        ]);
+        let spec = ToolsSpec {
+            profile: ToolProfile::Coding,
+            mcp: true,
+            allow: vec!["read".into()],
+            ..Default::default()
+        };
+        let ctx = harness_build_context(PathPolicy::workspace(PathBuf::from("/tmp")), true);
+        let tools = materialize_tools(&spec, &reg, &ctx, false).unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t.definition().name).collect();
+        assert!(names.contains(&"read".to_string()));
+        assert!(names.contains(&"search_tool".to_string()));
+        assert!(names.contains(&"use_tool".to_string()));
+    }
+
+    #[test]
+    fn mcp_false_strips_meta_tools() {
+        use async_trait::async_trait;
+        use one_core::tool::{Tool, ToolCall, ToolDefinition, ToolOutput};
+        use one_core::Result as CoreResult;
+        use std::sync::Arc;
+
+        struct StubMeta;
+        #[async_trait]
+        impl Tool for StubMeta {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "search_tool".into(),
+                    description: "stub".into(),
+                    parameters: serde_json::json!({"type": "object", "properties": {}}),
+                }
+            }
+            async fn execute(&self, _call: &ToolCall) -> CoreResult<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+
+        let mut reg = harness_registry();
+        reg.register_instances(vec![Arc::new(StubMeta) as Arc<dyn Tool>]);
+        let spec = ToolsSpec {
+            profile: ToolProfile::Coding,
+            mcp: false,
+            allow: vec!["read".into(), "search_tool".into()],
+            ..Default::default()
+        };
+        let ctx = harness_build_context(PathPolicy::workspace(PathBuf::from("/tmp")), true);
+        let tools = materialize_tools(&spec, &reg, &ctx, false).unwrap();
+        let names: Vec<_> = tools.iter().map(|t| t.definition().name).collect();
+        assert!(names.contains(&"read".to_string()));
+        assert!(!names.contains(&"search_tool".to_string()));
     }
 }

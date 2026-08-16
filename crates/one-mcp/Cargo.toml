@@ -29,6 +29,8 @@ regex = "1"
 parking_lot = "0.12"
 # Only for read-only Codex compat (`~/.codex/config.toml`); One native stays JSON.
 toml = "0.8"
+# Deferred MCP tool discovery (Grok-style search_tool index).
+bm25 = "2.3"
 
 [dev-dependencies]
 tempfile = "3"

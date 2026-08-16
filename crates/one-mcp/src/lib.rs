@@ -7,23 +7,30 @@
 //! - **Connect**: async background handshakes; tools appear as servers ready
 //! - **Sessions**: connection pool survives `/new` (only messages reset)
 
+pub mod catalog;
 pub mod config;
 pub mod error;
 pub mod manager;
+pub mod meta_tools;
 pub mod naming;
 mod paths;
 pub mod tool;
 
+pub use catalog::{
+    SearchSnapshot, ServerSummary, ToolExposure, ToolSearchResult, build_prompt_announcement,
+    is_mcp_meta_tool,
+};
 pub use config::{
-    expand_env, import_servers_to_user, load_effective, load_merged, load_one_only,
-    load_user_or_empty, parse_config_json, project_mcp_path, save_user_config,
-    scan_import_candidates, set_server_disabled_persistent, user_mcp_path, ConfigSourceKind,
-    ConfigSourceReport, ImportCandidate, ImportReport, LoadedMcpConfig, McpConfig, McpServerConfig,
-    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_STARTUP_TIMEOUT_SEC, DEFAULT_TOOL_TIMEOUT_SEC,
+    ConfigSourceKind, ConfigSourceReport, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_STARTUP_TIMEOUT_SEC,
+    DEFAULT_TOOL_TIMEOUT_SEC, ImportCandidate, ImportReport, LoadedMcpConfig, McpConfig,
+    McpServerConfig, expand_env, import_servers_to_user, load_effective, load_merged,
+    load_one_only, load_user_or_empty, parse_config_json, project_mcp_path, save_user_config,
+    scan_import_candidates, set_server_disabled_persistent, user_mcp_path,
 };
 pub use error::{McpError, Result};
 pub use manager::{
-    probe_server, McpChip, McpChipKind, McpLoadStatus, McpManager, McpProgressHandle, McpServerRow,
-    ServerHealth,
+    McpCatalog, McpChip, McpChipKind, McpLoadStatus, McpManager, McpProgressHandle, McpReminder,
+    McpReminderKind, McpReminderState, McpServerRow, McpServerStatus, McpStatusSnapshot,
+    ServerHealth, probe_server,
 };
 pub use naming::public_tool_name;

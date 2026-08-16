@@ -37,8 +37,14 @@ impl AppRuntime {
         };
         let bash = self.bg_registry.clone();
         tools.push(Arc::new(TaskTool::new(host.clone())));
-        tools.push(Arc::new(JobOutputTool::with_bash(host.jobs(), bash.clone())));
-        tools.push(Arc::new(WaitTasksTool::with_bash(host.jobs(), bash.clone())));
+        tools.push(Arc::new(JobOutputTool::with_bash(
+            host.jobs(),
+            bash.clone(),
+        )));
+        tools.push(Arc::new(WaitTasksTool::with_bash(
+            host.jobs(),
+            bash.clone(),
+        )));
         tools.push(Arc::new(JobKillTool::with_bash(host.jobs(), bash)));
     }
 
@@ -48,7 +54,7 @@ impl AppRuntime {
         self.recompose_base_prompt();
         self.rebuild_act_tools().await?;
         let mut agent = self.agent.lock().await;
-        agent.config.system_prompt = self.base_system_prompt.clone();
+        agent.config.system_prompt = self.effective_system_prompt();
         Ok(())
     }
 
@@ -84,23 +90,24 @@ impl AppRuntime {
         let mut registry = ToolRegistry::with_builtins();
         let ext = self.extensions.tools();
         registry.register_instances(ext.iter().cloned());
+        // Deferred (default): search_tool + use_tool only.
+        // Direct: full MCP tool schemas. Plan mode: nothing.
         let mcp_tools = if self.mode != AgentMode::Plan {
-            self.mcp.tools()
+            self.mcp.model_visible_tools()
         } else {
             vec![]
         };
         registry.register_instances(mcp_tools.iter().cloned());
 
         let tools_spec = self.effective_main_tools_spec();
-        // When main tools.mcp is true, registered MCP instances are appended.
-        // When false, materialize_tools strips MCP-looking names.
+        // When main tools.mcp is true, registered MCP / meta tools are appended.
+        // When false, materialize_tools strips MCP-looking names and meta tools.
         let mut tools = materialize_tools(&tools_spec, &registry, &ctx, false)
             .map_err(|e| format!("main tools materialize failed: {e}"))?;
 
         // Feature `memory` master switch: L2 tools only when package is on.
         let settings = crate::settings::load();
-        let mem_opts =
-            super::features::effective_memory_options(&self.applied_features, &settings);
+        let mem_opts = super::features::effective_memory_options(&self.applied_features, &settings);
         if mem_opts.enabled
             && !tools_spec.deny.iter().any(|d| d == "memory_search")
             && (tools_spec.allow.is_empty()
@@ -118,8 +125,7 @@ impl AppRuntime {
             && mem_opts.write_enabled
             && !self.read_only
             && !tools_spec.deny.iter().any(|d| d == "memory_write")
-            && (tools_spec.allow.is_empty()
-                || tools_spec.allow.iter().any(|a| a == "memory_write"))
+            && (tools_spec.allow.is_empty() || tools_spec.allow.iter().any(|a| a == "memory_write"))
         {
             tools.push(std::sync::Arc::new(
                 super::memory_write_tool::MemoryWriteTool::new(
@@ -160,8 +166,11 @@ impl AppRuntime {
         // Keep child harness MCP/ext set in sync.
         self.refresh_task_dynamic_tools().await;
 
+        let system_prompt = self.effective_system_prompt();
         let mut agent = self.agent.lock().await;
         agent.set_tools(tools);
+        // Refresh MCP announcement when the connected set changes (deferred mode).
+        agent.config.system_prompt = system_prompt;
         // Keep shared queue: bash + agent jobs (already set at build; re-apply if missing).
         if !self.read_only {
             if let Some(host) = &self.task_host {
@@ -175,6 +184,19 @@ impl AppRuntime {
             }
         }
         Ok(())
+    }
+
+    pub(crate) async fn inject_mcp_reminder(&mut self) {
+        if self.mcp.is_disabled() || self.mode == AgentMode::Plan {
+            return;
+        }
+        let snapshot = self.mcp.catalog().status_snapshot();
+        let Some(reminder) = self.mcp_reminder_state.next(&snapshot) else {
+            return;
+        };
+        let text = one_core::system_reminder(reminder.body);
+        let agent = self.agent.lock().await;
+        agent.push_notification(text);
     }
 
     /// Preview resolved main tool names (for status / debug).
@@ -195,13 +217,13 @@ impl AppRuntime {
             // Stay off MCP tools in plan mode even if pool is ready.
             return Ok(());
         }
-        let gen = self.mcp.generation();
-        if gen == self.mcp_tools_generation {
+        let generation = self.mcp.generation();
+        if generation == self.mcp_tools_generation {
             return Ok(());
         }
         tracing::debug!(
             from = self.mcp_tools_generation,
-            to = gen,
+            to = generation,
             tools = self.mcp.tool_count(),
             "syncing MCP tools into agent"
         );

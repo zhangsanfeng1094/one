@@ -30,9 +30,21 @@
     }
   },
   "maxOutputBytes": 51200,
-  "disabledServers": []
+  "disabledServers": [],
+  "toolExposure": "deferred"
 }
 ```
+
+### 工具暴露：`toolExposure`（Grok 风格 deferred）
+
+| 值 | 行为 |
+|----|------|
+| **`deferred`**（默认） | 模型 tools 列表只挂 `search_tool` + `use_tool`；system prompt 里只有轻量 server 公告；完整 schema 经 `search_tool` 按需返回，再经 `use_tool` 调用 |
+| **`direct`** | 旧行为：每个 MCP tool 的完整 schema 直接注册为 function |
+
+环境变量覆盖：`ONE_MCP_TOOL_EXPOSURE=direct|deferred`。
+
+命名仍是 `{server}__{tool}`。Plan 模式不挂 MCP（与以前一致）。
 
 字符串字段加载时做 `${VAR}` 展开。
 
@@ -104,6 +116,13 @@ Import
 
 工具命名：`{server}__{tool}`。
 
+Deferred 调用链：
+
+```text
+model → search_tool(query) → { tool_name, input_schema, … }
+model → use_tool(tool_name, tool_input) → MCP server
+```
+
 ---
 
 ## TUI 管理
@@ -141,9 +160,11 @@ one --no-mcp
 - Plan mode 不注册 MCP tools  
 - `/reload`：重读磁盘配置 + 合并 plugin；**已连接 server 保持**（不强制全量重连）  
 - `--no-mcp` 本 session 禁用  
+- **Deferred 暴露**（默认）：`search_tool` + `use_tool` + system-prompt server 公告；`toolExposure` / `ONE_MCP_TOOL_EXPOSURE`
 
 ## 尚未做
 
 - MCP 侧 OAuth / 浏览器凭证流  
 - `/reload` 强制断开并重连全部 server  
 - 导入时预览完整 argv / secrets 遮罩 UI
+- MCP 公告 delta（fingerprint 增量注入；当前为 generation 变化时全量刷新 system prompt 段）

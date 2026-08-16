@@ -34,26 +34,17 @@ impl AppRuntime {
         let mem_opts = super::features::effective_memory_options(&self.applied_features, &settings);
         self.refresh_context_snapshots(&mem_opts).await;
         {
+            let prompt = self.effective_system_prompt();
             let mut agent = self.agent.lock().await;
-            agent.config.system_prompt = if self.mode == AgentMode::Plan {
-                if let Some(path) = &self.plan_path {
-                    format!(
-                        "{}{}",
-                        self.base_system_prompt,
-                        one_tools::plan_mode_system_overlay(path)
-                    )
-                } else {
-                    self.base_system_prompt.clone()
-                }
-            } else {
-                self.base_system_prompt.clone()
-            };
+            agent.config.system_prompt = prompt;
         }
         // Ensure any MCP servers that finished loading attach to this clean slate.
         self.sync_mcp_tools().await?;
         if switching {
             self.extensions.notify_session_start().await;
         }
+        // New conversation gets a fresh full MCP reminder on its first prompt.
+        self.mcp_reminder_state.reset();
         self.prompt_index = 0;
         self.tool_audit.clear();
         self.tool_starts.clear();
@@ -91,6 +82,7 @@ impl AppRuntime {
             }
         }
         load_extension_state(self.extensions.as_ref(), &session);
+        self.mcp_reminder_state.reset();
         self.session = Some(session);
         if switching {
             self.extensions.notify_session_start().await;

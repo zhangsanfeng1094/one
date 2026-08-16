@@ -11,14 +11,14 @@
 
 mod build;
 pub mod env_context;
-pub mod memory_search_tool;
-pub mod memory_write_tool;
 pub mod explore_tools;
 pub mod features;
 pub mod harness;
 mod helpers;
 pub mod job_tools;
 pub mod jobs;
+pub mod memory_search_tool;
+pub mod memory_write_tool;
 mod mode;
 mod plan;
 mod policy;
@@ -42,12 +42,10 @@ use std::sync::{Arc, Mutex};
 
 use one_core::agent::{Agent, LlmProvider};
 use one_ext::ExtensionRuntime;
-use one_mcp::McpManager;
+use one_mcp::{McpManager, McpReminderState};
 use one_resources::ResourceLoader;
 use one_session::{SessionManager, ToolAuditItem};
-use one_tools::{
-    AskUserHandler, BackgroundTaskRegistry, PathPolicy, PlanExitState, TodoListState,
-};
+use one_tools::{AskUserHandler, BackgroundTaskRegistry, PathPolicy, PlanExitState, TodoListState};
 
 use crate::approval::PermissionGate;
 use crate::hitl::HitlChannel;
@@ -103,6 +101,10 @@ pub struct AppRuntime {
     pub mcp: McpManager,
     /// Last applied MCP tool generation (re-sync when background load advances).
     mcp_tools_generation: u64,
+    /// Per-conversation state for MCP full/delta reminders. Reminders are
+    /// injected as user-visible `<system-reminder>` notices so system prompt
+    /// cache remains stable while MCP runtime status changes.
+    mcp_reminder_state: McpReminderState,
     /// Langfuse sink (if `--trace`); held so we can flush before process exit.
     langfuse: Option<Arc<LangfuseTraceSink>>,
     /// Host for the `task` meta-tool (None when spawn disabled).
@@ -157,15 +159,39 @@ impl AppRuntime {
 
     /// Push current extension + MCP tools into the task host so children with
     /// `tools.mcp: true` (or allow-listed MCP names) can materialize them.
+    ///
+    /// Uses [`one_mcp::McpManager::model_visible_tools`] so deferred mode
+    /// children get `search_tool` / `use_tool` rather than every MCP schema.
     pub async fn refresh_task_dynamic_tools(&self) {
         let Some(host) = &self.task_host else {
             return;
         };
         let mut dyn_tools = self.extensions.tools();
         if self.mode != AgentMode::Plan {
-            dyn_tools.extend(self.mcp.tools());
+            dyn_tools.extend(self.mcp.model_visible_tools());
         }
         host.set_dynamic_tools(dyn_tools).await;
+    }
+
+    /// Live system prompt: base (+ plan overlay) + optional deferred MCP announcement.
+    pub(super) fn effective_system_prompt(&self) -> String {
+        let base = if self.mode == AgentMode::Plan {
+            if let Some(path) = &self.plan_path {
+                format!(
+                    "{}{}",
+                    self.base_system_prompt,
+                    one_tools::plan_mode_system_overlay(path)
+                )
+            } else {
+                self.base_system_prompt.clone()
+            }
+        } else {
+            self.base_system_prompt.clone()
+        };
+        // Plan mode never exposes MCP tools. MCP runtime state is injected as
+        // per-turn `<system-reminder>` notices instead of being appended here,
+        // so the cached base system prompt stays stable while servers connect.
+        base
     }
 
     /// Refresh session id on the task host (after session open / resume).
@@ -233,15 +259,14 @@ impl AppRuntime {
     ///
     /// Keeps frozen `env_context` / `memory_catalog` (session-stable for prompt cache).
     pub(super) fn recompose_base_prompt(&mut self) {
-        self.base_system_prompt = prompt_compose::compose_base_system_prompt(
-            prompt_compose::ComposeBaseInput {
+        self.base_system_prompt =
+            prompt_compose::compose_base_system_prompt(prompt_compose::ComposeBaseInput {
                 features: &self.applied_features,
                 resources: &self.resources,
                 can_spawn: self.can_spawn_policy(),
                 env_context: Some(self.env_context.as_str()),
                 memory_catalog: self.memory_catalog.as_deref(),
-            },
-        );
+            });
     }
 
     /// Refresh env + memory L2 snapshots and recompose (cold start, `/new`, `/reload`).
@@ -298,9 +323,7 @@ impl AppRuntime {
         if (id == FEATURE_MEMORY || id == features::FEATURE_MEMORY_LEGACY)
             && (self.no_memory_process || env_no_memory())
         {
-            return Err(
-                "memory disabled for this process (--no-memory / ONE_NO_MEMORY)".into(),
-            );
+            return Err("memory disabled for this process (--no-memory / ONE_NO_MEMORY)".into());
         }
 
         let mut s = crate::settings::load();
@@ -433,7 +456,8 @@ impl AppRuntime {
     pub fn shutdown_owned_tasks(&self) {
         self.bg_registry.kill_all_running();
         if let Some(host) = &self.task_host {
-            host.jobs().kill_all();
+            host.jobs()
+                .kill_all_with_reason(jobs::KillReason::SessionTeardown);
         }
         // Drop any completion notices produced by job kill so the next session
         // turn does not see teardown noise.
@@ -494,12 +518,22 @@ impl AppRuntime {
         self.abort_flag.store(false, Ordering::Relaxed);
     }
 
+    /// Shared abort flag (ACP / external hosts can signal without locking runtime).
+    pub fn abort_handle(&self) -> Arc<AtomicBool> {
+        self.abort_flag.clone()
+    }
+
+    pub fn is_aborted(&self) -> bool {
+        self.abort_flag.load(Ordering::Relaxed)
+    }
+
     pub fn abort(&self) {
         self.abort_flag.store(true, Ordering::Relaxed);
         // Cancel background subagent jobs (signals child abort_flag + notifies).
         // Background bash is intentionally left running (dev servers, watches).
         if let Some(host) = &self.task_host {
-            host.jobs().kill_all();
+            host.jobs()
+                .kill_all_with_reason(jobs::KillReason::ParentAbort);
         }
     }
 }

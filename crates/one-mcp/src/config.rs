@@ -123,6 +123,20 @@ pub struct McpConfig {
     /// Owned by user `mcp.json` only; applied after multi-source merge.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_servers: Vec<String>,
+
+    /// How MCP tools are exposed to the model.
+    ///
+    /// - `deferred` (default): only `search_tool` + `use_tool` in the tools list;
+    ///   full schemas via search (Grok-style).
+    /// - `direct`: register every MCP tool schema as a native function (legacy).
+    ///
+    /// Override with env `ONE_MCP_TOOL_EXPOSURE=direct|deferred`.
+    #[serde(default, skip_serializing_if = "is_default_exposure")]
+    pub tool_exposure: crate::catalog::ToolExposure,
+}
+
+fn is_default_exposure(e: &crate::catalog::ToolExposure) -> bool {
+    *e == crate::catalog::ToolExposure::Deferred
 }
 
 fn default_max_output() -> usize {
@@ -135,7 +149,18 @@ impl McpConfig {
             mcp_servers: BTreeMap::new(),
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             disabled_servers: Vec::new(),
+            tool_exposure: crate::catalog::ToolExposure::default(),
         }
+    }
+
+    /// Effective exposure: env `ONE_MCP_TOOL_EXPOSURE` wins over config.
+    pub fn effective_tool_exposure(&self) -> crate::catalog::ToolExposure {
+        if let Ok(v) = std::env::var("ONE_MCP_TOOL_EXPOSURE") {
+            if let Some(e) = crate::catalog::ToolExposure::parse(&v) {
+                return e;
+            }
+        }
+        self.tool_exposure
     }
 
     /// Merge `other` on top (other wins on same server name — full replace).
@@ -151,6 +176,9 @@ impl McpConfig {
             // Always take other's max if it was set via a file that parsed it.
             self.max_output_bytes = other.max_output_bytes;
         }
+        // Higher-priority document wins (project over user). Missing field deserializes
+        // as Deferred default — same as max_output_bytes tradeoff.
+        self.tool_exposure = other.tool_exposure;
         self
     }
 
@@ -759,6 +787,7 @@ pub fn parse_config_json(text: &str) -> Result<McpConfig> {
             mcp_servers: servers,
             max_output_bytes: DEFAULT_MAX_OUTPUT_BYTES,
             disabled_servers: Vec::new(),
+            tool_exposure: crate::catalog::ToolExposure::default(),
         });
     }
 

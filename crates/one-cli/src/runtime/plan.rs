@@ -28,6 +28,7 @@ impl AppRuntime {
         {
             let mut agent = self.agent.lock().await;
             agent.set_tools(tools);
+            // Plan mode: base + plan overlay only (no MCP announcement).
             agent.config.system_prompt = format!(
                 "{}{}",
                 self.base_system_prompt,

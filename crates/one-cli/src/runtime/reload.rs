@@ -107,21 +107,10 @@ impl AppRuntime {
         self.resources
             .apply_skills_config(&user_settings.skills_config_entries());
         self.recompose_base_prompt();
-        match self.mode {
-            AgentMode::Plan => {
-                if let Some(path) = self.plan_path.clone() {
-                    let mut agent = self.agent.lock().await;
-                    agent.config.system_prompt = format!(
-                        "{}{}",
-                        self.base_system_prompt,
-                        one_tools::plan_mode_system_overlay(&path)
-                    );
-                }
-            }
-            AgentMode::Act => {
-                let mut agent = self.agent.lock().await;
-                agent.config.system_prompt = self.base_system_prompt.clone();
-            }
+        {
+            let prompt = self.effective_system_prompt();
+            let mut agent = self.agent.lock().await;
+            agent.config.system_prompt = prompt;
         }
         self.maybe_persist_prompt_snapshot("skills_config").await;
         Ok(())

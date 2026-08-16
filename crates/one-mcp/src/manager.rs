@@ -8,7 +8,7 @@
 //!   tools onto the Agent before the next prompt.
 //! - `/new` keeps the live connection pool (shared across conversations).
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -23,12 +23,17 @@ use rmcp::transport::{ConfigureCommandExt, StreamableHttpClientTransport, TokioC
 use rmcp::{RoleClient, ServiceExt};
 use tracing::{info, warn};
 
+use crate::catalog::{
+    build_prompt_announcement, param_names_from_schema, sanitize_description, search_tools,
+    truncate_description, SearchSnapshot, ServerSummary, ToolExposure, ToolMeta,
+};
 use crate::config::{
     import_servers_to_user, load_effective, scan_import_candidates, set_server_disabled_persistent,
     ConfigSourceKind, ImportCandidate, ImportReport, LoadedMcpConfig, McpConfig, McpServerConfig,
     DEFAULT_MAX_OUTPUT_BYTES,
 };
 use crate::error::{McpError, Result};
+use crate::meta_tools;
 use crate::tool::tools_from_list;
 
 /// Health snapshot for `one mcp doctor`.
@@ -86,6 +91,458 @@ pub struct McpChip {
     pub kind: McpChipKind,
     pub ready: usize,
     pub total: usize,
+}
+
+/// A compact, model-facing snapshot of one configured MCP server.
+///
+/// This deliberately contains status and tool names, but never tool schemas or
+/// connection secrets. It is intended for the `mcp_status` meta-tool and for
+/// Grok-style runtime reminders.
+#[derive(Debug, Clone)]
+pub struct McpServerStatus {
+    pub name: String,
+    /// `ready`, `connecting`, `unavailable`, `auth_required`, or `disabled`.
+    pub status: &'static str,
+    pub enabled: bool,
+    pub transport: &'static str,
+    pub source: Option<String>,
+    pub tool_count: usize,
+    pub tools: Vec<String>,
+    /// Server-level instructions or title from the MCP initialize response.
+    /// This is not a per-tool description; detailed tool descriptions and
+    /// schemas remain deferred to `search_tool`.
+    pub description: Option<String>,
+    pub detail: Option<String>,
+}
+
+/// Runtime MCP status, distinct from the static MCP configuration.
+#[derive(Debug, Clone)]
+pub struct McpStatusSnapshot {
+    /// `ready` means the catalog has settled; individual servers may still be
+    /// unavailable. `connecting` means at least one enabled server is pending.
+    pub status: &'static str,
+    pub configured: usize,
+    pub enabled: usize,
+    pub ready: usize,
+    pub connecting: usize,
+    pub unavailable: usize,
+    pub auth_required: usize,
+    pub disabled: usize,
+    pub tool_count: usize,
+    pub servers: Vec<McpServerStatus>,
+}
+
+/// Tracks MCP server-status reminder state for one conversation.
+#[derive(Debug, Clone, Default)]
+pub struct McpReminderState {
+    last: Option<McpStatusFingerprint>,
+}
+
+/// Kind of MCP reminder to inject before the next model turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpReminderKind {
+    /// Full snapshot, typically at the beginning of a conversation.
+    Full,
+    /// Only changed server rows since the previous reminder.
+    Delta,
+}
+
+/// A model-visible reminder that should be injected as a `<system-reminder>`
+/// user notice, not appended to the system prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct McpReminder {
+    pub kind: McpReminderKind,
+    pub body: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpStatusFingerprint {
+    status: &'static str,
+    servers: BTreeMap<String, McpServerFingerprint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct McpServerFingerprint {
+    status: &'static str,
+    enabled: bool,
+    transport: &'static str,
+    tool_count: usize,
+    detail: Option<String>,
+}
+
+impl McpReminderState {
+    /// Build the next model-visible MCP reminder, if the runtime status changed.
+    ///
+    /// The first non-empty snapshot is emitted as a full reminder. Later changes
+    /// are emitted as compact deltas. The caller should inject the returned body
+    /// as a `<system-reminder>` user notice so the cached system prompt stays
+    /// stable while MCP's live state evolves.
+    pub fn next(&mut self, snapshot: &McpStatusSnapshot) -> Option<McpReminder> {
+        if snapshot.configured == 0 || snapshot.servers.is_empty() {
+            self.last = None;
+            return None;
+        }
+
+        let current = McpStatusFingerprint::from_snapshot(snapshot);
+        let reminder = match &self.last {
+            None => {
+                let body = render_full_mcp_reminder(snapshot);
+                (!body.trim().is_empty()).then_some(McpReminder {
+                    kind: McpReminderKind::Full,
+                    body,
+                })
+            }
+            Some(previous) if previous != &current => {
+                let body = render_delta_mcp_reminder(snapshot, previous, &current);
+                (!body.trim().is_empty()).then_some(McpReminder {
+                    kind: McpReminderKind::Delta,
+                    body,
+                })
+            }
+            Some(_) => None,
+        };
+        self.last = Some(current);
+        reminder
+    }
+
+    /// Force the next non-empty status snapshot to render as a full reminder.
+    pub fn reset(&mut self) {
+        self.last = None;
+    }
+}
+
+impl McpStatusFingerprint {
+    fn from_snapshot(snapshot: &McpStatusSnapshot) -> Self {
+        let servers = snapshot
+            .servers
+            .iter()
+            .map(|server| {
+                (
+                    server.name.clone(),
+                    McpServerFingerprint {
+                        status: server.status,
+                        enabled: server.enabled,
+                        transport: server.transport,
+                        tool_count: server.tool_count,
+                        detail: server.detail.clone(),
+                    },
+                )
+            })
+            .collect();
+        Self {
+            status: snapshot.status,
+            servers,
+        }
+    }
+}
+
+fn render_full_mcp_reminder(snapshot: &McpStatusSnapshot) -> String {
+    let mut out = String::new();
+    if snapshot.ready > 0 {
+        out.push_str("Connected MCP servers:\n");
+        for server in snapshot
+            .servers
+            .iter()
+            .filter(|server| server.status == "ready")
+        {
+            out.push_str(&format_mcp_server_summary_line(server));
+        }
+    }
+
+    if snapshot.connecting > 0 {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        append_connecting_servers(&mut out, snapshot);
+    }
+    append_unavailable_servers(&mut out, snapshot);
+    if out.trim().is_empty() {
+        return String::new();
+    }
+    out.push_str(mcp_runtime_usage_hint());
+    out
+}
+
+fn render_delta_mcp_reminder(
+    snapshot: &McpStatusSnapshot,
+    previous: &McpStatusFingerprint,
+    current: &McpStatusFingerprint,
+) -> String {
+    let mut out = String::new();
+    let mut added = Vec::new();
+    let mut updated = Vec::new();
+    let mut removed = Vec::new();
+
+    let names: BTreeSet<String> = previous
+        .servers
+        .keys()
+        .chain(current.servers.keys())
+        .cloned()
+        .collect();
+    for name in names {
+        match (previous.servers.get(&name), current.servers.get(&name)) {
+            (None, Some(next)) => {
+                if next.status == "ready" {
+                    added.push(name);
+                }
+            }
+            (Some(_), None) => removed.push(name),
+            (Some(prev), Some(next)) if prev != next => {
+                if prev.status != "ready" && next.status == "ready" {
+                    added.push(name);
+                } else if next.status == "ready" {
+                    updated.push(name);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !added.is_empty() {
+        out.push_str("MCP server(s) connected:\n");
+        for name in &added {
+            if let Some(server) = snapshot.servers.iter().find(|server| &server.name == name) {
+                out.push_str(&format_mcp_server_summary_line(server));
+            }
+        }
+    }
+    if !updated.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str("MCP server(s) updated:\n");
+        for name in &updated {
+            if let Some(server) = snapshot.servers.iter().find(|server| &server.name == name) {
+                out.push_str(&format_mcp_server_summary_line(server));
+            }
+        }
+    }
+    if !removed.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "MCP server(s) disconnected: {}\n",
+            removed.join(", ")
+        ));
+    }
+
+    if snapshot.connecting > 0 {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        append_connecting_servers(&mut out, snapshot);
+    }
+    append_unavailable_servers(&mut out, snapshot);
+
+    if out.trim().is_empty() {
+        return String::new();
+    }
+    out.push_str(mcp_runtime_usage_hint());
+    out
+}
+
+fn append_connecting_servers(out: &mut String, snapshot: &McpStatusSnapshot) {
+    out.push_str("MCP servers currently connecting (tools will become available shortly):\n");
+    for server in snapshot
+        .servers
+        .iter()
+        .filter(|server| server.status == "connecting")
+    {
+        out.push_str(&format!("- {}\n", server.name));
+    }
+    out.push_str(
+        "\nDo not attempt to use tools from these servers yet. If the user's request likely requires one of these servers, mention that the server is still connecting and proceed with what you can do in the meantime.\n",
+    );
+}
+
+fn append_unavailable_servers(out: &mut String, snapshot: &McpStatusSnapshot) {
+    let unavailable: Vec<_> = snapshot
+        .servers
+        .iter()
+        .filter(|server| matches!(server.status, "unavailable" | "auth_required" | "disabled"))
+        .collect();
+    if unavailable.is_empty() {
+        return;
+    }
+    if !out.is_empty() && !out.ends_with('\n') {
+        out.push('\n');
+    }
+    if !out.is_empty() {
+        out.push('\n');
+    }
+    out.push_str("MCP servers that are not currently usable:\n");
+    for server in unavailable {
+        let detail = server
+            .detail
+            .as_deref()
+            .filter(|d| !d.trim().is_empty())
+            .map(|d| format!(" — {d}"))
+            .unwrap_or_default();
+        out.push_str(&format!("- {}: {}{}\n", server.name, server.status, detail));
+    }
+}
+
+fn format_mcp_server_summary_line(server: &McpServerStatus) -> String {
+    let tool_word = if server.tool_count == 1 {
+        "tool"
+    } else {
+        "tools"
+    };
+    match server
+        .description
+        .as_deref()
+        .map(sanitize_description)
+        .map(|s| truncate_description(&s))
+        .filter(|s| !s.is_empty())
+    {
+        Some(description) => format!(
+            "- {} ({} {}): {}\n",
+            server.name, server.tool_count, tool_word, description
+        ),
+        None => format!("- {} ({} {})\n", server.name, server.tool_count, tool_word),
+    }
+}
+
+fn mcp_runtime_usage_hint() -> &'static str {
+    "\nTo use MCP tools, you MUST call `search_tool` first to retrieve the tool's input schema before calling `use_tool`. NEVER guess parameter names — always use the exact schema returned by `search_tool`.\nMCP tool schemas and per-tool descriptions are not preloaded into this reminder; use `search_tool` for details and call MCP tools only through `use_tool` with the qualified `server__tool` name.\n"
+}
+
+#[cfg(test)]
+mod reminder_tests {
+    use super::*;
+
+    fn server(
+        name: &str,
+        status: &'static str,
+        tool_count: usize,
+        tools: &[&str],
+        description: Option<&str>,
+        detail: Option<&str>,
+    ) -> McpServerStatus {
+        McpServerStatus {
+            name: name.into(),
+            status,
+            enabled: status != "disabled",
+            transport: "stdio",
+            source: Some("test".into()),
+            tool_count,
+            tools: tools.iter().map(|tool| (*tool).to_string()).collect(),
+            description: description.map(str::to_string),
+            detail: detail.map(str::to_string),
+        }
+    }
+
+    fn snapshot(servers: Vec<McpServerStatus>) -> McpStatusSnapshot {
+        let configured = servers.len();
+        let enabled = servers.iter().filter(|server| server.enabled).count();
+        let ready = servers
+            .iter()
+            .filter(|server| server.status == "ready")
+            .count();
+        let connecting = servers
+            .iter()
+            .filter(|server| server.status == "connecting")
+            .count();
+        let unavailable = servers
+            .iter()
+            .filter(|server| server.status == "unavailable")
+            .count();
+        let auth_required = servers
+            .iter()
+            .filter(|server| server.status == "auth_required")
+            .count();
+        let disabled = servers
+            .iter()
+            .filter(|server| server.status == "disabled")
+            .count();
+        let tool_count = servers.iter().map(|server| server.tool_count).sum();
+        McpStatusSnapshot {
+            status: if connecting > 0 {
+                "connecting"
+            } else {
+                "ready"
+            },
+            configured,
+            enabled,
+            ready,
+            connecting,
+            unavailable,
+            auth_required,
+            disabled,
+            tool_count,
+            servers,
+        }
+    }
+
+    #[test]
+    fn full_reminder_lists_servers_not_tool_names() {
+        let snap = snapshot(vec![server(
+            "deepwiki",
+            "ready",
+            3,
+            &["ask_question", "read_wiki_contents", "read_wiki_structure"],
+            Some("DeepWiki MCP provides AI-powered documentation."),
+            None,
+        )]);
+        let text = render_full_mcp_reminder(&snap);
+        assert!(text.contains("Connected MCP servers:"), "{text}");
+        assert!(
+            text.contains("- deepwiki (3 tools): DeepWiki MCP provides"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("ask_question"),
+            "per-tool names stay out: {text}"
+        );
+        assert!(text.contains("search_tool"), "{text}");
+        assert!(text.contains("use_tool"), "{text}");
+    }
+
+    #[test]
+    fn full_reminder_mentions_connecting_servers() {
+        let snap = snapshot(vec![server(
+            "context-mode",
+            "connecting",
+            0,
+            &[],
+            None,
+            Some("startup handshake is still in progress"),
+        )]);
+        let text = render_full_mcp_reminder(&snap);
+        assert!(text.contains("currently connecting"), "{text}");
+        assert!(text.contains("- context-mode"), "{text}");
+        assert!(text.contains("Do not attempt to use tools"), "{text}");
+    }
+
+    #[test]
+    fn state_emits_full_then_delta() {
+        let mut state = McpReminderState::default();
+        let loading = snapshot(vec![server("docs", "connecting", 0, &[], None, None)]);
+        let first = state.next(&loading).expect("full reminder");
+        assert_eq!(first.kind, McpReminderKind::Full);
+
+        let ready = snapshot(vec![server(
+            "docs",
+            "ready",
+            2,
+            &["search", "read"],
+            Some("Docs server"),
+            None,
+        )]);
+        let second = state.next(&ready).expect("delta reminder");
+        assert_eq!(second.kind, McpReminderKind::Delta);
+        assert!(
+            second.body.contains("MCP server(s) connected:"),
+            "{}",
+            second.body
+        );
+        assert!(
+            second.body.contains("- docs (2 tools): Docs server"),
+            "{}",
+            second.body
+        );
+    }
 }
 
 /// Cheap handle for the TUI to poll MCP progress every redraw (no CLI hop).
@@ -158,6 +615,8 @@ impl McpProgressHandle {
 
 struct LiveServer {
     name: String,
+    /// Optional description from MCP initialize (`instructions` / server title).
+    description: Option<String>,
     _service: RunningService<RoleClient, ()>,
     tools: Vec<Arc<dyn Tool>>,
     transport: String,
@@ -175,6 +634,123 @@ struct SharedState {
     generation: AtomicU64,
     loading: AtomicBool,
     pending: AtomicU64,
+}
+
+/// Shared handle for deferred meta tools (`search_tool` / `use_tool`).
+///
+/// Clones are cheap; all point at the process-level MCP connection pool.
+#[derive(Clone)]
+pub struct McpCatalog {
+    shared: Arc<SharedState>,
+    process_disabled: bool,
+}
+
+impl McpCatalog {
+    /// Search connected MCP tools (exact name fast path, then BM25).
+    pub fn search(&self, query: &str, limit: usize) -> SearchSnapshot {
+        let is_ready = !self.shared.loading.load(Ordering::SeqCst)
+            && self.shared.pending.load(Ordering::SeqCst) == 0;
+        let metas = catalog_tool_metas(&self.shared);
+        search_tools(&metas, query, limit, is_ready)
+    }
+
+    /// Look up a connected tool by qualified public name.
+    pub fn find_tool(&self, qualified_name: &str) -> Option<Arc<dyn Tool>> {
+        self.shared
+            .tools
+            .read()
+            .iter()
+            .find(|t| t.definition().name == qualified_name)
+            .cloned()
+    }
+
+    pub fn tool_count(&self) -> usize {
+        self.shared.tools.read().len()
+    }
+
+    /// Snapshot of all configured MCP server states, including servers with no
+    /// currently indexed tools.
+    pub fn status_snapshot(&self) -> McpStatusSnapshot {
+        if self.process_disabled {
+            return McpStatusSnapshot {
+                status: "disabled",
+                configured: 0,
+                enabled: 0,
+                ready: 0,
+                connecting: 0,
+                unavailable: 0,
+                auth_required: 0,
+                disabled: 0,
+                tool_count: 0,
+                servers: Vec::new(),
+            };
+        }
+        McpManager {
+            shared: Arc::clone(&self.shared),
+            _bg: None,
+            disabled: false,
+        }
+        .status_snapshot()
+    }
+}
+
+fn catalog_tool_metas(shared: &SharedState) -> Vec<ToolMeta> {
+    let disabled = shared.disabled_names.read().clone();
+    let live = shared.live.read();
+    let mut out = Vec::new();
+    for srv in live.iter() {
+        if disabled.contains(&srv.name) {
+            continue;
+        }
+        for t in &srv.tools {
+            let def = t.definition();
+            // public_name is server__tool; recover bare tool name after first `__`.
+            let tool_name = def
+                .name
+                .split_once("__")
+                .map(|(_, rest)| rest.to_string())
+                .unwrap_or_else(|| def.name.clone());
+            out.push(ToolMeta {
+                qualified_name: def.name.clone(),
+                server_name: srv.name.clone(),
+                tool_name,
+                description: def.description.clone(),
+                parameters: param_names_from_schema(&def.parameters),
+                input_schema: def.parameters.clone(),
+            });
+        }
+    }
+    out
+}
+
+fn server_summaries_from(shared: &SharedState) -> Vec<ServerSummary> {
+    let disabled = shared.disabled_names.read().clone();
+    let live = shared.live.read();
+    let mut out: Vec<ServerSummary> = live
+        .iter()
+        .filter(|s| !disabled.contains(&s.name))
+        .map(|s| {
+            let mut tool_names: Vec<String> = s
+                .tools
+                .iter()
+                .map(|t| {
+                    let n = t.definition().name;
+                    n.split_once("__")
+                        .map(|(_, rest)| rest.to_string())
+                        .unwrap_or(n)
+                })
+                .collect();
+            tool_names.sort();
+            ServerSummary {
+                name: s.name.clone(),
+                description: s.description.clone(),
+                tool_count: s.tools.len(),
+                tool_names,
+            }
+        })
+        .collect();
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
 }
 
 /// Process-level MCP runtime (held by AppRuntime for the whole process).
@@ -250,12 +826,233 @@ impl McpManager {
     }
 
     /// Snapshot of currently connected tools (safe to call from async without await).
+    ///
+    /// Full MCP tool set (for dispatch / doctor). For **model-visible** tools, use
+    /// [`Self::model_visible_tools`] which respects deferred exposure.
     pub fn tools(&self) -> Vec<Arc<dyn Tool>> {
         self.shared.tools.read().clone()
     }
 
     pub fn tool_count(&self) -> usize {
         self.shared.tools.read().len()
+    }
+
+    /// Return a compact snapshot of the live MCP runtime.
+    ///
+    /// Unlike `search_tool`, this reports configured servers even when they
+    /// have no tools because they are still connecting, disabled, or failed.
+    /// The snapshot is computed from shared runtime state, not from the
+    /// model's conversation and not from a tool-call failure.
+    pub fn status_snapshot(&self) -> McpStatusSnapshot {
+        if self.disabled {
+            return McpStatusSnapshot {
+                status: "disabled",
+                configured: 0,
+                enabled: 0,
+                ready: 0,
+                connecting: 0,
+                unavailable: 0,
+                auth_required: 0,
+                disabled: 0,
+                tool_count: 0,
+                servers: Vec::new(),
+            };
+        }
+
+        let config = self.shared.config.read().clone();
+        let disabled_names = self.shared.disabled_names.read().clone();
+        let live = self.shared.live.read();
+        let failures = self.shared.failures.read().clone();
+        let loading = self.is_loading();
+        let mut servers = Vec::with_capacity(config.mcp_servers.len());
+
+        for (name, cfg) in &config.mcp_servers {
+            let disabled = disabled_names.contains(name) || cfg.enabled == Some(false);
+            let transport = if cfg.is_http() { "http" } else { "stdio" };
+            let source = self
+                .server_source(name)
+                .map(|kind| kind.as_str().to_string());
+            let live_server = live.iter().find(|server| server.name == *name);
+            let failure = failures.iter().find(|(server, _)| server == name);
+
+            let server = if disabled {
+                McpServerStatus {
+                    name: name.clone(),
+                    status: "disabled",
+                    enabled: false,
+                    transport,
+                    source,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    description: None,
+                    detail: Some("disabled by configuration".into()),
+                }
+            } else if let Some(live_server) = live_server {
+                let mut tools: Vec<String> = live_server
+                    .tools
+                    .iter()
+                    .map(|tool| {
+                        tool.definition()
+                            .name
+                            .split_once("__")
+                            .map(|(_, bare)| bare.to_string())
+                            .unwrap_or_else(|| tool.definition().name.clone())
+                    })
+                    .collect();
+                tools.sort();
+                McpServerStatus {
+                    name: name.clone(),
+                    status: "ready",
+                    enabled: true,
+                    transport,
+                    source,
+                    tool_count: tools.len(),
+                    tools,
+                    description: live_server.description.clone(),
+                    detail: None,
+                }
+            } else if let Some((_, message)) = failure {
+                let lower = message.to_ascii_lowercase();
+                let auth = lower.contains("oauth")
+                    || lower.contains("auth")
+                    || lower.contains("login")
+                    || lower.contains("unauthorized")
+                    || lower.contains("401");
+                McpServerStatus {
+                    name: name.clone(),
+                    status: if auth { "auth_required" } else { "unavailable" },
+                    enabled: true,
+                    transport,
+                    source,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    description: None,
+                    detail: Some(message.clone()),
+                }
+            } else {
+                McpServerStatus {
+                    name: name.clone(),
+                    status: if loading { "connecting" } else { "unavailable" },
+                    enabled: true,
+                    transport,
+                    source,
+                    tool_count: 0,
+                    tools: Vec::new(),
+                    description: None,
+                    detail: if loading {
+                        Some("startup handshake is still in progress".into())
+                    } else {
+                        Some("no live connection".into())
+                    },
+                }
+            };
+            servers.push(server);
+        }
+
+        let configured = servers.len();
+        let enabled = servers.iter().filter(|server| server.enabled).count();
+        let ready = servers
+            .iter()
+            .filter(|server| server.status == "ready")
+            .count();
+        let connecting = servers
+            .iter()
+            .filter(|server| server.status == "connecting")
+            .count();
+        let unavailable = servers
+            .iter()
+            .filter(|server| server.status == "unavailable")
+            .count();
+        let auth_required = servers
+            .iter()
+            .filter(|server| server.status == "auth_required")
+            .count();
+        let disabled = servers
+            .iter()
+            .filter(|server| server.status == "disabled")
+            .count();
+        let status = if connecting > 0 {
+            "connecting"
+        } else {
+            "ready"
+        };
+        let tool_count = servers.iter().map(|server| server.tool_count).sum();
+
+        McpStatusSnapshot {
+            status,
+            configured,
+            enabled,
+            ready,
+            connecting,
+            unavailable,
+            auth_required,
+            disabled,
+            tool_count,
+            servers,
+        }
+    }
+
+    /// Effective tool exposure (config + env).
+    pub fn tool_exposure(&self) -> ToolExposure {
+        if self.disabled {
+            return ToolExposure::Deferred;
+        }
+        self.shared.config.read().effective_tool_exposure()
+    }
+
+    /// Catalog handle for meta tools / search.
+    pub fn catalog(&self) -> McpCatalog {
+        McpCatalog {
+            shared: Arc::clone(&self.shared),
+            process_disabled: self.disabled,
+        }
+    }
+
+    /// Tools to register on the agent for the model to call.
+    ///
+    /// - **Deferred** (default): `search_tool` + `use_tool` only (when any server configured).
+    /// - **Direct**: every connected MCP tool schema.
+    pub fn model_visible_tools(&self) -> Vec<Arc<dyn Tool>> {
+        if self.disabled {
+            return Vec::new();
+        }
+        match self.tool_exposure() {
+            ToolExposure::Direct => self.tools(),
+            ToolExposure::Deferred => {
+                let has_configured = !self.shared.config.read().mcp_servers.is_empty();
+                if !has_configured {
+                    return Vec::new();
+                }
+                meta_tools::meta_tools(self.catalog())
+            }
+        }
+    }
+
+    /// Connected server summaries for announcements / UI.
+    pub fn server_summaries(&self) -> Vec<ServerSummary> {
+        if self.disabled {
+            return Vec::new();
+        }
+        server_summaries_from(&self.shared)
+    }
+
+    /// System-prompt section for deferred mode (server list + usage hint).
+    ///
+    /// `None` in direct mode or when MCP is off / nothing configured.
+    pub fn prompt_announcement(&self) -> Option<String> {
+        if self.disabled {
+            return None;
+        }
+        if self.tool_exposure() != ToolExposure::Deferred {
+            return None;
+        }
+        let has_configured = !self.shared.config.read().mcp_servers.is_empty();
+        build_prompt_announcement(&self.server_summaries(), self.is_loading(), has_configured)
+    }
+
+    /// Search connected tools (tests / diagnostics).
+    pub fn search(&self, query: &str, limit: usize) -> SearchSnapshot {
+        self.catalog().search(query, limit)
     }
 
     pub fn server_names(&self) -> Vec<String> {
@@ -1004,6 +1801,24 @@ async fn finish_connect(
     max_output_bytes: usize,
 ) -> Result<LiveServer> {
     let peer = service.peer().clone();
+    // Optional human-readable server blurb for deferred-mode announcements.
+    let description = peer.peer_info().and_then(|info| {
+        let from_instructions = info
+            .instructions
+            .as_ref()
+            .map(|s| s.as_str())
+            .map(sanitize_description)
+            .map(|s| truncate_description(&s))
+            .filter(|s| !s.is_empty());
+        from_instructions.or_else(|| {
+            info.server_info
+                .title
+                .clone()
+                .map(|s| truncate_description(&sanitize_description(&s)))
+                .filter(|s| !s.is_empty())
+        })
+    });
+
     let listed = peer
         .list_all_tools()
         .await
@@ -1014,6 +1829,7 @@ async fn finish_connect(
 
     Ok(LiveServer {
         name: name.to_string(),
+        description,
         _service: service,
         tools,
         transport: transport.to_string(),

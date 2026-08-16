@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use one_core::agent::{Agent, AgentConfig, ThinkingLevel};
 use one_core::tool::Tool;
 use one_ext::{discover_all, ExtensionContext};
-use one_mcp::McpManager;
+use one_mcp::{McpManager, McpReminderState};
 use one_resources::ResourceLoader;
 use one_session::{agent_dir, SessionManager};
 use one_tools::{
@@ -119,7 +119,10 @@ impl AppRuntime {
         bg_registry.set_os_sandbox(OsSandbox::from_policy(&path_policy));
         let agent_jobs = super::jobs::AgentJobRegistry::new(shared_notifications.clone());
 
-        let interactive = matches!(cli.mode, RunMode::Interactive) && cli.print.is_none();
+        // ACP needs the same interactive PermissionGate / HitlChannel so tool
+        // approvals and ask_user can be bridged to the client over JSON-RPC.
+        let interactive = matches!(cli.mode, RunMode::Interactive | RunMode::Acp)
+            && cli.print.is_none();
         let perm_rules = user_settings
             .permissions
             .clone()
@@ -224,9 +227,10 @@ impl AppRuntime {
                 }
             }
         };
-        // Snapshot whatever is already ready (usually empty right after spawn).
+        // Snapshot model-visible MCP tools (deferred: meta tools; direct: full set).
+        // Usually only meta tools right after spawn; real tools appear via sync_mcp_tools.
         if !start_plan {
-            tools.extend(mcp.tools());
+            tools.extend(mcp.model_visible_tools());
         }
         let mcp_tools_generation = mcp.generation();
 
@@ -243,13 +247,14 @@ impl AppRuntime {
             None
         };
 
-        let base_system_prompt = compose_base_system_prompt(super::prompt_compose::ComposeBaseInput {
-            features: &applied_features,
-            resources: &resources,
-            can_spawn,
-            env_context: Some(env_context.as_str()),
-            memory_catalog: memory_catalog.as_deref(),
-        });
+        let base_system_prompt =
+            compose_base_system_prompt(super::prompt_compose::ComposeBaseInput {
+                features: &applied_features,
+                resources: &resources,
+                can_spawn,
+                env_context: Some(env_context.as_str()),
+                memory_catalog: memory_catalog.as_deref(),
+            });
         let system_prompt = if start_plan {
             let p = plan_path.as_ref().expect("plan path");
             format!("{base_system_prompt}{}", plan_mode_system_overlay(p))
@@ -351,7 +356,13 @@ impl AppRuntime {
                     }
                 }
             }
-        } else if matches!(cli.mode, crate::cli::RunMode::Interactive) && cli.print.is_none() {
+        } else if matches!(
+            cli.mode,
+            crate::cli::RunMode::Interactive | crate::cli::RunMode::Acp
+        ) && cli.print.is_none()
+        {
+            // Interactive TUI and ACP both get a durable session by default
+            // (ACP `session/load` / `session/list` need real session files).
             Some(SessionManager::create(&cwd).await?)
         } else {
             None
@@ -415,9 +426,7 @@ impl AppRuntime {
             plan_exit,
             bg_registry,
             todo_state: one_tools::TodoListState::new(),
-            memory_lookups: one_tools::MemoryLookupBudget::new(
-                memory_opts.max_lookups_per_turn,
-            ),
+            memory_lookups: one_tools::MemoryLookupBudget::new(memory_opts.max_lookups_per_turn),
             env_context,
             memory_catalog,
             base_system_prompt,
@@ -427,6 +436,7 @@ impl AppRuntime {
             context_window: 0,
             mcp,
             mcp_tools_generation,
+            mcp_reminder_state: McpReminderState::default(),
             langfuse: langfuse_sink,
             task_host,
             main_agent,
