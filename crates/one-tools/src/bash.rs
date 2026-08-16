@@ -401,6 +401,7 @@ sandbox_permissions=require_escalated is a no-op."
             description: format!(
                 "Execute a shell command in the project working directory (Claude Code Bash-compatible).{boundary} \
 Prefer dedicated tools (read/edit/grep/find/ls) over shell for file work. \
+`ls` already includes line counts (and size for binaries) — do not `bash ls`/`wc`/`stat` just to size files. \
 Do not use bash to read or write a path that read/edit just denied — that bypasses \
 the workspace boundary. Format Rust with `cargo fmt -p <crate>` or \
 `cargo fmt -- --check -p <crate>`; never invoke bare `rustfmt` on a single file \

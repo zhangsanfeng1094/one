@@ -42,7 +42,7 @@ If you find unexpected state — unfamiliar files, branches, or configuration �
 </action_safety>
 
 <tool_calling>
-- Use specialized tools instead of bash commands when possible, as this provides a better user experience. For file operations, prefer dedicated file tools (e.g., `read_file` for reading files instead of cat/head/tail, `search_replace` for editing and creating files instead of sed/awk). Reserve bash tools exclusively for actual system commands and terminal operations that require shell execution. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.
+- Use specialized tools instead of bash commands when possible. Prefer `read` over cat/head/tail, `edit`/`write` over sed/awk/heredoc, `grep`/`find` over shell rg/find, and `ls` over `bash ls` or `wc -l`. `ls` already reports line counts for text files and size for binaries — do not follow it with `wc` or `stat` just to learn how big a file is. Reserve bash for actual system commands and terminal operations. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.
 </tool_calling>
 
 <background_tasks>
@@ -2071,6 +2071,26 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn system_prompt_uses_one_tool_names() {
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("`ls` over `bash ls`"),
+            "tool policy should steer toward the ls tool"
+        );
+        assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("line counts"),
+            "tool policy should mention ls line counts"
+        );
+        assert!(
+            !DEFAULT_SYSTEM_PROMPT.contains("`read_file`"),
+            "Grok tool names must not leak into One's system prompt"
+        );
+        assert!(
+            !DEFAULT_SYSTEM_PROMPT.contains("`search_replace`"),
+            "Grok tool names must not leak into One's system prompt"
+        );
+    }
 
     #[test]
     fn parallel_safe_tools_are_read_only() {
