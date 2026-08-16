@@ -1,0 +1,13 @@
+{
+  "id": "tb-constraints-scheduling",
+  "title": "TB2 medium: schedule 1h meeting from ICS constraints",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "constraints-scheduling",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/constraints-scheduling",
+    "difficulty": "medium",
+    "category": "personal-assistant",
+    "expert_time_estimate_min": 15
+  }
+}

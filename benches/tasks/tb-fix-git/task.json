@@ -1,0 +1,13 @@
+{
+  "id": "tb-fix-git",
+  "title": "TB2 easy: recover detached-HEAD site edits into master",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "fix-git",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/fix-git",
+    "difficulty": "easy",
+    "category": "software-engineering",
+    "expert_time_estimate_min": 5
+  }
+}

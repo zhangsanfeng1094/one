@@ -1,0 +1,14 @@
+{
+  "id": "tb-feal-differential",
+  "title": "TB2 hard: FEAL differential cryptanalysis recover key[5]",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "feal-differential-cryptanalysis",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/feal-differential-cryptanalysis",
+    "difficulty": "hard",
+    "category": "mathematics",
+    "author": "Nicholas Carlini",
+    "expert_time_estimate_min": 480
+  }
+}

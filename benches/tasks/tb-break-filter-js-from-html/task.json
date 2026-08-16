@@ -1,0 +1,14 @@
+{
+  "id": "tb-break-filter-js-from-html",
+  "title": "TB2 medium: bypass naive HTML JS filter with XSS",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "break-filter-js-from-html",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/break-filter-js-from-html",
+    "difficulty": "medium",
+    "category": "security",
+    "author": "Nicholas Carlini",
+    "expert_time_estimate_min": 20
+  }
+}

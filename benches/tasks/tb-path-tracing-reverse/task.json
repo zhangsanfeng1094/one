@@ -1,0 +1,14 @@
+{
+  "id": "tb-path-tracing-reverse",
+  "title": "TB2 hard: reverse-engineer path tracer binary to mystery.c",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "path-tracing-reverse",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/path-tracing-reverse",
+    "difficulty": "hard",
+    "category": "software-engineering",
+    "author": "Nicholas Carlini",
+    "expert_time_estimate_min": 120
+  }
+}

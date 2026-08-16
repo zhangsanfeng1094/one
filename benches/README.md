@@ -128,39 +128,66 @@ chmod +x benches/run.sh
 | `edit-gauntlet` | full | **edit 高难压测**：近重复 twins、拥挤 `n+1`、CRLF、trailing WS/Tab、`replace_all` 重命名、smart quotes、nested、40 decoy；fingerprint 防整文件 rewrite |
 | `tb-cancel-async-tasks` | full | **TB2 hard**：async 限流 + SIGINT cleanup |
 | `tb-polyglot-rust-c` | full | **TB2 hard**：Rust/C++ 同文件 polyglot Fibonacci |
+| `tb-polyglot-c-py` | full | **TB2 medium**：C/Python 同文件 polyglot Fibonacci |
 | `tb-write-compressor` | full | **TB2 hard**：逆向自定义压缩格式，≤2500B |
 | `tb-path-tracing` | full | **TB2 hard**：逆向 path tracer 对齐参考 PPM |
+| `tb-path-tracing-reverse` | full | **TB2 hard**：逆向 `mystery` 二进制写出 `mystery.c` |
 | `tb-feal-linear` | full | **TB2 hard**：FEAL 线性密码分析 |
+| `tb-feal-differential` | full | **TB2 hard**：FEAL 差分密码分析恢复 `key[5]` |
 | `tb-circuit-fibsqrt` | full | **TB2 hard**：门级电路算 fib(isqrt(N)) |
 | `tb-regex-chess` | full | **TB2 hard**：正则着法生成器 |
+| `tb-regex-log` | full | **TB2 medium**：日志行里匹配 IPv4 行上最后一个日期 |
+| `tb-constraints-scheduling` | full | **TB2 medium**：ICS 约束排 1h 会议 |
+| `tb-filter-js-from-html` | full | **TB2 medium**：写 HTML XSS 过滤器 |
+| `tb-break-filter-js-from-html` | full | **TB2 medium**：绕过 naive HTML JS filter |
+| `tb-fix-git` | full | **TB2 easy**：恢复 detached HEAD 改动并 merge 进 master |
 
 `full` / `codex` / `compare` **不传 task 时弹出菜单**（默认只列 `suite=full`）。  
 `fix-all` = 固定 `kit-fix-all`，不弹菜单。
 
-### Terminal-Bench 2.0 移植（hard）
+### Terminal-Bench 2.0 移植
 
-| task | 上游 | 专家估时 | 一句话 |
-|------|------|----------|--------|
-| `tb-cancel-async-tasks` | cancel-async-tasks | ~120m | async 限流 + SIGINT cleanup（含排队边界） |
-| `tb-polyglot-rust-c` | polyglot-rust-c | ~180m | 单文件同时过 `rustc` 与 `g++ -x c++` 的 Fibonacci |
-| `tb-write-compressor` | write-compressor | ~1440m | 逆向自定义算术编码解压器，压出 ≤2500B |
-| `tb-path-tracing` | path-tracing | ~360m | 逆向 path tracer，写 <2KB gzip 的 `image.c` 对齐参考图 |
-| `tb-feal-linear` | feal-linear-cryptanalysis | ~960m | FEAL 线性密码分析，解密 100 条密文 |
-| `tb-circuit-fibsqrt` | circuit-fibsqrt | ~960m | 门级电路 `gates.txt` 算 `fib(isqrt(N))%2^32` |
-| `tb-regex-chess` | regex-chess | ~1440m | 纯正则替换实现完整国际象棋着法生成 |
+| task | 上游 | 难度 | 专家估时 | 一句话 |
+|------|------|------|----------|--------|
+| `tb-cancel-async-tasks` | cancel-async-tasks | hard | ~120m | async 限流 + SIGINT cleanup（含排队边界） |
+| `tb-polyglot-rust-c` | polyglot-rust-c | hard | ~180m | 单文件同时过 `rustc` 与 `g++ -x c++` 的 Fibonacci |
+| `tb-polyglot-c-py` | polyglot-c-py | medium | ~20m | 单文件同时过 `python3` 与 `gcc` 的 Fibonacci |
+| `tb-write-compressor` | write-compressor | hard | ~1440m | 逆向自定义算术编码解压器，压出 ≤2500B |
+| `tb-path-tracing` | path-tracing | hard | ~360m | 逆向 path tracer，写 <2KB gzip 的 `image.c` 对齐参考图 |
+| `tb-path-tracing-reverse` | path-tracing-reverse | hard | ~120m | 逆向 `mystery` 二进制，写 <2KB gzip 的 `mystery.c` |
+| `tb-feal-linear` | feal-linear-cryptanalysis | hard | ~960m | FEAL 线性密码分析，解密 100 条密文 |
+| `tb-feal-differential` | feal-differential-cryptanalysis | hard | ~480m | FEAL 差分攻击恢复 `key[5]`（&lt;30s） |
+| `tb-circuit-fibsqrt` | circuit-fibsqrt | hard | ~960m | 门级电路 `gates.txt` 算 `fib(isqrt(N))%2^32` |
+| `tb-regex-chess` | regex-chess | hard | ~1440m | 纯正则替换实现完整国际象棋着法生成 |
+| `tb-regex-log` | regex-log | medium | ~45m | 正则匹配「含合法 IPv4 的日志行」上最后一个 `YYYY-MM-DD` |
+| `tb-constraints-scheduling` | constraints-scheduling | medium | ~15m | 解析 3 个 ICS，排满足硬约束的最早 1h 会议 |
+| `tb-filter-js-from-html` | filter-js-from-html | medium | ~45m | 写 `filter.py` 去掉 HTML 中的 JS（静态 XSS 向量） |
+| `tb-break-filter-js-from-html` | break-filter-js-from-html | medium | ~20m | 构造 `out.html` 绕过提供的 naive filter |
+| `tb-fix-git` | fix-git | easy | ~5m | 从 reflog/detached HEAD 找回改动并 merge 进 master |
 
 统一打分：`python3 verify.py`（workspace cwd）。  
-`image.ppm` 以 `image.ppm.gz` 入库，`prepare_workspace` 自动 gunzip。  
-path-tracing 渲染可能较慢，可 `ONE_BENCH_CMD_TIMEOUT=900 ./benches/run.sh full tb-path-tracing`。  
-regex-chess 依赖 `python-chess`（verify 会尝试 `uv pip install chess`）。
+`image.ppm` / `reference.ppm` / `mystery` 以 `.gz` 入库；`prepare_workspace` 对 `*.ppm.gz` 自动 gunzip，其余由各任务 `prepare_fixture.sh` 展开。  
+path-tracing / path-tracing-reverse 渲染可能较慢，可 `ONE_BENCH_CMD_TIMEOUT=900 ./benches/run.sh full tb-path-tracing-reverse`。  
+regex-chess 依赖 `python-chess`（verify 会尝试 `uv pip install chess`）。  
+filter / break-filter 本移植为 **stdlib 静态判定**（不依赖 Selenium/Chrome）；`fix-git` 用合成小仓库 + `prepare_fixture.sh` 重建 `.git`（因 harness 拷贝时会剥掉 `.git/`）。
 
 ```bash
+# hard 原有
 ./benches/run.sh full tb-polyglot-rust-c
 ./benches/run.sh full tb-write-compressor
 ./benches/run.sh full tb-path-tracing
 ./benches/run.sh full tb-feal-linear
 ./benches/run.sh full tb-circuit-fibsqrt
 ./benches/run.sh full tb-regex-chess
+# 新增 medium / easy / 系列补齐
+./benches/run.sh full tb-polyglot-c-py
+./benches/run.sh full tb-regex-log
+./benches/run.sh full tb-constraints-scheduling
+./benches/run.sh full tb-filter-js-from-html
+./benches/run.sh full tb-break-filter-js-from-html
+./benches/run.sh full tb-path-tracing-reverse
+./benches/run.sh full tb-feal-differential
+./benches/run.sh full tb-fix-git
 ```
 
 出处 / oracle：各任务目录下 `SOURCE.md`、`SOLUTIONS.md`（SOLUTIONS 不进 workspace）。

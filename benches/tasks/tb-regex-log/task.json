@@ -1,0 +1,14 @@
+{
+  "id": "tb-regex-log",
+  "title": "TB2 medium: regex for last date on lines with valid IPv4",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "regex-log",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/regex-log",
+    "difficulty": "medium",
+    "category": "data-processing",
+    "author": "Orfeas Menis Mastromichalakis",
+    "expert_time_estimate_min": 45
+  }
+}

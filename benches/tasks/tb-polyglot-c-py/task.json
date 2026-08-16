@@ -1,0 +1,14 @@
+{
+  "id": "tb-polyglot-c-py",
+  "title": "TB2 medium: single-file C/Python polyglot Fibonacci",
+  "suite": "full",
+  "source": {
+    "benchmark": "Terminal-Bench 2.0",
+    "task": "polyglot-c-py",
+    "url": "https://github.com/harbor-framework/terminal-bench-2/tree/main/polyglot-c-py",
+    "difficulty": "medium",
+    "category": "software-engineering",
+    "author": "Nicholas Carlini",
+    "expert_time_estimate_min": 20
+  }
+}
