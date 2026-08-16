@@ -9,15 +9,16 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use ignore::overrides::OverrideBuilder;
-use ignore::{WalkBuilder, WalkState};
+use ignore::WalkState;
 use one_core::error::Result;
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use regex::RegexBuilder;
 use serde_json::json;
 
+use crate::glob_util::{expand_brace_glob, walk_builder, MAX_WALK_ENTRIES};
 use crate::memory_io::{is_memory_path, MemoryLookupBudget};
 use crate::path_policy::{AccessKind, PathPolicy};
-use crate::tool_args::{bool_arg, path_arg, u64_arg};
+use crate::tool_args::{bool_arg, path_arg_or, u64_arg};
 
 pub struct GrepTool {
     policy: PathPolicy,
@@ -97,10 +98,6 @@ impl Tool for GrepTool {
                         "type": "string",
                         "description": "File or directory to search (default: workspace root)"
                     },
-                    "file_path": {
-                        "type": "string",
-                        "description": "Alias for `path` (Claude Code compatibility)"
-                    },
                     "glob": {
                         "type": "string",
                         "description": "Glob to filter files, e.g. \"*.rs\", \"**/*.{ts,tsx}\""
@@ -116,11 +113,7 @@ impl Tool for GrepTool {
                     },
                     "case_insensitive": {
                         "type": "boolean",
-                        "description": "Case insensitive search (Claude name). Alias: ignore_case"
-                    },
-                    "ignore_case": {
-                        "type": "boolean",
-                        "description": "Alias for case_insensitive"
+                        "description": "Case insensitive search"
                     },
                     "multiline": {
                         "type": "boolean",
@@ -160,7 +153,9 @@ impl Tool for GrepTool {
             .ok_or_else(|| invalid_args("grep", "missing `pattern`"))?
             .to_string();
 
-        let path = path_arg(&call.arguments).unwrap_or(".").to_string();
+        let path = path_arg_or(&call.arguments, ".")
+            .map_err(|msg| invalid_args("grep", msg))?
+            .to_string();
         let ignore_case =
             bool_arg(&call.arguments, "case_insensitive", Some("ignore_case")).unwrap_or(false);
         let multiline = bool_arg(&call.arguments, "multiline", None).unwrap_or(false);
@@ -498,15 +493,7 @@ fn collect_files(root: &Path, glob: Option<&str>, policy: &PathPolicy) -> Result
         return Ok(vec![root.to_path_buf()]);
     }
 
-    let mut walker = WalkBuilder::new(root);
-    walker.hidden(true);
-    walker.parents(true);
-    walker.git_ignore(true);
-    walker.git_global(true);
-    walker.git_exclude(true);
-    walker.ignore(true);
-    // Follow rg-ish defaults: skip ignored, don't require git.
-    walker.require_git(false);
+    let mut walker = walk_builder(root);
 
     if let Some(g) = glob {
         let mut ob = OverrideBuilder::new(root);
@@ -523,11 +510,6 @@ fn collect_files(root: &Path, glob: Option<&str>, policy: &PathPolicy) -> Result
 
     let files = std::sync::Mutex::new(Vec::new());
     let err_slot = std::sync::Mutex::new(None::<String>);
-    // Cap walk concurrency so agent tools stay light.
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(4))
-        .unwrap_or(1);
-    walker.threads(threads);
 
     walker.build_parallel().run(|| {
         let files = &files;
@@ -554,7 +536,7 @@ fn collect_files(root: &Path, glob: Option<&str>, policy: &PathPolicy) -> Result
             }
             // Soft cap: avoid walking unbounded trees for agent use.
             if let Ok(guard) = files.lock() {
-                if guard.len() >= 50_000 {
+                if guard.len() >= MAX_WALK_ENTRIES {
                     if let Ok(mut e) = err_slot.lock() {
                         *e = Some("search capped at 50000 files; narrow path/glob".into());
                     }
@@ -578,27 +560,6 @@ fn collect_files(root: &Path, glob: Option<&str>, policy: &PathPolicy) -> Result
     let mut files = files.into_inner().unwrap_or_default();
     files.sort();
     Ok(files)
-}
-
-/// Expand a single-level brace glob: `**/*.{ts,tsx}` → two globs.
-fn expand_brace_glob(glob: &str) -> Vec<String> {
-    let Some(open) = glob.find('{') else {
-        return vec![glob.to_string()];
-    };
-    let Some(close) = glob[open..].find('}') else {
-        return vec![glob.to_string()];
-    };
-    let close = open + close;
-    let prefix = &glob[..open];
-    let suffix = &glob[close + 1..];
-    let inner = &glob[open + 1..close];
-    if inner.is_empty() || inner.contains('{') {
-        return vec![glob.to_string()];
-    }
-    inner
-        .split(',')
-        .map(|part| format!("{prefix}{}{suffix}", part.trim()))
-        .collect()
 }
 
 fn type_to_glob(t: &str) -> Option<&'static str> {
@@ -771,11 +732,5 @@ mod tests {
         assert!(text.contains("a.rs") || text.contains("b.rs"), "{text}");
         assert!(!text.contains("readme.md"), "{text}");
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn brace_glob_expands() {
-        let parts = expand_brace_glob("**/*.{ts,tsx}");
-        assert_eq!(parts, vec!["**/*.ts".to_string(), "**/*.tsx".to_string()]);
     }
 }

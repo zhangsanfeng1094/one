@@ -5,6 +5,7 @@ pub mod bash_output;
 pub mod edit;
 pub mod edit_diff;
 pub mod find;
+pub(crate) mod glob_util;
 pub mod grep;
 pub mod ls;
 pub mod memory_io;
@@ -46,9 +47,7 @@ pub use memory_io::{
 };
 pub use monitor::MonitorTool;
 pub use os_sandbox::OsSandbox;
-pub use path_policy::{
-    AccessKind, DynamicGrants, ExportedReadGrants, PathPolicy, SandboxMode,
-};
+pub use path_policy::{AccessKind, DynamicGrants, ExportedReadGrants, PathPolicy, SandboxMode};
 pub use permissions::{
     bash_command, call_fingerprint, call_summary, command_matches_prefix,
     evaluate as evaluate_permissions, suggested_command_prefix, suggested_command_prefix_from_cmd,
@@ -68,19 +67,17 @@ pub use sandbox_permissions::{
     SandboxPermissions,
 };
 pub use tasks::{
-    format_task_list, format_task_output, BackgroundTaskRegistry, TaskMeta, TaskSnapshot, TaskState,
-    DEFAULT_MONITOR_MAX_EVENTS,
+    format_task_list, format_task_output, BackgroundTaskRegistry, TaskMeta, TaskSnapshot,
+    TaskState, DEFAULT_MONITOR_MAX_EVENTS,
 };
 pub use todo::{TodoItem, TodoListState, TodoStatus, TodoWriteTool};
 pub use truncate::{
     apply_head_default, apply_tail_default, cleanup_tool_outputs, cleanup_tool_outputs_before,
     format_size, present_file_read, present_tool_output, present_tool_output_with,
-    strip_ansi_escapes,
-    set_tool_output_limits, set_tool_outputs_root_override, spill_full_output, tool_output_limits,
-    tool_outputs_root,
-    truncate_head, truncate_line, truncate_tail, CleanupReport, PresentedOutput, PreviewStyle,
-    ToolOutputLimits, DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH,
-    TOOL_OUTPUT_RETENTION_DAYS,
+    set_tool_output_limits, set_tool_outputs_root_override, spill_full_output, strip_ansi_escapes,
+    tool_output_limits, tool_outputs_root, truncate_head, truncate_line, truncate_tail,
+    CleanupReport, PresentedOutput, PreviewStyle, ToolOutputLimits, DEFAULT_MAX_BYTES,
+    DEFAULT_MAX_LINES, GREP_MAX_LINE_LENGTH, TOOL_OUTPUT_RETENTION_DAYS,
 };
 #[cfg(feature = "network")]
 pub use web_fetch::WebFetchTool;
