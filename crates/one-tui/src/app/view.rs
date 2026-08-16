@@ -38,6 +38,34 @@ impl super::App {
         Some(SelectPos::new(line, col))
     }
 
+    /// Like [`pos_at`], but clamps onto the nearest transcript line when the
+    /// pointer sits on empty pad / past the last content row.
+    pub(crate) fn pos_at_clamped(
+        &self,
+        row_in_view: usize,
+        terminal_col: u16,
+    ) -> Option<SelectPos> {
+        if self.chat_total_lines == 0 {
+            return None;
+        }
+        if let Some(pos) = self.pos_at(row_in_view, terminal_col) {
+            return Some(pos);
+        }
+        let max_line = self.chat_total_lines.saturating_sub(1);
+        let last_visible = self
+            .chat_view_start
+            .saturating_add(self.chat_view_height.saturating_sub(1))
+            .min(max_line);
+        let line = if row_in_view < self.chat_top_pad {
+            self.chat_view_start.min(max_line)
+        } else {
+            // Past content in the viewport (short transcript) or after last line.
+            last_visible
+        };
+        let col = self.view_col_to_caret(line, terminal_col);
+        Some(SelectPos::new(line, col))
+    }
+
     /// Click at row offset within the chat viewport (0 = top visible line).
     pub fn click_chat_row(&mut self, row_in_view: usize) {
         let Some(line) = self.view_row_to_line(row_in_view) else {
@@ -63,7 +91,7 @@ impl super::App {
 
     /// Begin in-app selection at a viewport cell (mouse down).
     pub fn select_begin(&mut self, row_in_view: usize, terminal_col: u16) {
-        let Some(pos) = self.pos_at(row_in_view, terminal_col) else {
+        let Some(pos) = self.pos_at_clamped(row_in_view, terminal_col) else {
             self.clear_selection();
             return;
         };
@@ -77,7 +105,7 @@ impl super::App {
     /// `from_drag`: true for Drag/Moved while held (always a select gesture).
     /// false for mouse-up release (only a real range counts as select).
     pub fn select_update(&mut self, row_in_view: usize, terminal_col: u16, from_drag: bool) {
-        let Some(pos) = self.pos_at(row_in_view, terminal_col) else {
+        let Some(pos) = self.pos_at_clamped(row_in_view, terminal_col) else {
             return;
         };
         if self.select_anchor.is_none() {
@@ -93,9 +121,97 @@ impl super::App {
                 self.select_dragging = true;
             }
         }
+        // Freeze the viewport while dragging. If we only clear `follow_bottom`
+        // and leave `chat_scroll` at 0 (the live-follow sentinel), the next
+        // paint jumps to the top of the transcript — selection then spans
+        // almost everything. Mirror `scroll_up`: pin scroll at the current
+        // bottom edge when leaving live follow.
         if self.select_dragging {
-            self.follow_bottom = false;
+            self.freeze_viewport_for_select();
         }
+    }
+
+    /// Leave live follow without jumping the chat window (used by drag-select).
+    fn freeze_viewport_for_select(&mut self) {
+        if self.follow_bottom {
+            self.chat_scroll = self.max_scroll();
+            self.follow_bottom = false;
+            self.sync_view_start_from_scroll();
+        }
+    }
+
+    /// Keep hit-testing in sync after programmatic scroll during a drag
+    /// (paint only updates `chat_view_start` on the next frame).
+    fn sync_view_start_from_scroll(&mut self) {
+        if self.chat_view_height == 0 {
+            return;
+        }
+        let max = self.max_scroll();
+        self.chat_view_start = if self.follow_bottom {
+            max
+        } else {
+            self.chat_scroll.min(max)
+        };
+    }
+
+    /// Drag while the left button is held: edge auto-scroll + extend selection.
+    ///
+    /// Without this, selection stops at the first/last *visible* row — the user
+    /// can only select one viewport of lines. When the pointer sits on the top/
+    /// bottom edge (or leaves the chat pane into the prompt), we scroll the
+    /// transcript so selection can grow beyond the current window.
+    ///
+    /// `chat_h` is the chat pane height in terminal rows (same metric as mouse.y).
+    pub fn select_drag(&mut self, mouse_row: u16, mouse_col: u16, chat_h: u16) {
+        if chat_h == 0 || self.chat_total_lines == 0 {
+            return;
+        }
+        // Enter drag mode before freeze/scroll so live-follow does not jump.
+        self.select_dragging = true;
+        self.freeze_viewport_for_select();
+
+        // Rows at the rim (and anything outside the chat pane) auto-scroll.
+        // Outside below the chat (prompt/footer) counts as "keep going down".
+        const EDGE: u16 = 1;
+        let at_top = mouse_row < EDGE;
+        let at_bottom = mouse_row + EDGE >= chat_h || mouse_row >= chat_h;
+        if at_top {
+            self.scroll_up(1);
+            self.sync_view_start_from_scroll();
+        } else if at_bottom {
+            // scroll_down may re-enable follow_bottom at the true end; re-freeze
+            // so a subsequent paint does not treat us as live-follow with scroll=0
+            // mid-gesture (selection must stay anchored to absolute lines).
+            let was_follow = self.follow_bottom;
+            self.scroll_down(1);
+            if self.follow_bottom && !was_follow {
+                // Reached true bottom — keep the viewport pinned for hit-testing.
+                self.chat_scroll = self.max_scroll();
+                self.follow_bottom = false;
+            }
+            self.sync_view_start_from_scroll();
+        }
+
+        let row = if mouse_row >= chat_h {
+            chat_h.saturating_sub(1) as usize
+        } else {
+            mouse_row as usize
+        };
+        self.select_update(row, mouse_col, true);
+    }
+
+    /// Mouse-up after a press that may have left the chat pane.
+    pub fn select_finish_at(&mut self, mouse_row: u16, mouse_col: u16, chat_h: u16) {
+        if chat_h == 0 {
+            self.clear_selection();
+            return;
+        }
+        let row = if mouse_row >= chat_h {
+            chat_h.saturating_sub(1) as usize
+        } else {
+            mouse_row as usize
+        };
+        self.select_finish(row, mouse_col);
     }
 
     /// Ordered half-open selection endpoints, if any.

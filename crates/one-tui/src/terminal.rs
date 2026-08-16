@@ -283,21 +283,19 @@ impl TerminalSession {
                 app.select_begin(row, col);
             }
             // Character / multi-line select: Drag + Moved while held (hosts vary).
+            // Keep tracking even when the pointer leaves the chat pane so the
+            // user can edge-scroll past one viewport of lines.
             MouseEventKind::Drag(MouseButton::Left) if self.left_down => {
-                if in_chat {
-                    app.select_update(row, col, true);
-                }
+                app.select_drag(mouse.row, col, chat_h);
             }
             MouseEventKind::Moved if self.left_down => {
-                if in_chat {
-                    app.select_update(row, col, true);
-                }
+                app.select_drag(mouse.row, col, chat_h);
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.left_down {
                     self.left_down = false;
                     // select_finish applies release cell; non-empty drag → auto-copy.
-                    app.select_finish(row, col);
+                    app.select_finish_at(mouse.row, col, chat_h);
                     self.flush_clipboard(app);
                 }
             }

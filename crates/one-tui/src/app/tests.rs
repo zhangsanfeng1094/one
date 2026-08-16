@@ -573,6 +573,89 @@ fn empty_selection_is_none() {
     assert!(app.selection_text().is_none());
 }
 
+/// Drag-select while live-following must freeze the viewport at the bottom
+/// edge — not jump to scroll=0 (top of history).
+#[test]
+fn drag_select_freezes_viewport_while_following_bottom() {
+    let mut app = App::new("t");
+    app.chat_total_lines = 40;
+    app.chat_view_height = 10;
+    app.chat_view_start = 30; // max_scroll = 30 while following bottom
+    app.chat_content_x = 1;
+    app.chat_top_pad = 0;
+    app.chat_line_text = (0..40).map(|i| format!("line-{i:02}")).collect();
+    app.follow_bottom = true;
+    app.chat_scroll = 0; // live-follow sentinel
+
+    // Begin at first visible row (absolute line 30), then drag one cell right.
+    app.select_begin(0, 1);
+    app.select_update(0, 5, true);
+
+    assert!(app.select_dragging);
+    assert!(!app.follow_bottom, "drag must leave live follow");
+    assert_eq!(
+        app.chat_scroll,
+        app.max_scroll(),
+        "viewport must stay pinned at bottom edge, not jump to top"
+    );
+    // Partial selection on the same absolute line — not the whole history.
+    let span = app.selection_span().expect("non-empty selection");
+    assert_eq!(span.0.line, 30);
+    assert_eq!(span.1.line, 30);
+    assert!(span.0.col < span.1.col);
+}
+
+/// Dragging against the top edge must auto-scroll older lines into view so
+/// selection can grow beyond one viewport.
+#[test]
+fn drag_select_edge_scrolls_up_past_viewport() {
+    let mut app = App::new("t");
+    app.chat_total_lines = 40;
+    app.chat_view_height = 10;
+    app.chat_content_x = 1;
+    app.chat_top_pad = 0;
+    app.chat_line_text = (0..40).map(|i| format!("line-{i:02}xxxx")).collect();
+    app.follow_bottom = false;
+    app.chat_scroll = 20;
+    app.chat_view_start = 20;
+
+    // Anchor on absolute line 25 (viewport row 5).
+    app.select_begin(5, 1);
+    assert_eq!(app.select_anchor.map(|p| p.line), Some(25));
+
+    // Drag to the top edge — should scroll older content and extend selection.
+    app.select_drag(0, 5, 10);
+    assert_eq!(app.chat_scroll, 19, "top-edge drag scrolls older");
+    assert_eq!(app.chat_view_start, 19);
+    let span = app.selection_span().expect("selection");
+    assert_eq!(span.0.line, 19, "end tracks the new top line after scroll");
+    assert_eq!(span.1.line, 25, "anchor stays on the original line");
+}
+
+/// Pointer leaving the chat pane (over the prompt) must still extend selection
+/// and can scroll toward newer content.
+#[test]
+fn drag_select_outside_chat_still_extends() {
+    let mut app = App::new("t");
+    app.chat_total_lines = 40;
+    app.chat_view_height = 10;
+    app.chat_content_x = 1;
+    app.chat_top_pad = 0;
+    app.chat_line_text = (0..40).map(|i| format!("line-{i:02}xxxx")).collect();
+    app.follow_bottom = false;
+    app.chat_scroll = 10;
+    app.chat_view_start = 10;
+
+    app.select_begin(2, 1); // absolute line 12
+    // Mouse over the prompt area (row >= chat_h).
+    app.select_drag(15, 5, 10);
+    assert_eq!(app.chat_scroll, 11, "below-chat drag scrolls newer");
+    let span = app.selection_span().expect("selection");
+    assert_eq!(span.0.line, 12);
+    // Clamped to last chat row after scroll: start=11, row=9 → line 20.
+    assert_eq!(span.1.line, 20);
+}
+
 #[test]
 fn display_col_to_caret_ascii_and_wide() {
     assert_eq!(display_col_to_caret("hello", 0), 0);
@@ -1543,6 +1626,129 @@ fn alert_is_ui_only_role() {
     let last = app.messages.last().unwrap();
     assert_eq!(last.role, MessageRole::Alert);
     assert_eq!(last.alert_level, Some(AlertLevel::Error));
+}
+
+#[test]
+fn finish_task_tool_from_job_seals_running_row() {
+    let mut app = App::new("test");
+    app.begin_busy();
+    app.push_tool_call_with_id("task", r#"{"description":"scan"}"#, Some("call_1".into()));
+    // Live bind while running.
+    app.update_task_tool_live("job_abc", "turn 2/16 · running · /tasks", true);
+    assert_eq!(
+        app.messages.last().unwrap().tool_status,
+        Some(ToolStatus::Running)
+    );
+
+    app.finish_task_tool_from_job(
+        "job_abc",
+        true,
+        "[task · explore · scan · status=runtime_error · id=job_abc]\nError: provider_error: overloaded",
+    );
+
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.tool_status, Some(ToolStatus::Error));
+    assert_eq!(last.tool_job_id.as_deref(), Some("job_abc"));
+    assert!(
+        last.tool_summary
+            .as_deref()
+            .unwrap_or("")
+            .contains("error"),
+        "summary={:?}",
+        last.tool_summary
+    );
+    // Second seal is a no-op (no panic, no second row).
+    app.finish_task_tool_from_job("job_abc", true, "again");
+    assert_eq!(
+        app.messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn finish_task_tool_from_job_seals_sole_running_without_binding() {
+    // Job went terminal before live bind could attach tool_job_id.
+    let mut app = App::new("test");
+    app.begin_busy();
+    app.push_tool_call_with_id("task", r#"{"description":"scan"}"#, Some("call_1".into()));
+    assert!(app.messages.last().unwrap().tool_job_id.is_none());
+
+    app.finish_task_tool_from_job(
+        "job_xyz",
+        false,
+        "[task · explore · scan · status=success · id=job_xyz]\nall good",
+    );
+
+    let last = app.messages.last().unwrap();
+    assert_eq!(last.tool_status, Some(ToolStatus::Done));
+    assert_eq!(last.tool_job_id.as_deref(), Some("job_xyz"));
+    assert!(
+        last.tool_output.as_deref().unwrap_or("").contains("all good"),
+        "output={:?}",
+        last.tool_output
+    );
+}
+
+#[test]
+fn finish_tool_upgrades_already_sealed_task_row() {
+    let mut app = App::new("test");
+    app.push_tool_call_with_id("task", r#"{"description":"scan"}"#, Some("call_1".into()));
+    app.finish_task_tool_from_job(
+        "job_abc",
+        true,
+        "[task · explore · status=runtime_error · id=job_abc]\nError: early",
+    );
+    // ToolExecutionEnd arrives later with richer body — upgrade, don't duplicate.
+    app.finish_tool_with_output_id(
+        "task",
+        true,
+        Some(
+            "[task · explore · scan · status=runtime_error · id=job_abc]\nError: full detail"
+                .into(),
+        ),
+        Some("call_1"),
+    );
+    assert_eq!(
+        app.messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .count(),
+        1
+    );
+    let out = app.messages.last().unwrap().tool_output.as_deref().unwrap_or("");
+    assert!(out.contains("full detail"), "{out}");
+}
+
+#[test]
+fn discard_partial_stream_drops_failed_sample_bubbles() {
+    let mut app = App::new("test");
+    app.begin_busy();
+    // Open streaming assistant only (still streaming — not sealed).
+    app.append_stream("[openai error] overloaded.[openai error] overloaded.");
+    app.sync_stream_message();
+    assert_eq!(app.messages.len(), 1);
+    assert!(app.messages[0].streaming);
+    assert!(!app.stream_buffer.is_empty());
+
+    app.discard_partial_stream();
+
+    assert!(app.stream_buffer.is_empty());
+    assert!(app.thinking_buffer.is_empty());
+    assert!(
+        app.messages.is_empty(),
+        "streaming bubbles from the failed sample must not remain: {:?}",
+        app.messages.iter().map(|m| &m.content).collect::<Vec<_>>()
+    );
+
+    // Thinking-only failed sample (still streaming).
+    app.append_thinking_stream("planning…");
+    app.sync_stream_message();
+    assert_eq!(app.messages.len(), 1);
+    app.discard_partial_stream();
+    assert!(app.messages.is_empty());
 }
 
 #[test]
