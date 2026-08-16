@@ -315,8 +315,11 @@ fn destructive_git_shape(segment: &str) -> Option<&'static str> {
         // Agents routinely use these to wipe WIP; always confirm.
         "checkout" | "switch" => Some("git checkout"),
         "push" => {
-            if has_flag(rest, 0, &["--force", "-f", "--force-with-lease", "--force-if-includes"])
-            {
+            if has_flag(
+                rest,
+                0,
+                &["--force", "-f", "--force-with-lease", "--force-if-includes"],
+            ) {
                 Some("git push --force")
             } else {
                 None

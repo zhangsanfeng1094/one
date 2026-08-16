@@ -168,16 +168,11 @@ impl Tool for PlanEditTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Required plan file path (aliases: file_path, filePath)"
+                        "description": "Required plan file path"
                     },
-                    "file_path": { "type": "string" },
-                    "filePath": { "type": "string" },
                     "old_string": { "type": "string" },
-                    "oldString": { "type": "string" },
                     "new_string": { "type": "string" },
-                    "newString": { "type": "string" },
-                    "replace_all": { "type": "boolean" },
-                    "replaceAll": { "type": "boolean" }
+                    "replace_all": { "type": "boolean" }
                 },
                 "required": ["path", "old_string", "new_string"]
             }),
@@ -189,15 +184,13 @@ impl Tool for PlanEditTool {
             apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success,
             normalize_to_lf, patch_for_details,
         };
-        use crate::tool_args::{bool_arg_names, new_string_arg, old_string_arg, path_arg};
+        use crate::tool_args::{bool_arg_names, new_string_arg, old_string_arg, path_arg_for_tool};
 
-        let path = path_arg(&call.arguments).ok_or_else(|| {
-            invalid_args(
-                "edit",
-                "missing `path` (or `file_path` / `filePath`). \
-                 Every edit call must include the plan file path.",
-            )
-        })?;
+        let path = path_arg_for_tool(
+            &call.arguments,
+            "edit",
+            "missing `path`. Every edit call must include the plan file path.",
+        )?;
         let old_string = old_string_arg(&call.arguments).ok_or_else(|| {
             invalid_args("edit", "missing `old_string` / `oldString` / `oldText`")
         })?;

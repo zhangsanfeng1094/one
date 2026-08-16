@@ -4,12 +4,12 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use one_core::error::Result;
 use one_core::image::{is_image_path, mime_from_bytes, mime_from_path, MAX_IMAGE_BYTES};
-use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
+use one_core::tool::{tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
 use crate::memory_io::{is_memory_path, wrap_memory_read, MemoryLookupBudget};
 use crate::path_policy::{AccessKind, PathPolicy};
-use crate::tool_args::{path_arg, path_properties};
+use crate::tool_args::{path_arg_for_tool, path_properties};
 
 pub struct ReadTool {
     policy: PathPolicy,
@@ -47,9 +47,7 @@ impl Tool for ReadTool {
                 self.policy.cwd().display()
             )
         };
-        let mut properties = path_properties(
-            "Required file path. Prefer `path`; Claude `file_path` and OpenCode `filePath` are accepted.",
-        );
+        let mut properties = path_properties("Required file path.");
         if let Some(obj) = properties.as_object_mut() {
             obj.insert(
                 "offset".into(),
@@ -70,7 +68,7 @@ impl Tool for ReadTool {
             name: "read".to_string(),
             description: format!(
                 "Read a file from the filesystem (Claude Code Read-compatible). Always pass \
-                 `path` (or `file_path`). Text files return clean content (no line-number prefixes); \
+                 `path`. Text files return clean content (no line-number prefixes); \
                  image files (png/jpeg/gif/webp/bmp) return image content for vision models. \
                  Text output is capped (~2000 lines / 50KB from the requested window; use offset/limit for slices). \
                  Allowed: {scope}."
@@ -84,13 +82,11 @@ impl Tool for ReadTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = path_arg(&call.arguments).ok_or_else(|| {
-            invalid_args(
-                "read",
-                "missing `path` (or Claude `file_path` / OpenCode `filePath`). \
-                 Every read call must include the file path.",
-            )
-        })?;
+        let path = path_arg_for_tool(
+            &call.arguments,
+            "read",
+            "missing `path`. Every read call must include the file path.",
+        )?;
 
         let resolved = self
             .policy
@@ -154,6 +150,28 @@ impl Tool for ReadTool {
         let max_window = limit
             .map(|n| (n as usize).min(line_cap))
             .unwrap_or(line_cap);
+
+        // Offset past EOF used to panic: `&lines[start..end]` with start > end
+        // (e.g. offset=1680 on a 1674-line file → start=1679, end=1674).
+        if start >= lines.len() {
+            let file_lines = lines.len();
+            let text = one_core::system_reminder(format!(
+                "Offset {offset} is past the end of `{path}` ({file_lines} lines).\n\
+                 Use offset=1 to read from the start, or a value ≤ {file_lines}."
+            ));
+            return Ok(ToolOutput::text_with_details(
+                text,
+                json!({
+                    "path": path,
+                    "lines": 0,
+                    "offset": offset,
+                    "fileLines": file_lines,
+                    "truncated": false,
+                    "offsetPastEnd": true,
+                }),
+            ));
+        }
+
         let end = (start + max_window).min(lines.len());
         let slice = &lines[start..end];
 
@@ -338,6 +356,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn offset_past_eof_does_not_panic() {
+        // Regression: offset past file end used to panic with
+        // "slice index starts at N but ends at M" (start > end).
+        let dir = tempfile_dir();
+        let path = dir.join("short.txt");
+        let body: String = (1..=10).map(|i| format!("L{i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": "short.txt", "offset": 1680, "limit": 50 }),
+            })
+            .await
+            .unwrap();
+
+        let text = out.as_text();
+        assert!(
+            text.contains("past the end") || text.contains("offset"),
+            "expected past-EOF guidance, got:\n{text}"
+        );
+        assert_eq!(
+            out.details.as_ref().and_then(|d| d.get("offsetPastEnd")),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            out.details.as_ref().and_then(|d| d.get("fileLines")),
+            Some(&json!(10))
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn offset_exactly_last_line_ok() {
+        let dir = tempfile_dir();
+        let path = dir.join("tail.txt");
+        let body: String = (1..=5).map(|i| format!("L{i}\n")).collect();
+        std::fs::write(&path, &body).unwrap();
+
+        let tool = ReadTool::new(dir.clone());
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": "tail.txt", "offset": 5, "limit": 10 }),
+            })
+            .await
+            .unwrap();
+
+        let text = out.as_text();
+        assert!(text.contains("L5"), "expected last line, got:\n{text}");
+        assert!(!text.contains("past the end"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
     async fn denies_read_outside_workspace() {
         let dir = tempfile_dir();
         let tool = ReadTool::new(dir.clone());
@@ -377,8 +453,14 @@ mod tests {
             .unwrap();
         let text = out.as_text();
         assert!(text.contains("system-reminder"), "{text}");
-        assert!(text.contains("Point-in-time") || text.contains("verify"), "{text}");
-        assert!(text.contains("Prefer cargo test") || text.contains("cargo"), "{text}");
+        assert!(
+            text.contains("Point-in-time") || text.contains("verify"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Prefer cargo test") || text.contains("cargo"),
+            "{text}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

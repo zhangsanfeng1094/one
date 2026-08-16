@@ -17,7 +17,9 @@ use crate::edit_diff::{
     patch_for_details,
 };
 use crate::path_policy::{AccessKind, PathPolicy};
-use crate::tool_args::{bool_arg_names, new_string_arg, old_string_arg, path_arg, path_properties};
+use crate::tool_args::{
+    bool_arg_names, new_string_arg, old_string_arg, path_arg_for_tool, path_properties,
+};
 
 pub struct EditTool {
     policy: PathPolicy,
@@ -56,11 +58,10 @@ impl Tool for EditTool {
                 self.policy.cwd().display()
             )
         };
-        // Canonical required key is `path` (Grok Build requires path on every edit call).
-        // Runtime still accepts Claude `file_path` / OpenCode `filePath` via path_arg.
+        // Canonical required key is `path`. Aliases are accepted at runtime only.
         let mut properties = path_properties(
-            "Required path of the existing file to edit. Prefer `path`; Claude `file_path` and \
-             OpenCode `filePath` are accepted. Repeat on every edit call — batch siblings do not inherit path.",
+            "Required path of the existing file to edit. Repeat on every edit call — \
+             batch siblings do not inherit path.",
         );
         if let Some(obj) = properties.as_object_mut() {
             obj.insert(
@@ -89,15 +90,16 @@ impl Tool for EditTool {
             name: "edit".to_string(),
             description: format!(
                 "Surgical in-place edit (Claude / OpenCode / Pi compatible): replace `old_string` \
-                 with `new_string` in an existing file. Always pass `path` (or `file_path`) on \
-                 every call — never omit it when batching multiple edits. Prefer this over `write` \
+                 with `new_string` in an existing file. Always pass `path` on every call — never \
+                 omit it when batching multiple edits. Prefer this over `write` \
                  for bugfixes and localized changes. Matching: exact first, then low-risk fuzzy \
                  (trailing whitespace, smart quotes/dashes), then stricter multi-line fallbacks. \
                  If any strategy finds multiple candidates the edit fails — looser strategies do \
                  not guess past ambiguity. By default the match must be unique (fails if 0 or >1); \
                  set `replace_all=true` only for clear bulk renames (exact/normalized equality; \
                  never similarity-ranked blocks). Include enough surrounding context when not \
-                 using replace_all. Read the file before editing when you need current contents. \
+                 using replace_all. Re-read the file immediately before each edit on a file you \
+                 just changed (or after an edit failure) — stale old_string will not match. \
                  Allowed: {scope}."
             ),
             parameters: json!({
@@ -109,14 +111,12 @@ impl Tool for EditTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = path_arg(&call.arguments).ok_or_else(|| {
-            invalid_args(
-                "edit",
-                "missing `path` (or Claude `file_path` / OpenCode `filePath`). \
-                 Every edit call must include the file path — sibling tool calls in the same turn \
-                 do not share path; repeat it on each edit.",
-            )
-        })?;
+        let path = path_arg_for_tool(
+            &call.arguments,
+            "edit",
+            "missing `path`. Every edit call must include the file path — sibling tool calls \
+             in the same turn do not share path; repeat it on each edit.",
+        )?;
         let old_string = old_string_arg(&call.arguments).ok_or_else(|| {
             invalid_args("edit", "missing `old_string` / `oldString` / `oldText`")
         })?;
@@ -227,6 +227,44 @@ mod tests {
         );
         assert!(names.contains(&"old_string"));
         assert!(names.contains(&"new_string"));
+        let props = def.parameters["properties"]
+            .as_object()
+            .expect("properties");
+        assert!(
+            !props.contains_key("file_path") && !props.contains_key("filePath"),
+            "schema must not advertise path aliases: {props:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conflicting_path_aliases_fail_without_writing() {
+        let dir = temp_dir();
+        let file = dir.join("lib.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let err = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "path": format!("{}/missing.rs", dir.display()),
+                    "file_path": "lib.rs",
+                    "filePath": "lib.rs",
+                    "old_string": "fn main() {}",
+                    "new_string": "fn main() { /* x */ }"
+                }),
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("conflicting path aliases"), "{msg}");
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "fn main() {}\n",
+            "conflict must not write"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

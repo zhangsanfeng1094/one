@@ -176,9 +176,7 @@ impl MemorySettings {
     }
 
     pub fn archive_compaction_enabled(&self) -> bool {
-        self.archive_compaction
-            .unwrap_or(true)
-            && self.enabled.unwrap_or(true)
+        self.archive_compaction.unwrap_or(true) && self.enabled.unwrap_or(true)
     }
 
     pub fn summary_line(&self) -> String {
@@ -450,11 +448,7 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                     .collect();
                 specs.sort();
                 specs.dedup();
-                settings.enabled_models = if specs.is_empty() {
-                    None
-                } else {
-                    Some(specs)
-                };
+                settings.enabled_models = if specs.is_empty() { None } else { Some(specs) };
             }
         }
         "thinking" => {
@@ -601,11 +595,9 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
         | "compaction.prefire-ratio"
         | "compaction_prefire_ratio"
         | "compaction.prefire" => {
-            let r: f64 = value
-                .trim()
-                .trim_end_matches('%')
-                .parse()
-                .map_err(|_| "compaction.prefire_ratio must be a number (0–1 or percent)".to_string())?;
+            let r: f64 = value.trim().trim_end_matches('%').parse().map_err(|_| {
+                "compaction.prefire_ratio must be a number (0–1 or percent)".to_string()
+            })?;
             let r = if r > 1.0 && r <= 100.0 { r / 100.0 } else { r };
             if !(r > 0.0 && r < 1.0) {
                 return Err(
@@ -632,10 +624,7 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                 .map_err(|_| "compaction.prune_max_chars must be a number".to_string())?;
             settings.compaction_mut().prune_max_chars = Some(n);
         }
-        "empty_response_retries"
-        | "empty-response-retries"
-        | "empty_retries"
-        | "empty-retries" => {
+        "empty_response_retries" | "empty-response-retries" | "empty_retries" | "empty-retries" => {
             let v = value.trim().to_ascii_lowercase();
             if matches!(v.as_str(), "default" | "auto" | "clear" | "") {
                 settings.empty_response_retries = None;
@@ -693,9 +682,10 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
         | "memory.max-lookups-per-turn"
         | "memory.max_lookups"
         | "memory_max_lookups" => {
-            let n: usize = value.trim().parse().map_err(|_| {
-                "memory.max_lookups_per_turn must be a positive number".to_string()
-            })?;
+            let n: usize = value
+                .trim()
+                .parse()
+                .map_err(|_| "memory.max_lookups_per_turn must be a positive number".to_string())?;
             if n < 1 {
                 return Err("memory.max_lookups_per_turn must be >= 1".into());
             }
@@ -711,9 +701,7 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                     settings.memory_mut().subagent = Some("index".into());
                 }
                 other => {
-                    return Err(format!(
-                        "memory.subagent must be off|index (got `{other}`)"
-                    ));
+                    return Err(format!("memory.subagent must be off|index (got `{other}`)"));
                 }
             }
         }
@@ -730,9 +718,7 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                 "0" | "false" | "no" | "off" | "disable" | "disabled" => {
                     m.archive_compaction = Some(false)
                 }
-                "toggle" => {
-                    m.archive_compaction = Some(!m.archive_compaction.unwrap_or(true))
-                }
+                "toggle" => m.archive_compaction = Some(!m.archive_compaction.unwrap_or(true)),
                 other => {
                     return Err(format!(
                         "memory.archive_compaction must be on|off|toggle (got `{other}`)"
@@ -996,10 +982,7 @@ mod tests {
         set_key(&mut s, "enabledModels", "xai:grok-4.5").unwrap();
         // key is matched after to_ascii_lowercase in set_key match arms via aliases
         // — "enabledModels" lowercases to "enabledmodels"
-        assert_eq!(
-            s.enabled_models,
-            Some(vec!["xai:grok-4.5".into()])
-        );
+        assert_eq!(s.enabled_models, Some(vec!["xai:grok-4.5".into()]));
     }
 
     #[test]
@@ -1041,10 +1024,7 @@ mod tests {
         assert_eq!(cfg2.token_threshold, 50_000);
         set_key(&mut s, "compaction.auto", "off").unwrap();
         assert!(!s.compaction_config(100_000).enabled);
-        assert!(s
-            .compaction_or_default()
-            .summary_line()
-            .contains("prune"));
+        assert!(s.compaction_or_default().summary_line().contains("prune"));
     }
 
     #[test]

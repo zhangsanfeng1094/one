@@ -2,11 +2,11 @@ use std::path::PathBuf;
 
 use async_trait::async_trait;
 use one_core::error::Result;
-use one_core::tool::{tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
+use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
 use crate::path_policy::{AccessKind, PathPolicy};
-use crate::tool_args::path_arg;
+use crate::tool_args::path_arg_or;
 
 pub struct LsTool {
     policy: PathPolicy,
@@ -35,11 +35,7 @@ impl Tool for LsTool {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Directory path (Claude Code alias: `file_path`)"
-                    },
-                    "file_path": {
-                        "type": "string",
-                        "description": "Alias for `path` (Claude Code compatibility)"
+                        "description": "Directory path"
                     }
                 }
             }),
@@ -47,7 +43,7 @@ impl Tool for LsTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = path_arg(&call.arguments).unwrap_or(".");
+        let path = path_arg_or(&call.arguments, ".").map_err(|msg| invalid_args("ls", msg))?;
         let resolved = self
             .policy
             .resolve(path, AccessKind::Read)

@@ -401,6 +401,16 @@ sandbox_permissions=require_escalated is a no-op."
             description: format!(
                 "Execute a shell command in the project working directory (Claude Code Bash-compatible).{boundary} \
 Prefer dedicated tools (read/edit/grep/find/ls) over shell for file work. \
+Do not use bash to read or write a path that read/edit just denied — that bypasses \
+the workspace boundary. Format Rust with `cargo fmt -p <crate>` or \
+`cargo fmt -- --check -p <crate>`; never invoke bare `rustfmt` on a single file \
+(it assumes edition 2015 and fails on async fn). \
+Git: prefer compact commands (`git status --short`, `git diff --stat`, \
+`git diff --cached --stat`, `git log -5 --oneline`). Avoid dumping full file diffs \
+into the conversation when a stat/name-only view is enough. To re-stage selectively, \
+use `git restore --staged <path>` + `git add <paths>` — do **not** use bare `git reset` \
+(clears the whole index; needs confirmation and often destroys intentional staging). \
+Do not stage local junk (`.rustup/`, local secrets). \
 Always set `description` to a short human-readable summary of what the command does. \
 For long-running work (tests, builds, dev servers) set run_in_background=true: \
 returns a task_id immediately so you can continue other tools. \
@@ -422,10 +432,6 @@ over limit → full spill under ~/.one/agent/tool-outputs/ + preview + path for 
                     "timeout_secs": {
                         "type": "integer",
                         "description": "Max seconds before the command is killed (foreground default 120; background optional hard limit)"
-                    },
-                    "timeout": {
-                        "type": "integer",
-                        "description": "Alias for timeout_secs (seconds). If value is >= 1000, treated as milliseconds like Claude Code."
                     },
                     "run_in_background": {
                         "type": "boolean",
@@ -631,6 +637,25 @@ mod tests {
     use super::*;
     use one_core::tool::ToolCall;
     use serde_json::json;
+
+    #[test]
+    fn schema_exposes_only_timeout_secs() {
+        let dir = std::env::temp_dir();
+        let tool = BashTool::with_policy(
+            PathPolicy::workspace(dir),
+            true,
+            Arc::new(BackgroundTaskRegistry::new()),
+        );
+        let def = tool.definition();
+        let props = def.parameters["properties"].as_object().unwrap();
+        assert!(props.contains_key("timeout_secs"));
+        assert!(
+            !props.contains_key("timeout"),
+            "do not advertise timeout alias: {props:?}"
+        );
+        let desc = &def.description;
+        assert!(desc.contains("cargo fmt -p"), "{desc}");
+    }
 
     #[tokio::test]
     async fn bash_output_reports_sandbox_status() {

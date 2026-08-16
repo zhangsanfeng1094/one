@@ -108,7 +108,10 @@ fn git_snapshot(cwd: &Path) -> Option<String> {
                 .collect();
             let branch_line = lines.iter().find(|l| l.starts_with("## ")).copied();
             if let Some(b) = branch_line {
-                out.push_str(&format!("\ngit_upstream: {}", b.trim_start_matches("## ").trim()));
+                out.push_str(&format!(
+                    "\ngit_upstream: {}",
+                    b.trim_start_matches("## ").trim()
+                ));
             }
             let total = body.len();
             if total == 0 {
@@ -120,9 +123,7 @@ fn git_snapshot(cwd: &Path) -> Option<String> {
                     block = block.chars().take(GIT_STATUS_MAX_CHARS).collect();
                     block.push('…');
                 }
-                out.push_str(&format!(
-                    "\ngit_status: {total} changed path(s)\n{block}"
-                ));
+                out.push_str(&format!("\ngit_status: {total} changed path(s)\n{block}"));
                 if total > GIT_STATUS_MAX_LINES {
                     out.push_str(&format!(
                         "\n… +{} more (run `git status` for full list)",
@@ -162,7 +163,10 @@ mod tests {
         let block = build_env_context(&tmp);
         assert!(block.contains("<env>"));
         assert!(block.contains("cwd:"));
-        assert!(block.contains(tmp.file_name().unwrap().to_str().unwrap()) || block.contains("one-env-ctx"));
+        assert!(
+            block.contains(tmp.file_name().unwrap().to_str().unwrap())
+                || block.contains("one-env-ctx")
+        );
         assert!(block.contains("platform:"));
         let _ = std::fs::remove_dir_all(&tmp);
     }

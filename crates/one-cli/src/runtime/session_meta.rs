@@ -52,31 +52,19 @@ impl AppRuntime {
     }
 
     /// After messages are appended: write `one.usage`, `one.tool_audit`, and summary.
-    pub async fn persist_run_meta(
-        &mut self,
-        usage_before: TokenUsage,
-        messages_before: usize,
-    ) {
+    pub async fn persist_run_meta(&mut self, usage_before: TokenUsage, messages_before: usize) {
         let (total, context_size, provider, model, new_msgs) = {
             let agent = self.agent.lock().await;
             let total = agent.token_usage;
             let context_size = agent.last_prompt_tokens;
-            let provider = agent
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| match m {
-                    AgentMessage::Assistant(a) => Some(a.provider.clone()),
-                    _ => None,
-                });
-            let model = agent
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| match m {
-                    AgentMessage::Assistant(a) => Some(a.model.clone()),
-                    _ => None,
-                });
+            let provider = agent.messages.iter().rev().find_map(|m| match m {
+                AgentMessage::Assistant(a) => Some(a.provider.clone()),
+                _ => None,
+            });
+            let model = agent.messages.iter().rev().find_map(|m| match m {
+                AgentMessage::Assistant(a) => Some(a.model.clone()),
+                _ => None,
+            });
             let start = messages_before.min(agent.messages.len());
             let new_msgs = agent.messages[start..].to_vec();
             (total, context_size, provider, model, new_msgs)
@@ -141,12 +129,7 @@ impl AppRuntime {
     /// Call **after** [`Self::persist_run_meta`] so `prompt_index` matches the
     /// usage/audit row for the finished run (`prompt_index` was already advanced).
     /// Does **not** enter LLM context (`SessionEntry::Custom`).
-    pub async fn persist_run_error(
-        &mut self,
-        kind: &str,
-        message: &str,
-        stop_reason: &str,
-    ) {
+    pub async fn persist_run_error(&mut self, kind: &str, message: &str, stop_reason: &str) {
         let (provider, model) = {
             let agent = self.agent.lock().await;
             let provider = agent.messages.iter().rev().find_map(|m| match m {
@@ -192,22 +175,14 @@ impl AppRuntime {
             let agent = self.agent.lock().await;
             let text = agent.config.system_prompt.clone();
             // Best-effort last known model from session context / messages.
-            let model = agent
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| match m {
-                    AgentMessage::Assistant(a) => Some(a.model.clone()),
-                    _ => None,
-                });
-            let provider = agent
-                .messages
-                .iter()
-                .rev()
-                .find_map(|m| match m {
-                    AgentMessage::Assistant(a) => Some(a.provider.clone()),
-                    _ => None,
-                });
+            let model = agent.messages.iter().rev().find_map(|m| match m {
+                AgentMessage::Assistant(a) => Some(a.model.clone()),
+                _ => None,
+            });
+            let provider = agent.messages.iter().rev().find_map(|m| match m {
+                AgentMessage::Assistant(a) => Some(a.provider.clone()),
+                _ => None,
+            });
             (text, provider, model)
         };
         if text.is_empty() {

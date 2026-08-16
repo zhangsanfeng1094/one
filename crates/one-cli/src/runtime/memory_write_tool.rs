@@ -139,10 +139,11 @@ L2 in the current session is frozen — new index lines appear after `/reload` o
         // Disk I/O is small; keep off async runtime blocking concerns with spawn_blocking.
         let agent_dir = self.agent_dir.clone();
         let cwd = self.cwd.clone();
-        let result = tokio::task::spawn_blocking(move || upsert_memory_entry(&agent_dir, &cwd, &input))
-            .await
-            .map_err(|e| tool_error("memory_write", format!("join: {e}")))?
-            .map_err(|e| tool_error("memory_write", e))?;
+        let result =
+            tokio::task::spawn_blocking(move || upsert_memory_entry(&agent_dir, &cwd, &input))
+                .await
+                .map_err(|e| tool_error("memory_write", format!("join: {e}")))?
+                .map_err(|e| tool_error("memory_write", e))?;
 
         let action = if result.created {
             "created"
@@ -241,6 +242,9 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("description") || err.to_string().contains("body"), "{err}");
+        assert!(
+            err.to_string().contains("description") || err.to_string().contains("body"),
+            "{err}"
+        );
     }
 }

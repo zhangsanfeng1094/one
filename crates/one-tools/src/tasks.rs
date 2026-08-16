@@ -504,9 +504,7 @@ impl BackgroundTaskRegistry {
         drop(tasks);
 
         let truncated = truncate_monitor_line(line);
-        let body = format!(
-            "[Monitor event · {id} · #{n}]\ncommand: {cmd}\n{truncated}"
-        );
+        let body = format!("[Monitor event · {id} · #{n}]\ncommand: {cmd}\n{truncated}");
         self.push_notification(one_core::system_reminder(body));
         true
     }

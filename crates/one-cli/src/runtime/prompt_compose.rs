@@ -69,7 +69,11 @@ pub fn compose_base_system_prompt(input: ComposeBaseInput<'_>) -> String {
         base.push_str("\n\n");
         base.push_str(env);
     }
-    if let Some(mem) = input.memory_catalog.map(str::trim).filter(|s| !s.is_empty()) {
+    if let Some(mem) = input
+        .memory_catalog
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         base.push_str("\n\n");
         base.push_str(mem);
     }

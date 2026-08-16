@@ -153,7 +153,9 @@ fn soft_check_body(path: &Path, content: &str) -> Option<String> {
                 .to_string(),
         );
     } else if parse_frontmatter_updated(content).is_none() {
-        hints.push("Frontmatter missing `updated: YYYY-MM-DD` (helps age reminders on read).".into());
+        hints.push(
+            "Frontmatter missing `updated: YYYY-MM-DD` (helps age reminders on read).".into(),
+        );
     }
     // Suggest updating MEMORY.md when writing a new body.
     if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
@@ -251,11 +253,7 @@ fn days_since_ymd(s: &str) -> Option<u64> {
     }
     // Days since Unix epoch (approximate civil calendar via time crate free algorithm).
     let epoch_days = civil_days_from_ymd(y, m, d)?;
-    let today = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()?
-        .as_secs()
-        / 86_400;
+    let today = SystemTime::now().duration_since(UNIX_EPOCH).ok()?.as_secs() / 86_400;
     let today = today as i64;
     if today >= epoch_days {
         Some((today - epoch_days) as u64)
@@ -295,9 +293,7 @@ mod tests {
         assert!(is_memory_index_path(Path::new(
             "/x/memory/_global/MEMORY.md"
         )));
-        assert!(!is_memory_index_path(Path::new(
-            "/x/memory/_global/tip.md"
-        )));
+        assert!(!is_memory_index_path(Path::new("/x/memory/_global/tip.md")));
     }
 
     #[test]
@@ -322,10 +318,7 @@ mod tests {
     #[test]
     fn frontmatter_updated() {
         let c = "---\nname: X\nupdated: 2026-01-01\n---\nbody\n";
-        assert_eq!(
-            parse_frontmatter_updated(c).as_deref(),
-            Some("2026-01-01")
-        );
+        assert_eq!(parse_frontmatter_updated(c).as_deref(), Some("2026-01-01"));
     }
 
     #[test]

@@ -6,7 +6,7 @@ use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, T
 use serde_json::json;
 
 use crate::path_policy::{AccessKind, PathPolicy};
-use crate::tool_args::{path_arg, path_properties};
+use crate::tool_args::{path_arg_for_tool, path_properties};
 
 pub struct WriteTool {
     policy: PathPolicy,
@@ -33,10 +33,7 @@ impl Tool for WriteTool {
                 self.policy.cwd().display()
             )
         };
-        let mut properties = path_properties(
-            "Required path to create or overwrite. Prefer `path`; Claude `file_path` and \
-             OpenCode `filePath` are accepted.",
-        );
+        let mut properties = path_properties("Required path to create or overwrite.");
         if let Some(obj) = properties.as_object_mut() {
             obj.insert(
                 "content".into(),
@@ -50,7 +47,7 @@ impl Tool for WriteTool {
             name: "write".to_string(),
             description: format!(
                 "Create a new file or intentionally overwrite an entire file with `content` \
-                 (Claude Code Write-compatible). Always pass `path` (or `file_path`). Prefer \
+                 (Claude Code Write-compatible). Always pass `path`. Prefer \
                  `edit` for small/localized changes — do not rewrite a whole file when a unique \
                  string replace would suffice. Allowed: {scope}."
             ),
@@ -63,13 +60,11 @@ impl Tool for WriteTool {
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let path = path_arg(&call.arguments).ok_or_else(|| {
-            invalid_args(
-                "write",
-                "missing `path` (or Claude `file_path` / OpenCode `filePath`). \
-                 Every write call must include the file path.",
-            )
-        })?;
+        let path = path_arg_for_tool(
+            &call.arguments,
+            "write",
+            "missing `path`. Every write call must include the file path.",
+        )?;
         let content = call
             .arguments
             .get("content")
@@ -165,7 +160,11 @@ mod tests {
             })
             .await
             .unwrap();
-        assert!(out.as_text().contains("system-reminder"), "{}", out.as_text());
+        assert!(
+            out.as_text().contains("system-reminder"),
+            "{}",
+            out.as_text()
+        );
         assert!(out.as_text().contains("frontmatter"), "{}", out.as_text());
         let _ = std::fs::remove_dir_all(&dir);
     }

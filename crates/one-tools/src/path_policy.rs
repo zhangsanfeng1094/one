@@ -314,6 +314,17 @@ impl PathPolicy {
 
     /// Check an already-joined path (absolute or relative-to-cwd).
     pub fn check(&self, path: &Path, access: AccessKind) -> Result<(), String> {
+        // Opaque git objects/index are never useful as text to the model and burn
+        // explore turns. Always refuse (even full-access) so agents use `git` via bash.
+        if matches!(access, AccessKind::Read) && is_opaque_git_path(path) {
+            return Err(format!(
+                "refusing to read opaque git path `{}` — use bash \
+                 (`git status --short`, `git diff --stat`, `git diff --cached --stat`) \
+                 instead of reading `.git/index` / `.git/objects`.",
+                path.display()
+            ));
+        }
+
         if self.mode == SandboxMode::FullAccess {
             return Ok(());
         }
@@ -417,6 +428,31 @@ pub fn resolve_against_cwd(cwd: &Path, path: &str) -> PathBuf {
         cwd.join(p)
     };
     normalize_for_check(&joined)
+}
+
+/// True for git metadata that is binary or useless as model text input.
+///
+/// Allowed (text): `.git/HEAD`, `refs/**`, `logs/**`, `COMMIT_EDITMSG`, `config`.
+/// Denied: `.git/index`, `.git/objects/**` (explore was burning turns on these).
+pub fn is_opaque_git_path(path: &Path) -> bool {
+    let parts: Vec<_> = path
+        .components()
+        .filter_map(|c| match c {
+            Component::Normal(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect();
+    let Some(git_i) = parts.iter().position(|p| p.as_ref() == ".git") else {
+        return false;
+    };
+    let rest = &parts[git_i + 1..];
+    if rest.is_empty() {
+        return false;
+    }
+    match rest[0].as_ref() {
+        "objects" | "index" | "index.lock" => true,
+        _ => false,
+    }
 }
 
 /// Prefer real path via canonicalize of longest existing prefix.
@@ -564,14 +600,7 @@ fn under_sensitive_home(path: &Path, home_norm: &Path) -> bool {
     let first = first.to_string_lossy();
     // Single-segment sensitive dirs
     const SENSITIVE_TOP: &[&str] = &[
-        ".ssh",
-        ".gnupg",
-        ".aws",
-        ".kube",
-        ".docker",
-        ".netrc",
-        ".npmrc",
-        ".mozilla",
+        ".ssh", ".gnupg", ".aws", ".kube", ".docker", ".netrc", ".npmrc", ".mozilla",
     ];
     if SENSITIVE_TOP.iter().any(|s| first == *s) {
         return true;
@@ -691,6 +720,49 @@ mod tests {
     }
 
     #[test]
+    fn opaque_git_paths_detected() {
+        assert!(is_opaque_git_path(Path::new("/proj/.git/index")));
+        assert!(is_opaque_git_path(Path::new("/proj/.git/index.lock")));
+        assert!(is_opaque_git_path(Path::new(
+            "/proj/.git/objects/ab/cdef1234"
+        )));
+        assert!(!is_opaque_git_path(Path::new("/proj/.git/HEAD")));
+        assert!(!is_opaque_git_path(Path::new(
+            "/proj/.git/refs/heads/main"
+        )));
+        assert!(!is_opaque_git_path(Path::new("/proj/.git/COMMIT_EDITMSG")));
+        assert!(!is_opaque_git_path(Path::new("/proj/src/main.rs")));
+    }
+
+    #[test]
+    fn refuse_read_git_index_and_objects() {
+        let dir = temp_dir();
+        let policy = PathPolicy::workspace(dir.clone());
+        let index = dir.join(".git").join("index");
+        let obj = dir.join(".git").join("objects").join("aa").join("bb");
+        let head = dir.join(".git").join("HEAD");
+        std::fs::create_dir_all(obj.parent().unwrap()).unwrap();
+        std::fs::write(&index, b"\0bin").unwrap();
+        std::fs::write(&obj, b"x").unwrap();
+        std::fs::write(&head, "ref: refs/heads/main\n").unwrap();
+
+        let err = policy
+            .check(&index, AccessKind::Read)
+            .expect_err("index must be denied");
+        assert!(err.contains("opaque git"), "{err}");
+        let err = policy
+            .check(&obj, AccessKind::Read)
+            .expect_err("objects must be denied");
+        assert!(err.contains("opaque git"), "{err}");
+        // Text git metadata remains readable when under workspace.
+        policy
+            .check(&head, AccessKind::Read)
+            .expect("HEAD is text metadata");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn skill_roots_readable_not_writable() {
         let dir = temp_dir();
         let policy = PathPolicy::workspace(dir.clone());
@@ -751,8 +823,7 @@ mod tests {
             "clone must share dynamic Arc"
         );
 
-        a.check(&file, AccessKind::Read)
-            .expect_err("before grant");
+        a.check(&file, AccessKind::Read).expect_err("before grant");
         a.grant_read_path(&file);
         b.check(&file, AccessKind::Read)
             .expect("grant on A visible on B");

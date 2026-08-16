@@ -226,10 +226,7 @@ pub fn env_no_memory() -> bool {
 ///
 /// When the feature is off (or env/CLI force-off), `enabled` and `write_enabled`
 /// are both false — no L2, no tools, no memory path grants, no compact archive.
-pub fn effective_memory_options(
-    features: &FeatureState,
-    settings: &Settings,
-) -> MemoryLoadOptions {
+pub fn effective_memory_options(features: &FeatureState, settings: &Settings) -> MemoryLoadOptions {
     let mut opts = settings.memory_load_options();
     if !features.memory_enabled() {
         opts.enabled = false;

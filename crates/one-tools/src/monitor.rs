@@ -56,7 +56,7 @@ Session end / `/new` kills running monitors."
                     "timeout_secs": {
                         "type": "integer",
                         "description": "Hard wall-clock seconds before kill. Default 36000 (10h). \
-Set 0 with persistent=true for no wall limit (still killed on session end)."
+            Set 0 with persistent=true for no wall limit (still killed on session end)."
                     },
                     "timeout_ms": {
                         "type": "integer",
@@ -118,9 +118,8 @@ Set 0 with persistent=true for no wall limit (still killed on session end)."
             .await
             .map_err(|e| tool_error("monitor", e))?;
 
-        let mut text = format!(
-            "Monitor started\ntask_id: {id}\nstatus: running\nmax_events: {max_events}\n"
-        );
+        let mut text =
+            format!("Monitor started\ntask_id: {id}\nstatus: running\nmax_events: {max_events}\n");
         if let Some(secs) = timeout_secs {
             text.push_str(&format!("timeout_secs: {secs}\n"));
         } else {
@@ -154,13 +153,21 @@ Set 0 with persistent=true for no wall limit (still killed on session end)."
 fn resolve_timeout(args: &serde_json::Value, persistent: bool) -> Option<u64> {
     if let Some(ms) = args.get("timeout_ms").and_then(|v| v.as_u64()) {
         if ms == 0 {
-            return if persistent { None } else { Some(DEFAULT_TIMEOUT_SECS) };
+            return if persistent {
+                None
+            } else {
+                Some(DEFAULT_TIMEOUT_SECS)
+            };
         }
         return Some((ms.saturating_add(999)) / 1000);
     }
     if let Some(secs) = args.get("timeout_secs").and_then(|v| v.as_u64()) {
         if secs == 0 {
-            return if persistent { None } else { Some(DEFAULT_TIMEOUT_SECS) };
+            return if persistent {
+                None
+            } else {
+                Some(DEFAULT_TIMEOUT_SECS)
+            };
         }
         return Some(secs);
     }

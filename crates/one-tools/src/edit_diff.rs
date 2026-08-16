@@ -104,15 +104,15 @@ impl EditApplyError {
             }
             EditApplyError::NotFound => {
                 "Could not find old_string in the file (exact and relaxed match strategies failed). \
-                 Tips: re-read the file; do not include read-tool line-number prefixes \
-                 (e.g. `12|`); provide more surrounding context; check indentation, \
-                 whitespace, and quotes."
+                 If you just edited this file, re-read it — the buffer has changed. \
+                 Do not include read-tool line-number prefixes (e.g. `12|`); \
+                 provide more surrounding context; check indentation, whitespace, and quotes."
                     .to_string()
             }
             EditApplyError::Multiple { count } => {
                 format!(
                     "old_string matched {count} times; must be unique. \
-                     Provide more surrounding context to make the match unique, \
+                     Re-read the file, then provide more surrounding context to make the match unique, \
                      or set replace_all=true to change every occurrence."
                 )
             }
@@ -1341,12 +1341,10 @@ mod tests {
     #[test]
     fn block_anchor_tolerates_middle_typo() {
         // Last line must be a strong anchor (not bare `}`).
-        let content =
-            "fn run() {\n    let x = 1;\n    let y = 2;\n    finish_run();\n}\n";
+        let content = "fn run() {\n    let x = 1;\n    let y = 2;\n    finish_run();\n}\n";
         // Middle line slightly wrong (model typo) but anchors match.
         let old = "fn run() {\n    let x = 999;\n    let y = 2;\n    finish_run();";
-        let new =
-            "fn run() {\n    let x = 1;\n    let y = 2;\n    finish_run();\n    ok();";
+        let new = "fn run() {\n    let x = 1;\n    let y = 2;\n    finish_run();\n    ok();";
         let r = apply_edit_lf(content, old, new, false).unwrap();
         assert_eq!(r.strategy, MatchStrategy::BlockAnchor);
         assert!(r.content_lf.contains("ok();"), "{}", r.content_lf);
@@ -1398,8 +1396,13 @@ start_marker {
             find_block_anchor_matches(content, old).is_empty(),
             "near-tie block-anchor must yield no match"
         );
-        let err = apply_edit_lf(content, old, "start_marker {\n    fixed\n    end_marker", false)
-            .unwrap_err();
+        let err = apply_edit_lf(
+            content,
+            old,
+            "start_marker {\n    fixed\n    end_marker",
+            false,
+        )
+        .unwrap_err();
         assert!(
             matches!(
                 err,
@@ -1468,8 +1471,13 @@ start_block {
         // No exact/fuzzy/trim unique equality across both; block-anchor would
         // be the only multi-hit path — it must not run under replace_all.
         let old = "start_block {\n    let a = 0;\n    let b = 0;\n    end_block";
-        let err = apply_edit_lf(content, old, "start_block {\n    fixed\n    end_block", true)
-            .unwrap_err();
+        let err = apply_edit_lf(
+            content,
+            old,
+            "start_block {\n    fixed\n    end_block",
+            true,
+        )
+        .unwrap_err();
         assert!(
             matches!(err, EditApplyError::NotFound),
             "replace_all + block-anchor must not apply, got {err:?}"

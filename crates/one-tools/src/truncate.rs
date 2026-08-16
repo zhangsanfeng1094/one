@@ -73,11 +73,21 @@ fn env_usize(key: &str) -> Option<usize> {
 ///
 /// Colored CLI output (rustfmt, cargo, grep --color) otherwise injects ESC
 /// into tool results and corrupts the Ratatui screen when painted as spans.
+///
+/// Binary-ish tool output may contain lone `ESC` bytes followed by multi-byte
+/// UTF-8. Sequence parsers must never advance into the middle of a character —
+/// `input[i..]` panics when `i` is not a char boundary.
 pub fn strip_ansi_escapes(input: &str) -> String {
     let bytes = input.as_bytes();
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < bytes.len() {
+        // Safety net: never index mid-character (orphan continuation after a
+        // mis-parsed ESC in binary payloads).
+        if (bytes[i] & 0xc0) == 0x80 {
+            i += 1;
+            continue;
+        }
         let b = bytes[i];
         if b == 0x1b {
             i += 1;
@@ -109,15 +119,19 @@ pub fn strip_ansi_escapes(input: &str) -> String {
                         i += 1;
                     }
                 }
+                // Charset designators: ESC ( B, ESC ) 0, etc. — both args ASCII.
+                // Advance one *character* (not one byte) so multi-byte UTF-8
+                // after a malformed sequence stays on a char boundary.
                 b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => {
                     i += 1;
                     if i < bytes.len() {
-                        i += 1;
+                        i = advance_one_utf8_char(bytes, i);
                     }
                 }
-                _ => {
-                    i += 1;
-                }
+                // Unknown ESC-introducer: drop only the ESC. Do **not** skip
+                // the following byte — it may be the lead of a multi-byte char
+                // (common in binary tool output / `file` on ELF + paths).
+                _ => {}
             }
             continue;
         }
@@ -129,11 +143,29 @@ pub fn strip_ansi_escapes(input: &str) -> String {
             i += 1;
             continue;
         }
+        // `i` is a char boundary for valid UTF-8 (or we skipped continuations).
         let ch = input[i..].chars().next().unwrap_or('\u{fffd}');
         out.push(ch);
         i += ch.len_utf8();
     }
     out
+}
+
+/// Advance `i` past one UTF-8 character starting at `i` (or one byte if
+/// the lead is invalid / truncated).
+fn advance_one_utf8_char(bytes: &[u8], i: usize) -> usize {
+    if i >= bytes.len() {
+        return i;
+    }
+    let width = match bytes[i] {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        // Continuation or illegal lead: skip a single byte.
+        _ => 1,
+    };
+    (i + width).min(bytes.len())
 }
 
 fn limits_cell() -> &'static RwLock<ToolOutputLimits> {
@@ -723,6 +755,83 @@ mod tests {
         assert!(!clean.contains('\u{1b}'));
     }
 
+    /// Regression: ESC followed by multi-byte UTF-8 must not panic.
+    ///
+    /// Repro shape from panic log: tool output mixed Japanese path text with
+    /// ELF bytes (`\x7fELF…`). A lone ESC before a multi-byte char used to
+    /// advance one byte into the character, then `input[i..]` panicked with
+    /// "byte index N is not a char boundary".
+    #[test]
+    fn strip_ansi_esc_before_multibyte_utf8_no_panic() {
+        // ESC + U+030F (combining double grave, 2 bytes) — exact panic char.
+        let raw = "\u{1b}\u{30f}tail";
+        let clean = strip_ansi_escapes(raw);
+        assert!(clean.contains('t'));
+        assert!(!clean.contains('\u{1b}'));
+
+        // ESC + Japanese "月" (3-byte UTF-8) as in `7月 15`.
+        let raw = "7\u{1b}月 15";
+        let clean = strip_ansi_escapes(raw);
+        assert_eq!(clean, "7月 15");
+
+        // Charset designator form then multi-byte.
+        let raw = "\u{1b}(月x";
+        let _ = strip_ansi_escapes(raw);
+
+        // Binary-ish payload: DEL+ELF magic, NULs, ESC mid-stream, multi-byte.
+        let mut raw = String::from("path 7月\n");
+        raw.push('\u{7f}');
+        raw.push_str("ELF");
+        raw.push('\0');
+        raw.push('\u{1b}');
+        raw.push('\u{30f}');
+        raw.push_str("more");
+        let clean = strip_ansi_escapes(&raw);
+        assert!(clean.contains("7月"));
+        assert!(clean.contains("ELF"));
+        assert!(clean.contains("more"));
+        assert!(!clean.contains('\u{1b}'));
+        assert!(!clean.contains('\u{7f}'));
+    }
+
+    #[test]
+    fn present_tool_output_binary_mixed_utf8_no_panic() {
+        with_temp_spill_root(|_| {
+            let dir = std::env::temp_dir().join(format!(
+                "one-bin-utf8-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0)
+            ));
+            let _ = std::fs::create_dir_all(&dir);
+            // Build a large payload that hits byte limits and exercises strip.
+            let mut content = String::new();
+            for _ in 0..200 {
+                content
+                    .push_str("lrwxrwxrwx 1 fxh fxh 24  7月 15 21:18 /home/fxh/.local/bin/grok\n");
+                content.push('\u{7f}');
+                content.push_str("ELF");
+                content.push('\u{1b}');
+                content.push('\u{30f}');
+                content.push_str("binary-tail\n");
+            }
+            let presented = present_tool_output_with(
+                &content,
+                "bash",
+                &dir,
+                PreviewStyle::Tail,
+                Some(ToolOutputLimits {
+                    max_lines: 50,
+                    max_bytes: 2048,
+                }),
+            );
+            assert!(presented.truncated || !presented.text.is_empty());
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
     #[test]
     fn head_no_truncation() {
         let r = truncate_head("a\nb\nc", 10, 1000);
@@ -842,7 +951,10 @@ mod tests {
                 presented.text
             );
             let path = presented.spill_path.unwrap();
-            assert!(path.starts_with(root), "spill outside override root: {path:?}");
+            assert!(
+                path.starts_with(root),
+                "spill outside override root: {path:?}"
+            );
             assert!(path.exists());
             let on_disk = std::fs::read_to_string(&path).unwrap();
             assert_eq!(on_disk, big.trim_end());
