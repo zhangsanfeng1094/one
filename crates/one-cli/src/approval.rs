@@ -244,8 +244,7 @@ impl PermissionGate {
                     }
                 }
                 PendingKind::Standard | PendingKind::SandboxEscalate => {
-                    let escalate =
-                        matches!(pending.kind, PendingKind::SandboxEscalate);
+                    let escalate = matches!(pending.kind, PendingKind::SandboxEscalate);
                     match &choice {
                         ApprovalChoice::Session => {
                             self.session_allows
@@ -338,7 +337,6 @@ impl PermissionGate {
             },
         }
     }
-
 }
 
 fn is_path_read_tool(name: &str) -> bool {
@@ -351,9 +349,7 @@ fn is_path_write_tool(name: &str) -> bool {
 
 /// When Interactive and path Select is allowed (not session_auto / kill-switch).
 fn path_prompt_allowed(mode: ApprovalMode, session_auto: bool) -> bool {
-    matches!(mode, ApprovalMode::Interactive)
-        && !session_auto
-        && path_read_escalate_env_enabled()
+    matches!(mode, ApprovalMode::Interactive) && !session_auto && path_read_escalate_env_enabled()
 }
 
 /// Kill-switch: `ONE_PATH_READ_ESCALATE=0` disables Select (hard deny).
@@ -368,14 +364,12 @@ fn path_read_escalate_env_enabled() -> bool {
     }
 }
 
-fn path_from_call(call: &ToolCall) -> Option<String> {
-    if let Some(p) = path_arg(&call.arguments) {
-        return Some(p.to_string());
+fn path_from_call(call: &ToolCall) -> std::result::Result<Option<String>, String> {
+    match path_arg(&call.arguments)? {
+        Some(p) => Ok(Some(p.to_string())),
+        None if matches!(call.name.as_str(), "grep" | "find" | "ls") => Ok(Some(".".into())),
+        None => Ok(None),
     }
-    if matches!(call.name.as_str(), "grep" | "find" | "ls") {
-        return Some(".".into());
-    }
-    None
 }
 
 #[async_trait]
@@ -448,7 +442,9 @@ impl ToolGate for PermissionGate {
                         }
                         // Interactive TUI (including Auto mode from auto_approve /
                         // Always): surface the Select dock.
-                        ApprovalMode::Interactive | ApprovalMode::Auto | ApprovalMode::FailClosed => {
+                        ApprovalMode::Interactive
+                        | ApprovalMode::Auto
+                        | ApprovalMode::FailClosed => {
                             let id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
                             let escalate = requires_escalation(call);
                             let request = ApprovalRequest {
@@ -494,8 +490,10 @@ impl PermissionGate {
         let name = call.name.as_str();
 
         if is_path_write_tool(name) {
-            let Some(path_str) = path_arg(&call.arguments) else {
-                return ToolGateDecision::Allow; // tool will invalid_args
+            let path_str = match path_arg(&call.arguments) {
+                Ok(Some(p)) => p,
+                Ok(None) => return ToolGateDecision::Allow, // tool will invalid_args
+                Err(msg) => return ToolGateDecision::Deny { message: msg },
             };
             return match policy.resolve(path_str, AccessKind::Write) {
                 Ok(_) => ToolGateDecision::Allow,
@@ -507,8 +505,10 @@ impl PermissionGate {
             return ToolGateDecision::Allow;
         }
 
-        let Some(path_str) = path_from_call(call) else {
-            return ToolGateDecision::Allow;
+        let path_str = match path_from_call(call) {
+            Ok(Some(p)) => p,
+            Ok(None) => return ToolGateDecision::Allow,
+            Err(msg) => return ToolGateDecision::Deny { message: msg },
         };
 
         match policy.resolve(&path_str, AccessKind::Read) {
@@ -641,7 +641,10 @@ mod tests {
         );
         assert!(gate.respond(ApprovalChoice::Deny { feedback: None }));
         let decision = check.await.expect("join");
-        assert!(matches!(decision, ToolGateDecision::Deny { .. }), "{decision:?}");
+        assert!(
+            matches!(decision, ToolGateDecision::Deny { .. }),
+            "{decision:?}"
+        );
     }
 
     #[tokio::test]
@@ -1130,6 +1133,37 @@ mod tests {
         }
         assert!(gate.poll_request().is_none());
         let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_alias_conflict_is_denied() {
+        let ws = temp_workspace();
+        let policy = PathPolicy::workspace(ws.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            true,
+            Some(policy),
+        );
+        let d = gate
+            .check(&ToolCall {
+                id: "1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "path": "/tmp/wrong.rs",
+                    "file_path": "src/lib.rs",
+                    "old_string": "a",
+                    "new_string": "b"
+                }),
+            })
+            .await;
+        match d {
+            ToolGateDecision::Deny { message } => {
+                assert!(message.contains("conflicting path aliases"), "{message}");
+            }
+            other => panic!("expected conflict deny, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(&ws);
     }
 

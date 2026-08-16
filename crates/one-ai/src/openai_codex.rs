@@ -217,6 +217,8 @@ mod inner {
             let mut status: Option<String> = None;
             let mut usage = TokenUsage::default();
             let mut citations = Vec::new();
+            // Capture once — never TextDelta (duplicates on retry / multi-event).
+            let mut stream_error: Option<String> = None;
 
             let aborted = matches!(
                 crate::sse::read_sse_response(
@@ -399,14 +401,22 @@ mod inner {
                                 }
                             }
                             "response.failed" | "error" => {
-                                if let Some(msg) = value
-                                    .pointer("/response/error/message")
-                                    .or_else(|| value.get("message"))
-                                    .and_then(|v| v.as_str())
-                                {
-                                    on_event(StreamEvent::TextDelta(format!(
-                                        "[openai-codex error] {msg}"
-                                    )));
+                                if stream_error.is_none() {
+                                    if let Some(msg) = value
+                                        .pointer("/response/error/message")
+                                        .or_else(|| value.pointer("/error/message"))
+                                        .or_else(|| value.get("message"))
+                                        .and_then(|v| v.as_str())
+                                        .filter(|m| !m.is_empty())
+                                    {
+                                        stream_error = Some(msg.to_string());
+                                    } else {
+                                        stream_error =
+                                            Some("response failed (no error message)".into());
+                                    }
+                                }
+                                if status.is_none() {
+                                    status = Some("failed".into());
                                 }
                             }
                             _ => {}
@@ -418,11 +428,35 @@ mod inner {
                 Err(OneError::Aborted)
             );
 
+            if aborted {
+                let mut response = assemble(
+                    self.name(),
+                    &self.model,
+                    full_text,
+                    thinking_text,
+                    tool_acc.into_values().collect(),
+                    Some("stop"),
+                    usage,
+                );
+                response.stop_reason = StopReason::Aborted;
+                response.citations = citations;
+                let _ = self.inner.model();
+                return Ok(response);
+            }
+
+            if let Some(msg) = stream_error {
+                return Err(OneError::Provider(format!("openai-codex: {msg}")));
+            }
+            if status.as_deref() == Some("failed") {
+                return Err(OneError::Provider(
+                    "openai-codex: response failed".into(),
+                ));
+            }
+
             let finish = match status.as_deref() {
                 Some("completed") if !tool_acc.is_empty() => Some("tool_calls"),
                 Some("completed") => Some("stop"),
                 Some("incomplete") => Some("length"),
-                Some("failed") => Some("stop"),
                 _ if !tool_acc.is_empty() => Some("tool_calls"),
                 _ => Some("stop"),
             };
@@ -436,9 +470,6 @@ mod inner {
                 finish,
                 usage,
             );
-            if aborted {
-                response.stop_reason = StopReason::Aborted;
-            }
             response.citations = citations;
 
             // Silence unused field warning for inner (kept for future shared helpers).

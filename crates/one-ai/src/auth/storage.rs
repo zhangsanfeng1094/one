@@ -183,17 +183,51 @@ impl AuthStorage {
         self.remove(provider)
     }
 
-    /// Blocking resolve — safe inside a multi-thread Tokio runtime via `block_in_place`.
+    /// Blocking resolve for sync call sites (provider factory).
+    ///
+    /// Safe from multi-thread Tokio workers **and** from a `LocalSet` (ACP
+    /// mode): `block_in_place` panics inside LocalSet, so we always run the
+    /// async resolve on a short-lived OS thread with its own current-thread
+    /// runtime when a Tokio handle is already present.
     pub fn resolve_api_key_blocking(&self, provider: &str) -> AuthResult<Option<ModelAuth>> {
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            tokio::task::block_in_place(|| handle.block_on(self.resolve_api_key(provider)))
-        } else {
+        // Fast path: no Tokio runtime → nested current-thread runtime on this thread.
+        if tokio::runtime::Handle::try_current().is_err() {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .map_err(|e| AuthError::Msg(e.to_string()))?;
-            rt.block_on(self.resolve_api_key(provider))
+            return rt.block_on(self.resolve_api_key(provider));
         }
+
+        // Inside Tokio (incl. LocalSet / ACP): never call block_in_place.
+        // Snapshot state and resolve on a dedicated OS thread.
+        let path = self.path.clone();
+        let runtime_overrides = self
+            .runtime
+            .lock()
+            .expect("auth runtime lock")
+            .clone();
+        let data_snapshot = self.data.lock().expect("auth data lock").clone();
+        let provider = provider.to_string();
+
+        let join = std::thread::Builder::new()
+            .name("one-auth-resolve".into())
+            .spawn(move || {
+                let storage = AuthStorage {
+                    path,
+                    data: Mutex::new(data_snapshot),
+                    runtime: Mutex::new(runtime_overrides),
+                };
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|e| AuthError::Msg(e.to_string()))?;
+                rt.block_on(storage.resolve_api_key(&provider))
+            })
+            .map_err(|e| AuthError::Msg(format!("spawn auth resolve thread: {e}")))?;
+
+        join.join()
+            .map_err(|_| AuthError::Msg("auth resolve thread panicked".into()))?
     }
 
     /// Resolve an access token / API key for a provider, refreshing OAuth if needed.

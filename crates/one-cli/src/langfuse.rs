@@ -511,9 +511,7 @@ impl LangfuseTraceSink {
                 state.provider = provider.clone();
 
                 let is_subagent = self.parent_for_root.is_some()
-                    || task_id
-                        .as_ref()
-                        .is_some_and(|t| t.starts_with("subagent:"));
+                    || task_id.as_ref().is_some_and(|t| t.starts_with("subagent:"));
                 let name = match task_id {
                     Some(t) if t.starts_with("subagent:") => t.clone(),
                     Some(t) => format!("one:{t}"),
@@ -572,10 +570,7 @@ impl LangfuseTraceSink {
                     ));
                 }
                 if let Some(preview) = input_preview {
-                    attrs.push(KeyValue::new(
-                        "langfuse.observation.input",
-                        preview.clone(),
-                    ));
+                    attrs.push(KeyValue::new("langfuse.observation.input", preview.clone()));
                     // Trace-level input only for top-level runs (not nested subagents).
                     if self.parent_for_root.is_none() {
                         attrs.push(KeyValue::new("langfuse.trace.input", preview.clone()));
@@ -686,12 +681,8 @@ impl LangfuseTraceSink {
             } => {
                 // End previous turns so waterfall durations are per-turn, not
                 // stretched to RunEnd. Also close any stray tools/llms from prior turns.
-                let prior_turns: Vec<usize> = state
-                    .turns
-                    .keys()
-                    .copied()
-                    .filter(|t| *t < *turn)
-                    .collect();
+                let prior_turns: Vec<usize> =
+                    state.turns.keys().copied().filter(|t| *t < *turn).collect();
                 for t in prior_turns {
                     if let Some(cx) = state.turns.remove(&t) {
                         cx.span().end_with_timestamp(ms_to_system_time(*ts_ms));
@@ -754,10 +745,7 @@ impl LangfuseTraceSink {
                 // Set model early so Langfuse types this as a generation even if the
                 // response never arrives (timeout / abort mid-stream).
                 if let Some(m) = &state.model {
-                    attrs.push(KeyValue::new(
-                        "langfuse.observation.model.name",
-                        m.clone(),
-                    ));
+                    attrs.push(KeyValue::new("langfuse.observation.model.name", m.clone()));
                     attrs.push(KeyValue::new("gen_ai.request.model", m.clone()));
                 }
                 if let Some(p) = &state.provider {
@@ -852,15 +840,14 @@ impl LangfuseTraceSink {
                     span.set_attribute(KeyValue::new("thinking_len", *thinking_len as i64));
                     // Structured tool calls for Langfuse generation detail / filters.
                     if !tool_calls.is_empty() {
-                        let tc_json = serde_json::to_string(tool_calls)
-                            .unwrap_or_else(|_| "[]".into());
+                        let tc_json =
+                            serde_json::to_string(tool_calls).unwrap_or_else(|_| "[]".into());
                         span.set_attribute(KeyValue::new(
                             "langfuse.observation.metadata.tool_calls",
                             tc_json.clone(),
                         ));
                         // Also expose a compact names list for quick filters.
-                        let names: Vec<&str> =
-                            tool_calls.iter().map(|c| c.name.as_str()).collect();
+                        let names: Vec<&str> = tool_calls.iter().map(|c| c.name.as_str()).collect();
                         span.set_attribute(KeyValue::new(
                             "langfuse.observation.metadata.tool_names",
                             names.join(","),
@@ -897,10 +884,7 @@ impl LangfuseTraceSink {
                     // Intermediate retry samples are warnings, not success.
                     let is_retry = stop_reason == "empty_retry" || stop_reason == "provider_retry";
                     if is_retry {
-                        span.set_attribute(KeyValue::new(
-                            "langfuse.observation.level",
-                            "WARNING",
-                        ));
+                        span.set_attribute(KeyValue::new("langfuse.observation.level", "WARNING"));
                         span.set_status(Status::error(stop_reason.clone()));
                     } else {
                         span.set_status(Status::Ok);
@@ -1239,7 +1223,62 @@ impl TraceSink for LangfuseTraceSink {
 
 impl Drop for LangfuseTraceSink {
     fn drop(&mut self) {
-        self.shutdown();
+        // Never run blocking OTLP `force_flush` / score joins on the Drop path
+        // when this is a **child** fork (`owns_provider == false`). Subagent
+        // harnesses drop their sink on a Tokio worker right after `AgentEnd`;
+        // a hung flush (BatchSpanProcessor + Tokio runtime) leaves the job stuck
+        // on "▸ finishing" for tens of minutes, holds the LLM permit, and makes
+        // wall `timeout()` useless (it cannot cancel blocking code).
+        //
+        // Child spans stay open until the process-root sink flushes on exit /
+        // explicit `shutdown()`. End open spans so we do not leak handles.
+        if !self.owns_provider {
+            self.end_open_spans_only();
+            return;
+        }
+        // Root sink: prefer explicit `shutdown()` from CLI exit paths. Drop is a
+        // last-resort best-effort — still avoid deadlocking a Tokio worker by
+        // moving the blocking flush onto a detached thread.
+        let end_only = self.exporting;
+        if end_only {
+            // Detach so Drop returns immediately; process exit may race the flush.
+            // CLI still calls `shutdown()` explicitly before exit when possible.
+            self.end_open_spans_only();
+            // Best-effort async flush off the worker (ignore join — Drop cannot wait).
+            let provider = Arc::clone(&self.provider);
+            let _ = std::thread::Builder::new()
+                .name("langfuse-drop-flush".into())
+                .spawn(move || {
+                    if let Ok(guard) = provider.lock() {
+                        if let Some(p) = guard.as_ref() {
+                            let _ = p.force_flush();
+                        }
+                    }
+                });
+        } else {
+            self.end_open_spans_only();
+        }
+    }
+}
+
+impl LangfuseTraceSink {
+    /// End open spans without network I/O (safe on Tokio workers / Drop).
+    fn end_open_spans_only(&self) {
+        if let Ok(mut st) = self.state.lock() {
+            for (_, cx) in st.tools.drain() {
+                cx.span().end();
+            }
+            for (_, cx) in st.llms.drain() {
+                cx.span().end();
+            }
+            for (_, cx) in st.turns.drain() {
+                cx.span().end();
+            }
+            if let Some(cx) = st.root.take() {
+                cx.span().end();
+            }
+            st.run_id = None;
+        }
     }
 }
 
@@ -1441,9 +1480,7 @@ mod tests {
             },
             provider: "mock".into(),
             model: "m".into(),
-            output_preview: Some(
-                json!({"role": "assistant", "content": "ok"}).to_string(),
-            ),
+            output_preview: Some(json!({"role": "assistant", "content": "ok"}).to_string()),
             tool_calls: vec![],
         });
         sink.record(TraceEvent::RunEnd {

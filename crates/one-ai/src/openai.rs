@@ -277,8 +277,16 @@ mod inner {
                 &base_url,
                 &model,
             );
+            // Connect timeout only — do not set a total request timeout: SSE
+            // streams for long tool-use turns legitimately stay open for minutes.
+            // A hung TCP connect (dead proxy / blackholed host) used to park the
+            // parent agent on "Thinking…" forever with no tokens and no error.
+            let client = Client::builder()
+                .connect_timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_else(|_| Client::new());
             Self {
-                client: Client::new(),
+                client,
                 api_key: api_key.into(),
                 model,
                 base_url,
@@ -703,6 +711,9 @@ mod inner {
             let mut status: Option<String> = None;
             let mut usage = TokenUsage::default();
             let mut citations = Vec::new();
+            // Capture once — never TextDelta: that polluted the assistant bubble
+            // and concatenated on every empty/provider retry (see UI screenshot).
+            let mut stream_error: Option<String> = None;
 
             let aborted = crate::sse::read_sse_may_abort(
                 response,
@@ -871,13 +882,24 @@ mod inner {
                                 .map(|s| s.to_string());
                         }
                         "response.failed" | "error" => {
-                            // Surface later via empty content + error if needed; store message.
-                            if let Some(msg) = value
-                                .pointer("/response/error/message")
-                                .or_else(|| value.get("message"))
-                                .and_then(|v| v.as_str())
-                            {
-                                on_event(StreamEvent::TextDelta(format!("[openai error] {msg}")));
+                            // Keep first message only; proxies often emit both
+                            // `error` and `response.failed` with the same text.
+                            if stream_error.is_none() {
+                                if let Some(msg) = value
+                                    .pointer("/response/error/message")
+                                    .or_else(|| value.pointer("/error/message"))
+                                    .or_else(|| value.get("message"))
+                                    .and_then(|v| v.as_str())
+                                    .filter(|m| !m.is_empty())
+                                {
+                                    stream_error = Some(msg.to_string());
+                                } else {
+                                    stream_error =
+                                        Some("response failed (no error message)".into());
+                                }
+                            }
+                            if status.is_none() {
+                                status = Some("failed".into());
                             }
                         }
                         _ => {}
@@ -887,11 +909,37 @@ mod inner {
             )
             .await?;
 
+            // Abort wins over stream failure — user cancelled.
+            if aborted {
+                let mut response = assemble_response_with_usage(
+                    self.name(),
+                    &self.model,
+                    full_text,
+                    thinking_text,
+                    tool_acc.into_values().collect(),
+                    Some("stop"),
+                    usage,
+                );
+                response.stop_reason = StopReason::Aborted;
+                response.citations = citations;
+                return Ok(response);
+            }
+
+            // Failed stream → Provider error (retryable when overloaded/etc.),
+            // never an empty Ok that gets mis-classified as blank completion.
+            if let Some(msg) = stream_error {
+                return Err(OneError::Provider(format!("openai responses: {msg}")));
+            }
+            if status.as_deref() == Some("failed") {
+                return Err(OneError::Provider(
+                    "openai responses: response failed".into(),
+                ));
+            }
+
             let finish = match status.as_deref() {
                 Some("completed") if !tool_acc.is_empty() => Some("tool_calls"),
                 Some("completed") => Some("stop"),
                 Some("incomplete") => Some("length"),
-                Some("failed") => Some("stop"),
                 _ if !tool_acc.is_empty() => Some("tool_calls"),
                 _ => Some("stop"),
             };
@@ -905,9 +953,6 @@ mod inner {
                 finish,
                 usage,
             );
-            if aborted {
-                response.stop_reason = StopReason::Aborted;
-            }
             response.citations = citations;
             Ok(response)
         }
@@ -2067,6 +2112,62 @@ mod inner {
                 .unwrap()
                 .iter()
                 .any(|tool| tool["type"] == "web_search"));
+        }
+
+        /// Streamed `error` + `response.failed` must become a single Provider
+        /// error — never repeated TextDelta assistant content.
+        #[tokio::test]
+        async fn streamed_response_failure_is_provider_error_not_text() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let _ = read_json_body(&mut socket).await;
+                let sse = concat!(
+                    "data: {\"type\":\"error\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}\n\n",
+                    "data: {\"type\":\"response.failed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n",
+                    "data: {\"type\":\"error\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}\n\n",
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{sse}",
+                    sse.len()
+                );
+                socket.write_all(response.as_bytes()).await.unwrap();
+            });
+
+            let provider = OpenAiProvider::with_base("key", "gpt-5", format!("http://{addr}/v1"))
+                .with_wire_api(OpenaiWireApi::Responses);
+
+            let mut text_deltas = Vec::new();
+            let err = provider
+                .complete_streaming(
+                    request(Vec::new()),
+                    &mut |event| {
+                        if let StreamEvent::TextDelta(d) = event {
+                            text_deltas.push(d);
+                        }
+                    },
+                    None,
+                )
+                .await
+                .unwrap_err();
+
+            let msg = err.to_string();
+            assert!(
+                msg.contains("overloaded"),
+                "expected provider error, got: {msg}"
+            );
+            assert!(
+                text_deltas.is_empty(),
+                "must not emit error as TextDelta (would duplicate in UI): {text_deltas:?}"
+            );
+            // Single error string — not concatenated copies.
+            assert_eq!(
+                msg.matches("overloaded").count(),
+                1,
+                "error message should appear once: {msg}"
+            );
+            server.await.unwrap();
         }
     }
 }
