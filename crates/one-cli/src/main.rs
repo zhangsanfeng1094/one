@@ -18,7 +18,7 @@ use clap::{CommandFactory, FromArgMatches};
 use one_session::export_html;
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Commands, ResumeCli, RunMode};
+use crate::cli::{AcpCli, Cli, Commands, ResumeCli, RunMode};
 use crate::protocol::{RunResult, UsageSnapshot};
 use crate::provider::ProviderSet;
 use crate::runtime::AppRuntime;
@@ -27,7 +27,10 @@ use std::process::ExitCode;
 use std::time::Instant;
 
 /// Map `one resume [SPEC] [--list]` onto existing `--session` / `--resume` flags.
-async fn apply_resume_cli(cli: &mut Cli, resume: ResumeCli) -> Result<(), Box<dyn std::error::Error>> {
+async fn apply_resume_cli(
+    cli: &mut Cli,
+    resume: ResumeCli,
+) -> Result<(), Box<dyn std::error::Error>> {
     let cwd = cli.cwd.canonicalize().unwrap_or_else(|_| cli.cwd.clone());
 
     if resume.list {
@@ -59,7 +62,12 @@ async fn apply_resume_cli(cli: &mut Cli, resume: ResumeCli) -> Result<(), Box<dy
         std::process::exit(0);
     }
 
-    match resume.spec.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+    match resume
+        .spec
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
         None => {
             // Same as `one -r`: TUI picker, or most-recent in print mode.
             cli.resume = true;
@@ -69,11 +77,7 @@ async fn apply_resume_cli(cli: &mut Cli, resume: ResumeCli) -> Result<(), Box<dy
         }
         Some(spec) => match SessionManager::resolve(&cwd, spec).await {
             Ok(info) => {
-                eprintln!(
-                    "resume: {} · {}",
-                    info.display_label(),
-                    info.path.display()
-                );
+                eprintln!("resume: {} · {}", info.display_label(), info.path.display());
                 cli.session = Some(info.path);
                 cli.resume = false;
                 cli.r#continue = false;
@@ -277,11 +281,19 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 
     // Interactive TUI owns the terminal — never print tracing to stderr
     // (MCP background connect would otherwise corrupt the alternate screen).
+    // ACP reserves stdout for JSON-RPC; keep tracing on stderr.
     let interactive_tui = matches!(run_mode, RunMode::Interactive)
         && cli.command.is_none()
         && !cli.list_models
         && !cli.list_providers;
     init_tracing(interactive_tui);
+
+    // `one acp` — Agent Client Protocol over stdio (IDE embedding).
+    if matches!(&cli.command, Some(Commands::Acp(_))) {
+        if let Some(Commands::Acp(acp)) = cli.command.take() {
+            return run_acp_command(cli, acp).await;
+        }
+    }
 
     if let Some(Commands::Mcp(mcp)) = cli.command {
         mcp_cmd::run_mcp(mcp).await?;
@@ -351,6 +363,12 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
                 .unwrap_or_default();
             println!("{}:{} — {}{ctx}", model.provider, model.id, model.name);
         }
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // ACP manages its own sessions — skip default AppRuntime assembly.
+    if matches!(run_mode, RunMode::Acp) {
+        modes::run_acp(cli).await?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -445,6 +463,10 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             modes::run_rpc(&mut runtime, providers.as_llm()).await?;
             ExitCode::SUCCESS
         }
+        RunMode::Acp => {
+            // Handled before AppRuntime::build.
+            unreachable!("acp mode exits earlier");
+        }
         RunMode::Interactive => {
             // `-p` / `--tui -p` seeds the first user turn inside the TUI.
             modes::run_interactive(&mut runtime, &mut providers, cli.print.clone()).await?;
@@ -458,6 +480,17 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     runtime.flush_trace();
 
     Ok(exit)
+}
+
+/// `one acp` — apply yolo / mode flags and enter ACP stdio server.
+async fn run_acp_command(mut cli: Cli, acp: AcpCli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    cli.mode = RunMode::Acp;
+    if acp.yolo {
+        cli.auto_approve = true;
+    }
+    // Do not build a default TUI/print runtime first — ACP owns session lifecycle.
+    modes::run_acp(cli).await?;
+    Ok(ExitCode::SUCCESS)
 }
 
 /// `--output-format json`: single RunResult line (docs/protocol.md).

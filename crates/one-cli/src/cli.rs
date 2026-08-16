@@ -63,6 +63,9 @@ pub enum RunMode {
     Print,
     Json,
     Rpc,
+    /// Agent Client Protocol over stdio (IDE / external clients).
+    /// Prefer the `one acp` subcommand for editor configs.
+    Acp,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -102,7 +105,7 @@ pub struct Cli {
     pub session: Option<PathBuf>,
 
     /// Do not persist a session file.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub no_session: bool,
 
     /// Provider to use (defaults to last selection, or mock).
@@ -146,11 +149,11 @@ pub struct Cli {
     pub name: Option<String>,
 
     /// Read-only tools only.
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub read_only: bool,
 
     /// Start in plan mode (explore + write plan; no code edits until /act).
-    #[arg(long)]
+    #[arg(long, global = true)]
     pub plan: bool,
 
     /// Export current session to HTML file.
@@ -175,22 +178,22 @@ pub struct Cli {
     pub share: bool,
 
     /// Do not connect MCP servers for this session.
-    #[arg(long = "no-mcp")]
+    #[arg(long = "no-mcp", global = true)]
     pub no_mcp: bool,
 
     /// Do not inject the skills catalog into the system prompt (or load skill roots).
     /// Also set via env `ONE_DISABLE_SKILLS=1`. Useful for isolated harness evals.
-    #[arg(long = "no-skills")]
+    #[arg(long = "no-skills", global = true)]
     pub no_skills: bool,
 
     /// Disable the subagent feature for this process (`task` / job tools + prompt section).
     /// Also set via env `ONE_DISABLE_SUBAGENT=1`. Overrides settings.features.subagent.
-    #[arg(long = "no-subagent")]
+    #[arg(long = "no-subagent", global = true)]
     pub no_subagent: bool,
 
     /// Do not inject the cross-session memory L2 catalog into the system prompt.
     /// Also set via env `ONE_NO_MEMORY=1` / `ONE_MEMORY=0`.
-    #[arg(long = "no-memory")]
+    #[arg(long = "no-memory", global = true)]
     pub no_memory: bool,
 
     /// Export execution trace to Langfuse (turns / LLM / tools / usage / scores).
@@ -235,6 +238,21 @@ pub enum Commands {
     Run(crate::agent_cmd::RunCli),
     /// Resume a session after quitting (`one resume` / `one resume <id|name|path>`)
     Resume(ResumeCli),
+    /// Speak Agent Client Protocol (ACP) over stdio for IDE embedding
+    ///
+    /// JSON-RPC 2.0 on stdin/stdout. Configure editors as:
+    /// `one acp --cwd /path/to/project --provider …`
+    Acp(AcpCli),
+}
+
+/// CLI: `one acp` — Agent Client Protocol server (stdio).
+#[derive(Debug, Clone, clap::Args)]
+pub struct AcpCli {
+    /// Auto-approve tool permission requests (yolo).
+    ///
+    /// Equivalent to `--yes` for the ACP process.
+    #[arg(long = "yolo")]
+    pub yolo: bool,
 }
 
 /// CLI: `one resume [SPEC]` — re-open a project session from the shell.

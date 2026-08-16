@@ -7,6 +7,9 @@ one                          # 交互模式（自动创建 session）
 one -p "explain this repo"   # print 模式（裸 -p；脚本/CI）
 one --tui -p "fix the bug"  # TUI + 首条消息自动发出（监督/评测）
 one --mode interactive -p "…"  # 同上（显式 mode）
+one acp                      # Agent Client Protocol（IDE 嵌入；JSON-RPC stdio）
+one acp --cwd /proj --provider xai -y
+one --mode acp               # 同上
 one --continue / -c          # 继续最近 session
 one --resume / -r            # 交互：打开 session 选择器；非交互：最近 session
 one resume                   # 退出后恢复：同 `one -r`（TUI 选择器）
@@ -47,6 +50,7 @@ one -p "hello" --provider mock -y --output-format json   # 主会话 RunResult e
 # 参数：prompt（必填）, agent|mode=explore, description?, agent_spec?
 # tool_result 形如：[task · explore · status=success]\n<summary>
 # 物理 LLM 并发：ONE_LLM_CONCURRENCY（默认 4）；逻辑 task 槽：spawn_policy.max_concurrent（默认 4）
+# 子 job 事件落盘：~/.one/agent/jobs/<job_id>.jsonl（ONE_JOB_LOG_DIR / ONE_JOB_LOG=0）
 
 # 订阅 / OAuth 登录（catalog：Codex · xAI · OpenCode Zen/Go）
 one login                    # 交互选择

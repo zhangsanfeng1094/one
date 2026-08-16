@@ -26,11 +26,21 @@ one-resources.workspace = true
 one-ext.workspace = true
 one-mcp.workspace = true
 one-tui.workspace = true
+# ACP agent mode (JSON-RPC over stdio for IDE clients). Trait API is stable for
+# implementers; enable session list/model/usage unstable methods we already support.
+agent-client-protocol = { version = "0.9.5", features = [
+    "unstable_session_list",
+    "unstable_session_model",
+    "unstable_session_resume",
+    "unstable_session_usage",
+] }
 async-trait.workspace = true
 base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 dotenvy = "0.15"
+futures = { workspace = true }
+tokio-util = { version = "0.7", features = ["compat"] }
 opentelemetry = "0.31"
 opentelemetry_sdk = { version = "0.31", default-features = false, features = [
     "trace",

@@ -92,7 +92,7 @@ flowchart TB
 | 分层 Memory（跨 session） | 🟨 | [memory.md](./memory.md) + `one-resources/memory` | **M1–M6**：feature `memory` 整包；L2+写+age/budget；`memory_search`/`memory_write`；compact→L4；子 agent 默认 off |
 | Prompt 模板 `/name` | ✅ | `one-resources/prompts` | |
 | Compaction | ✅ | `one-core/compaction` + runtime | 默认 prune 旧 tool body + prefire（~85% 阈值）+ LLM 摘要 + overflow 重试；`<system-reminder>` 用于空读/spill/后台完成 |
-| 四模式 Interactive/Print/JSON/RPC | ✅ | `one-cli/modes` | |
+| 五模式 Interactive/Print/JSON/RPC/ACP | ✅ | `one-cli/modes` | ACP：`one acp` / `--mode acp`，见 [acp.md](./acp.md) |
 | 执行轨迹 / harness 评测 | ✅ | `one-core/trace` + Langfuse `--trace` / `one bench` | 可选 TraceSink → Langfuse；见 [harness-eval.md](./harness-eval.md) |
 | Plan / Act 模式 | ✅ | runtime + tools/plan | 硬工具门控 |
 | MCP 平台客户端 | ✅ | `one-mcp` | stdio + streamable HTTP；**只加载 One 配置** |
@@ -421,6 +421,7 @@ stateDiagram-v2
 | Print | `-p` | 可选 | 流式 stdout/stderr |
 | JSON | `--mode json` | 可选 | 事件行 |
 | RPC | `--mode rpc` | 常 `--no-session` | stdin/out JSONL |
+| ACP | `one acp` / `--mode acp` | 默认 session | JSON-RPC stdio（IDE） |
 
 ---
 

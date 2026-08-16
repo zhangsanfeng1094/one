@@ -8,7 +8,7 @@ Rust 实现的编程 Agent，灵感来自 [Pi Agent](https://pi.dev)：极简核
 - **内置工具**：`read` / `write` / `edit` / `bash` / `bash_output` / `bash_kill` / `grep` / `find` / `ls` / `ask_user` / `web_search` / `web_fetch`（联网：feature `server_search` 只控制是否注入 hosted `web_search`；否则本地 Brave/DDG；响应始终解析 citations，见 `docs/cli.md`）
 - **工作区路径沙箱**：默认只能读写 `--cwd`（+ `--add-dir`）；`--full-access` 关闭边界；可选 bash bubblewrap
 - **权限门控**：allow / deny / ask 规则 + 交互审批列表
-- **四种运行模式**：Interactive TUI / Print / JSON / RPC
+- **五种运行模式**：Interactive TUI / Print / JSON / RPC / **ACP**（IDE 嵌入）
 - **会话持久化**：JSONL 树形 session，`--continue` / `--resume` 恢复
 - **资源加载**：`AGENTS.md` / `CLAUDE.md`、skills（progressive disclosure + 内置 `create-skill`）、`/prompt` 模板
 - **MCP 平台客户端**：stdio + streamable HTTP；`one mcp` / `/mcp`；可从 Claude/Codex/Cursor 导入
@@ -39,6 +39,10 @@ cargo run -p one-cli -- --mode json -p "hello"
 
 # RPC 模式（stdin JSONL）
 cargo run -p one-cli -- --mode rpc --no-session
+
+# ACP 模式（Agent Client Protocol，IDE / Zed 等）
+cargo run -p one-cli -- acp --provider mock --yes
+# 详见 docs/acp.md
 
 # 真实 LLM（http-providers 已是 one-cli 默认 feature）
 export ANTHROPIC_API_KEY=...

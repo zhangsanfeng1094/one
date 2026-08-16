@@ -125,6 +125,7 @@
 - [ ] **TV5** scrollback 生命周期块（`Subagent running…` 活动后缀）
 
 #### P2 — 扩展
+- [x] **ACP（Agent Client Protocol）** — `one acp` / `--mode acp`；initialize / session lifecycle / prompt streaming / permission / modes / load·list·resume（见 [acp.md](./acp.md)）
 - [ ] RPC `spawn` / `run`
 - [ ] `agents/*.md` 磁盘 preset
 - [ ] 示例脚本 workflow
