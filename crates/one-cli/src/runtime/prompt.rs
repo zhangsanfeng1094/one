@@ -33,6 +33,7 @@ impl AppRuntime {
             }
         }
         self.sync_mcp_tools().await?;
+        self.inject_mcp_reminder().await;
 
         let text = self.resources.resolve_prompt(text);
         self.maybe_compact(provider, false).await?;
