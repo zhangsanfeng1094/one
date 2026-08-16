@@ -282,6 +282,10 @@ const EXPLORE_TOOLS: &[&str] = &[
 | 结束 | 子 run End 后 **一次性** summary 写入 tool_view | summary 仍一次性；event log 可回看 |
 | abort | 主 Esc → agent jobs `kill_all`（**不**杀 background bash） | 同左；`/tasks` 内 `x` 杀单个 subagent |
 | session | 子消息默认不进主 JSONL | 同左 |
+| **durable job log** | — | 每个 job 事件流实时 append 到 `~/.one/agent/jobs/<job_id>.jsonl`（`ONE_JOB_LOG_DIR` 可改；`ONE_JOB_LOG=0` 关）。`job_output` / `task` details 带 `log_path`；abort/kill 后仍可 `cat` 查卡在哪一 turn/tool |
+| **前台完成语义** | spawn + `Notify` 等待（会丢唤醒） | **`run_foreground`：当前任务直接 await harness 返回值**；job 行只做 TUI/abort/落盘。主 transcript 完成**仅**走 `ToolExecutionEnd`（tool_result），不从 job 状态二次 force-finish。UI `ToolEnd` 在 `after_tool` 钩子之前发出，避免钩子拖住主行 |
+| **后台** | `task(background=true)` | 仍 `spawn` + `[job completed]`；`wait_tasks`/`job_output` 轮询，Notify 仅作 wake hint |
+| **wall timeout** | 仅 background | **前台 + 后台** 均套 `ONE_JOB_MAX_WALL_MS`（默认 300s） |
 | trace | Langfuse child under parent | 同左 |
 
 **分层（硬约束）**

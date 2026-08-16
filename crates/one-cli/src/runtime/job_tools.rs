@@ -41,23 +41,23 @@ impl Tool for JobOutputTool {
             name: "job_output".into(),
             description: "\
 Get status and summary of a background agent job (`job_*`), bash task (`bg_*`), or monitor (`mon_*`). \
-Omit id to list agent jobs and bash tasks. Optional wait_ms waits for completion \
-(0 = snapshot only)."
+Omit job_id to list agent jobs and bash tasks. \
+Omit wait_ms (or pass 0) for an immediate snapshot. \
+To actually wait, pass wait_ms >= 15000 (milliseconds) — 1000 is one second and will \
+almost always time out on explore jobs. Prefer wait_tasks without wait_ms to block \
+until completion."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "job_id": {
                         "type": "string",
-                        "description": "Agent job id or bash task id. Alias: task_id."
-                    },
-                    "task_id": {
-                        "type": "string",
-                        "description": "Alias for job_id (bash bg_* or agent job_*)"
+                        "description": "Agent job id (`job_*`), bash task (`bg_*`), or monitor (`mon_*`)."
                     },
                     "wait_ms": {
                         "type": "integer",
-                        "description": "Max ms to wait for completion (default 0 = immediate snapshot)"
+                        "description": "0/omit = snapshot now. To block, milliseconds >= 15000. \
+                                        Do not pass 1000 — that is 1 second."
                     }
                 }
             }),
@@ -74,16 +74,8 @@ Omit id to list agent jobs and bash tasks. Optional wait_ms waits for completion
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        let wait_ms = call
-            .arguments
-            .get("wait_ms")
-            .and_then(|v| v.as_u64())
-            .or_else(|| {
-                call.arguments
-                    .get("wait_ms")
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n.max(0) as u64)
-            });
+        let wait_ms = parse_wait_ms(&call.arguments, WaitMsMode::SnapshotOrBlock)
+            .map_err(|msg| invalid_args("job_output", msg))?;
 
         if job_id.is_none() {
             let jobs = self.jobs.list();
@@ -160,6 +152,7 @@ Omit id to list agent jobs and bash tasks. Optional wait_ms waits for completion
                 "duration_ms": snap.duration_ms,
                 "turns": snap.turns,
                 "max_turns": snap.max_turns,
+                "log_path": snap.log_path.as_ref().map(|p| p.display().to_string()),
             }),
         ))
     }
@@ -194,8 +187,9 @@ Wait for background work to finish — agent jobs from task(background=true) (`j
 and/or bash tasks (`bg_*`) and monitors (`mon_*`). \
 Use ONLY after you have spawned all needed background work and have nothing else useful to do. \
 mode=all (default) waits for every target; mode=any returns when the next running task \
-completes. Omit ids to wait on all currently running agent jobs and bash tasks. \
-Optional wait_ms caps how long this call may block."
+completes. Omit job_ids to wait on all currently running agent jobs and bash tasks. \
+Omit wait_ms to block until completion (preferred). If you must cap the wait, pass \
+wait_ms >= 15000 (milliseconds). Do not pass 1000 — that is 1 second and will time out."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -205,11 +199,6 @@ Optional wait_ms caps how long this call may block."
                         "items": { "type": "string" },
                         "description": "Ids to wait on (job_* / bg_* / mon_*). Omit = all currently running."
                     },
-                    "task_ids": {
-                        "type": "array",
-                        "items": { "type": "string" },
-                        "description": "Alias for job_ids"
-                    },
                     "mode": {
                         "type": "string",
                         "enum": ["all", "any"],
@@ -217,7 +206,8 @@ Optional wait_ms caps how long this call may block."
                     },
                     "wait_ms": {
                         "type": "integer",
-                        "description": "Max ms to block (optional). On timeout returns partial results + still-running list."
+                        "description": "Optional cap in milliseconds (>= 15000). Omit to wait until done. \
+                                        1000 is 1 second — do not use it."
                     }
                 }
             }),
@@ -232,16 +222,8 @@ Optional wait_ms caps how long this call may block."
             .and_then(JoinMode::parse)
             .unwrap_or(JoinMode::All);
 
-        let wait_ms = call
-            .arguments
-            .get("wait_ms")
-            .and_then(|v| v.as_u64())
-            .or_else(|| {
-                call.arguments
-                    .get("wait_ms")
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n.max(0) as u64)
-            });
+        let wait_ms = parse_wait_ms(&call.arguments, WaitMsMode::BlockUntilDone)
+            .map_err(|msg| invalid_args("wait_tasks", msg))?;
 
         let explicit = parse_id_list(call, &["job_ids", "task_ids"]);
         let report = unified_join(
@@ -293,20 +275,17 @@ impl Tool for JobKillTool {
             name: "job_kill".into(),
             description: "\
 Stop a background agent job (`job_*`), bash task (`bg_*`), or monitor (`mon_*`). \
-Accepts `job_id` or `task_id`. No-op if already finished."
+Pass `job_id`. No-op if already finished."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "job_id": {
                         "type": "string",
-                        "description": "Agent job id or bash task id"
-                    },
-                    "task_id": {
-                        "type": "string",
-                        "description": "Alias for job_id"
+                        "description": "Agent job id (`job_*`), bash task (`bg_*`), or monitor (`mon_*`)."
                     }
-                }
+                },
+                "required": ["job_id"]
             }),
         }
     }
@@ -368,6 +347,42 @@ Accepts `job_id` or `task_id`. No-op if already finished."
 
 fn looks_like_bash_id(id: &str) -> bool {
     id.starts_with("bg_") || id.starts_with("mon_")
+}
+
+/// Short waits are almost always the model meaning "wait a second" and then
+/// treating a timeout as progress. 15s is the floor for a *blocking* wait.
+const MIN_BLOCKING_WAIT_MS: u64 = 15_000;
+
+#[derive(Clone, Copy)]
+enum WaitMsMode {
+    /// `job_output`: 0 / omit = snapshot; positive must be a real wait.
+    SnapshotOrBlock,
+    /// `wait_tasks`: omit = wait until done; 0 is not a snapshot.
+    BlockUntilDone,
+}
+
+fn parse_wait_ms(
+    args: &serde_json::Value,
+    mode: WaitMsMode,
+) -> std::result::Result<Option<u64>, String> {
+    let raw = args
+        .get("wait_ms")
+        .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)));
+    match (mode, raw) {
+        (_, None) => Ok(None),
+        (WaitMsMode::SnapshotOrBlock, Some(0)) => Ok(Some(0)),
+        (WaitMsMode::BlockUntilDone, Some(0)) => Err(format!(
+            "wait_ms=0 is not a snapshot on wait_tasks. Omit wait_ms to block until \
+             completion, or pass at least {MIN_BLOCKING_WAIT_MS} (milliseconds)."
+        )),
+        (_, Some(ms)) if ms < MIN_BLOCKING_WAIT_MS => Err(format!(
+            "wait_ms={ms} is only {}s; agent/explore jobs typically take 30s–5min. \
+             Omit wait_ms to wait until completion, or pass at least {MIN_BLOCKING_WAIT_MS} \
+             (milliseconds). Do not pass 1000 — that is 1 second.",
+            ms / 1000
+        )),
+        (_, Some(ms)) => Ok(Some(ms)),
+    }
 }
 
 fn parse_id_list(call: &ToolCall, keys: &[&str]) -> Option<Vec<String>> {
@@ -654,10 +669,7 @@ fn format_unified_report(
         let id = f.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let kind = f.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
         let state = f.get("state").and_then(|v| v.as_str()).unwrap_or("?");
-        let running = f
-            .get("running")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let running = f.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
         out.push_str(&format!(
             "- {kind} {id}: {state}{}\n",
             if running { " (running)" } else { "" }
@@ -666,3 +678,51 @@ fn format_unified_report(
     out
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn wait_ms_snapshot_allows_zero_and_omit() {
+        assert_eq!(
+            parse_wait_ms(&json!({}), WaitMsMode::SnapshotOrBlock).unwrap(),
+            None
+        );
+        assert_eq!(
+            parse_wait_ms(&json!({"wait_ms": 0}), WaitMsMode::SnapshotOrBlock).unwrap(),
+            Some(0)
+        );
+        assert_eq!(
+            parse_wait_ms(&json!({"wait_ms": 30_000}), WaitMsMode::SnapshotOrBlock).unwrap(),
+            Some(30_000)
+        );
+    }
+
+    #[test]
+    fn wait_ms_rejects_one_second_pretend_wait() {
+        let err =
+            parse_wait_ms(&json!({"wait_ms": 1000}), WaitMsMode::SnapshotOrBlock).unwrap_err();
+        assert!(err.contains("wait_ms=1000"), "{err}");
+        assert!(err.contains("1 second") || err.contains("1s"), "{err}");
+
+        let err = parse_wait_ms(&json!({"wait_ms": 1000}), WaitMsMode::BlockUntilDone).unwrap_err();
+        assert!(err.contains("1000"), "{err}");
+
+        let err = parse_wait_ms(&json!({"wait_ms": 0}), WaitMsMode::BlockUntilDone).unwrap_err();
+        assert!(err.contains("wait_ms=0"), "{err}");
+    }
+
+    #[test]
+    fn job_output_schema_hides_task_id_alias() {
+        let jobs = AgentJobRegistry::new(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let tool = JobOutputTool::new(jobs);
+        let def = tool.definition();
+        let props = def.parameters["properties"].as_object().unwrap();
+        assert!(props.contains_key("job_id"));
+        assert!(
+            !props.contains_key("task_id"),
+            "do not advertise task_id alias: {props:?}"
+        );
+    }
+}

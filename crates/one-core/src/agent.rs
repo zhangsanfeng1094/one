@@ -1274,8 +1274,8 @@ impl Agent {
             };
 
             if side_effect {
-                self.run_pending_at(slots, i).await;
-                self.emit_slot_tool_end(slots, i, turn, run_id);
+                // UI ToolEnd before after_tool hooks (hooks must not delay the transcript).
+                self.run_pending_at(slots, i, turn, run_id).await;
                 i += 1;
                 continue;
             }
@@ -1383,7 +1383,19 @@ impl Agent {
         }
     }
 
-    async fn run_pending_at(&mut self, slots: &mut [ToolSlot], index: usize) {
+    /// Run one pending tool, emit UI `ToolExecutionEnd`, then run after_tool hooks.
+    ///
+    /// **Order is intentional:** the transcript must flip the tool row as soon as
+    /// `tool.execute` returns. Extension / permission `after_tool` hooks are
+    /// observational and must not delay (or hang) the parent UI — especially for
+    /// long-running tools like foreground `task` whose child already finalized.
+    async fn run_pending_at(
+        &mut self,
+        slots: &mut [ToolSlot],
+        index: usize,
+        turn: usize,
+        run_id: &str,
+    ) {
         let (original, effective, gate, tool) = match &slots[index] {
             ToolSlot::Pending {
                 original,
@@ -1407,6 +1419,7 @@ impl Agent {
                 duration_ms: 0,
                 ui_emitted: false,
             };
+            self.emit_slot_tool_end(slots, index, turn, run_id);
             return;
         }
         let start = Instant::now();
@@ -1423,26 +1436,13 @@ impl Agent {
         let (output, is_error) = match res {
             Ok(output) => {
                 let failed = tool_output_indicates_error(&original.name, &output);
-                if let Some(g) = &self.tool_gate {
-                    g.after_tool(&effective, &output, failed).await;
-                }
                 (output, failed)
             }
-            Err(OneError::Aborted) => {
-                let output = ToolOutput::text("aborted");
-                if let Some(g) = &self.tool_gate {
-                    g.after_tool(&effective, &output, true).await;
-                }
-                (output, true)
-            }
-            Err(err) => {
-                let output = ToolOutput::text(err.to_string());
-                if let Some(g) = &self.tool_gate {
-                    g.after_tool(&effective, &output, true).await;
-                }
-                (output, true)
-            }
+            Err(OneError::Aborted) => (ToolOutput::text("aborted"), true),
+            Err(err) => (ToolOutput::text(err.to_string()), true),
         };
+        // Capture hook inputs before moving into the slot.
+        let hook_output = output.clone();
         slots[index] = ToolSlot::Done {
             original,
             output,
@@ -1451,6 +1451,19 @@ impl Agent {
             duration_ms,
             ui_emitted: false,
         };
+        // Transcript first — parent row must not wait on after_tool.
+        // Observational hooks are fire-and-forget with a hard cap so a stuck
+        // extension/hook can never leave the parent agent parked on
+        // "Thinking…" after a foreground `task` (or any tool) has already
+        // returned. ToolExecutionEnd is already in the event queue for the UI.
+        self.emit_slot_tool_end(slots, index, turn, run_id);
+        if let Some(g) = self.tool_gate.clone() {
+            let effective = effective.clone();
+            tokio::spawn(async move {
+                let fut = g.after_tool(&effective, &hook_output, is_error);
+                let _ = tokio::time::timeout(Duration::from_secs(5), fut).await;
+            });
+        }
     }
 
     /// Run consecutive parallel-safe tools concurrently; emit UI ToolEnd as each finishes.
@@ -1465,8 +1478,7 @@ impl Agent {
             return;
         }
         if indices.len() == 1 {
-            self.run_pending_at(slots, indices[0]).await;
-            self.emit_slot_tool_end(slots, indices[0], turn, run_id);
+            self.run_pending_at(slots, indices[0], turn, run_id).await;
             return;
         }
 
@@ -1524,26 +1536,12 @@ impl Agent {
             let (output, is_error) = match res {
                 Ok(output) => {
                     let failed = tool_output_indicates_error(&original.name, &output);
-                    if let Some(g) = &self.tool_gate {
-                        g.after_tool(&effective, &output, failed).await;
-                    }
                     (output, failed)
                 }
-                Err(OneError::Aborted) => {
-                    let output = ToolOutput::text("aborted");
-                    if let Some(g) = &self.tool_gate {
-                        g.after_tool(&effective, &output, true).await;
-                    }
-                    (output, true)
-                }
-                Err(err) => {
-                    let output = ToolOutput::text(err.to_string());
-                    if let Some(g) = &self.tool_gate {
-                        g.after_tool(&effective, &output, true).await;
-                    }
-                    (output, true)
-                }
+                Err(OneError::Aborted) => (ToolOutput::text("aborted"), true),
+                Err(err) => (ToolOutput::text(err.to_string()), true),
             };
+            let hook_output = output.clone();
             slots[i] = ToolSlot::Done {
                 original,
                 output,
@@ -1553,8 +1551,16 @@ impl Agent {
                 ui_emitted: false,
             };
             // UI flips this row to Done as soon as *this* tool finishes — not when
-            // the whole parallel group drains.
+            // the whole parallel group drains, and not after after_tool hooks.
+            // Fire-and-forget after_tool (same policy as run_pending_at).
             self.emit_slot_tool_end(slots, i, turn, run_id);
+            if let Some(g) = self.tool_gate.clone() {
+                let effective = effective.clone();
+                tokio::spawn(async move {
+                    let fut = g.after_tool(&effective, &hook_output, is_error);
+                    let _ = tokio::time::timeout(Duration::from_secs(5), fut).await;
+                });
+            }
         }
     }
 
@@ -2220,6 +2226,155 @@ mod tests {
         assert!(
             slow_at.saturating_sub(fast_at) >= Duration::from_millis(80),
             "ends must not be batched: fast={fast_at:?} slow={slow_at:?}"
+        );
+    }
+
+    /// UI ToolExecutionEnd must fire before after_tool hooks so a slow/hanging
+    /// post-tool extension cannot leave the parent transcript spinner stuck
+    /// after the tool has already returned (e.g. foreground `task`).
+    #[tokio::test]
+    async fn tool_end_emits_before_after_tool_hooks() {
+        use crate::tool::{Tool, ToolDefinition};
+        use crate::tool_gate::{ToolGate, ToolGateDecision};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        struct InstantTool;
+        #[async_trait::async_trait]
+        impl Tool for InstantTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "ls".into(),
+                    description: "instant".into(),
+                    parameters: serde_json::json!({"type":"object","properties":{}}),
+                }
+            }
+            async fn execute(&self, _call: &ToolCall) -> Result<ToolOutput> {
+                Ok(ToolOutput::text("ok"))
+            }
+        }
+
+        struct SlowAfterGate {
+            after_entered: Arc<AtomicBool>,
+            end_seen_before_after: Arc<AtomicBool>,
+        }
+        #[async_trait::async_trait]
+        impl ToolGate for SlowAfterGate {
+            async fn check(&self, _call: &ToolCall) -> ToolGateDecision {
+                ToolGateDecision::Allow
+            }
+            async fn after_tool(
+                &self,
+                _call: &ToolCall,
+                _output: &ToolOutput,
+                _is_error: bool,
+            ) {
+                // If ToolExecutionEnd already fired, the flag is set by the listener.
+                if self.end_seen_before_after.load(Ordering::SeqCst) {
+                    // good path recorded below
+                }
+                self.after_entered.store(true, Ordering::SeqCst);
+                tokio::time::sleep(Duration::from_millis(80)).await;
+            }
+        }
+
+        struct OneToolProvider {
+            calls: AtomicU64,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for OneToolProvider {
+            fn name(&self) -> &str {
+                "end-before-after"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                unreachable!()
+            }
+            async fn complete_streaming(
+                &self,
+                _request: CompletionRequest,
+                _on_event: &mut (dyn FnMut(crate::streaming::StreamEvent) + Send),
+                _abort: Option<&AtomicBool>,
+            ) -> Result<CompletionResponse> {
+                let n = self.calls.fetch_add(1, Ordering::Relaxed);
+                if n == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().to_string(),
+                        model: self.model().to_string(),
+                        content: vec![ContentBlock::ToolCall {
+                            id: "c1".into(),
+                            name: "ls".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        provider: self.name().to_string(),
+                        model: self.model().to_string(),
+                        content: vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let end_at: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+        let after_entered = Arc::new(AtomicBool::new(false));
+        let end_seen_before_after = Arc::new(AtomicBool::new(false));
+        let end_at_l = end_at.clone();
+        let after_entered_l = after_entered.clone();
+        let end_seen_l = end_seen_before_after.clone();
+
+        let mut agent = Agent::new(AgentConfig::default(), vec![Arc::new(InstantTool)]);
+        agent.set_tool_gate(Some(Arc::new(SlowAfterGate {
+            after_entered: after_entered.clone(),
+            end_seen_before_after: end_seen_before_after.clone(),
+        })));
+        agent.subscribe(Box::new(move |ev| {
+            if let AgentEvent::ToolExecutionEnd { .. } = ev {
+                // Record whether after_tool has started yet.
+                if !after_entered_l.load(Ordering::SeqCst) {
+                    end_seen_l.store(true, Ordering::SeqCst);
+                }
+                *end_at_l.lock().expect("end_at") = Some(std::time::Instant::now());
+            }
+        }));
+
+        agent
+            .prompt(
+                &OneToolProvider {
+                    calls: AtomicU64::new(0),
+                },
+                "go",
+            )
+            .await
+            .expect("prompt ok");
+
+        assert!(
+            end_seen_before_after.load(Ordering::SeqCst),
+            "ToolExecutionEnd must fire before after_tool begins"
+        );
+        assert!(
+            end_at.lock().expect("end_at").is_some(),
+            "ToolExecutionEnd must have fired"
+        );
+        // after_tool is fire-and-forget; wait briefly for the spawned hook.
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !after_entered.load(Ordering::SeqCst) && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            after_entered.load(Ordering::SeqCst),
+            "after_tool should still run after UI end"
         );
     }
 

@@ -352,16 +352,19 @@ fn build_chat_lines(
                 .iter()
                 .filter(|m| m.tool_status == Some(ToolStatus::Running))
                 .count();
+            // Prefer "Running…" while tools are in flight. Once every tool row
+            // is sealed (e.g. foreground `task` finished) but the parent is still
+            // busy on the next model call, say so explicitly — "Thinking…" was
+            // misleading when the subagent had already returned and the hang was
+            // the parent waiting on the next LLM turn.
             let label = if running_n > 0 {
                 if running_n == 1 {
                     "Running…".into()
                 } else {
                     format!("Running ({running_n})…")
                 }
-            } else if app.thinking_level != "off" {
-                "Thinking…".into()
             } else {
-                "Working…".into()
+                "Waiting for model…".into()
             };
             // Cyan spinner family — same as running tools (not focus blue / user peach).
             lines.push(Line::from(vec![

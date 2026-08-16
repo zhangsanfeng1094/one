@@ -105,6 +105,9 @@ impl super::App {
         } else {
             ToolStatus::Done
         };
+        let job_id_from_out = output
+            .as_ref()
+            .and_then(|raw| extract_job_id_from_task_output(raw));
         let apply = |msg: &mut Message| {
             msg.tool_status = Some(status);
             msg.seal_duration();
@@ -113,10 +116,8 @@ impl super::App {
             // Preserve / recover job_id from tool output for post-run reopen.
             if tool_name == "task" {
                 if msg.tool_job_id.is_none() {
-                    if let Some(raw) = output.as_ref() {
-                        if let Some(id) = extract_job_id_from_task_output(raw) {
-                            msg.tool_job_id = Some(id);
-                        }
+                    if let Some(id) = job_id_from_out.clone() {
+                        msg.tool_job_id = Some(id);
                     }
                 }
                 msg.tool_ungroup = true;
@@ -135,12 +136,8 @@ impl super::App {
                 };
                 msg.tool_output = Some(stored);
                 msg.tool_summary = Some(summary);
-                // Task with job_id: prefer collapsed one-liner; click reopens log.
-                msg.tool_expanded = if tool_name == "task" && msg.tool_job_id.is_some() {
-                    false
-                } else {
-                    expand
-                };
+                // Expand policy lives in summarize_tool_special (single source).
+                msg.tool_expanded = expand;
             } else if error {
                 msg.tool_summary = Some("failed".into());
                 msg.tool_expanded = true;
@@ -158,13 +155,28 @@ impl super::App {
             }
         };
 
-        // 1) Exact call_id match (correct for parallel batches / duplicate names).
+        // 1) Exact call_id match among *running* tools.
         if let Some(id) = call_id {
             if !id.is_empty() {
                 for msg in self.messages.iter_mut().rev() {
                     if msg.role == MessageRole::Tool
                         && msg.tool_status == Some(ToolStatus::Running)
                         && msg.tool_call_id.as_deref() == Some(id)
+                    {
+                        apply(msg);
+                        return;
+                    }
+                }
+            }
+        }
+        // 1b) task job_id match among running tools (live-bound before tool_result).
+        if name == "task" {
+            if let Some(ref jid) = job_id_from_out {
+                for msg in self.messages.iter_mut().rev() {
+                    if msg.role == MessageRole::Tool
+                        && msg.tool_name.as_deref() == Some("task")
+                        && msg.tool_status == Some(ToolStatus::Running)
+                        && msg.tool_job_id.as_deref() == Some(jid.as_str())
                     {
                         apply(msg);
                         return;
@@ -190,6 +202,31 @@ impl super::App {
                 return;
             }
         }
+        // 4) Already sealed (e.g. job-state finish raced ToolExecutionEnd): upgrade
+        //    content in place — never invent a second tool row.
+        if let Some(id) = call_id {
+            if !id.is_empty() {
+                for msg in self.messages.iter_mut().rev() {
+                    if msg.role == MessageRole::Tool && msg.tool_call_id.as_deref() == Some(id) {
+                        apply(msg);
+                        return;
+                    }
+                }
+            }
+        }
+        if name == "task" {
+            if let Some(ref jid) = job_id_from_out {
+                for msg in self.messages.iter_mut().rev() {
+                    if msg.role == MessageRole::Tool
+                        && msg.tool_name.as_deref() == Some("task")
+                        && msg.tool_job_id.as_deref() == Some(jid.as_str())
+                    {
+                        apply(msg);
+                        return;
+                    }
+                }
+            }
+        }
         if error {
             let mut msg = Message::tool_with_id(
                 name,
@@ -207,8 +244,98 @@ impl super::App {
                 msg.tool_summary = Some("failed".into());
                 msg.tool_expanded = true;
             }
+            if let Some(jid) = job_id_from_out {
+                msg.tool_job_id = Some(jid);
+            }
             self.messages.push(msg);
         }
+    }
+
+    /// Finish a running `task` row from job registry state (success / fail / timeout).
+    ///
+    /// Used when the child job is already terminal but `ToolExecutionEnd` has not
+    /// yet painted the main transcript (or never will if the parent hangs after
+    /// finalize). Safe to call repeatedly — no-op once the row is sealed.
+    pub fn finish_task_tool_from_job(
+        &mut self,
+        job_id: &str,
+        error: bool,
+        output: impl Into<String>,
+    ) {
+        let output = output.into();
+        // Prefer exact job_id binding. Fall back to a single unbound running
+        // task row, then to a sole running task row of any binding (covers the
+        // case where live bind never ran before the job went terminal).
+        let mut exact: Option<usize> = None;
+        let mut unbound: Vec<usize> = Vec::new();
+        let mut running: Vec<usize> = Vec::new();
+        for (i, msg) in self.messages.iter().enumerate() {
+            if msg.role != MessageRole::Tool || msg.tool_name.as_deref() != Some("task") {
+                continue;
+            }
+            if msg.tool_job_id.as_deref() == Some(job_id) {
+                exact = Some(i);
+                break;
+            }
+            if msg.tool_status == Some(ToolStatus::Running) {
+                running.push(i);
+                if msg.tool_job_id.is_none() {
+                    unbound.push(i);
+                }
+            }
+        }
+        let idx = exact
+            .or_else(|| {
+                if unbound.len() == 1 {
+                    Some(unbound[0])
+                } else {
+                    None
+                }
+            })
+            .or_else(|| {
+                if running.len() == 1 {
+                    Some(running[0])
+                } else {
+                    None
+                }
+            });
+        let Some(idx) = idx else {
+            return;
+        };
+        let Some(msg) = self.messages.get_mut(idx) else {
+            return;
+        };
+        if msg.tool_job_id.is_none() {
+            msg.tool_job_id = Some(job_id.to_string());
+        }
+        // Only seal still-running rows; leave finished ones for ToolEnd upgrade.
+        if msg.tool_status != Some(ToolStatus::Running) {
+            return;
+        }
+        let status = if error {
+            ToolStatus::Error
+        } else {
+            ToolStatus::Done
+        };
+        msg.tool_status = Some(status);
+        msg.seal_duration();
+        msg.tool_ungroup = true;
+        let args = msg.content.clone();
+        let mut stored = truncate_tool_output_for_ui(&output, 4_000);
+        let (summary, expand) =
+            if let Some((s, e, better)) =
+                tool_view::summarize_tool_special("task", &args, &stored, error)
+            {
+                if let Some(b) = better {
+                    stored = truncate_tool_output_for_ui(&b, 4_000);
+                }
+                (s, e)
+            } else {
+                summarize_tool_output(&stored, error)
+            };
+        msg.tool_output = Some(stored);
+        msg.tool_summary = Some(summary);
+        msg.tool_expanded = expand;
     }
 
     /// Expand a multi-tool chip into individual rows (bodies stay collapsed).
@@ -291,13 +418,33 @@ impl super::App {
                 return;
             }
         }
-        // task · job_id → open **subagent** live log (`/tasks`, not `/ps` bash).
+        // task click:
+        //   - still Running + job_id → live subagent log (`/tasks`)
+        //   - Done with tool_output → toggle findings on the main row
+        //   - Done without body but with job_id → reopen job detail
         if let Some(msg) = self.messages.get(msg_index) {
             if msg.tool_name.as_deref() == Some("task") {
-                if let Some(id) = msg.tool_job_id.clone() {
-                    self.queue_busy_ui(RunOutcome::OpenSubagentDetail { id });
-                    return;
+                let running = msg.tool_status == Some(ToolStatus::Running);
+                let has_body = msg
+                    .tool_output
+                    .as_deref()
+                    .is_some_and(|s| {
+                        s.lines()
+                            .skip_while(|l| l.starts_with('[') || l.trim().is_empty())
+                            .any(|l| !l.trim().is_empty())
+                    });
+                if running {
+                    if let Some(id) = msg.tool_job_id.clone() {
+                        self.queue_busy_ui(RunOutcome::OpenSubagentDetail { id });
+                        return;
+                    }
+                } else if !has_body {
+                    if let Some(id) = msg.tool_job_id.clone() {
+                        self.queue_busy_ui(RunOutcome::OpenSubagentDetail { id });
+                        return;
+                    }
                 }
+                // Finished with findings → expand/collapse on main transcript.
             }
         }
         if let Some(msg) = self.messages.get_mut(msg_index) {
@@ -567,6 +714,23 @@ impl super::App {
         self.stream_buffer.clear();
         self.thinking_buffer.clear();
         self.remove_trailing_empty_stream();
+    }
+
+    /// Drop partial assistant/thinking bubbles from a failed sample before
+    /// the next retry attempt. Prevents prior attempt text (including
+    /// mis-surfaced provider errors) from concatenating into the next try.
+    pub fn discard_partial_stream(&mut self) {
+        self.stream_buffer.clear();
+        self.thinking_buffer.clear();
+        while let Some(last) = self.messages.last() {
+            if last.streaming
+                && matches!(last.role, MessageRole::Assistant | MessageRole::Thinking)
+            {
+                self.messages.pop();
+            } else {
+                break;
+            }
+        }
     }
 
     pub(crate) fn remove_trailing_empty_stream(&mut self) {

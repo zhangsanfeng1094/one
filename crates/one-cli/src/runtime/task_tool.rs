@@ -327,7 +327,10 @@ impl Tool for TaskTool {
             description: format!(
                 "Run a sub-agent via the same harness as `one agent run` (Agent ≡ Subagent). \
 Default agent=explore when allowed. Returns a concise summary so this conversation stays small. \
-Do not use for a single trivial file read. Allowed agent names: [{allowed}].{child_blurb} \
+Do not use for a single trivial file read. \
+**Do not use explore for git/VCS workflows** (status, diff, stage, commit, reset, \
+categorize uncommitted changes) — explore has no bash; run those with bash yourself. \
+Allowed agent names: [{allowed}].{child_blurb} \
 Set background=true for long work that should not block this turn: returns \
 status=started + job_id immediately; when done a [job completed] notice is \
 injected before the next LLM turn (or poll with job_output). \
@@ -453,6 +456,23 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             req.agent.isolation = crate::protocol::IsolationMode::Worktree;
         }
 
+        // Fail closed: read-only explore cannot inspect VCS via bash — do not burn
+        // 10+ turns reading `.git/index` and return a fake success summary.
+        if child_lacks_bash(&req.agent) && prompt_looks_like_vcs_workflow(&prompt) {
+            drop(slot);
+            let msg = "ERROR: need bash (explore/read-only subagent has no shell; \
+parent must run `git status --short` / `git diff --stat` / stage+commit directly). \
+Do not re-delegate git workflows to explore.";
+            let mut rr = RunResult::success(msg, 0).with_status(TaskExitStatus::IncompleteInfo);
+            rr.stop_reason = Some("incomplete_info".into());
+            rr.error = Some(ProtocolError::new(error_code::INVALID_REQUEST, msg));
+            return Ok(format_task_output(
+                &agent_name,
+                description.as_deref(),
+                &rr,
+            ));
+        }
+
         // Validate tools can materialize before spending a slot on LLM work.
         if let Err(e) = validate_child_tools(&req.agent) {
             drop(slot);
@@ -503,95 +523,77 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             );
             // Bind until completion notification is absorbed — keep for /ps open.
             self.host.bind_tool_job(&call.id, &job_id);
+            let log_path = self
+                .host
+                .jobs
+                .get(&job_id)
+                .and_then(|s| s.log_path.map(|p| p.display().to_string()));
             return Ok(format_task_started(
                 &agent_name,
                 description.as_deref(),
                 &job_id,
+                log_path.as_deref(),
             ));
         }
 
-        // Sync with live job UI when a provider is bound (production path).
+        // Sync path: await harness **return value** on this task (not spawn+Notify).
+        // Job row is only for TUI/live log / job_kill abort flag.
         // Tests using FakeHarness leave provider unbound → harness.run only.
         if let Some(provider) = self.host.provider.read().await.clone() {
             let opts = self.host.child_harness_opts().await;
-            let job_id = self.host.jobs.spawn_with(
-                req,
-                provider,
-                opts,
-                agent_name.clone(),
-                description.clone(),
-                Some(slot),
-                SpawnOptions {
-                    // tool_result is the parent signal — do not also inject [job completed]
-                    notify_completion: false,
-                    // Foreground waits on the tool; wall budget is parent-abort / Esc.
-                    apply_wall_timeout: false,
-                    trace: child_trace,
-                    trace_meta: child_trace_meta,
-                },
-            );
-            self.host.bind_tool_job(&call.id, &job_id);
-            let snap = match self.host.jobs.wait_until_done(&job_id).await {
-                Ok(s) => s,
-                Err(e) => {
-                    self.host.unbind_tool_job(&call.id);
-                    return Ok(format_task_output(
-                        &agent_name,
-                        description.as_deref(),
-                        &RunResult::failure(
-                            ProtocolError::new(error_code::INTERNAL, e),
-                            0,
-                        )
-                        .with_status(TaskExitStatus::RuntimeError),
-                    ));
-                }
-            };
-            self.host.unbind_tool_job(&call.id);
-            let result = self
+            let host = self.host.clone();
+            let tool_call_id = call.id.clone();
+            let (job_id, result) = self
                 .host
                 .jobs
-                .take_result_clone(&job_id)
-                .unwrap_or_else(|| {
-                    // Prefer fields from snapshot when result blob is missing.
-                    let mut rr = if snap.ok {
-                        RunResult::success(snap.summary.clone(), snap.duration_ms)
-                    } else {
-                        RunResult::failure(
-                            ProtocolError::new(
-                                error_code::INTERNAL,
-                                snap.error
-                                    .clone()
-                                    .unwrap_or_else(|| "task job finished without result".into()),
-                            ),
-                            snap.duration_ms,
-                        )
-                    };
-                    if let Some(st) = snap.status {
-                        rr = rr.with_status(st);
-                    }
-                    rr.result = snap.summary.clone();
-                    rr.turns = snap.turns;
-                    rr
-                });
+                .run_foreground(
+                    req,
+                    provider,
+                    opts,
+                    agent_name.clone(),
+                    description.clone(),
+                    Some(slot),
+                    SpawnOptions {
+                        // tool_result is the parent signal — no [job completed] notice
+                        notify_completion: false,
+                        apply_wall_timeout: true,
+                        trace: child_trace,
+                        trace_meta: child_trace_meta,
+                    },
+                    |job_id| host.bind_tool_job(&tool_call_id, job_id),
+                )
+                .await;
+            self.host.unbind_tool_job(&call.id);
+            let log_path = self
+                .host
+                .jobs
+                .get(&job_id)
+                .and_then(|s| s.log_path.map(|p| p.display().to_string()));
             let mut out = format_task_output(&agent_name, description.as_deref(), &result);
-            // Expose job_id so TUI can reopen log after completion.
             if let Some(details) = out.details.as_mut() {
                 if let Some(obj) = details.as_object_mut() {
                     obj.insert("job_id".into(), json!(job_id));
+                    if let Some(ref p) = log_path {
+                        obj.insert("log_path".into(), json!(p));
+                    }
                 }
             }
-            // Stamp id into the visible header line (click / parse).
             if let Some(first) = out.content.first_mut() {
                 if let one_core::message::TextOrImage::Text { text } = first {
                     if let Some(rest) = text.strip_prefix('[') {
                         if let Some(end) = rest.find(']') {
                             let inside = &rest[..end];
                             if !inside.contains("id=") {
-                                let stamped = format!(
-                                    "[{inside} · id={job_id}]{}",
-                                    &rest[end + 1..]
-                                );
+                                let stamped =
+                                    format!("[{inside} · id={job_id}]{}", &rest[end + 1..]);
                                 *text = stamped;
+                            }
+                        }
+                    }
+                    if !result.ok {
+                        if let Some(ref p) = log_path {
+                            if !text.contains("log_path:") {
+                                text.push_str(&format!("\nlog_path: {p}"));
                             }
                         }
                     }
@@ -627,6 +629,69 @@ fn resolve_agent_name(args: &Value) -> String {
     "explore".into()
 }
 
+/// True when the child agent will not get a `bash` tool (explore / read-only faces).
+fn child_lacks_bash(spec: &AgentSpec) -> bool {
+    use crate::protocol::ToolProfile;
+    if spec.display_name() == "explore" {
+        return true;
+    }
+    if spec.tools.deny.iter().any(|n| n == "bash") {
+        return true;
+    }
+    if !spec.tools.allow.is_empty() {
+        return !spec.tools.allow.iter().any(|n| n == "bash");
+    }
+    matches!(
+        spec.tools.profile,
+        ToolProfile::ReadOnly | ToolProfile::Plan | ToolProfile::None
+    )
+}
+
+/// Heuristic: task needs live git/shell, which explore cannot provide.
+pub(crate) fn prompt_looks_like_vcs_workflow(prompt: &str) -> bool {
+    let p = prompt.to_ascii_lowercase();
+    const KEYS: &[&str] = &[
+        "git status",
+        "git diff",
+        "git commit",
+        "git add",
+        "git reset",
+        "git log",
+        "git stash",
+        "git restore",
+        "staged",
+        "unstaged",
+        "working tree",
+        "uncommitted",
+        "diff --stat",
+        "diff --cached",
+        "categorize repository",
+        "categorize repo",
+        "repository changes",
+        "repo changes",
+        "commit by feature",
+        "by feature commit",
+        "split commit",
+        "split into commit",
+        "prepare commit",
+        "create commit",
+        "make commit",
+        "stage files",
+        "commit message",
+        "commit splitting",
+    ];
+    if KEYS.iter().any(|k| p.contains(k)) {
+        return true;
+    }
+    // "commit" alone is too broad; require a staging/diff signal nearby.
+    p.contains("commit")
+        && (p.contains("stage")
+            || p.contains("diff")
+            || p.contains("change")
+            || p.contains("feature")
+            || p.contains("split"))
+}
+
 /// Apply `settings.memory.subagent` (default off). Only **upgrades** Off → Index
 /// so an explicit AgentSpec `resources.memory: index` is never cleared.
 ///
@@ -638,8 +703,8 @@ fn apply_subagent_memory_settings(agent: &mut AgentSpec) {
         return;
     }
     let settings = crate::settings::load();
-    let features = FeatureState::from_settings(&settings)
-        .with_process_overrides(false, env_no_memory());
+    let features =
+        FeatureState::from_settings(&settings).with_process_overrides(false, env_no_memory());
     if !features.memory_enabled() {
         return;
     }
@@ -796,14 +861,18 @@ pub fn format_task_started(
     agent_name: &str,
     description: Option<&str>,
     job_id: &str,
+    log_path: Option<&str>,
 ) -> ToolOutput {
     let desc_part = description.map(|d| format!(" · {d}")).unwrap_or_default();
-    let text = format!(
+    let mut text = format!(
         "[task · {agent_name}{desc_part} · status=started · id={job_id}]\n\
          Background job started. Continue other work.\n\
          Result arrives as a [job completed] notice before the next LLM turn, \
          or poll with job_output(job_id=\"{job_id}\")."
     );
+    if let Some(p) = log_path {
+        text.push_str(&format!("\nlog_path: {p}"));
+    }
     let details = json!({
         "ok": true,
         "status": "started",
@@ -811,6 +880,7 @@ pub fn format_task_started(
         "background": true,
         "agent": agent_name,
         "description": description,
+        "log_path": log_path,
     });
     ToolOutput::text_with_details(text, details)
 }
@@ -836,27 +906,57 @@ pub fn format_task_output(
         body.push_str("\n…[truncated]");
     }
 
-    let text = if matches!(status, TaskExitStatus::IncompleteInfo) {
-        format!(
+    let text = match status {
+        TaskExitStatus::IncompleteInfo => format!(
             "{header}\n\
              Sub-agent could not finish without clarification (do not treat as a question to the user).\n\
              Partial findings:\n{body}"
-        )
-    } else if !result.ok {
-        let err = result
-            .error
-            .as_ref()
-            .map(|e| e.to_string())
-            .unwrap_or_else(|| "unknown error".into());
-        if body.is_empty() {
-            format!("{header}\nError: {err}")
-        } else {
-            format!("{header}\nError: {err}\nPartial:\n{body}")
+        ),
+        TaskExitStatus::TimedOut => {
+            let err = result
+                .error
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "wall time exceeded".into());
+            if body.is_empty() {
+                format!("{header}\nTimeout: {err}")
+            } else {
+                format!("{header}\nTimeout: {err}\nPartial:\n{body}")
+            }
         }
-    } else if body.is_empty() {
-        format!("{header}\n(no summary)")
-    } else {
-        format!("{header}\n{body}")
+        TaskExitStatus::Aborted => {
+            let err = result
+                .error
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "aborted".into());
+            if body.is_empty() {
+                format!("{header}\nAborted: {err}")
+            } else {
+                format!("{header}\nAborted: {err}\nPartial:\n{body}")
+            }
+        }
+        TaskExitStatus::MaxTurnsExceeded => {
+            if body.is_empty() {
+                format!("{header}\nMax turns exceeded (partial empty).")
+            } else {
+                format!("{header}\nMax turns exceeded. Partial findings:\n{body}")
+            }
+        }
+        _ if !result.ok || status.is_failure() => {
+            let err = result
+                .error
+                .as_ref()
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".into());
+            if body.is_empty() {
+                format!("{header}\nError: {err}")
+            } else {
+                format!("{header}\nError: {err}\nPartial:\n{body}")
+            }
+        }
+        _ if body.is_empty() => format!("{header}\n(no summary)"),
+        _ => format!("{header}\n{body}"),
     };
 
     let details = json!({
@@ -876,9 +976,54 @@ pub fn format_task_output(
     ToolOutput::text_with_details(text, details)
 }
 
+/// Build parent-facing tool text from a finished job snapshot (TUI / recovery).
+pub fn format_task_output_from_job(snap: &super::jobs::JobSnapshot) -> (bool, String) {
+    let status = snap.status.unwrap_or(if snap.ok {
+        TaskExitStatus::Success
+    } else {
+        TaskExitStatus::RuntimeError
+    });
+    let is_error = !snap.ok || status.is_failure();
+    let desc_part = snap
+        .description
+        .as_ref()
+        .filter(|d| !d.is_empty())
+        .map(|d| format!(" · {d}"))
+        .unwrap_or_default();
+    let header = format!(
+        "[task · {}{desc_part} · status={} · id={}]",
+        snap.agent,
+        status.as_str(),
+        snap.id
+    );
+    let mut body = snap.summary.clone();
+    if body.len() > SUMMARY_MAX_CHARS {
+        body.truncate(SUMMARY_MAX_CHARS);
+        body.push_str("\n…[truncated]");
+    }
+    let text = if is_error {
+        let err = snap.error.clone().unwrap_or_else(|| status.as_str().into());
+        let kind = match status {
+            TaskExitStatus::TimedOut => "Timeout",
+            TaskExitStatus::Aborted => "Aborted",
+            _ => "Error",
+        };
+        if body.is_empty() {
+            format!("{header}\n{kind}: {err}")
+        } else {
+            format!("{header}\n{kind}: {err}\nPartial:\n{body}")
+        }
+    } else if body.is_empty() {
+        format!("{header}\n(no summary)")
+    } else {
+        format!("{header}\n{body}")
+    };
+    (is_error, text)
+}
+
 /// One-liner for main agent system prompt.
 pub const TASK_TOOL_PROMPT_HINT: &str = "\
-- To delegate work to a sub-agent, use the `task` tool with `agent` set to a name allowed by spawn policy (default: explore for multi-file research). Findings return as a summary so this conversation stays small. Do not use task for a trivial single-file read. For long work that should not block this turn, use task(background=true); when you have spawned all background work (agent jobs and/or bash bg tasks) and have nothing else to do, call wait_tasks (mode=all) to block until they finish — or wait_tasks(mode=any) for the next one. job_output / job_kill accept both `job_*` and `bg_*` ids. For agents that write/edit/bash, prefer isolation=worktree (or background, which defaults worktree for writable tools) so changes stay under .one/worktrees and are not auto-merged.";
+- To delegate work to a sub-agent, use the `task` tool with `agent` set to a name allowed by spawn policy (default: explore for multi-file **code** research: read/grep/find/ls only). Findings return as a summary so this conversation stays small. Do not use task for a trivial single-file read, and do not use task to implement code when you already have the design/context — edit/write yourself. **Never use explore/task for git workflows** (status, diff, stage, commit, split commits by feature) — explore has no bash; run compact git via bash yourself (`git status --short`, `git diff --stat`, `git add <paths>`, `git commit`). Prefer task only when isolation of a large research fan-out is worth the latency. For long work that should not block this turn, use task(background=true); when you have spawned all background work (agent jobs and/or bash bg tasks) and have nothing else to do, call wait_tasks (mode=all) with no wait_ms to block until they finish — or wait_tasks(mode=any) for the next one. Do not pass wait_ms=1000 (that is 1 second). job_output without wait_ms is a snapshot; to wait, omit wait_ms on wait_tasks. job_output / job_kill accept both `job_*` and `bg_*` ids. Foreground and background tasks share ONE_JOB_MAX_WALL_MS (default 5 minutes). For agents that write/edit/bash, prefer isolation=worktree (or background, which defaults worktree for writable tools) so changes stay under .one/worktrees and are not auto-merged.";
 
 /// Build parent AgentSpec for the interactive / -p main agent.
 ///
@@ -970,6 +1115,56 @@ mod tests {
         )
     }
 
+    #[test]
+    fn format_task_output_distinguishes_timeout() {
+        let mut rr = RunResult::failure(
+            ProtocolError::new(error_code::TIMEOUT, "job wall time exceeded (1000ms)"),
+            1000,
+        )
+        .with_status(TaskExitStatus::TimedOut);
+        rr.stop_reason = Some("wall_timeout".into());
+        let out = format_task_output("explore", Some("scan"), &rr);
+        let text = out.as_text();
+        assert!(text.contains("status=timeout"), "{text}");
+        assert!(text.contains("Timeout:"), "{text}");
+        assert_eq!(
+            out.details
+                .as_ref()
+                .and_then(|d| d.get("ok"))
+                .and_then(|v| v.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn format_task_output_from_job_marks_failures() {
+        use super::super::jobs::{JobSnapshot, JobState};
+        let snap = JobSnapshot {
+            id: "job_x".into(),
+            kind: "task",
+            agent: "explore".into(),
+            description: Some("scan".into()),
+            state: JobState::Failed,
+            status: Some(TaskExitStatus::RuntimeError),
+            summary: String::new(),
+            ok: false,
+            duration_ms: 12,
+            turns: Some(4),
+            max_turns: Some(16),
+            error: Some("provider_error: overloaded".into()),
+            notified: true,
+            activity: String::new(),
+            event_lines: vec![],
+            notify_completion: false,
+            log_path: None,
+        };
+        let (is_error, text) = format_task_output_from_job(&snap);
+        assert!(is_error);
+        assert!(text.contains("status=runtime_error"), "{text}");
+        assert!(text.contains("provider_error"), "{text}");
+        assert!(text.contains("id=job_x"), "{text}");
+    }
+
     #[tokio::test]
     async fn task_tool_formats_runner_summary() {
         let host = test_host();
@@ -1034,6 +1229,46 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("prompt") || format!("{err:?}").contains("prompt"));
+    }
+
+    #[tokio::test]
+    async fn task_tool_rejects_explore_for_git_workflow() {
+        let host = test_host();
+        // Harness would succeed if reached — precheck must short-circuit first.
+        let tool = TaskTool::with_harness(
+            host,
+            Arc::new(FakeHarness {
+                summary: "should not run".into(),
+                status: TaskExitStatus::Success,
+            }),
+        );
+        let out = tool
+            .execute(&ToolCall {
+                id: "c_git".into(),
+                name: "task".into(),
+                arguments: json!({
+                    "prompt": "Categorize repository changes and split commits by feature",
+                    "agent": "explore",
+                    "description": "categorize",
+                }),
+            })
+            .await
+            .unwrap();
+        let text = out.as_text();
+        assert!(text.contains("status=incomplete_info"), "{text}");
+        assert!(text.contains("need bash") || text.contains("ERROR:"), "{text}");
+        assert!(!text.contains("should not run"), "{text}");
+    }
+
+    #[test]
+    fn vcs_prompt_heuristic() {
+        assert!(prompt_looks_like_vcs_workflow(
+            "Categorize repository changes for feature commits"
+        ));
+        assert!(prompt_looks_like_vcs_workflow("run git status and group diffs"));
+        assert!(prompt_looks_like_vcs_workflow("split commit by feature"));
+        assert!(!prompt_looks_like_vcs_workflow("find auth middleware callers"));
+        assert!(!prompt_looks_like_vcs_workflow("how does Agent::run work?"));
     }
 
     #[tokio::test]

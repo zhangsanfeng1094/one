@@ -5,14 +5,23 @@
 //! **UI layer (separate from bash `/ps`):** each job keeps a live event log
 //! (turns / tools / activity) for TUI `/tasks` · `SubagentDetail` — not the
 //! process list.
+//!
+//! **Durable log:** each job also appends the same event stream to
+//! `~/.one/agent/jobs/<job_id>.jsonl` (override with `ONE_JOB_LOG_DIR`; disable
+//! with `ONE_JOB_LOG=0`) so post-mortem after kill/crash still shows where the
+//! child stuck (turns / tools / activity).
 
 use std::collections::{HashMap, VecDeque};
+use std::fs::{File, OpenOptions};
+use std::io::Write;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use one_core::agent::LlmProvider;
 use one_core::events::AgentEvent;
+use serde_json::{json, Value};
 use tokio::sync::{Notify, OwnedSemaphorePermit};
 use tokio::time::timeout;
 
@@ -27,16 +36,172 @@ const DEFAULT_JOB_MAX_WALL_MS: u64 = 300_000;
 /// Cap live event lines retained per job (ring buffer).
 const EVENT_LOG_CAP: usize = 200;
 
+/// Directory for durable job JSONL logs.
+///
+/// Override with `ONE_JOB_LOG_DIR`. Default: `~/.one/agent/jobs`.
+pub fn job_log_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("ONE_JOB_LOG_DIR") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    one_session::agent_dir().join("jobs")
+}
+
+/// Whether durable job logs are enabled (default: on).
+pub fn job_log_enabled() -> bool {
+    match std::env::var("ONE_JOB_LOG") {
+        Ok(s) => !matches!(
+            s.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+/// Path for a job's durable JSONL log (`…/jobs/<safe_id>.jsonl`).
+pub fn job_log_path(job_id: &str) -> PathBuf {
+    let safe: String = job_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    let name = if safe.is_empty() {
+        "job_unknown".into()
+    } else {
+        safe
+    };
+    job_log_dir().join(format!("{name}.jsonl"))
+}
+
+fn now_rfc3339() -> String {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    // Prefer chrono when available for readable UTC; fall back to epoch ms.
+    chrono::DateTime::<chrono::Utc>::from_timestamp_millis(ms as i64)
+        .map(|dt| dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+        .unwrap_or_else(|| format!("epoch_ms:{ms}"))
+}
+
+struct DurableLog {
+    path: PathBuf,
+    file: File,
+}
+
 /// Live activity + event ring for one job (shared with harness subscribe).
 #[derive(Debug, Default)]
 pub struct JobEventLog {
     lines: Mutex<VecDeque<String>>,
     activity: Mutex<String>,
+    durable: Mutex<Option<DurableLog>>,
+}
+
+impl std::fmt::Debug for DurableLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DurableLog")
+            .field("path", &self.path)
+            .finish_non_exhaustive()
+    }
 }
 
 impl JobEventLog {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    /// Open `path` for append and write a `meta` header line (best-effort).
+    pub fn open_durable(&self, path: impl Into<PathBuf>, meta: Value) {
+        if !job_log_enabled() {
+            return;
+        }
+        let path = path.into();
+        if let Some(parent) = path.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "job log: failed to create directory"
+                );
+                return;
+            }
+        }
+        match OpenOptions::new().create(true).append(true).open(&path) {
+            Ok(mut file) => {
+                let rec = json!({
+                    "t": "meta",
+                    "ts": now_rfc3339(),
+                    "meta": meta,
+                });
+                if let Err(e) = writeln!(file, "{rec}") {
+                    tracing::warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "job log: failed to write meta"
+                    );
+                    return;
+                }
+                let _ = file.flush();
+                if let Ok(mut slot) = self.durable.lock() {
+                    *slot = Some(DurableLog { path, file });
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "job log: failed to open"
+                );
+            }
+        }
+    }
+
+    /// Path of the durable log if opened.
+    pub fn log_path(&self) -> Option<PathBuf> {
+        self.durable
+            .lock()
+            .ok()
+            .and_then(|d| d.as_ref().map(|x| x.path.clone()))
+    }
+
+    /// Append a terminal `end` record (state + optional fields).
+    pub fn write_end(&self, state: &str, extra: Value) {
+        let mut rec = json!({
+            "t": "end",
+            "ts": now_rfc3339(),
+            "state": state,
+        });
+        if let Some(obj) = rec.as_object_mut() {
+            if let Some(extra_obj) = extra.as_object() {
+                for (k, v) in extra_obj {
+                    obj.insert(k.clone(), v.clone());
+                }
+            }
+        }
+        self.append_json_record(&rec);
+        // Ensure durable file is flushed for post-mortem after kill.
+        if let Ok(mut slot) = self.durable.lock() {
+            if let Some(d) = slot.as_mut() {
+                let _ = d.file.flush();
+            }
+        }
+    }
+
+    fn append_json_record(&self, rec: &Value) {
+        if let Ok(mut slot) = self.durable.lock() {
+            if let Some(d) = slot.as_mut() {
+                if let Err(e) = writeln!(d.file, "{rec}") {
+                    tracing::debug!(
+                        path = %d.path.display(),
+                        error = %e,
+                        "job log: append failed"
+                    );
+                } else {
+                    let _ = d.file.flush();
+                }
+            }
+        }
     }
 
     pub fn set_activity(&self, text: impl Into<String>) {
@@ -47,10 +212,7 @@ impl JobEventLog {
     }
 
     pub fn activity(&self) -> String {
-        self.activity
-            .lock()
-            .map(|a| a.clone())
-            .unwrap_or_default()
+        self.activity.lock().map(|a| a.clone()).unwrap_or_default()
     }
 
     pub fn push_line(&self, line: impl Into<String>) {
@@ -62,8 +224,14 @@ impl JobEventLog {
             if lines.len() >= EVENT_LOG_CAP {
                 lines.pop_front();
             }
-            lines.push_back(line);
+            lines.push_back(line.clone());
         }
+        // Durable JSONL — one record per UI log line (survives kill/crash).
+        self.append_json_record(&json!({
+            "t": "line",
+            "ts": now_rfc3339(),
+            "text": line,
+        }));
     }
 
     pub fn lines(&self) -> Vec<String> {
@@ -109,10 +277,7 @@ impl JobEventLog {
                 self.set_activity(line.clone());
                 self.push_line(line);
             }
-            AgentEvent::RetryStarted {
-                retry,
-                max_retries,
-            } => {
+            AgentEvent::RetryStarted { retry, max_retries } => {
                 let line = format!("→ retry {retry}/{max_retries} started");
                 self.set_activity(line.clone());
                 self.push_line(line);
@@ -207,7 +372,10 @@ fn truncate_chars(s: &str, max: usize) -> String {
     if t.chars().count() <= max {
         t.to_string()
     } else {
-        format!("{}…", t.chars().take(max.saturating_sub(1)).collect::<String>())
+        format!(
+            "{}…",
+            t.chars().take(max.saturating_sub(1)).collect::<String>()
+        )
     }
 }
 
@@ -265,6 +433,33 @@ pub fn job_max_wall_ms() -> Option<u64> {
     }
 }
 
+/// Why a live job was terminalized from outside the harness.
+///
+/// Shown in durable logs + parent tool text so "aborted by job_kill" is not the
+/// only message for Esc / wall timeout / session teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KillReason {
+    /// Explicit `job_kill` tool or `/tasks` kill.
+    JobKill,
+    /// Parent Esc / soft abort (`AppRuntime::abort`).
+    ParentAbort,
+    /// Session teardown (`/new`, `/resume`, process exit).
+    SessionTeardown,
+    /// Independent wall-clock watchdog (`ONE_JOB_MAX_WALL_MS`).
+    WallTimeout,
+}
+
+impl KillReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::JobKill => "job_kill",
+            Self::ParentAbort => "parent_abort",
+            Self::SessionTeardown => "session_teardown",
+            Self::WallTimeout => "wall_timeout",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
     Running,
@@ -310,6 +505,8 @@ pub struct JobSnapshot {
     pub event_lines: Vec<String>,
     /// When false, completion did not (and will not) notify the parent agent.
     pub notify_completion: bool,
+    /// Durable JSONL log path (`~/.one/agent/jobs/<id>.jsonl`), if enabled.
+    pub log_path: Option<PathBuf>,
 }
 
 struct JobInner {
@@ -377,35 +574,41 @@ impl AgentJobRegistry {
         )
     }
 
-    /// Spawn harness with notification / wall-time options.
+    /// Register a live job row (TUI `/tasks` + durable log) and build [`RunControl`].
     ///
-    /// Use `notify_completion: false` for **sync** `task` so the tool_result
-    /// is the only parent signal, while still exposing live status in `/ps`.
-    pub fn spawn_with(
-        self: &Arc<Self>,
-        req: RunRequest,
-        provider: Arc<dyn LlmProvider>,
-        opts: HarnessOptions,
-        agent_name: String,
-        description: Option<String>,
-        slot: Option<OwnedSemaphorePermit>,
-        spawn_opts: SpawnOptions,
-    ) -> String {
+    /// Does **not** start the harness — caller either awaits it on the current
+    /// task ([`Self::run_foreground`]) or detaches it ([`Self::spawn_with`]).
+    fn register_job(
+        &self,
+        agent_name: &str,
+        description: Option<&str>,
+        opts: &HarnessOptions,
+        max_turns: u64,
+        spawn_opts: &SpawnOptions,
+    ) -> (String, RunControl, Arc<AtomicBool>) {
         let id = Self::next_id();
         let abort = Arc::new(AtomicBool::new(false));
         let turn_progress = Arc::new(AtomicU64::new(0));
         let done = Arc::new(Notify::new());
         let event_log = JobEventLog::new();
-        let max_turns = req.agent.max_turns.unwrap_or(16) as u64;
+        event_log.open_durable(
+            job_log_path(&id),
+            json!({
+                "job_id": id,
+                "agent": agent_name,
+                "description": description,
+                "max_turns": max_turns,
+                "notify_completion": spawn_opts.notify_completion,
+                "apply_wall_timeout": spawn_opts.apply_wall_timeout,
+                "cwd": opts.cwd.display().to_string(),
+            }),
+        );
         event_log.set_activity("queued");
         event_log.push_line(format!(
             "▸ job {} · {}{}",
             id,
             agent_name,
-            description
-                .as_ref()
-                .map(|d| format!(" · {d}"))
-                .unwrap_or_default()
+            description.map(|d| format!(" · {d}")).unwrap_or_default()
         ));
 
         {
@@ -414,8 +617,8 @@ impl AgentJobRegistry {
                 id.clone(),
                 JobInner {
                     id: id.clone(),
-                    agent: agent_name.clone(),
-                    description: description.clone(),
+                    agent: agent_name.to_string(),
+                    description: description.map(|s| s.to_string()),
                     state: JobState::Running,
                     result: None,
                     started: Instant::now(),
@@ -431,50 +634,187 @@ impl AgentJobRegistry {
             );
         }
 
-        let registry = Arc::clone(self);
-        let job_id = id.clone();
         let control = RunControl {
             abort: Some(abort.clone()),
             turn_progress: Some(turn_progress),
             event_log: Some(event_log),
-            trace: spawn_opts.trace,
-            trace_meta: spawn_opts.trace_meta,
+            trace: spawn_opts.trace.clone(),
+            trace_meta: spawn_opts.trace_meta.clone(),
         };
+        (id, control, abort)
+    }
+
+    /// Independent wall-clock watchdog.
+    ///
+    /// `tokio::time::timeout` around the harness **cannot** cancel a task stuck
+    /// in blocking code (e.g. Langfuse `force_flush` on a Tokio worker after
+    /// `AgentEnd`). A separate sleep task calls [`Self::kill_with_reason`] so
+    /// the job row becomes terminal, waiters wake, and the parent is not parked
+    /// on "Waiting for model…" holding a dead child forever.
+    fn arm_wall_watchdog(self: &Arc<Self>, id: &str, apply_wall: bool) {
+        if !apply_wall {
+            return;
+        }
+        let Some(ms) = job_max_wall_ms() else {
+            return;
+        };
+        let reg = Arc::clone(self);
+        let jid = id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            if let Some(snap) = reg.get(&jid) {
+                if !snap.state.is_terminal() {
+                    let _ = reg.kill_with_reason(&jid, KillReason::WallTimeout);
+                }
+            }
+        });
+    }
+
+    async fn run_harness_with_wall(
+        req: RunRequest,
+        provider: Arc<dyn LlmProvider>,
+        opts: HarnessOptions,
+        control: RunControl,
+        abort: Arc<AtomicBool>,
+        apply_wall: bool,
+    ) -> RunResult {
+        // Soft async timeout (cancels cooperative awaits). Hard terminalization
+        // of a non-cooperative hang is handled by [`Self::arm_wall_watchdog`].
+        let wall = if apply_wall { job_max_wall_ms() } else { None };
+        if let Some(ms) = wall {
+            match timeout(
+                Duration::from_millis(ms),
+                harness::run_with_control(req, provider.as_ref(), &opts, control),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    abort.store(true, Ordering::Relaxed);
+                    let mut rr = RunResult::failure(
+                        ProtocolError::new(
+                            error_code::TIMEOUT,
+                            format!("job wall time exceeded ({ms}ms)"),
+                        ),
+                        ms,
+                    )
+                    .with_status(TaskExitStatus::TimedOut);
+                    rr.stop_reason = Some("wall_timeout".into());
+                    rr
+                }
+            }
+        } else {
+            harness::run_with_control(req, provider.as_ref(), &opts, control).await
+        }
+    }
+
+    /// **Foreground / sync `task` path** — completion **is** the return value of
+    /// the awaited harness, not a `Notify` side-channel.
+    ///
+    /// Still registers a live job so TUI `/tasks` and durable JSONL work, and so
+    /// Esc / `job_kill` can set the shared abort flag. The parent never
+    /// `wait_until_done`s: when this future resolves, the child has finished.
+    ///
+    /// `on_registered(job_id)` runs after the live row exists and **before** the
+    /// harness await — use it to `bind_tool_job` for TUI click-to-open.
+    ///
+    /// This is the fix for "UI stuck on ▸ finishing forever": that state meant
+    /// the child had already emitted `AgentEnd`, but the parent was waiting on
+    /// a lost `notify_waiters` from a detached spawn.
+    pub async fn run_foreground(
+        self: &Arc<Self>,
+        req: RunRequest,
+        provider: Arc<dyn LlmProvider>,
+        opts: HarnessOptions,
+        agent_name: String,
+        description: Option<String>,
+        slot: Option<OwnedSemaphorePermit>,
+        spawn_opts: SpawnOptions,
+        on_registered: impl FnOnce(&str),
+    ) -> (String, RunResult) {
+        let max_turns = req.agent.max_turns.unwrap_or(16) as u64;
+        let (id, control, abort) = self.register_job(
+            &agent_name,
+            description.as_deref(),
+            &opts,
+            max_turns,
+            &spawn_opts,
+        );
+        on_registered(&id);
         let apply_wall = spawn_opts.apply_wall_timeout;
+        self.arm_wall_watchdog(&id, apply_wall);
+        // Race harness against an external terminalization (job_kill / wall
+        // timeout finalize on another path). If kill() already sealed the job
+        // while the harness is stuck ignoring abort, return the stored result
+        // instead of parking the parent `task` tool forever on "Thinking…".
+        let harness =
+            Self::run_harness_with_wall(req, provider, opts, control, abort.clone(), apply_wall);
+        let early_terminal = {
+            let reg = Arc::clone(self);
+            let jid = id.clone();
+            async move {
+                let _ = reg.wait_until_done(&jid).await;
+                reg.take_result_clone(&jid)
+            }
+        };
+        let result = tokio::select! {
+            r = harness => r,
+            early = early_terminal => {
+                // Prefer the snapshot kill/timeout already stored; if missing,
+                // synthesize an aborted result so the parent unblocks.
+                if let Some(r) = early {
+                    r
+                } else {
+                    RunResult::failure(
+                        ProtocolError::new(error_code::ABORTED, "job terminated"),
+                        0,
+                    )
+                    .with_status(TaskExitStatus::Aborted)
+                }
+            }
+        };
+        drop(slot);
+        // If kill() already terminalized the job, keep that snapshot's result.
+        self.finalize(&id, result);
+        let result = self
+            .take_result_clone(&id)
+            .expect("finalize always stores a result");
+        (id, result)
+    }
+
+    /// Spawn harness as a **background** job (`task(background=true)`).
+    ///
+    /// Completions push `[job completed]` when `notify_completion` is set.
+    /// Waiters should prefer polling / `wait` with timeout; the Notify is a
+    /// wake hint only (see `wait_until_done` subscribe-before-recheck).
+    pub fn spawn_with(
+        self: &Arc<Self>,
+        req: RunRequest,
+        provider: Arc<dyn LlmProvider>,
+        opts: HarnessOptions,
+        agent_name: String,
+        description: Option<String>,
+        slot: Option<OwnedSemaphorePermit>,
+        spawn_opts: SpawnOptions,
+    ) -> String {
+        let max_turns = req.agent.max_turns.unwrap_or(16) as u64;
+        let (id, control, abort) = self.register_job(
+            &agent_name,
+            description.as_deref(),
+            &opts,
+            max_turns,
+            &spawn_opts,
+        );
+
+        let registry = Arc::clone(self);
+        let job_id = id.clone();
+        let apply_wall = spawn_opts.apply_wall_timeout;
+        self.arm_wall_watchdog(&id, apply_wall);
         tokio::spawn(async move {
             let _slot = slot;
-            let wall = if apply_wall {
-                job_max_wall_ms()
-            } else {
-                None
-            };
-            let result = if let Some(ms) = wall {
-                match timeout(
-                    Duration::from_millis(ms),
-                    harness::run_with_control(req, provider.as_ref(), &opts, control),
-                )
-                .await
-                {
-                    Ok(r) => r,
-                    Err(_) => {
-                        // Signal child agent to stop if still in LLM call.
-                        abort.store(true, Ordering::Relaxed);
-                        let mut rr = RunResult::failure(
-                            ProtocolError::new(
-                                error_code::TIMEOUT,
-                                format!("background job wall time exceeded ({ms}ms)"),
-                            ),
-                            ms,
-                        )
-                        .with_status(TaskExitStatus::RuntimeError);
-                        rr.stop_reason = Some("wall_timeout".into());
-                        rr
-                    }
-                }
-            } else {
-                harness::run_with_control(req, provider.as_ref(), &opts, control).await
-            };
-            // Nested LangfuseTraceSink flushes on Drop when `control.trace` is dropped here.
+            let result =
+                Self::run_harness_with_wall(req, provider, opts, control, abort, apply_wall).await;
+            // Nested LangfuseTraceSink: child Drop is non-blocking; root flushes later.
             registry.finalize(&job_id, result);
         });
 
@@ -511,7 +851,16 @@ impl AgentJobRegistry {
     }
 
     /// Request abort on the child agent; mark job aborted and notify once.
+    ///
+    /// Reason is recorded in the durable log and parent-facing error so the UI
+    /// is not always the opaque `"aborted by job_kill"` (Esc / wall / teardown
+    /// used to look identical).
     pub fn kill(&self, id: &str) -> Result<JobSnapshot, String> {
+        self.kill_with_reason(id, KillReason::JobKill)
+    }
+
+    /// Like [`Self::kill`] with an explicit cause.
+    pub fn kill_with_reason(&self, id: &str, reason: KillReason) -> Result<JobSnapshot, String> {
         let mut jobs = self.jobs.lock().expect("jobs lock");
         let job = jobs
             .get_mut(id)
@@ -520,15 +869,45 @@ impl AgentJobRegistry {
             return Ok(snapshot_of(job));
         }
         job.abort.store(true, Ordering::Relaxed);
-        job.state = JobState::Aborted;
+        let duration_ms = job.started.elapsed().as_millis() as u64;
+        let turns = job.turn_progress.load(Ordering::Relaxed);
+        let (state, status, code, msg, activity) = match reason {
+            KillReason::WallTimeout => {
+                let ms = job_max_wall_ms().unwrap_or(DEFAULT_JOB_MAX_WALL_MS);
+                (
+                    JobState::Failed,
+                    TaskExitStatus::TimedOut,
+                    error_code::TIMEOUT,
+                    format!("job wall time exceeded ({ms}ms)"),
+                    "timeout",
+                )
+            }
+            other => (
+                JobState::Aborted,
+                TaskExitStatus::Aborted,
+                error_code::ABORTED,
+                format!("aborted by {}", other.as_str()),
+                "aborted",
+            ),
+        };
+        job.state = state;
         job.finished = Some(Instant::now());
-        job.event_log.set_activity("aborted");
-        job.event_log.push_line("▸ aborted");
-        let mut rr = RunResult::failure(
-            ProtocolError::new(error_code::ABORTED, "aborted by job_kill"),
-            job.started.elapsed().as_millis() as u64,
-        )
-        .with_status(TaskExitStatus::Aborted);
+        job.event_log.set_activity(activity);
+        job.event_log.push_line(format!("▸ {activity} · {}", reason.as_str()));
+        job.event_log.write_end(
+            activity,
+            json!({
+                "duration_ms": duration_ms,
+                "turns": turns,
+                "reason": reason.as_str(),
+            }),
+        );
+        let mut rr = RunResult::failure(ProtocolError::new(code, msg), duration_ms).with_status(status);
+        if matches!(reason, KillReason::WallTimeout) {
+            rr.stop_reason = Some("wall_timeout".into());
+        } else {
+            rr.stop_reason = Some(reason.as_str().into());
+        }
         rr.ok = false;
         job.result = Some(rr);
         let should_notify = job.notify_completion && !job.notified;
@@ -548,6 +927,11 @@ impl AgentJobRegistry {
 
     /// Abort every running job (parent Esc / session abort).
     pub fn kill_all(&self) {
+        self.kill_all_with_reason(KillReason::ParentAbort);
+    }
+
+    /// Abort every running job with an explicit cause (Esc vs session teardown).
+    pub fn kill_all_with_reason(&self, reason: KillReason) {
         let ids: Vec<String> = self
             .jobs
             .lock()
@@ -557,7 +941,7 @@ impl AgentJobRegistry {
             .map(|(id, _)| id.clone())
             .collect();
         for id in ids {
-            let _ = self.kill(&id);
+            let _ = self.kill_with_reason(&id, reason);
         }
     }
 
@@ -589,13 +973,33 @@ impl AgentJobRegistry {
             | TaskExitStatus::IncompleteInfo
             | TaskExitStatus::MaxTurnsExceeded
             | TaskExitStatus::Started => JobState::Completed,
-            TaskExitStatus::RuntimeError => JobState::Failed,
+            TaskExitStatus::RuntimeError | TaskExitStatus::TimedOut => JobState::Failed,
         };
         job.finished = Some(Instant::now());
+        let duration_ms = job
+            .finished
+            .unwrap()
+            .duration_since(job.started)
+            .as_millis() as u64;
+        let turns = result
+            .turns
+            .unwrap_or_else(|| job.turn_progress.load(Ordering::Relaxed));
+        let stop_reason = result.stop_reason.clone();
+        let err_s = result.error.as_ref().map(|e| e.to_string());
         job.result = Some(result);
         let st = job.state.as_str();
         job.event_log.set_activity(st);
         job.event_log.push_line(format!("▸ {st}"));
+        job.event_log.write_end(
+            st,
+            json!({
+                "duration_ms": duration_ms,
+                "turns": turns,
+                "status": status.as_str(),
+                "stop_reason": stop_reason,
+                "error": err_s,
+            }),
+        );
         let should_notify = job.notify_completion && !job.notified;
         if should_notify {
             job.notified = true;
@@ -614,25 +1018,53 @@ impl AgentJobRegistry {
     }
 
     pub async fn wait(&self, id: &str, wait_ms: Option<u64>) -> Result<JobSnapshot, String> {
-        let done = {
-            let jobs = self.jobs.lock().expect("jobs lock");
-            let job = jobs
-                .get(id)
-                .ok_or_else(|| format!("unknown job_id: {id}"))?;
-            if job.state.is_terminal() {
-                return Ok(snapshot_of(job));
-            }
-            job.done.clone()
-        };
         let ms = wait_ms.unwrap_or(0);
         if ms == 0 {
             return self.get(id).ok_or_else(|| format!("unknown job_id: {id}"));
         }
-        let _ = tokio::time::timeout(Duration::from_millis(ms), done.notified()).await;
-        self.get(id).ok_or_else(|| format!("unknown job_id: {id}"))
+        let deadline = Instant::now() + Duration::from_millis(ms);
+        loop {
+            // Subscribe *before* re-checking terminal: `notify_waiters` does not
+            // store a permit, so a completion between check and subscribe is lost
+            // and the waiter would hang until timeout (or forever in wait_until_done).
+            let done = {
+                let jobs = self.jobs.lock().expect("jobs lock");
+                let job = jobs
+                    .get(id)
+                    .ok_or_else(|| format!("unknown job_id: {id}"))?;
+                if job.state.is_terminal() {
+                    return Ok(snapshot_of(job));
+                }
+                job.done.clone()
+            };
+            let notified = done.notified();
+            {
+                let jobs = self.jobs.lock().expect("jobs lock");
+                let job = jobs
+                    .get(id)
+                    .ok_or_else(|| format!("unknown job_id: {id}"))?;
+                if job.state.is_terminal() {
+                    return Ok(snapshot_of(job));
+                }
+            }
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return self.get(id).ok_or_else(|| format!("unknown job_id: {id}"));
+            }
+            match timeout(left, notified).await {
+                Ok(()) => continue,
+                Err(_) => {
+                    return self.get(id).ok_or_else(|| format!("unknown job_id: {id}"));
+                }
+            }
+        }
     }
 
     /// Block until the job is terminal (used by sync `task`).
+    ///
+    /// Uses subscribe-before-recheck so a job that finishes between the state
+    /// read and `notified().await` still wakes the waiter (`Notify::notify_waiters`
+    /// drops the signal when nobody is subscribed yet).
     pub async fn wait_until_done(&self, id: &str) -> Result<JobSnapshot, String> {
         loop {
             let done = {
@@ -645,7 +1077,17 @@ impl AgentJobRegistry {
                 }
                 job.done.clone()
             };
-            done.notified().await;
+            let notified = done.notified();
+            {
+                let jobs = self.jobs.lock().expect("jobs lock");
+                let job = jobs
+                    .get(id)
+                    .ok_or_else(|| format!("unknown job_id: {id}"))?;
+                if job.state.is_terminal() {
+                    return Ok(snapshot_of(job));
+                }
+            }
+            notified.await;
         }
     }
 
@@ -790,6 +1232,9 @@ impl AgentJobRegistry {
                     break;
                 }
                 let slice = (dl - now).min(Duration::from_millis(200));
+                // Poll-with-timeout: even if a notify_waiters is missed, the
+                // 200ms slice rechecks terminal state (join is not hang-critical
+                // the way sync `wait_until_done` is). Still subscribe before sleep.
                 let done = {
                     let jobs = self.jobs.lock().expect("jobs lock");
                     pending
@@ -797,7 +1242,17 @@ impl AgentJobRegistry {
                         .and_then(|id| jobs.get(id).map(|j| j.done.clone()))
                 };
                 if let Some(done) = done {
-                    let _ = timeout(slice, done.notified()).await;
+                    let notified = done.notified();
+                    // Re-check under lock so we do not wait a full slice if already done.
+                    let already = {
+                        let jobs = self.jobs.lock().expect("jobs lock");
+                        pending
+                            .first()
+                            .and_then(|id| jobs.get(id).map(|j| j.state.is_terminal()))
+                    };
+                    if already != Some(true) {
+                        let _ = timeout(slice, notified).await;
+                    }
                 } else {
                     tokio::time::sleep(slice).await;
                 }
@@ -978,6 +1433,7 @@ fn snapshot_of(job: &JobInner) -> JobSnapshot {
         String::new()
     };
     let event_lines = job.event_log.lines();
+    let log_path = job.event_log.log_path();
     JobSnapshot {
         id: job.id.clone(),
         kind: "task",
@@ -995,6 +1451,7 @@ fn snapshot_of(job: &JobInner) -> JobSnapshot {
         activity,
         event_lines,
         notify_completion: job.notify_completion,
+        log_path,
     }
 }
 
@@ -1023,6 +1480,9 @@ pub fn format_job_completed_notification(snap: &JobSnapshot) -> String {
     }
     if let Some(err) = &snap.error {
         out.push_str(&format!("error: {err}\n"));
+    }
+    if let Some(p) = &snap.log_path {
+        out.push_str(&format!("log_path: {}\n", p.display()));
     }
     out.push('\n');
     if snap.summary.is_empty() {
@@ -1085,6 +1545,9 @@ pub fn format_job_snapshot(snap: &JobSnapshot) -> String {
     if let Some(err) = &snap.error {
         out.push_str(&format!("error: {err}\n"));
     }
+    if let Some(p) = &snap.log_path {
+        out.push_str(&format!("log_path: {}\n", p.display()));
+    }
     if !snap.activity.is_empty() && snap.state == JobState::Running {
         out.push_str(&format!("activity: {}\n", snap.activity));
     }
@@ -1132,6 +1595,7 @@ mod tests {
             activity: String::new(),
             event_lines: vec![],
             notify_completion: true,
+            log_path: None,
         };
         let t = format_job_completed_notification(&snap);
         assert!(t.contains("[job completed]"), "{t}");
@@ -1156,9 +1620,174 @@ mod tests {
         assert!(log.activity().contains("grep"), "{}", log.activity());
         let lines = log.lines();
         assert!(
-            lines.iter().any(|l| l.contains("grep") && l.contains("auth")),
+            lines
+                .iter()
+                .any(|l| l.contains("grep") && l.contains("auth")),
             "{lines:?}"
         );
+    }
+
+    #[test]
+    fn durable_log_appends_jsonl() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-job-log-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::env::set_var("ONE_JOB_LOG_DIR", &dir);
+        std::env::remove_var("ONE_JOB_LOG"); // ensure enabled
+        let log = JobEventLog::new();
+        let path = job_log_path("job_test_durable_1");
+        log.open_durable(
+            &path,
+            json!({"job_id": "job_test_durable_1", "agent": "explore"}),
+        );
+        log.push_line("▸ started");
+        log.on_agent_event(&AgentEvent::ToolExecutionStart {
+            tool_call: one_core::tool::ToolCall {
+                id: "c1".into(),
+                name: "read".into(),
+                arguments: serde_json::json!({"path": "src/main.rs"}),
+            },
+        });
+        log.write_end("aborted", json!({"duration_ms": 42, "reason": "job_kill"}));
+        assert_eq!(log.log_path().as_deref(), Some(path.as_path()));
+        let body = std::fs::read_to_string(&path).expect("read log");
+        assert!(body.contains("\"t\":\"meta\""), "{body}");
+        assert!(body.contains("▸ started"), "{body}");
+        assert!(body.contains("read"), "{body}");
+        assert!(body.contains("\"t\":\"end\""), "{body}");
+        assert!(body.contains("aborted"), "{body}");
+        // cleanup env so other tests keep default dir
+        std::env::remove_var("ONE_JOB_LOG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Foreground completion is the harness return value — no Notify wait.
+    #[tokio::test]
+    async fn run_foreground_returns_when_child_ends() {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue.clone());
+        let provider = Arc::new(one_ai::MockProvider::new());
+        let opts = HarnessOptions::from_cwd(std::env::temp_dir());
+        let mut req = RunRequest::new(
+            crate::protocol::AgentSpec::builtin_explore(),
+            "foreground probe",
+        );
+        req.session.mode = crate::protocol::SessionMode::Ephemeral;
+        let registered = Arc::new(AtomicBool::new(false));
+        let flag = registered.clone();
+        let fut = reg.run_foreground(
+            req,
+            provider,
+            opts,
+            "explore".into(),
+            Some("fg".into()),
+            None,
+            SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: true,
+                trace: None,
+                trace_meta: None,
+            },
+            |_| flag.store(true, Ordering::Relaxed),
+        );
+        let (id, result) = tokio::time::timeout(Duration::from_secs(5), fut)
+            .await
+            .expect("run_foreground must not hang after child AgentEnd");
+        assert!(registered.load(Ordering::Relaxed), "on_registered fired");
+        assert!(id.starts_with("job_"));
+        let snap = reg.get(&id).expect("job row");
+        assert!(snap.state.is_terminal(), "{:?}", snap.state);
+        // No background notify for foreground.
+        assert!(queue.lock().unwrap().is_empty());
+        // Result must be present (success or structured failure — mock is success).
+        assert!(result.duration_ms > 0 || result.ok || result.error.is_some());
+    }
+
+    /// Regression: completion must not be lost when it races with wait_until_done.
+    /// Previously `notify_waiters` + check-then-await dropped the wake and hung forever
+    /// (UI stuck on ▸ finishing after the child had already ended).
+    #[tokio::test]
+    async fn wait_until_done_survives_completion_race() {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue);
+        let provider = Arc::new(one_ai::MockProvider::new());
+        let opts = HarnessOptions::from_cwd(std::env::temp_dir());
+        for i in 0..40 {
+            let mut req = RunRequest::new(
+                crate::protocol::AgentSpec::builtin_explore(),
+                format!("race probe {i}"),
+            );
+            req.session.mode = crate::protocol::SessionMode::Ephemeral;
+            let id = reg.spawn(
+                req,
+                provider.clone(),
+                opts.clone(),
+                "explore".into(),
+                None,
+                None,
+            );
+            // No yield: maximize chance completion lands in the race window.
+            let snap = tokio::time::timeout(Duration::from_secs(3), reg.wait_until_done(&id))
+                .await
+                .unwrap_or_else(|_| panic!("wait_until_done hung on job {id} (lost notify?)"))
+                .expect("job exists");
+            assert!(snap.state.is_terminal(), "job {id} state={:?}", snap.state);
+        }
+    }
+
+    #[tokio::test]
+    async fn spawn_writes_durable_log_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-job-log-spawn-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        std::env::set_var("ONE_JOB_LOG_DIR", &dir);
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue);
+        let provider = Arc::new(one_ai::MockProvider::new());
+        let opts = HarnessOptions::from_cwd(std::env::temp_dir());
+        let mut req = RunRequest::new(
+            crate::protocol::AgentSpec::builtin_explore(),
+            "Summarize auth",
+        );
+        req.session.mode = crate::protocol::SessionMode::Ephemeral;
+        let id = reg.spawn(
+            req,
+            provider,
+            opts,
+            "explore".into(),
+            Some("auth".into()),
+            None,
+        );
+        for _ in 0..100 {
+            if let Some(s) = reg.get(&id) {
+                if s.state.is_terminal() {
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let snap = reg.get(&id).expect("job");
+        assert!(snap.state.is_terminal(), "{:?}", snap.state);
+        let path = snap.log_path.expect("log_path set");
+        assert!(path.exists(), "{}", path.display());
+        let body = std::fs::read_to_string(&path).expect("read");
+        assert!(body.contains(&id), "{body}");
+        assert!(
+            body.contains("\"t\":\"end\"") || body.contains("▸"),
+            "{body}"
+        );
+        std::env::remove_var("ONE_JOB_LOG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1243,6 +1872,47 @@ mod tests {
         std::env::set_var("ONE_JOB_MAX_WALL_MS", "0");
         assert_eq!(job_max_wall_ms(), None);
         std::env::remove_var("ONE_JOB_MAX_WALL_MS");
+    }
+
+    /// Independent watchdog must terminalize even when the harness future is
+    /// stuck in non-cooperative work (the soft `timeout()` cannot cancel that).
+    #[tokio::test]
+    async fn wall_watchdog_kills_stuck_job_row() {
+        std::env::set_var("ONE_JOB_MAX_WALL_MS", "50");
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue);
+        let (id, _control, _abort) = reg.register_job(
+            "explore",
+            Some("stuck"),
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: true,
+                trace: None,
+                trace_meta: None,
+            },
+        );
+        // Arm only the watchdog — never start a harness (simulates hang after AgentEnd).
+        reg.arm_wall_watchdog(&id, true);
+        let snap = tokio::time::timeout(Duration::from_secs(3), reg.wait_until_done(&id))
+            .await
+            .expect("watchdog should terminalize within 3s")
+            .expect("job exists");
+        assert!(
+            matches!(snap.state, JobState::Failed | JobState::Aborted),
+            "state={:?}",
+            snap.state
+        );
+        assert_eq!(snap.status, Some(TaskExitStatus::TimedOut));
+        std::env::remove_var("ONE_JOB_MAX_WALL_MS");
+    }
+
+    #[test]
+    fn kill_reason_labels() {
+        assert_eq!(KillReason::ParentAbort.as_str(), "parent_abort");
+        assert_eq!(KillReason::WallTimeout.as_str(), "wall_timeout");
+        assert_eq!(KillReason::SessionTeardown.as_str(), "session_teardown");
     }
 
     #[tokio::test]

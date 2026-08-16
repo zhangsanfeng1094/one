@@ -200,7 +200,11 @@ pub async fn run_with_control(
     // Whole-run hold is safe for leaf agents (no spawn). Agents that can spawn
     // must not hold the permit across the whole run or child harness::run would
     // deadlock when ONE_LLM_CONCURRENCY=1.
-    let _permit = if req.agent.can_spawn() {
+    //
+    // Hold the permit only around `prompt` — release **before** dropping the
+    // agent. A stuck post-run sink Drop must not keep the parent queued on
+    // "Waiting for model…".
+    let mut permit = if req.agent.can_spawn() {
         None
     } else {
         Some(super::provider_limit::acquire_llm_permit().await)
@@ -283,6 +287,13 @@ pub async fn run_with_control(
     result.citations = last_assistant_citations(&agent);
     result.parent = req.parent.clone();
 
+    // Free the LLM slot before agent/sink Drop (Drop must never block parent LLM).
+    drop(permit.take());
+    // Detach nested Langfuse sink so any residual Drop work is non-blocking
+    // (child sinks no longer flush on Drop; this is belt-and-suspenders).
+    agent.set_trace(None);
+    drop(agent);
+
     if let Some(ref h) = wt_handle {
         let kept = super::worktree::WorktreeManager::cleanup_after_run(h, result.ok);
         result = result.with_worktree(h.to_info(kept));
@@ -353,12 +364,25 @@ fn apply_isolation(
 }
 
 fn classify_success_text(text: &str) -> TaskExitStatus {
-    let trimmed = text.trim_start();
-    if trimmed.starts_with("ERROR:") || trimmed.starts_with("ERROR ") {
-        TaskExitStatus::IncompleteInfo
-    } else {
-        TaskExitStatus::Success
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return TaskExitStatus::IncompleteInfo;
     }
+    let head = trimmed.trim_start();
+    if head.starts_with("ERROR:") || head.starts_with("ERROR ") {
+        return TaskExitStatus::IncompleteInfo;
+    }
+    // Explore / fail-closed wording without the ERROR: prefix still counts as incomplete.
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.contains("need bash")
+        || lower.contains("no bash")
+        || lower.contains("cannot run git")
+        || lower.contains("explore is read-only")
+        || lower.contains("parent must run git")
+    {
+        return TaskExitStatus::IncompleteInfo;
+    }
+    TaskExitStatus::Success
 }
 
 fn last_assistant_text(agent: &Agent) -> Option<String> {
@@ -586,8 +610,36 @@ mod tests {
         let opts = HarnessOptions::from_cwd("/tmp");
         let p = resolve_system_prompt(&s, &opts);
         assert!(p.contains("read-only") || p.contains("sub-agent"));
+        assert!(
+            p.contains("No bash") || p.contains("no bash") || p.contains("No bash, no git"),
+            "explore prompt must state no bash/git: {p}"
+        );
+        assert!(
+            p.contains("ERROR:") && p.to_ascii_lowercase().contains("bash"),
+            "explore must fail-closed to ERROR when VCS needed: {p}"
+        );
         // M4: explore default memory off — no Memory L2 section forced in.
         assert_eq!(s.resources.memory, MemoryResourceMode::Off);
+    }
+
+    #[test]
+    fn classify_success_marks_need_bash_incomplete() {
+        assert!(matches!(
+            classify_success_text("ERROR: need bash (explore is read-only)"),
+            TaskExitStatus::IncompleteInfo
+        ));
+        assert!(matches!(
+            classify_success_text("I cannot run git without bash"),
+            TaskExitStatus::IncompleteInfo
+        ));
+        assert!(matches!(
+            classify_success_text(""),
+            TaskExitStatus::IncompleteInfo
+        ));
+        assert!(matches!(
+            classify_success_text("Auth is in crates/one-cli/src/auth.rs"),
+            TaskExitStatus::Success
+        ));
     }
 
     #[test]

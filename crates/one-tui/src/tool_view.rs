@@ -724,10 +724,69 @@ pub fn summarize_tool_special(
     is_error: bool,
 ) -> Option<(String, bool, Option<String>)> {
     // bash synthesizes its own summary even when is_error (exit ≠ 0).
-    if is_error && name != "bash" && name != "shell" {
+    // task: still summarize so the main row shows status + first finding line.
+    if is_error && name != "bash" && name != "shell" && name != "task" {
         return None;
     }
     match name {
+        "task" => {
+            // Sole source for main-row presentation is tool_result text (not job
+            // state). One-liner = status · description; expand when findings body
+            // exists so the main transcript matches what `/tasks` shows.
+            let mut status = if is_error { "error" } else { "done" };
+            let mut body_lines = 0usize;
+            let mut first_body = String::new();
+            for line in output.lines() {
+                let t = line.trim();
+                if t.starts_with('[') && t.contains("task") {
+                    if let Some(idx) = t.find("status=") {
+                        let rest = &t[idx + 7..];
+                        let token = rest
+                            .split(|c: char| c == ' ' || c == '·' || c == ']')
+                            .next()
+                            .unwrap_or("")
+                            .trim();
+                        if !token.is_empty() {
+                            status = match token {
+                                s if s.starts_with("success") => "success",
+                                s if s.starts_with("started") => "started",
+                                s if s.starts_with("aborted") => "aborted",
+                                s if s.starts_with("runtime_error") => "error",
+                                s if s.starts_with("timeout") || s.starts_with("timed_out") => {
+                                    "timeout"
+                                }
+                                s if s.starts_with("max_turns") => "max_turns",
+                                s if s.starts_with("incomplete") => "incomplete",
+                                other => other,
+                            };
+                        }
+                    }
+                    continue;
+                }
+                if t.is_empty() || t.starts_with("log_path:") {
+                    continue;
+                }
+                body_lines += 1;
+                if first_body.is_empty()
+                    && !t.starts_with("Background job started")
+                    && !t.starts_with("Result arrives")
+                {
+                    first_body = truncate(t, 48);
+                }
+            }
+            let desc = json_field(args, "description")
+                .or_else(|| json_field(args, "agent"))
+                .or_else(|| json_field(args, "mode"))
+                .unwrap_or_else(|| "explore".into());
+            let summary = if first_body.is_empty() {
+                format!("{status} · {desc}")
+            } else {
+                format!("{status} · {desc} · {first_body}")
+            };
+            let bg_started = status == "started";
+            let expand = is_error || (!bg_started && body_lines > 0);
+            Some((summary, expand, None))
+        }
         "edit" => {
             if is_error {
                 return None;
@@ -759,38 +818,6 @@ pub fn summarize_tool_special(
             // Path on header; summary is size only.
             let summary = format!("wrote {bytes} B");
             Some((summary, false, better))
-        }
-        "task" => {
-            // Prefer status from trailer; keep ungrouped so rows stay clickable.
-            let status = output
-                .lines()
-                .find_map(|l| {
-                    let l = l.trim();
-                    if l.starts_with('[') && l.contains("task") {
-                        l.split("status=")
-                            .nth(1)
-                            .map(|s| s.split([']', ' ', '·']).next().unwrap_or(s).to_string())
-                    } else {
-                        None
-                    }
-                })
-                .unwrap_or_else(|| if is_error { "error" } else { "done" }.into());
-            let desc = json_field(args, "description")
-                .or_else(|| json_field(args, "agent"))
-                .or_else(|| json_field(args, "mode"))
-                .unwrap_or_else(|| "explore".into());
-            let id_bit = output
-                .split("id=")
-                .nth(1)
-                .map(|s| {
-                    s.chars()
-                        .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-                        .collect::<String>()
-                })
-                .filter(|s| !s.is_empty())
-                .map(|s| format!(" · {s}"))
-                .unwrap_or_default();
-            Some((format!("{status} · {desc}{id_bit}"), false, None))
         }
         "bash" | "shell" => {
             // Background start: show task_id prominently (Claude-style), keep expanded
@@ -1161,6 +1188,29 @@ Wrote 12 bytes → foo.txt (2 lines)\n\
 +hello\n\
 +world\n";
         assert!(looks_like_diff(write_preview));
+    }
+
+    #[test]
+    fn task_findings_auto_expand() {
+        let args = r#"{"description":"Research MCP","agent":"explore"}"#;
+        let out = "\
+[task · explore · Research MCP · status=success · id=job_ab12_1]
+## 结论
+当前 McpManager 已有状态快照。
+";
+        let (s, expand, _) = summarize_tool_special("task", args, out, false).unwrap();
+        assert!(s.contains("success"), "{s}");
+        assert!(s.contains("Research MCP"), "{s}");
+        assert!(s.contains("结论") || s.contains("McpManager"), "{s}");
+        assert!(expand, "findings body must expand on main transcript");
+
+        let started = "\
+[task · explore · long job · status=started · id=job_x]
+Background job started. Continue other work.
+";
+        let (s2, expand2, _) = summarize_tool_special("task", args, started, false).unwrap();
+        assert!(s2.contains("started"), "{s2}");
+        assert!(!expand2, "background start stays compact");
     }
 
     #[test]

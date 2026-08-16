@@ -74,6 +74,8 @@ pub enum TaskExitStatus {
     MaxTurnsExceeded,
     Aborted,
     RuntimeError,
+    /// Wall-clock limit hit (`ONE_JOB_MAX_WALL_MS` / job timeout).
+    TimedOut,
     /// Sub-agent ended with ERROR: … or lacks info (not a question to the user).
     IncompleteInfo,
     /// Background job accepted (not a terminal research status).
@@ -87,6 +89,7 @@ impl TaskExitStatus {
             Self::MaxTurnsExceeded => "max_turns_exceeded",
             Self::Aborted => "aborted",
             Self::RuntimeError => "runtime_error",
+            Self::TimedOut => "timeout",
             Self::IncompleteInfo => "incomplete_info",
             Self::Started => "started",
         }
@@ -104,6 +107,18 @@ impl TaskExitStatus {
 
     pub fn is_terminal(self) -> bool {
         !matches!(self, Self::Started)
+    }
+
+    /// Soft / hard failure the parent should treat as a failed tool.
+    pub fn is_failure(self) -> bool {
+        matches!(
+            self,
+            Self::RuntimeError
+                | Self::TimedOut
+                | Self::Aborted
+                | Self::MaxTurnsExceeded
+                | Self::IncompleteInfo
+        )
     }
 }
 
@@ -456,15 +471,22 @@ impl AgentSpec {
         Self {
             name: Some("explore".into()),
             description: Some(
-                "Read-only codebase research. Use for multi-file exploration so the parent context stays small."
+                "Read-only multi-file research (read/grep/find/ls only — no bash/git). \
+Not for git status/diff/commit, staging, or shell workflows; parent must use bash for those."
                     .into(),
             ),
             system_prompt: Some(
                 "You are a read-only sub-agent of One.\n\
                  Complete the research task, then stop.\n\
-                 - Use only the tools provided.\n\
+                 - Tools: only what you were given (typically read/grep/find/ls). **No bash, no git.**\n\
+                 - Do **not** try to reconstruct `git status` / `git diff` by reading `.git/index`, \
+`.git/objects`, or other opaque git metadata — that fails and wastes turns.\n\
+                 - If the task needs live VCS state (status, diff, staged/unstaged, commit, reset, \
+branch ops) or shell commands, end immediately with:\n\
+                 `ERROR: need bash (explore is read-only; parent must run git/shell directly)`\n\
                  - Do not ask the user questions.\n\
                  - Final answer: findings first, key paths/symbols, residual risks. Be concise.\n\
+                 - Cite concrete file paths you actually read. Do not invent a change list without evidence.\n\
                  - Do not restate the entire task prompt."
                     .into(),
             ),

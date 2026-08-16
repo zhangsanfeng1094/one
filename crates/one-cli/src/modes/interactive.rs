@@ -458,12 +458,16 @@ fn subagent_detail(runtime: &AppRuntime, id: &str) -> (String, String, Vec<(Stri
                 .unwrap_or(j.agent.as_str());
             // Title: short description; agent name lives in the status strip.
             let title = truncate_cmd(desc, 48);
-            let st = match j.state {
-                crate::runtime::jobs::JobState::Running => "running",
-                crate::runtime::jobs::JobState::Completed if j.ok => "done",
-                crate::runtime::jobs::JobState::Completed => "failed",
-                crate::runtime::jobs::JobState::Aborted => "aborted",
-                crate::runtime::jobs::JobState::Failed => "failed",
+            let st = if matches!(j.status, Some(crate::protocol::TaskExitStatus::TimedOut)) {
+                "timeout"
+            } else {
+                match j.state {
+                    crate::runtime::jobs::JobState::Running => "running",
+                    crate::runtime::jobs::JobState::Completed if j.ok => "done",
+                    crate::runtime::jobs::JobState::Completed => "failed",
+                    crate::runtime::jobs::JobState::Aborted => "aborted",
+                    crate::runtime::jobs::JobState::Failed => "failed",
+                }
             };
             let progress = match (j.turns, j.max_turns) {
                 (Some(t), Some(m)) => format!("turn {t}/{m}"),
@@ -514,10 +518,7 @@ fn subagent_detail(runtime: &AppRuntime, id: &str) -> (String, String, Vec<(Stri
                 rows.extend(text_lines_as_rows(&j.summary));
             }
             if rows.is_empty() {
-                rows.push((
-                    "·".into(),
-                    "waiting for first turn…".into(),
-                ));
+                rows.push(("·".into(), "waiting for first turn…".into()));
             }
             return (title, section, rows);
         }
@@ -532,7 +533,14 @@ fn subagent_detail(runtime: &AppRuntime, id: &str) -> (String, String, Vec<(Stri
     )
 }
 
-/// Refresh running `task` tool rows with live activity; bind job ids for click-to-open.
+/// Live activity on running `task` rows + seal terminal outcomes on the main
+/// transcript.
+///
+/// While the child is **running**, only refresh the live summary (turn/activity).
+/// When the job is **terminal** (success / fail / timeout / abort), seal the
+/// main `task` row from the job snapshot so the UI never stays on `Running…`
+/// after `/tasks` already shows `failed`. `ToolExecutionEnd` may later upgrade
+/// the same row with the full tool_result text (no duplicate row).
 fn refresh_task_tools_live(app: &mut App, runtime: &AppRuntime) {
     let Some(jobs) = runtime.agent_jobs() else {
         return;
@@ -546,18 +554,29 @@ fn refresh_task_tools_live(app: &mut App, runtime: &AppRuntime) {
     let mut bound_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
     for (_tool_id, job_id) in &bindings {
         bound_ids.insert(job_id.clone());
-        if let Some(j) = list.iter().find(|j| j.id == *job_id) {
+        let Some(j) = list.iter().find(|j| j.id == *job_id) else {
+            continue;
+        };
+        if j.state == crate::runtime::jobs::JobState::Running {
             let summary = task_live_summary(j);
             app.update_task_tool_live(&j.id, summary, true);
+        } else if j.state.is_terminal() {
+            let (is_error, text) = crate::runtime::task_tool::format_task_output_from_job(j);
+            app.finish_task_tool_from_job(&j.id, is_error, text);
         }
     }
-    // Any other running jobs (orphaned binding edge cases).
-    for j in list.iter().filter(|j| j.state == crate::runtime::jobs::JobState::Running) {
+    // Any other jobs (orphaned binding edge cases).
+    for j in &list {
         if bound_ids.contains(&j.id) {
             continue;
         }
-        let summary = task_live_summary(j);
-        app.update_task_tool_live(&j.id, summary, true);
+        if j.state == crate::runtime::jobs::JobState::Running {
+            let summary = task_live_summary(j);
+            app.update_task_tool_live(&j.id, summary, true);
+        } else if j.state.is_terminal() {
+            let (is_error, text) = crate::runtime::task_tool::format_task_output_from_job(j);
+            app.finish_task_tool_from_job(&j.id, is_error, text);
+        }
     }
 }
 
@@ -827,9 +846,7 @@ fn kill_background_task_sync(app: &mut App, runtime: &AppRuntime, id: &str) {
         open_background_list_panel(app, runtime);
         return;
     }
-    app.set_notice(format!(
-        "not a bash task `{id}` · use /tasks for subagents"
-    ));
+    app.set_notice(format!("not a bash task `{id}` · use /tasks for subagents"));
     open_background_list_panel(app, runtime);
 }
 
@@ -902,8 +919,12 @@ fn short_task_id(id: &str) -> String {
     }
 }
 
-/// Compact status key for subagent list renderer (`run`/`ok`/`fail`/`stop`).
+/// Compact status key for subagent list renderer (`run`/`ok`/`fail`/`stop`/`time`).
 fn job_status_key(j: &crate::runtime::jobs::JobSnapshot) -> &'static str {
+    use crate::protocol::TaskExitStatus;
+    if matches!(j.status, Some(TaskExitStatus::TimedOut)) {
+        return "time";
+    }
     match j.state {
         crate::runtime::jobs::JobState::Running => "run",
         crate::runtime::jobs::JobState::Completed if j.ok => "ok",
@@ -1672,10 +1693,7 @@ fn print_resume_hint(runtime: &AppRuntime) {
     };
 
     eprintln!();
-    if let Some(name) = session
-        .session_name()
-        .filter(|n| !n.trim().is_empty())
-    {
+    if let Some(name) = session.session_name().filter(|n| !n.trim().is_empty()) {
         let name = name.trim();
         if name
             .chars()
@@ -1684,10 +1702,7 @@ fn print_resume_hint(runtime: &AppRuntime) {
             eprintln!("resume:  one resume{cwd_flag} {short}   # or: one resume{cwd_flag} {name}");
         } else {
             eprintln!("resume:  one resume{cwd_flag} {short}");
-            eprintln!(
-                "     or: one resume{cwd_flag} {}",
-                shell_quote_arg(name)
-            );
+            eprintln!("     or: one resume{cwd_flag} {}", shell_quote_arg(name));
         }
     } else {
         eprintln!("resume:  one resume{cwd_flag} {short}");
@@ -1702,9 +1717,10 @@ fn shell_quote_arg(s: &str) -> String {
     if s.is_empty() {
         return "''".into();
     }
-    if s.chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '-' | '_' | '.' | ':' | ',' | '@' | '+' | '='))
-    {
+    if s.chars().all(|c| {
+        c.is_ascii_alphanumeric()
+            || matches!(c, '/' | '-' | '_' | '.' | ':' | ',' | '@' | '+' | '=')
+    }) {
         return s.to_string();
     }
     format!("'{}'", s.replace('\'', "'\\''"))
@@ -2042,6 +2058,10 @@ async fn run_turn_streaming(
         Err(err) => {
             // Persist for resume/debug (one.error Custom; not LLM context). UI still
             // shows an alert like Grok SessionEvent::TurnFailed.
+            // Discard partial stream first so seal_stream_segment (from the
+            // alert) does not promote failed-sample text into a permanent
+            // assistant bubble alongside the error card.
+            app.discard_partial_stream();
             runtime.persist_run_error_one(&err).await;
             app.push_error_alert(format!("{err}"));
             app.set_notice("error · saved to session".to_string());
@@ -2101,13 +2121,19 @@ fn drain_events(
                 delay,
                 reason,
             } => {
+                // Drop any partial tokens / mis-surfaced error text from the
+                // failed sample so the next attempt starts a clean bubble.
+                app.discard_partial_stream();
                 app.begin_retry_wait(retry, max_retries, delay);
                 app.set_notice(format!(
                     "{reason} · retry {retry}/{max_retries} in {}s",
                     delay.as_secs()
                 ));
             }
-            AgentEvent::RetryStarted { .. } => app.clear_retry_wait(),
+            AgentEvent::RetryStarted { .. } => {
+                app.discard_partial_stream();
+                app.clear_retry_wait();
+            }
             AgentEvent::ServerTool {
                 provider,
                 tool,
@@ -2969,7 +2995,11 @@ async fn resolve_resume_target(
             Err(format!(
                 "ambiguous ({} matches); try a longer id or exact /name:\n  · {}",
                 candidates.len(),
-                candidates.into_iter().take(5).collect::<Vec<_>>().join("\n  · ")
+                candidates
+                    .into_iter()
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .join("\n  · ")
             )
             .into())
         }

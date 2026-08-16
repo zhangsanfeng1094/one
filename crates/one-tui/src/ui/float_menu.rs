@@ -387,7 +387,7 @@ fn subagent_header_line(title: &str, col_w: usize) -> Line<'static> {
 
 /// Subagent list row: colored status badge · description · muted meta.
 ///
-/// `label` is a status key: `run` / `ok` / `fail` / `stop` (or legacy glyphs).
+/// `label` is a status key: `run` / `ok` / `fail` / `stop` / `time` (or legacy glyphs).
 fn subagent_item_line(
     label: &str,
     detail: &str,
@@ -411,6 +411,12 @@ fn subagent_item_line(
         "fail" | "✗" | "✗ fail" | "✗ agent" => (
             "✗",
             " FAIL",
+            Theme::subagent_status_fail(),
+            Theme::subagent_status_fail_sel(),
+        ),
+        "time" | "timeout" | "⏱" => (
+            "⏱",
+            " TIME",
             Theme::subagent_status_fail(),
             Theme::subagent_status_fail_sel(),
         ),
