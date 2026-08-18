@@ -350,6 +350,37 @@ pub fn analyze_request_body(body: &Value) -> Value {
     })
 }
 
+const BODY_PREVIEW_MAX_BYTES: usize = 32_000;
+
+/// Truncate `s` to at most `max_bytes` without splitting a UTF-8 character.
+///
+/// `&str` indexing is byte-based; slicing inside a multi-byte char (e.g. CJK)
+/// panics. Walk back to the previous char boundary.
+fn truncate_to_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Wire-body snapshot for cache-debug logs. Large bodies keep a UTF-8-safe head.
+fn preview_request_body(body: &Value) -> Value {
+    let s = serde_json::to_string(body).unwrap_or_default();
+    if s.len() > BODY_PREVIEW_MAX_BYTES {
+        json!({
+            "truncated": true,
+            "chars": s.len(),
+            "head": truncate_to_char_boundary(&s, BODY_PREVIEW_MAX_BYTES),
+        })
+    } else {
+        body.clone()
+    }
+}
+
 /// Record one LLM call for cache troubleshooting.
 ///
 /// Writes:
@@ -389,18 +420,7 @@ pub fn record_cache_debug(
     });
 
     // Optional: include a truncated wire body (no API keys — body shouldn't have them).
-    let body_preview = body.map(|b| {
-        let s = serde_json::to_string(b).unwrap_or_default();
-        if s.len() > 32_000 {
-            json!({
-                "truncated": true,
-                "chars": s.len(),
-                "head": &s[..32_000],
-            })
-        } else {
-            b.clone()
-        }
-    });
+    let body_preview = body.map(preview_request_body);
 
     let entry = json!({
         "ts_ms": ts,
@@ -574,5 +594,30 @@ mod tests {
         assert_eq!(content[1]["input"]["path"], "a");
         assert!(content[0].get("cache_control").is_none());
         assert!(content[1].get("cache_control").is_some());
+    }
+
+    #[test]
+    fn truncate_to_char_boundary_does_not_split_cjk() {
+        // '清' is 3 bytes (E6 B8 85). Cutting at 4 would land inside it.
+        let s = "ab清cd";
+        assert_eq!(s.len(), 7);
+        assert_eq!(truncate_to_char_boundary(s, 4), "ab");
+        assert_eq!(truncate_to_char_boundary(s, 5), "ab清");
+        assert_eq!(truncate_to_char_boundary(s, 7), s);
+        assert_eq!(truncate_to_char_boundary(s, 99), s);
+    }
+
+    #[test]
+    fn preview_request_body_truncates_on_utf8_boundary() {
+        // Reproduce the panic: a wire body whose JSON is > 32KB, with a
+        // multi-byte char sitting on the 32_000-byte cut.
+        let pad = "清".repeat(BODY_PREVIEW_MAX_BYTES);
+        let body = json!({ "messages": [{ "content": pad }] });
+        let preview = preview_request_body(&body);
+        assert_eq!(preview["truncated"], true);
+        let head = preview["head"].as_str().expect("head string");
+        assert!(head.len() <= BODY_PREVIEW_MAX_BYTES);
+        assert!(head.is_char_boundary(head.len()));
+        assert!(head.contains("清"));
     }
 }
