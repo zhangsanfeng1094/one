@@ -104,8 +104,8 @@ flowchart TB
 | dylib 动态扩展 | 🟨 | `one-ext` feature | 仅 builtin 名映射 |
 | Package / Suite 领域包 | 📝 | [package-suites.md](./package-suites.md) | **未实现** |
 | 程序化 result envelope / CI bare | 📝 | [claude-workflow-model.md](./claude-workflow-model.md) P0 | 设计已拍板 |
-| Subagent（task / agents.md） | 📝 | [subagents.md](./subagents.md) P1 | 设计草案；未实现 |
-| 宿主 spawn（CLI/RPC） | 📝 | 同上 P2 | 编排刚需；未实现 |
+| Subagent（task / agents.md） | ✅ | [subagents.md](./subagents.md) | `task` + explore/plan/general；默认 background；独立 coordinator 队列；TV4 画框 |
+| 宿主 spawn（CLI/RPC） | ✅ | `one agent run` · RPC `spawn` | 与 task 同一 harness |
 | Workflow（外置脚本 / YAML） | 📝 | 同上 P3 | **默认外置**；不内嵌 QuickJS |
 | Agent Teams（peer 协作） | ❌ | — | 后置 / 非默认 |
 | 内嵌 JS workflow runtime | ❌ | — | 非目标（§5.1） |

@@ -15,6 +15,7 @@ mod dock;
 mod float_menu;
 mod prompt;
 mod status;
+mod subagent_frame;
 mod text;
 mod toast;
 
@@ -26,6 +27,7 @@ use ratatui::widgets::Block;
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::float::FloatKind;
 use crate::theme::Theme;
 
 use chat::draw_chat;
@@ -33,11 +35,26 @@ use dock::{draw_select_dock, draw_slash_dock};
 use float_menu::draw_float_menu;
 use prompt::draw_prompt;
 use status::draw_status;
+use subagent_frame::draw_subagent_frame;
 use toast::draw_toast;
 
 pub(crate) const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
+    app.tick_toast();
+    // TV4: a framed child transcript replaces the parent view (Grok overlay).
+    if app
+        .float
+        .as_ref()
+        .is_some_and(|m| m.kind == FloatKind::SubagentDetail)
+    {
+        if let Some(menu) = app.float.as_ref() {
+            draw_subagent_frame(frame, frame.area(), app, menu);
+        }
+        draw_toast(frame, frame.area(), app);
+        return;
+    }
+
     // Clear to OpenCode near-black.
     frame.render_widget(Block::default().style(Theme::bg()), frame.area());
 
@@ -61,8 +78,6 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1),        // footer
         ])
         .split(frame.area());
-
-    app.tick_toast();
 
     draw_chat(frame, chunks[0], app);
     if select_h > 0 {

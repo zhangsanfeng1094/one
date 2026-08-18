@@ -121,13 +121,13 @@
 - [x] **TV1** 同步 `task` 也注册进 `AgentJobRegistry`（完成后不发 `[job completed]`）
 - [x] **TV2** **分层 UI**：`bg:N` + `/ps` 仅 bash；`task:N` + `/tasks` 仅 subagent live log
 - [x] **TV3** transcript `task` 行 → `OpenSubagentDetail`（**不**走 `/ps`）
-- [ ] **TV4** 全屏 framed 子 transcript（Grok 子会话框）
-- [ ] **TV5** scrollback 生命周期块（`Subagent running…` 活动后缀）
+- [x] **TV4** 全屏 framed 子 transcript（Grok 子会话框；`/tasks` Enter / 点击 task 行 / Ctrl+F；`q` 关）
+- [x] **TV5** 主行生命周期（started / auto-bg / completed；细节仍在 `/tasks`）
 
 #### P2 — 扩展
 - [x] **ACP（Agent Client Protocol）** — `one acp` / `--mode acp`；initialize / session lifecycle / prompt streaming / permission / modes / load·list·resume（见 [acp.md](./acp.md)）
-- [ ] RPC `spawn` / `run`
-- [ ] `agents/*.md` 磁盘 preset
+- [x] RPC `spawn` / `run` — `spawn` 走同一 `task` 工具（background 默认 true）
+- [x] `agents/*.md` 磁盘 preset（project/user + builtin explore/plan/general）
 - [ ] 示例脚本 workflow
 
 #### P3 — Workflow（默认外置）

@@ -10,6 +10,7 @@
 //! - [`subscribe`] — agent event fans-out
 
 mod build;
+pub mod coordinator;
 pub mod env_context;
 pub mod explore_tools;
 pub mod features;
@@ -456,6 +457,7 @@ impl AppRuntime {
     pub fn shutdown_owned_tasks(&self) {
         self.bg_registry.kill_all_running();
         if let Some(host) = &self.task_host {
+            host.coordinator().shutdown();
             host.jobs()
                 .kill_all_with_reason(jobs::KillReason::SessionTeardown);
         }

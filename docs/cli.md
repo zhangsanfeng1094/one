@@ -46,10 +46,13 @@ one run --preset explore -p "…" -y
 one run --spec ./my-agent.json -p "…" -y  # 完整 AgentSpec
 one -p "hello" --provider mock -y --output-format json   # 主会话 RunResult envelope
 
-# 主会话内的 task 工具（P1b）：模型可调用 task → 同一 harness::run
-# 参数：prompt（必填）, agent|mode=explore, description?, agent_spec?
+# 主会话内的 task 工具：模型可调用 task → 同一 harness::run
+# 参数：prompt（必填）, agent|subagent_type|mode=explore|plan|general,
+#       background（默认 true）, isolation, capability_mode, resume_from, cwd, model
 # tool_result 形如：[task · explore · status=success]\n<summary>
 # 物理 LLM 并发：ONE_LLM_CONCURRENCY（默认 4）；逻辑 task 槽：spawn_policy.max_concurrent（默认 4）
+# 槽满：background 立即返回 queued=true（独立 coordinator 队列，不堵 caller）
+# 前台等槽超时：ONE_TASK_FOREGROUND_BUDGET_MS（默认 1000；0=一直等槽）
 # 子 job 事件落盘：~/.one/agent/jobs/<job_id>.jsonl（ONE_JOB_LOG_DIR / ONE_JOB_LOG=0）
 
 # 订阅 / OAuth 登录（catalog：Codex · xAI · OpenCode Zen/Go）
@@ -754,7 +757,7 @@ Slash 命令：
 | `/skill:name [args]` | **可选**强制加载 skill（默认由模型 `read` 按需加载） |
 | `/mcp [import\|enable\|disable <name>]` | MCP 面板 / 导入 / 开关 |
 | `/ps` `[id]` | **仅** background bash 进程列表 / stdout-stderr 尾；`x` 杀进程（**不含** subagent） |
-| `/tasks` `[job_id]` | **Subagent**（`task` 工具）列表；Enter 打开 turn/tool **live log**；`x` 杀 job。别名：`/jobs` `/subagents` |
+| `/tasks` `[job_id]` | **Subagent**（`task` 工具）列表；Enter 打开 **TV4 全屏画框**（子 transcript）；`q`/Esc 返回；`x` 杀 job。别名：`/jobs` `/subagents` |
 | `/export [path]` | 导出 HTML |
 | `/reload` | 热重载扩展 / skills / prompts / MCP 配置 |
 | `/clear` | 清空屏幕历史 |
@@ -769,7 +772,7 @@ Slash 命令：
 | `bash_output` | Act | 轮询/等待后台 bash 输出（`task_id` 可省略则列 `/ps` 式快照） |
 | `bash_kill` | Act | 终止指定后台 bash 任务 |
 | `grep` / `find` / `ls` | Act / Plan / read-only | 搜索与列举 |
-| `task` | Act / Plan / read-only | 子 agent（默认 explore）→ 同一 `harness::run`；见 [protocol.md](./protocol.md)。观测面与 bash **分层**：chip `task:N`、`/tasks` live log；点击 transcript 的 `task` 行打开 subagent 详情（**不**进 `/ps`） |
+| `task` | Act / Plan / read-only | 子 agent（默认 explore）→ 同一 `harness::run`；见 [protocol.md](./protocol.md)。观测面与 bash **分层**：chip `task:N`、`/tasks` TV4 画框；点击 / Enter / Ctrl+F 打开（**不**进 `/ps`） |
 | `ask_user` | 均有（仅 Interactive） | 结构化澄清问题 |
 | `web_search` / `web_fetch` | Act / Plan / read-only | 联网（需 `network` feature，CLI 默认开） |
 | `plan` 相关 + `exit_plan_mode` | Plan | 写 plan 文件并退出 Plan |
@@ -933,6 +936,7 @@ one --mode rpc --no-session
 | `status` | — | provider/model/thinking/usage/mcp |
 | `thinking` | `{ "level"?: "off\|low\|medium\|high" }` | 读/写 thinking level |
 | `compact` | — | 强制上下文压缩 |
+| `spawn` | `{ "prompt", "agent"?, "background"?, … }` | 与 `task` 同构的子 agent（默认后台） |
 
 示例：
 

@@ -236,6 +236,14 @@ impl Theme {
         Style::default().fg(Self::ACCENT).bg(Self::PANEL)
     }
 
+    /// TV4 fullscreen frame — brighter purple double border.
+    pub fn subagent_frame_border() -> Style {
+        Style::default()
+            .fg(Self::ACCENT)
+            .bg(Self::PANEL)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn subagent_title() -> Style {
         Style::default()
             .fg(Self::ACCENT)

@@ -545,6 +545,12 @@ impl super::App {
         }
     }
 
+    /// Job id of the focused `task` row, if any (Enter / Ctrl+F → TV4 frame).
+    pub fn focused_subagent_job_id(&self) -> Option<String> {
+        let idx = self.chat_focus?;
+        self.messages.get(idx).and_then(|m| m.tool_job_id.clone())
+    }
+
     /// Toggle expand on the focused chat row (or last tool when none).
     pub fn toggle_focused_or_last(&mut self) -> bool {
         if let Some(idx) = self.chat_focus {

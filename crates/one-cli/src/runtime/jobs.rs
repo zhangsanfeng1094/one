@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use one_core::agent::LlmProvider;
 use one_core::events::AgentEvent;
 use serde_json::{json, Value};
-use tokio::sync::{Notify, OwnedSemaphorePermit};
+use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
 use super::harness::{self, HarnessOptions, RunControl};
@@ -390,6 +390,9 @@ pub struct SpawnOptions {
     pub trace: Option<one_core::SharedTrace>,
     /// Trace labels for the child run.
     pub trace_meta: Option<one_core::TraceRunMeta>,
+    /// If `slot` is `None`, acquire this semaphore inside the spawned task
+    /// (admission timeout → auto-background while still queued).
+    pub acquire_slot: Option<Arc<Semaphore>>,
 }
 
 impl Default for SpawnOptions {
@@ -400,6 +403,7 @@ impl Default for SpawnOptions {
             apply_wall_timeout: true,
             trace: None,
             trace_meta: None,
+            acquire_slot: None,
         }
     }
 }
@@ -411,6 +415,7 @@ impl std::fmt::Debug for SpawnOptions {
             .field("apply_wall_timeout", &self.apply_wall_timeout)
             .field("trace", &self.trace.is_some())
             .field("trace_meta", &self.trace_meta.is_some())
+            .field("acquire_slot", &self.acquire_slot.is_some())
             .finish()
     }
 }
@@ -462,6 +467,8 @@ impl KillReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JobState {
+    /// Registered, waiting for a coordinator slot (Grok queued spawn).
+    Queued,
     Running,
     Completed,
     Aborted,
@@ -471,6 +478,7 @@ pub enum JobState {
 impl JobState {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Queued => "queued",
             Self::Running => "running",
             Self::Completed => "completed",
             Self::Aborted => "aborted",
@@ -479,8 +487,25 @@ impl JobState {
     }
 
     pub fn is_terminal(self) -> bool {
-        !matches!(self, Self::Running)
+        !matches!(self, Self::Queued | Self::Running)
     }
+
+    pub fn is_live(self) -> bool {
+        matches!(self, Self::Queued | Self::Running)
+    }
+}
+
+/// Enough of a finished child to implement Grok-style `resume_from`.
+#[derive(Debug, Clone, Default)]
+pub struct ResumeSource {
+    pub job_id: String,
+    pub agent: String,
+    pub parent_session_id: Option<String>,
+    pub prompt: String,
+    pub summary: String,
+    pub cwd: Option<String>,
+    pub worktree_path: Option<String>,
+    pub transcript: Vec<Value>,
 }
 
 #[derive(Debug, Clone)]
@@ -524,12 +549,15 @@ struct JobInner {
     done: Arc<Notify>,
     event_log: Arc<JobEventLog>,
     notify_completion: bool,
+    resume: ResumeSource,
 }
 
 /// Registry for background `task` jobs (one-cli only).
 pub struct AgentJobRegistry {
     jobs: Mutex<HashMap<String, JobInner>>,
     notifications: Arc<Mutex<Vec<String>>>,
+    /// Coordinator finish hook (job id). Fired after `finalize` / `kill`.
+    finish_sink: Mutex<Option<mpsc::UnboundedSender<String>>>,
 }
 
 impl AgentJobRegistry {
@@ -537,7 +565,28 @@ impl AgentJobRegistry {
         Arc::new(Self {
             jobs: Mutex::new(HashMap::new()),
             notifications,
+            finish_sink: Mutex::new(None),
         })
+    }
+
+    /// Wire the independent coordinator so it can dequeue when a child ends.
+    pub fn set_finish_sink(&self, tx: mpsc::UnboundedSender<String>) {
+        *self.finish_sink.lock().expect("finish_sink") = Some(tx);
+    }
+
+    fn notify_finish(&self, id: &str) {
+        if let Ok(g) = self.finish_sink.lock() {
+            if let Some(tx) = g.as_ref() {
+                let _ = tx.send(id.to_string());
+            }
+        }
+    }
+
+    /// Append a live-log line (coordinator handoff, etc.).
+    pub fn push_event(&self, id: &str, line: impl Into<String>) {
+        if let Some(job) = self.jobs.lock().expect("jobs lock").get(id) {
+            job.event_log.push_line(line.into());
+        }
     }
 
     pub fn notification_queue(&self) -> Arc<Mutex<Vec<String>>> {
@@ -577,14 +626,17 @@ impl AgentJobRegistry {
     /// Register a live job row (TUI `/tasks` + durable log) and build [`RunControl`].
     ///
     /// Does **not** start the harness — caller either awaits it on the current
-    /// task ([`Self::run_foreground`]) or detaches it ([`Self::spawn_with`]).
-    fn register_job(
+    /// task ([`Self::run_foreground`]) or detaches it ([`Self::spawn_with`] /
+    /// [`Self::launch_registered`]). `queued` starts the row as
+    /// [`JobState::Queued`] until the coordinator admits it.
+    pub fn register_job(
         &self,
         agent_name: &str,
         description: Option<&str>,
         opts: &HarnessOptions,
         max_turns: u64,
         spawn_opts: &SpawnOptions,
+        queued: bool,
     ) -> (String, RunControl, Arc<AtomicBool>) {
         let id = Self::next_id();
         let abort = Arc::new(AtomicBool::new(false));
@@ -603,12 +655,13 @@ impl AgentJobRegistry {
                 "cwd": opts.cwd.display().to_string(),
             }),
         );
-        event_log.set_activity("queued");
+        event_log.set_activity(if queued { "queued" } else { "starting" });
         event_log.push_line(format!(
-            "▸ job {} · {}{}",
+            "▸ job {} · {}{}{}",
             id,
             agent_name,
-            description.map(|d| format!(" · {d}")).unwrap_or_default()
+            description.map(|d| format!(" · {d}")).unwrap_or_default(),
+            if queued { " · queued" } else { "" }
         ));
 
         {
@@ -619,7 +672,11 @@ impl AgentJobRegistry {
                     id: id.clone(),
                     agent: agent_name.to_string(),
                     description: description.map(|s| s.to_string()),
-                    state: JobState::Running,
+                    state: if queued {
+                        JobState::Queued
+                    } else {
+                        JobState::Running
+                    },
                     result: None,
                     started: Instant::now(),
                     finished: None,
@@ -630,6 +687,11 @@ impl AgentJobRegistry {
                     done: done.clone(),
                     event_log: event_log.clone(),
                     notify_completion: spawn_opts.notify_completion,
+                    resume: ResumeSource {
+                        job_id: id.clone(),
+                        agent: agent_name.to_string(),
+                        ..ResumeSource::default()
+                    },
                 },
             );
         }
@@ -739,6 +801,7 @@ impl AgentJobRegistry {
             &opts,
             max_turns,
             &spawn_opts,
+            false,
         );
         on_registered(&id);
         let apply_wall = spawn_opts.apply_wall_timeout;
@@ -804,21 +867,98 @@ impl AgentJobRegistry {
             &opts,
             max_turns,
             &spawn_opts,
+            false,
         );
+        self.launch_registered(id.clone(), req, provider, opts, control, abort, spawn_opts);
+        let _ = slot;
+        id
+    }
 
-        let registry = Arc::clone(self);
-        let job_id = id.clone();
+    /// Flip a queued row to running and start the harness (coordinator admit).
+    pub fn launch_registered(
+        self: &Arc<Self>,
+        id: String,
+        req: RunRequest,
+        provider: Arc<dyn LlmProvider>,
+        opts: HarnessOptions,
+        control: RunControl,
+        abort: Arc<AtomicBool>,
+        spawn_opts: SpawnOptions,
+    ) {
+        {
+            let mut jobs = self.jobs.lock().expect("jobs lock");
+            if let Some(job) = jobs.get_mut(&id) {
+                if job.state == JobState::Queued {
+                    job.state = JobState::Running;
+                    job.event_log.set_activity("starting");
+                    job.event_log.push_line("▸ starting");
+                }
+            }
+        }
         let apply_wall = spawn_opts.apply_wall_timeout;
+        let late_slot = spawn_opts.acquire_slot.clone();
         self.arm_wall_watchdog(&id, apply_wall);
+        let registry = Arc::clone(self);
         tokio::spawn(async move {
-            let _slot = slot;
+            let _slot = if let Some(sem) = late_slot {
+                sem.acquire_owned().await.ok()
+            } else {
+                None
+            };
             let result =
                 Self::run_harness_with_wall(req, provider, opts, control, abort, apply_wall).await;
-            // Nested LangfuseTraceSink: child Drop is non-blocking; root flushes later.
-            registry.finalize(&job_id, result);
+            registry.finalize(&id, result);
         });
+    }
 
-        id
+    /// Flip whether a still-running job should push `[job completed]` (auto-bg).
+    pub fn set_notify_completion(&self, id: &str, notify: bool) -> bool {
+        let mut jobs = self.jobs.lock().expect("jobs lock");
+        if let Some(job) = jobs.get_mut(id) {
+            job.notify_completion = notify;
+            return true;
+        }
+        false
+    }
+
+    /// Attach spawn-time identity used later by `resume_from`.
+    pub fn attach_resume_meta(
+        &self,
+        id: &str,
+        parent_session_id: Option<String>,
+        prompt: String,
+        cwd: Option<String>,
+    ) {
+        let mut jobs = self.jobs.lock().expect("jobs lock");
+        if let Some(job) = jobs.get_mut(id) {
+            job.resume.parent_session_id = parent_session_id;
+            job.resume.prompt = prompt;
+            job.resume.cwd = cwd;
+        }
+    }
+
+    /// Snapshot a completed job for `resume_from`.
+    pub fn resume_source(&self, id: &str) -> Option<ResumeSource> {
+        let jobs = self.jobs.lock().expect("jobs lock");
+        let job = jobs.get(id)?;
+        if !job.state.is_terminal() {
+            return None;
+        }
+        let mut src = job.resume.clone();
+        src.job_id = job.id.clone();
+        src.agent = job.agent.clone();
+        if let Some(r) = &job.result {
+            if src.summary.is_empty() {
+                src.summary = r.result.clone();
+            }
+            if src.transcript.is_empty() {
+                src.transcript = r.transcript.clone();
+            }
+            if src.worktree_path.is_none() {
+                src.worktree_path = r.worktree.as_ref().map(|w| w.path.clone());
+            }
+        }
+        Some(src)
     }
 
     /// Full [`RunResult`] for a finished job (if available).
@@ -918,11 +1058,14 @@ impl AgentJobRegistry {
             job.done.notify_waiters();
             drop(jobs);
             self.push_notification(text);
+            self.notify_finish(id);
             return Ok(snap);
         }
         job.notified = true;
         job.done.notify_waiters();
-        Ok(snapshot_of(job))
+        drop(jobs);
+        self.notify_finish(id);
+        Ok(self.get(id).expect("just killed"))
     }
 
     /// Abort every running job (parent Esc / session abort).
@@ -1008,6 +1151,7 @@ impl AgentJobRegistry {
             job.done.notify_waiters();
             drop(jobs);
             self.push_notification(text);
+            self.notify_finish(id);
             return;
         }
         // Sync jobs: mark notified so kill/finalize do not double-fire later.
@@ -1015,6 +1159,8 @@ impl AgentJobRegistry {
             job.notified = true;
         }
         job.done.notify_waiters();
+        drop(jobs);
+        self.notify_finish(id);
     }
 
     pub async fn wait(&self, id: &str, wait_ms: Option<u64>) -> Result<JobSnapshot, String> {
@@ -1427,7 +1573,7 @@ fn snapshot_of(job: &JobInner) -> JobSnapshot {
             None,
         )
     };
-    let activity = if job.state == JobState::Running {
+    let activity = if job.state.is_live() {
         job.event_log.activity()
     } else {
         String::new()
@@ -1692,6 +1838,7 @@ mod tests {
                 apply_wall_timeout: true,
                 trace: None,
                 trace_meta: None,
+                acquire_slot: None,
             },
             |_| flag.store(true, Ordering::Relaxed),
         );
@@ -1891,7 +2038,9 @@ mod tests {
                 apply_wall_timeout: true,
                 trace: None,
                 trace_meta: None,
+                acquire_slot: None,
             },
+            false,
         );
         // Arm only the watchdog — never start a harness (simulates hang after AgentEnd).
         reg.arm_wall_watchdog(&id, true);

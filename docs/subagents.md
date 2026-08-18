@@ -173,8 +173,24 @@ Main Agent::run
       },
       "mode": {
         "type": "string",
-        "enum": ["explore", "general"],
-        "description": "explore = read-only tools (default). general = coding tools without nesting task (v1.1)."
+        "enum": ["explore", "plan", "general", "general-purpose"],
+        "description": "Alias for agent / subagent_type. explore = read-only (default). plan = read-only plan. general = coding tools."
+      },
+      "subagent_type": {
+        "type": "string",
+        "description": "Grok-style alias for agent (explore | plan | general-purpose)"
+      },
+      "background": {
+        "type": "boolean",
+        "description": "Default true (async). False blocks until the child ends. Auto-bg only if waiting for a slot exceeds ONE_TASK_FOREGROUND_BUDGET_MS."
+      },
+      "capability_mode": {
+        "type": "string",
+        "enum": ["read-only", "read-write", "execute", "all"]
+      },
+      "resume_from": {
+        "type": "string",
+        "description": "Completed job_id to continue (same type, same parent session)"
       },
       "model": {
         "type": "string",
@@ -295,7 +311,7 @@ const EXPLORE_TOOLS: &[&str] = &[
 | 进程 | `/ps` | `bg:N` | background **bash** stdout/stderr |
 | Subagent | `/tasks`（别名 `/jobs` `/subagents`） | `task:N` | `task` 工具 · turn/tool live log |
 
-**单路展开**（P1c）：一次只看一个 subagent 的 live log（`SubagentDetail` float），禁止 4 路并行打同一 viewport。全屏 framed 子 transcript 为后续 TV4。
+**单路展开**：一次只看一个 subagent。`/tasks` Enter、主 transcript 点击 `task` 行、聚焦后 Enter / Ctrl+F 打开 **TV4 全屏画框**（替换父会话视口；`q` / Esc 返回）。禁止 4 路并行打同一 viewport。
 
 ### 3.5 ask_user / 反向提问污染（绑定）
 
@@ -347,6 +363,8 @@ Rules:
 │ one-cli/src/runtime/task_tool.rs   ← 禁止放进 one-tools │
 │  · args → RunRequest::child                             │
 │  · envelope summary + status                            │
+│ one-cli/src/runtime/coordinator.rs                      │
+│  · Start / Enqueue / Reject · foreground_budget 只卡排队 │
 └───────────────────────────┬─────────────────────────────┘
                             │
 ┌───────────────────────────▼─────────────────────────────┐
@@ -407,7 +425,7 @@ pub enum TaskExitStatus {
 2. 通知只在 **父 turn 边界** `drain_notifications` 注入 User 消息。  
 3. 终态 status 与同步 `task` 同形；`started` 仅表示已接受。  
 4. 仍 **禁止** 子 token 流刷主 TUI。  
-5. 默认 **同步**；`background=true` 显式开启。  
+5. 默认 **异步**（`background` 省略或 true，对齐 Grok）；`background=false` **阻塞到子任务结束**。并发由独立 **`SubagentCoordinator`** actor 入队（Start / Enqueue / Reject），**不**在 caller 上 `acquire` 信号量。`ONE_TASK_FOREGROUND_BUDGET_MS`（默认 1s）只约束 **排队等槽**；槽满超时才 `backgrounded=true`，子任务已经开跑后不会因「跑太久」被踢到后台。槽满时 `background=true` 立即返回 `queued=true`，孩子仍在队列里。  
 6. **软 abort ≠ session teardown**：`abort()` 只动 agent jobs；`shutdown_owned_tasks()`（进程退出、`/new`、`/resume`、`Drop`）杀 bash + jobs 并清空通知队列，避免下一会话读到 teardown 噪声。
 
 ### 4.4.1 Worktree 隔离（计划）

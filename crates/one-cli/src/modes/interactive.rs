@@ -320,7 +320,7 @@ fn refresh_task_chip(app: &mut App, runtime: &AppRuntime) {
     let jobs = runtime.agent_jobs().map(|j| j.list()).unwrap_or_default();
     let running = jobs
         .iter()
-        .filter(|j| j.state == crate::runtime::jobs::JobState::Running)
+        .filter(|j| j.state.is_live())
         .count();
     let failed = jobs.iter().any(|j| {
         matches!(j.state, crate::runtime::jobs::JobState::Failed)
@@ -350,7 +350,7 @@ fn refresh_task_chip(app: &mut App, runtime: &AppRuntime) {
 
     let label = jobs
         .iter()
-        .filter(|j| j.state == crate::runtime::jobs::JobState::Running)
+        .filter(|j| j.state.is_live())
         .map(|j| {
             j.description
                 .clone()
@@ -462,6 +462,7 @@ fn subagent_detail(runtime: &AppRuntime, id: &str) -> (String, String, Vec<(Stri
                 "timeout"
             } else {
                 match j.state {
+                    crate::runtime::jobs::JobState::Queued => "queued",
                     crate::runtime::jobs::JobState::Running => "running",
                     crate::runtime::jobs::JobState::Completed if j.ok => "done",
                     crate::runtime::jobs::JobState::Completed => "failed",
@@ -557,7 +558,7 @@ fn refresh_task_tools_live(app: &mut App, runtime: &AppRuntime) {
         let Some(j) = list.iter().find(|j| j.id == *job_id) else {
             continue;
         };
-        if j.state == crate::runtime::jobs::JobState::Running {
+        if j.state.is_live() {
             let summary = task_live_summary(j);
             app.update_task_tool_live(&j.id, summary, true);
         } else if j.state.is_terminal() {
@@ -570,7 +571,7 @@ fn refresh_task_tools_live(app: &mut App, runtime: &AppRuntime) {
         if bound_ids.contains(&j.id) {
             continue;
         }
-        if j.state == crate::runtime::jobs::JobState::Running {
+        if j.state.is_live() {
             let summary = task_live_summary(j);
             app.update_task_tool_live(&j.id, summary, true);
         } else if j.state.is_terminal() {
@@ -805,7 +806,7 @@ fn open_subagent_detail_panel(app: &mut App, runtime: &AppRuntime, id: &str) {
     let running = runtime
         .agent_jobs()
         .and_then(|jobs| jobs.get(id))
-        .is_some_and(|j| j.state == crate::runtime::jobs::JobState::Running);
+        .is_some_and(|j| j.state.is_live());
     let summary_at = rows
         .iter()
         .position(|(label, detail)| label == "──" && detail == "summary");
@@ -926,6 +927,7 @@ fn job_status_key(j: &crate::runtime::jobs::JobSnapshot) -> &'static str {
         return "time";
     }
     match j.state {
+        crate::runtime::jobs::JobState::Queued => "queue",
         crate::runtime::jobs::JobState::Running => "run",
         crate::runtime::jobs::JobState::Completed if j.ok => "ok",
         crate::runtime::jobs::JobState::Completed => "fail",

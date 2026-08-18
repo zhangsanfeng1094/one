@@ -784,6 +784,13 @@ pub fn summarize_tool_special(
                 format!("{status} · {desc} · {first_body}")
             };
             let bg_started = status == "started";
+            let backgrounded = output.contains("handed off to background")
+                || json_field(args, "backgrounded").as_deref() == Some("true");
+            let summary = if backgrounded && bg_started {
+                format!("started · auto-bg · {desc}")
+            } else {
+                summary
+            };
             let expand = is_error || (!bg_started && body_lines > 0);
             Some((summary, expand, None))
         }

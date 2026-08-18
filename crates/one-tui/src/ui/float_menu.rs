@@ -346,8 +346,8 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         FloatKind::McpImport => " ↑/↓  ·  Enter import  ·  Esc back ",
         FloatKind::Background => " ↑/↓ wheel  ·  Enter log  ·  x kill  ·  Esc ",
         FloatKind::BackgroundDetail => " ↑/↓ wheel  ·  x kill  ·  Esc list ",
-        FloatKind::Subagent => " ↑/↓ wheel  ·  ↵ live log  ·  x kill  ·  Esc ",
-        FloatKind::SubagentDetail => " ↑/↓ wheel  ·  PgUp/Dn  ·  x kill  ·  Esc back ",
+        FloatKind::Subagent => " ↑/↓ wheel  ·  ↵ framed log  ·  x kill  ·  Esc ",
+        FloatKind::SubagentDetail => " ↑/↓  ·  x kill  ·  q/Esc back  ·  observational ",
         FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
     };
     base.into()
@@ -419,6 +419,12 @@ fn subagent_item_line(
             " TIME",
             Theme::subagent_status_fail(),
             Theme::subagent_status_fail_sel(),
+        ),
+        "queue" | "queued" | "…" => (
+            "…",
+            "WAIT ",
+            Theme::subagent_status_stop(),
+            Theme::subagent_status_stop_sel(),
         ),
         "stop" | "■" | "■ stop" | "■ agent" => (
             "■",

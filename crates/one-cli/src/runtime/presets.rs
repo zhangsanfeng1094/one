@@ -37,8 +37,10 @@ pub fn load_preset(name: &str, cwd: &Path) -> Result<AgentSpec, ProtocolError> {
     }
 
     // Built-ins
-    match name {
+    match crate::protocol::normalize_agent_name(name).as_str() {
         "explore" => Ok(AgentSpec::builtin_explore()),
+        "plan" => Ok(AgentSpec::builtin_plan()),
+        "general" => Ok(AgentSpec::builtin_general()),
         "main" | "default" => Ok(AgentSpec::builtin_main()),
         other => Err(ProtocolError::new(
             error_code::UNKNOWN_AGENT,
@@ -243,6 +245,8 @@ pub fn list_agents(cwd: &Path) -> Vec<AgentCatalogEntry> {
     // Builtins if not already present as disk files.
     for (name, spec) in [
         ("explore", AgentSpec::builtin_explore()),
+        ("plan", AgentSpec::builtin_plan()),
+        ("general", AgentSpec::builtin_general()),
         ("main", AgentSpec::builtin_main()),
     ] {
         if by_name.contains_key(name) {

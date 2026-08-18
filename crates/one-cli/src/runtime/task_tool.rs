@@ -3,8 +3,13 @@
 //! Lives in **one-cli only** (not one-tools). Parent agents register this tool
 //! when `spawn_policy` allows children; explore children never get it.
 //!
-//! Sync path returns tool_result. `background=true` returns `status=started` and
-//! pushes `[job completed]` onto the shared notification queue when done.
+//! Default is **async** (Grok-aligned): omit `background` or set it true →
+//! `status=started` + `job_id`; completion arrives as `[job completed]`.
+//! `background=false` **blocks until the child ends**. Admission lives on the
+//! independent [`super::coordinator::SubagentCoordinator`] queue: slot-full
+//! background spawns return immediately (`queued=true`); a foreground caller
+//! still queued after `ONE_TASK_FOREGROUND_BUDGET_MS` is handed off
+//! (`backgrounded=true`). A child that has already started is never auto-bg'd.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,17 +19,19 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use one_core::agent::LlmProvider;
 use one_core::error::Result;
-use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
+use one_core::tool::{invalid_args, Tool, ToolCall, ToolDefinition, ToolOutput};
 use one_tools::DEFAULT_MAX_BYTES;
 use serde_json::{json, Value};
-use tokio::sync::{RwLock, Semaphore};
+use tokio::sync::RwLock;
 
+use super::coordinator::{CoordinatorConfig, SpawnSpec, SubagentCoordinator};
 use super::harness::{self, HarnessOptions, ParentReadGrants};
 use super::jobs::{AgentJobRegistry, SpawnOptions};
 use super::presets;
 use crate::protocol::{
-    error_code, AgentSpec, ProtocolError, RunParent, RunRequest, RunResult, SessionMode,
-    TaskExitStatus,
+    error_code, normalize_agent_name, AgentSpec, CapabilityMode, IsolationMode, McpInheritance,
+    ProtocolError, RunParent, RunRequest, RunResult, SessionMode, TaskExitStatus, ToolProfile,
+    ToolsSpec,
 };
 use one_tools::PathPolicy;
 
@@ -43,8 +50,8 @@ pub struct TaskToolHost {
     parent_run_id: RwLock<String>,
     parent_session_id: RwLock<Option<String>>,
     parent_depth: AtomicU32,
-    /// Logical concurrent `task` slots (default 4); shared with background jobs.
-    task_slots: Arc<Semaphore>,
+    /// Independent admission actor (Grok SubagentCoordinator).
+    coordinator: Arc<SubagentCoordinator>,
     /// Background agent jobs (completion → notification queue).
     jobs: Arc<AgentJobRegistry>,
     /// Parent tool_call id → live job id (for TUI click-to-open while running).
@@ -63,6 +70,7 @@ impl TaskToolHost {
         parent_path_policy: PathPolicy,
     ) -> Arc<Self> {
         let max_c = parent_agent.spawn_policy.max_concurrent.max(1) as usize;
+        let coordinator = SubagentCoordinator::new(jobs.clone(), CoordinatorConfig::from_env(max_c));
         Arc::new(Self {
             provider: RwLock::new(None),
             opts: RwLock::new(opts),
@@ -71,7 +79,7 @@ impl TaskToolHost {
             parent_run_id: RwLock::new(format!("run_{}", uuid_simple())),
             parent_session_id: RwLock::new(None),
             parent_depth: AtomicU32::new(0),
-            task_slots: Arc::new(Semaphore::new(max_c)),
+            coordinator,
             jobs,
             tool_jobs: Mutex::new(HashMap::new()),
             langfuse: RwLock::new(None),
@@ -197,12 +205,12 @@ impl TaskToolHost {
 
     pub async fn set_parent_agent(&self, agent: AgentSpec) {
         let max_c = agent.spawn_policy.max_concurrent.max(1) as usize;
-        // Resize semaphore only if larger; shrinking mid-flight is racy — keep max of both.
-        let available = self.task_slots.available_permits();
-        if max_c > available {
-            self.task_slots.add_permits(max_c - available);
-        }
+        self.coordinator.resize(max_c);
         *self.parent_agent.write().await = agent;
+    }
+
+    pub fn coordinator(&self) -> Arc<SubagentCoordinator> {
+        self.coordinator.clone()
     }
 
     pub async fn set_opts(&self, opts: HarnessOptions) {
@@ -325,15 +333,20 @@ impl Tool for TaskTool {
         ToolDefinition {
             name: "task".into(),
             description: format!(
-                "Run a sub-agent via the same harness as `one agent run` (Agent ≡ Subagent). \
-Default agent=explore when allowed. Returns a concise summary so this conversation stays small. \
-Do not use for a single trivial file read. \
-**Do not use explore for git/VCS workflows** (status, diff, stage, commit, reset, \
-categorize uncommitted changes) — explore has no bash; run those with bash yourself. \
+                "Spawn a sub-agent (same harness as `one agent run`). Isolated context; \
+returns a summary so this conversation stays small. Do not use for a single trivial file read. \
+Default agent=explore when allowed. Types: explore (read-only research), plan (read-only plan), \
+general / general-purpose (writable). \
+**Do not use explore for git/VCS workflows** — explore has no bash. \
 Allowed agent names: [{allowed}].{child_blurb} \
-Set background=true for long work that should not block this turn: returns \
-status=started + job_id immediately; when done a [job completed] notice is \
-injected before the next LLM turn (or poll with job_output). \
+**background defaults to true** (Grok-aligned): returns status=started + job_id immediately; \
+when done a [job completed] notice is injected (or poll with job_output / wait_tasks). \
+Set background=false to **block until the child finishes**. A dedicated coordinator \
+queues excess spawns (does not block the caller). Auto-background \
+(details.backgrounded=true) only happens if the parent is still queued for a concurrent \
+slot longer than ONE_TASK_FOREGROUND_BUDGET_MS (~1s) — not because the child is slow. \
+resume_from=<job_id> continues a completed sibling's transcript. \
+capability_mode=read-only|read-write|execute|all optionally filters tools. \
 The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR:."
             ),
             parameters: json!({
@@ -346,13 +359,17 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                     },
                     "description": {
                         "type": "string",
-                        "description": "Short label for logs / TUI (optional)"
+                        "description": "Short label for logs / TUI (3–8 words)"
                     },
                     "agent": {
                         "type": "string",
                         "description": format!(
-                            "Preset / child name under spawn_policy.allow (one of: {allowed}; default explore if allowed)"
+                            "Preset / child name (one of: {allowed}; default explore if allowed)"
                         )
+                    },
+                    "subagent_type": {
+                        "type": "string",
+                        "description": "Grok-style alias for agent (explore | plan | general-purpose)"
                     },
                     "mode": {
                         "type": "string",
@@ -364,11 +381,31 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                     },
                     "background": {
                         "type": "boolean",
-                        "description": "If true, return immediately with job_id; result arrives as [job completed] notification"
+                        "description": "Default true: return immediately with job_id (queued if slots are full). False blocks until the child ends. Auto-bg only if still queued for a slot after ~1s."
+                    },
+                    "run_in_background": {
+                        "type": "boolean",
+                        "description": "Alias for background (Grok spawn_subagent name)"
                     },
                     "isolation": {
                         "type": "string",
-                        "description": "none (default, shared cwd) | worktree (isolated git worktree under .one/worktrees; no auto-merge). Prefer worktree for writable agents."
+                        "description": "none (default, shared cwd) | worktree (isolated git worktree; no auto-merge)"
+                    },
+                    "capability_mode": {
+                        "type": "string",
+                        "description": "Optional tool filter: read-only | read-write | execute | all"
+                    },
+                    "resume_from": {
+                        "type": "string",
+                        "description": "Completed job_id whose transcript/model/cwd to continue"
+                    },
+                    "cwd": {
+                        "type": "string",
+                        "description": "Working directory for the child. Ignored when isolation=worktree or resume_from is set."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model id override for this child"
                     }
                 }
             }),
@@ -392,25 +429,38 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             .map(|s| s.to_string());
 
         let agent_name = resolve_agent_name(&call.arguments);
-        let background = call
-            .arguments
-            .get("background")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        let background = parse_background(&call.arguments);
         let isolation_arg = call
             .arguments
             .get("isolation")
             .and_then(|v| v.as_str())
-            .and_then(crate::protocol::IsolationMode::parse);
-
-        // Logical concurrency (independent of physical LLM permit).
-        let slot = self
-            .host
-            .task_slots
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|_| tool_error("task", "task slot semaphore closed"))?;
+            .and_then(IsolationMode::parse);
+        let capability_mode = call
+            .arguments
+            .get("capability_mode")
+            .and_then(|v| v.as_str())
+            .and_then(CapabilityMode::parse);
+        let resume_from = call
+            .arguments
+            .get("resume_from")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let cwd_arg = call
+            .arguments
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
+        let model_override = call
+            .arguments
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
 
         let parent_agent = self.host.parent_agent.read().await.clone();
         let parent_depth = self.host.parent_depth.load(Ordering::Relaxed);
@@ -434,7 +484,6 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
         ) {
             Ok(r) => r,
             Err(e) => {
-                drop(slot);
                 return Ok(format_task_output(
                     &agent_name,
                     description.as_deref(),
@@ -444,22 +493,61 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
         };
         // M4: settings.memory.subagent may opt-in Index for children still at Off.
         apply_subagent_memory_settings(&mut req.agent);
-        // task arg overrides AgentSpec.isolation when provided.
+        if let Some(mode) = capability_mode {
+            apply_capability_mode(&mut req.agent, mode);
+        }
+        apply_mcp_inheritance(&mut req.agent);
+        if let Some(ref mid) = model_override {
+            req.agent.model.id = Some(mid.clone());
+            req.agent.model.inherit = false;
+        }
         if let Some(iso) = isolation_arg {
             req.agent.isolation = iso;
         }
+        // resume_from: inherit transcript / cwd; isolation=worktree + explicit cwd ignored.
+        if let Some(ref src_id) = resume_from {
+            if let Err(e) = apply_resume_from(
+                &self.host,
+                &mut req,
+                src_id,
+                &parent_agent,
+                &agent_name,
+                &parent_meta,
+            ) {
+                return Ok(format_task_output(
+                    &agent_name,
+                    description.as_deref(),
+                    &RunResult::failure(e, 0).with_status(TaskExitStatus::RuntimeError),
+                ));
+            }
+        } else if let Some(ref cwd) = cwd_arg {
+            if matches!(req.agent.isolation, IsolationMode::Worktree) {
+                return Ok(format_task_output(
+                    &agent_name,
+                    description.as_deref(),
+                    &RunResult::failure(
+                        ProtocolError::new(
+                            error_code::INVALID_REQUEST,
+                            "cwd is mutually exclusive with isolation=worktree",
+                        ),
+                        0,
+                    )
+                    .with_status(TaskExitStatus::RuntimeError),
+                ));
+            }
+            req.agent.cwd = Some(cwd.clone());
+        }
         // Default: writable children in background → worktree when still none.
         if background
-            && matches!(req.agent.isolation, crate::protocol::IsolationMode::None)
+            && matches!(req.agent.isolation, IsolationMode::None)
             && child_tools_look_writable(&req.agent)
         {
-            req.agent.isolation = crate::protocol::IsolationMode::Worktree;
+            req.agent.isolation = IsolationMode::Worktree;
         }
 
         // Fail closed: read-only explore cannot inspect VCS via bash — do not burn
         // 10+ turns reading `.git/index` and return a fake success summary.
         if child_lacks_bash(&req.agent) && prompt_looks_like_vcs_workflow(&prompt) {
-            drop(slot);
             let msg = "ERROR: need bash (explore/read-only subagent has no shell; \
 parent must run `git status --short` / `git diff --stat` / stage+commit directly). \
 Do not re-delegate git workflows to explore.";
@@ -475,7 +563,6 @@ Do not re-delegate git workflows to explore.";
 
         // Validate tools can materialize before spending a slot on LLM work.
         if let Err(e) = validate_child_tools(&req.agent) {
-            drop(slot);
             return Ok(format_task_output(
                 &agent_name,
                 description.as_deref(),
@@ -489,122 +576,101 @@ Do not re-delegate git workflows to explore.";
             .child_trace(&call.id, &agent_name, &parent_meta)
             .await;
 
-        if background {
-            let provider = self.host.provider.read().await.clone();
-            let Some(provider) = provider else {
-                drop(slot);
+        // Bound provider → independent coordinator (Start / Enqueue / Reject).
+        // Unbound provider (unit tests / FakeHarness) skips admission.
+        if let Some(provider) = self.host.provider.read().await.clone() {
+            let opts = self.host.child_harness_opts().await;
+            let session_id = parent_meta.session_id.clone();
+            let prompt_snap = req.prompt.text.clone();
+            let cwd_snap = req.agent.cwd.clone();
+            let reply = self
+                .host
+                .coordinator
+                .spawn(SpawnSpec {
+                    req,
+                    provider,
+                    opts,
+                    agent_name: agent_name.clone(),
+                    description: description.clone(),
+                    background,
+                    spawn_opts: SpawnOptions {
+                        notify_completion: background,
+                        apply_wall_timeout: true,
+                        trace: child_trace,
+                        trace_meta: child_trace_meta,
+                        acquire_slot: None,
+                    },
+                    session_id,
+                    prompt: prompt_snap,
+                    cwd: cwd_snap,
+                })
+                .await;
+
+            if reply.rejected {
                 return Ok(format_task_output(
                     &agent_name,
                     description.as_deref(),
-                    &RunResult::failure(
-                        ProtocolError::new(
-                            error_code::INTERNAL,
-                            "task tool has no LLM provider bound (call bind_provider)",
-                        ),
-                        0,
-                    )
-                    .with_status(TaskExitStatus::RuntimeError),
+                    &reply.result.unwrap_or_else(|| {
+                        RunResult::failure(
+                            ProtocolError::new(error_code::SPAWN_NOT_ALLOWED, "admission rejected"),
+                            0,
+                        )
+                        .with_status(TaskExitStatus::RuntimeError)
+                    }),
                 ));
-            };
-            let opts = self.host.child_harness_opts().await;
-            let job_id = self.host.jobs.spawn_with(
-                req,
-                provider,
-                opts,
-                agent_name.clone(),
-                description.clone(),
-                Some(slot),
-                SpawnOptions {
-                    notify_completion: true,
-                    apply_wall_timeout: true,
-                    trace: child_trace,
-                    trace_meta: child_trace_meta,
-                },
-            );
-            // Bind until completion notification is absorbed — keep for /ps open.
-            self.host.bind_tool_job(&call.id, &job_id);
+            }
+
+            if !reply.job_id.is_empty() {
+                self.host.bind_tool_job(&call.id, &reply.job_id);
+            }
+
+            if let Some(result) = reply.result {
+                self.host.unbind_tool_job(&call.id);
+                let log_path = self
+                    .host
+                    .jobs
+                    .get(&reply.job_id)
+                    .and_then(|s| s.log_path.map(|p| p.display().to_string()));
+                return Ok(stamp_job_output(
+                    format_task_output(&agent_name, description.as_deref(), &result),
+                    &reply.job_id,
+                    &result,
+                    log_path,
+                ));
+            }
+
             let log_path = self
                 .host
                 .jobs
-                .get(&job_id)
+                .get(&reply.job_id)
                 .and_then(|s| s.log_path.map(|p| p.display().to_string()));
             return Ok(format_task_started(
                 &agent_name,
                 description.as_deref(),
-                &job_id,
+                &reply.job_id,
                 log_path.as_deref(),
+                reply.backgrounded,
+                reply.queued,
             ));
         }
 
-        // Sync path: await harness **return value** on this task (not spawn+Notify).
-        // Job row is only for TUI/live log / job_kill abort flag.
-        // Tests using FakeHarness leave provider unbound → harness.run only.
-        if let Some(provider) = self.host.provider.read().await.clone() {
-            let opts = self.host.child_harness_opts().await;
-            let host = self.host.clone();
-            let tool_call_id = call.id.clone();
-            let (job_id, result) = self
-                .host
-                .jobs
-                .run_foreground(
-                    req,
-                    provider,
-                    opts,
-                    agent_name.clone(),
-                    description.clone(),
-                    Some(slot),
-                    SpawnOptions {
-                        // tool_result is the parent signal — no [job completed] notice
-                        notify_completion: false,
-                        apply_wall_timeout: true,
-                        trace: child_trace,
-                        trace_meta: child_trace_meta,
-                    },
-                    |job_id| host.bind_tool_job(&tool_call_id, job_id),
+        if background {
+            return Ok(format_task_output(
+                &agent_name,
+                description.as_deref(),
+                &RunResult::failure(
+                    ProtocolError::new(
+                        error_code::INTERNAL,
+                        "task tool has no LLM provider bound (call bind_provider)",
+                    ),
+                    0,
                 )
-                .await;
-            self.host.unbind_tool_job(&call.id);
-            let log_path = self
-                .host
-                .jobs
-                .get(&job_id)
-                .and_then(|s| s.log_path.map(|p| p.display().to_string()));
-            let mut out = format_task_output(&agent_name, description.as_deref(), &result);
-            if let Some(details) = out.details.as_mut() {
-                if let Some(obj) = details.as_object_mut() {
-                    obj.insert("job_id".into(), json!(job_id));
-                    if let Some(ref p) = log_path {
-                        obj.insert("log_path".into(), json!(p));
-                    }
-                }
-            }
-            if let Some(first) = out.content.first_mut() {
-                if let one_core::message::TextOrImage::Text { text } = first {
-                    if let Some(rest) = text.strip_prefix('[') {
-                        if let Some(end) = rest.find(']') {
-                            let inside = &rest[..end];
-                            if !inside.contains("id=") {
-                                let stamped =
-                                    format!("[{inside} · id={job_id}]{}", &rest[end + 1..]);
-                                *text = stamped;
-                            }
-                        }
-                    }
-                    if !result.ok {
-                        if let Some(ref p) = log_path {
-                            if !text.contains("log_path:") {
-                                text.push_str(&format!("\nlog_path: {p}"));
-                            }
-                        }
-                    }
-                }
-            }
-            return Ok(out);
+                .with_status(TaskExitStatus::RuntimeError),
+            ));
         }
 
-        // Sync fallback (tests / unbound provider): hold slot until harness returns.
+        // Sync fallback (tests / unbound provider): no admission.
         let result = self.harness.run(req).await;
-        drop(slot);
         Ok(format_task_output(
             &agent_name,
             description.as_deref(),
@@ -614,19 +680,168 @@ Do not re-delegate git workflows to explore.";
 }
 
 fn resolve_agent_name(args: &Value) -> String {
-    if let Some(a) = args.get("agent").and_then(|v| v.as_str()) {
-        let t = a.trim();
-        if !t.is_empty() {
-            return t.to_string();
-        }
-    }
-    if let Some(m) = args.get("mode").and_then(|v| v.as_str()) {
-        let t = m.trim();
-        if !t.is_empty() {
-            return t.to_string();
+    for key in ["subagent_type", "agent", "mode"] {
+        if let Some(a) = args.get(key).and_then(|v| v.as_str()) {
+            let t = a.trim();
+            if !t.is_empty() {
+                return t.to_string();
+            }
         }
     }
     "explore".into()
+}
+
+/// Grok-aligned default: background unless the caller explicitly waits.
+fn parse_background(args: &Value) -> bool {
+    args.get("background")
+        .or_else(|| args.get("run_in_background"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+}
+
+fn apply_capability_mode(agent: &mut AgentSpec, mode: CapabilityMode) {
+    match mode {
+        CapabilityMode::ReadOnly => {
+            agent.tools = ToolsSpec::read_only();
+            agent.tools.deny = vec![
+                "ask_user".into(),
+                "write".into(),
+                "edit".into(),
+                "bash".into(),
+                "bash_output".into(),
+                "bash_kill".into(),
+                "monitor".into(),
+            ];
+            agent.tools.mcp = false;
+            agent.mcp_inheritance = McpInheritance::None;
+        }
+        CapabilityMode::ReadWrite => {
+            agent.tools.profile = ToolProfile::Coding;
+            agent.tools.allow.clear();
+            for n in ["bash", "bash_output", "bash_kill", "monitor", "ask_user"] {
+                if !agent.tools.deny.iter().any(|d| d == n) {
+                    agent.tools.deny.push(n.into());
+                }
+            }
+        }
+        CapabilityMode::Execute => {
+            agent.tools.profile = ToolProfile::Coding;
+            agent.tools.allow.clear();
+            for n in ["write", "edit", "ask_user"] {
+                if !agent.tools.deny.iter().any(|d| d == n) {
+                    agent.tools.deny.push(n.into());
+                }
+            }
+        }
+        CapabilityMode::All => {
+            agent.tools = ToolsSpec::coding();
+            agent.tools.deny = vec!["ask_user".into(), "task".into()];
+            agent.tools.mcp = true;
+            agent.mcp_inheritance = McpInheritance::All;
+        }
+    }
+}
+
+fn apply_mcp_inheritance(agent: &mut AgentSpec) {
+    match agent.mcp_inheritance {
+        McpInheritance::All => agent.tools.mcp = true,
+        McpInheritance::None => {
+            // Leave explicit tools.mcp=true from capability_mode=all / general.
+        }
+    }
+}
+
+fn apply_resume_from(
+    host: &TaskToolHost,
+    req: &mut RunRequest,
+    src_id: &str,
+    parent_agent: &AgentSpec,
+    agent_name: &str,
+    parent_meta: &RunParent,
+) -> std::result::Result<(), ProtocolError> {
+    let src = host.jobs.resume_source(src_id).ok_or_else(|| {
+        ProtocolError::new(
+            error_code::INVALID_REQUEST,
+            format!("resume_from `{src_id}` is unknown or still running"),
+        )
+    })?;
+    let want = normalize_agent_name(agent_name);
+    let have = normalize_agent_name(&src.agent);
+    if want != have {
+        return Err(ProtocolError::new(
+            error_code::INVALID_REQUEST,
+            format!(
+                "resume_from type mismatch: source is `{}`, requested `{}`",
+                src.agent, agent_name
+            ),
+        ));
+    }
+    if let (Some(parent_sid), Some(src_sid)) = (
+        parent_meta.session_id.as_deref(),
+        src.parent_session_id.as_deref(),
+    ) {
+        if parent_sid != src_sid {
+            return Err(ProtocolError::new(
+                error_code::INVALID_REQUEST,
+                "resume_from job belongs to a different parent session",
+            ));
+        }
+    }
+    // Grok: isolation/cwd ignored on resume — inherit source cwd / worktree path.
+    req.agent.isolation = IsolationMode::None;
+    if let Some(path) = src.worktree_path.or(src.cwd) {
+        req.agent.cwd = Some(path);
+    }
+    req.seed_messages = src.transcript;
+    if req.seed_messages.is_empty() && (!src.prompt.is_empty() || !src.summary.is_empty()) {
+        let fallback = format!(
+            "[resumed from {src_id} · {}]\nPrevious task:\n{}\n\nPrevious summary:\n{}",
+            src.agent, src.prompt, src.summary
+        );
+        req.seed_messages.push(serde_json::json!({
+            "role": "user",
+            "content": fallback,
+        }));
+    }
+    let _ = parent_agent;
+    Ok(())
+}
+
+fn stamp_job_output(
+    mut out: ToolOutput,
+    job_id: &str,
+    result: &RunResult,
+    log_path: Option<String>,
+) -> ToolOutput {
+    if let Some(details) = out.details.as_mut() {
+        if let Some(obj) = details.as_object_mut() {
+            obj.insert("job_id".into(), json!(job_id));
+            if let Some(ref p) = log_path {
+                obj.insert("log_path".into(), json!(p));
+            }
+        }
+    }
+    if let Some(first) = out.content.first_mut() {
+        if let one_core::message::TextOrImage::Text { text } = first {
+            if let Some(rest) = text.strip_prefix('[') {
+                if let Some(end) = rest.find(']') {
+                    let inside = &rest[..end];
+                    if !inside.contains("id=") {
+                        let stamped = format!("[{inside} · id={job_id}]{}", &rest[end + 1..]);
+                        *text = stamped;
+                    }
+                }
+            }
+            if !result.ok {
+                if let Some(ref p) = log_path {
+                    if !text.contains("log_path:") {
+                        text.push_str(&format!("\nlog_path: {p}"));
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 /// True when the child agent will not get a `bash` tool (explore / read-only faces).
@@ -862,11 +1077,20 @@ pub fn format_task_started(
     description: Option<&str>,
     job_id: &str,
     log_path: Option<&str>,
+    backgrounded: bool,
+    queued: bool,
 ) -> ToolOutput {
     let desc_part = description.map(|d| format!(" · {d}")).unwrap_or_default();
+    let auto = if backgrounded {
+        " Concurrent slot wait exceeded — handed off to background (child had not started)."
+    } else if queued {
+        " No free slot — queued; starts when another subagent finishes."
+    } else {
+        ""
+    };
     let mut text = format!(
         "[task · {agent_name}{desc_part} · status=started · id={job_id}]\n\
-         Background job started. Continue other work.\n\
+         Background job started.{auto} Continue other work.\n\
          Result arrives as a [job completed] notice before the next LLM turn, \
          or poll with job_output(job_id=\"{job_id}\")."
     );
@@ -878,6 +1102,8 @@ pub fn format_task_started(
         "status": "started",
         "job_id": job_id,
         "background": true,
+        "backgrounded": backgrounded,
+        "queued": queued,
         "agent": agent_name,
         "description": description,
         "log_path": log_path,
@@ -1023,7 +1249,7 @@ pub fn format_task_output_from_job(snap: &super::jobs::JobSnapshot) -> (bool, St
 
 /// One-liner for main agent system prompt.
 pub const TASK_TOOL_PROMPT_HINT: &str = "\
-- To delegate work to a sub-agent, use the `task` tool with `agent` set to a name allowed by spawn policy (default: explore for multi-file **code** research: read/grep/find/ls only). Findings return as a summary so this conversation stays small. Do not use task for a trivial single-file read, and do not use task to implement code when you already have the design/context — edit/write yourself. **Never use explore/task for git workflows** (status, diff, stage, commit, split commits by feature) — explore has no bash; run compact git via bash yourself (`git status --short`, `git diff --stat`, `git add <paths>`, `git commit`). Prefer task only when isolation of a large research fan-out is worth the latency. For long work that should not block this turn, use task(background=true); when you have spawned all background work (agent jobs and/or bash bg tasks) and have nothing else to do, call wait_tasks (mode=all) with no wait_ms to block until they finish — or wait_tasks(mode=any) for the next one. Do not pass wait_ms=1000 (that is 1 second). job_output without wait_ms is a snapshot; to wait, omit wait_ms on wait_tasks. job_output / job_kill accept both `job_*` and `bg_*` ids. Foreground and background tasks share ONE_JOB_MAX_WALL_MS (default 5 minutes). For agents that write/edit/bash, prefer isolation=worktree (or background, which defaults worktree for writable tools) so changes stay under .one/worktrees and are not auto-merged.";
+- To delegate work to a sub-agent, use the `task` tool. `agent` / `subagent_type` / `mode` select the role (explore = read-only research; plan = read-only implementation plan; general / general-purpose = writable coding). Default agent is explore when allowed. Findings return as a summary so this conversation stays small. Do not use task for a trivial single-file read, and do not use task to implement code when you already have the design/context — edit/write yourself. **Never use explore/task for git workflows** — explore has no bash; run compact git via bash yourself. **background defaults to true** (returns status=started + job_id; completion is a [job completed] notice). Set background=false when you need the summary this turn — that **waits for the child to finish**. Auto-background only happens if all concurrent slots are busy for ~1s (admission), not because the child is slow. Use resume_from=<job_id> to continue a completed sibling. capability_mode=read-only|read-write|execute|all optionally filters tools. When you have spawned all background work and have nothing else to do, call wait_tasks (mode=all) with no wait_ms. job_output without wait_ms is a snapshot. job_output / job_kill accept both `job_*` and `bg_*` ids. For agents that write/edit/bash, prefer isolation=worktree (background writable children default to worktree).";
 
 /// Build parent AgentSpec for the interactive / -p main agent.
 ///
@@ -1056,10 +1282,17 @@ fn merge_disk_main(spec: &mut AgentSpec) {
     if spec.name.is_none() {
         spec.name = Some("main".into());
     }
-    // Ensure explore child exists when allow lists explore but agents table omits it.
+    // Ensure builtin children exist when allow lists them but the table omits them.
     if spec.spawn_allowed("explore") && !spec.agents.contains_key("explore") {
         spec.agents
             .insert("explore".into(), AgentSpec::builtin_explore());
+    }
+    if spec.spawn_allowed("plan") && !spec.agents.contains_key("plan") {
+        spec.agents.insert("plan".into(), AgentSpec::builtin_plan());
+    }
+    if spec.spawn_allowed("general") && !spec.agents.contains_key("general") {
+        spec.agents
+            .insert("general".into(), AgentSpec::builtin_general());
     }
 }
 
@@ -1179,7 +1412,7 @@ mod tests {
             .execute(&ToolCall {
                 id: "call_1".into(),
                 name: "task".into(),
-                arguments: json!({"prompt": "find auth", "description": "auth map"}),
+                arguments: json!({"prompt": "find auth", "description": "auth map", "background": false}),
             })
             .await
             .unwrap();
@@ -1207,7 +1440,7 @@ mod tests {
             .execute(&ToolCall {
                 id: "c2".into(),
                 name: "task".into(),
-                arguments: json!({"prompt": "x"}),
+                arguments: json!({"prompt": "x", "background": false}),
             })
             .await
             .unwrap();
@@ -1250,6 +1483,7 @@ mod tests {
                     "prompt": "Categorize repository changes and split commits by feature",
                     "agent": "explore",
                     "description": "categorize",
+                    "background": false,
                 }),
             })
             .await
@@ -1290,7 +1524,7 @@ mod tests {
             .execute(&ToolCall {
                 id: "c4".into(),
                 name: "task".into(),
-                arguments: json!({"prompt": "go", "mode": "explore"}),
+                arguments: json!({"prompt": "go", "mode": "explore", "background": false}),
             })
             .await
             .unwrap();
@@ -1364,7 +1598,7 @@ mod tests {
             .execute(&ToolCall {
                 id: "c5".into(),
                 name: "task".into(),
-                arguments: json!({"prompt": "x", "agent": "explore"}),
+                arguments: json!({"prompt": "x", "agent": "explore", "background": false}),
             })
             .await
             .unwrap();
@@ -1415,6 +1649,7 @@ mod tests {
     /// Real harness path: TaskTool → harness::run → MockProvider (no nested parent LLM).
     #[tokio::test]
     async fn task_tool_harness_mock_end_to_end() {
+        std::env::set_var("ONE_TASK_FOREGROUND_BUDGET_MS", "0");
         let host = test_host();
         host.bind_provider(Arc::new(one_ai::MockProvider::new()))
             .await;
@@ -1426,7 +1661,8 @@ mod tests {
                 arguments: json!({
                     "prompt": "Summarize the auth module layout",
                     "description": "auth",
-                    "agent": "explore"
+                    "agent": "explore",
+                    "background": false
                 }),
             })
             .await
@@ -1448,6 +1684,7 @@ mod tests {
 
     #[tokio::test]
     async fn task_tool_inline_agent_spec() {
+        std::env::set_var("ONE_TASK_FOREGROUND_BUDGET_MS", "0");
         let host = test_host();
         host.bind_provider(Arc::new(one_ai::MockProvider::new()))
             .await;
@@ -1460,6 +1697,7 @@ mod tests {
                 arguments: json!({
                     "prompt": "quick scan",
                     "agent": "explore",
+                    "background": false,
                     "agent_spec": explore
                 }),
             })
@@ -1525,7 +1763,8 @@ mod tests {
                         arguments: json!({
                             "prompt": "Locate authentication entrypoints",
                             "agent": "explore",
-                            "description": "auth"
+                            "description": "auth",
+                            "background": false
                         }),
                     }],
                     stop_reason: StopReason::ToolUse,
@@ -1550,6 +1789,7 @@ mod tests {
             },
             vec![task],
         );
+        std::env::set_var("ONE_TASK_FOREGROUND_BUDGET_MS", "0");
         let parent_llm = ParentThenFinal {
             n: AtomicUsize::new(0),
         };
@@ -1615,5 +1855,152 @@ mod tests {
         let b = b.unwrap().unwrap();
         assert!(a.as_text().contains("status="), "{}", a.as_text());
         assert!(b.as_text().contains("status="), "{}", b.as_text());
+    }
+
+    #[tokio::test]
+    async fn task_defaults_to_background() {
+        let host = test_host();
+        host.bind_provider(Arc::new(one_ai::MockProvider::new()))
+            .await;
+        let tool = TaskTool::new(host);
+        let out = tool
+            .execute(&ToolCall {
+                id: "def_bg".into(),
+                name: "task".into(),
+                arguments: json!({"prompt": "research auth entrypoints", "agent": "explore"}),
+            })
+            .await
+            .unwrap();
+        let details = out.details.expect("details");
+        assert_eq!(details["status"], "started");
+        assert_eq!(details["background"], true);
+        assert_eq!(details["backgrounded"], false);
+        assert_eq!(details["queued"], false);
+    }
+
+    #[tokio::test]
+    async fn background_false_waits_for_child_not_auto_bg() {
+        // Regression: d934bfc1-d96 — explicit sync must not hand off after 1s
+        // just because the child is still running. Slot is free → block for result.
+        let host = test_host();
+        host.bind_provider(Arc::new(one_ai::MockProvider::new()))
+            .await;
+        let tool = TaskTool::new(host);
+        let out = tool
+            .execute(&ToolCall {
+                id: "sync_wait".into(),
+                name: "task".into(),
+                arguments: json!({
+                    "prompt": "summarize the repo in one line",
+                    "agent": "explore",
+                    "background": false
+                }),
+            })
+            .await
+            .unwrap();
+        let text = out.as_text();
+        let details = out.details.expect("details");
+        assert_ne!(
+            details["status"], "started",
+            "sync task with a free slot must not auto-bg: {text}"
+        );
+        assert!(
+            details["status"] == "success"
+                || details["status"] == "incomplete_info"
+                || details["status"] == "max_turns_exceeded",
+            "unexpected status: {} text={text}",
+            details["status"],
+        );
+    }
+
+    #[tokio::test]
+    async fn subagent_type_alias_and_capability_read_only() {
+        let host = test_host();
+        let seen: Arc<Mutex<Option<AgentSpec>>> = Arc::new(Mutex::new(None));
+        struct Capture {
+            seen: Arc<Mutex<Option<AgentSpec>>>,
+        }
+        #[async_trait]
+        impl TaskHarness for Capture {
+            async fn run(&self, req: RunRequest) -> RunResult {
+                *self.seen.lock().unwrap() = Some(req.agent.clone());
+                RunResult::success("ok", 1)
+            }
+        }
+        let tool = TaskTool::with_harness(host, Arc::new(Capture { seen: seen.clone() }));
+        let _ = tool
+            .execute(&ToolCall {
+                id: "cap1".into(),
+                name: "task".into(),
+                arguments: json!({
+                    "prompt": "go",
+                    "subagent_type": "general-purpose",
+                    "capability_mode": "read-only",
+                    "background": false
+                }),
+            })
+            .await
+            .unwrap();
+        let spec = seen.lock().unwrap().clone().expect("captured");
+        assert_eq!(normalize_agent_name(spec.display_name()), "general");
+        assert!(!child_tools_look_writable(&spec));
+    }
+
+    #[tokio::test]
+    async fn resume_from_completed_job_seeds_transcript() {
+        let host = test_host();
+        host.bind_provider(Arc::new(one_ai::MockProvider::new()))
+            .await;
+        let tool = TaskTool::new(host.clone());
+        let first = tool
+            .execute(&ToolCall {
+                id: "r1".into(),
+                name: "task".into(),
+                arguments: json!({
+                    "prompt": "first research pass",
+                    "agent": "explore",
+                    "background": true
+                }),
+            })
+            .await
+            .unwrap();
+        let job_id = first.details.unwrap()["job_id"].as_str().unwrap().to_string();
+        for _ in 0..100 {
+            if host
+                .jobs()
+                .get(&job_id)
+                .is_some_and(|s| s.state.is_terminal())
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            host.jobs().resume_source(&job_id).is_some(),
+            "source should be resumeable"
+        );
+
+        std::env::set_var("ONE_TASK_FOREGROUND_BUDGET_MS", "0");
+        let second = tool
+            .execute(&ToolCall {
+                id: "r2".into(),
+                name: "task".into(),
+                arguments: json!({
+                    "prompt": "continue from prior findings",
+                    "agent": "explore",
+                    "resume_from": job_id,
+                    "background": false
+                }),
+            })
+            .await
+            .unwrap();
+        std::env::remove_var("ONE_TASK_FOREGROUND_BUDGET_MS");
+        let text = second.as_text();
+        assert!(
+            text.contains("status=success")
+                || text.contains("status=incomplete")
+                || text.contains("status=started"),
+            "{text}"
+        );
     }
 }

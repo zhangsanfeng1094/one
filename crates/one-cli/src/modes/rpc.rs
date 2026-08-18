@@ -11,7 +11,7 @@
 //! ```
 //!
 //! Methods: `ping`, `prompt`, `abort`, `steer`, `follow_up`, `session`, `status`,
-//! `thinking`, `compact`.
+//! `thinking`, `compact`, `spawn`.
 
 use std::io::{self, BufRead};
 
@@ -20,6 +20,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::runtime::AppRuntime;
+use one_core::tool::{Tool, ToolCall};
 
 #[derive(Debug, Deserialize)]
 struct RpcRequest {
@@ -27,6 +28,47 @@ struct RpcRequest {
     method: String,
     #[serde(default)]
     params: serde_json::Value,
+}
+
+async fn spawn_rpc(
+    runtime: &AppRuntime,
+    params: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let prompt = params
+        .get("prompt")
+        .or_else(|| params.get("text"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "params.prompt required".to_string())?;
+    let host = runtime
+        .task_host()
+        .ok_or_else(|| "subagent spawn is not enabled on this runtime".to_string())?;
+    let tool = crate::runtime::task_tool::TaskTool::new(host);
+    let mut args = params.clone();
+    if let Some(obj) = args.as_object_mut() {
+        obj.insert("prompt".into(), serde_json::json!(prompt));
+    }
+    let out = tool
+        .execute(&ToolCall {
+            id: format!("rpc_spawn_{}", uuid_lite()),
+            name: "task".into(),
+            arguments: args,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(json!({
+        "text": out.as_text(),
+        "details": out.details,
+    }))
+}
+
+fn uuid_lite() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| format!("{:x}", d.as_nanos()))
+        .unwrap_or_else(|_| "0".into())
 }
 
 pub async fn run_rpc(
@@ -197,11 +239,16 @@ async fn handle(
             Err(e) => json!({"id": id, "ok": false, "error": e.to_string()}),
         },
 
+        "spawn" => match spawn_rpc(runtime, &request.params).await {
+            Ok(result) => json!({"id": id, "ok": true, "result": result}),
+            Err(e) => json!({"id": id, "ok": false, "error": e}),
+        },
+
         other => json!({
             "id": id,
             "ok": false,
             "error": format!(
-                "unknown method: {other} (known: ping, prompt, abort, steer, follow_up, session, status, thinking, compact)"
+                "unknown method: {other} (known: ping, prompt, abort, steer, follow_up, session, status, thinking, compact, spawn)"
             )
         }),
     }

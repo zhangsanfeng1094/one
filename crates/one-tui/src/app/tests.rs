@@ -1950,3 +1950,32 @@ fn provider_models_space_toggles_ctrl_l_visibility() {
         Some(["openai:o3".to_string()].as_slice())
     );
 }
+
+#[test]
+fn q_closes_tv4_frame_to_list() {
+    let mut app = App::new("test");
+    app.open_subagent_detail_float(
+        "job_1",
+        "scan",
+        "explore  ·  running",
+        &[("▸".into(), "started".into())],
+    );
+    match app.handle_key(key(KeyCode::Char('q'), KeyModifiers::NONE)) {
+        RunOutcome::OpenSubagentList => {}
+        other => panic!("expected OpenSubagentList, got {other:?}"),
+    }
+}
+
+#[test]
+fn enter_on_focused_task_opens_frame() {
+    let mut app = App::new("test");
+    app.push_tool_call("task", r#"{"prompt":"scan"}"#);
+    let idx = app.messages.len() - 1;
+    app.messages[idx].tool_job_id = Some("job_tv4".into());
+    app.chat_focus = Some(idx);
+    app.input.clear();
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+        RunOutcome::OpenSubagentDetail { id } => assert_eq!(id, "job_tv4"),
+        other => panic!("expected OpenSubagentDetail, got {other:?}"),
+    }
+}

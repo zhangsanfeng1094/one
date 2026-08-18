@@ -30,6 +30,13 @@ impl super::App {
             return RunOutcome::Noop;
         }
 
+        // Grok: Ctrl+F on a subagent lifecycle row opens the framed child view.
+        if !self.float_open() && Self::is_ctrl_f(key) {
+            if let Some(id) = self.focused_subagent_job_id() {
+                return RunOutcome::OpenSubagentDetail { id };
+            }
+        }
+
         if Self::is_goto_bottom_key(key) {
             self.scroll_to_bottom();
             return RunOutcome::Noop;
@@ -164,9 +171,12 @@ impl super::App {
                     self.input.clear();
                     return RunOutcome::OpenMcpPanel;
                 }
-                // Empty prompt + chat focus → toggle expand (transcript browse).
-                if t.is_empty() && self.chat_focus.is_some() {
-                    if self.toggle_focused_or_last() {
+                // Empty prompt + focused task row → open TV4 framed transcript.
+                if t.is_empty() {
+                    if let Some(id) = self.focused_subagent_job_id() {
+                        return RunOutcome::OpenSubagentDetail { id };
+                    }
+                    if self.chat_focus.is_some() && self.toggle_focused_or_last() {
                         return RunOutcome::Noop;
                     }
                 }

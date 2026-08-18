@@ -329,6 +329,96 @@ impl SpawnPolicy {
             max_concurrent: 4,
         }
     }
+
+    /// Grok-aligned parent allow-list: explore / plan / general-purpose.
+    pub fn default_children() -> Self {
+        Self {
+            allow: vec![
+                "explore".into(),
+                "plan".into(),
+                "general".into(),
+                "general-purpose".into(),
+            ],
+            max_depth: 1,
+            max_concurrent: 4,
+        }
+    }
+}
+
+/// Coarse tool filter applied at spawn time (Grok `capability_mode`).
+///
+/// When omitted, the child uses its agent type's toolset.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum CapabilityMode {
+    /// Read / search / inspect (and web). No writes, no shell.
+    ReadOnly,
+    /// Read + create/edit/delete files. No shell.
+    ReadWrite,
+    /// Read + shell / background bash. No file edits.
+    Execute,
+    /// Unrestricted (coding profile + MCP).
+    All,
+}
+
+impl CapabilityMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::ReadWrite => "read-write",
+            Self::Execute => "execute",
+            Self::All => "all",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "read-only" | "read_only" | "readonly" | "ro" => Some(Self::ReadOnly),
+            "read-write" | "read_write" | "readwrite" | "rw" => Some(Self::ReadWrite),
+            "execute" | "exec" | "shell" => Some(Self::Execute),
+            "all" | "unrestricted" | "full" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// Whether a child inherits the parent's already-connected MCP servers.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum McpInheritance {
+    /// No parent MCP (explore / plan default).
+    #[default]
+    None,
+    /// Inherit every parent-connected MCP tool (`tools.mcp = true`).
+    All,
+}
+
+impl McpInheritance {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::All => "all",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "off" | "false" | "0" => Some(Self::None),
+            "all" | "on" | "true" | "1" | "inherit" => Some(Self::All),
+            _ => None,
+        }
+    }
+}
+
+/// Canonical child role name (`explore` / `plan` / `general`).
+pub fn normalize_agent_name(name: &str) -> String {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "general-purpose" | "general_purpose" | "generalpurpose" | "general"
+        | "implementer" => "general".into(),
+        "explore" | "researcher" | "research" => "explore".into(),
+        "plan" | "planner" | "planning" => "plan".into(),
+        other => other.trim().to_string(),
+    }
 }
 
 /// Where a harness run may read/write files.
@@ -413,6 +503,9 @@ pub struct AgentSpec {
     /// File isolation for this run (CLI / task can override).
     #[serde(default)]
     pub isolation: IsolationMode,
+    /// Inherit parent-connected MCP servers (Grok `mcpInheritance`).
+    #[serde(default)]
+    pub mcp_inheritance: McpInheritance,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub meta: Value,
 }
@@ -436,9 +529,10 @@ impl Default for AgentSpec {
             add_dirs: vec![],
             skills: SkillsSpec::default(),
             resources: ResourcesSpec::default(),
-            spawn_policy: SpawnPolicy::explore_only(),
+            spawn_policy: SpawnPolicy::default_children(),
             agents: std::collections::BTreeMap::new(),
             isolation: IsolationMode::None,
+            mcp_inheritance: McpInheritance::None,
             meta: Value::Null,
         }
     }
@@ -521,11 +615,92 @@ branch ops) or shell commands, end immediately with:\n\
             spawn_policy: SpawnPolicy::none(),
             agents: std::collections::BTreeMap::new(),
             isolation: IsolationMode::None,
+            mcp_inheritance: McpInheritance::None,
             meta: Value::Null,
         }
     }
 
-    /// Default root coding agent with explore as a child role.
+    /// Writable general-purpose child (Grok `general-purpose`). No nested spawn.
+    pub fn builtin_general() -> Self {
+        Self {
+            name: Some("general".into()),
+            description: Some(
+                "Full-capability coding sub-agent (read/write/edit/bash). \
+Use for implementation that should stay out of the parent context."
+                    .into(),
+            ),
+            system_prompt: Some(
+                "You are a general-purpose sub-agent of One.\n\
+                 Complete the delegated implementation or mixed task, then stop.\n\
+                 - Use the tools provided. Prefer surgical edits over rewrites.\n\
+                 - Do not ask the user questions.\n\
+                 - If you lack critical information or permission, end immediately with:\n\
+                 `ERROR: <reason>`\n\
+                 then optional partial findings.\n\
+                 - Final answer: what changed, key paths, residual risks. Be concise.\n\
+                 - Do not restate the entire task prompt."
+                    .into(),
+            ),
+            append_system_prompt: None,
+            tools: {
+                let mut t = ToolsSpec::coding();
+                t.deny = vec!["ask_user".into(), "task".into()];
+                t.mcp = true;
+                t
+            },
+            model: ModelSpec {
+                inherit: true,
+                thinking: Some("off".into()),
+                ..Default::default()
+            },
+            max_turns: Some(32),
+            permission_mode: Some("dont_ask".into()),
+            sandbox: Some("workspace-write".into()),
+            cwd: None,
+            add_dirs: vec![],
+            skills: SkillsSpec {
+                enabled: false,
+                catalog: false,
+                preload: vec![],
+            },
+            resources: ResourcesSpec {
+                agents_md: false,
+                claude_md: false,
+                memory: MemoryResourceMode::Off,
+            },
+            spawn_policy: SpawnPolicy::none(),
+            agents: std::collections::BTreeMap::new(),
+            isolation: IsolationMode::None,
+            mcp_inheritance: McpInheritance::All,
+            meta: Value::Null,
+        }
+    }
+
+    /// Planning child (Grok `plan`): read-only research + a structured plan.
+    pub fn builtin_plan() -> Self {
+        let mut spec = Self::builtin_explore();
+        spec.name = Some("plan".into());
+        spec.description = Some(
+            "Read-only planning agent. Explores the codebase and returns a structured \
+implementation plan. Does not edit files."
+                .into(),
+        );
+        spec.system_prompt = Some(
+            "You are a planning sub-agent of One.\n\
+             Explore the codebase and produce a structured implementation plan, then stop.\n\
+             - Tools: only what you were given (typically read/grep/find/ls). **No edits.**\n\
+             - Do not ask the user questions.\n\
+             - If you lack critical information, end with `ERROR: <reason>`.\n\
+             - Final answer: a markdown plan with goal, files to touch, steps, risks, \
+and open questions (as statements, not questions to the user).\n\
+             - Do not restate the entire task prompt."
+                .into(),
+        );
+        spec.max_turns = Some(20);
+        spec
+    }
+
+    /// Default root coding agent with explore / plan / general as child roles.
     pub fn builtin_main() -> Self {
         let mut main = Self::default();
         // Interactive main loads memory via settings; AgentSpec marks intent for
@@ -533,6 +708,11 @@ branch ops) or shell commands, end immediately with:\n\
         main.resources.memory = MemoryResourceMode::Index;
         main.agents
             .insert("explore".into(), Self::builtin_explore());
+        main.agents.insert("plan".into(), Self::builtin_plan());
+        main.agents
+            .insert("general".into(), Self::builtin_general());
+        main.agents
+            .insert("general-purpose".into(), Self::builtin_general());
         main
     }
 
@@ -550,18 +730,28 @@ branch ops) or shell commands, end immediately with:\n\
         if let Some(spec) = self.agents.get(name) {
             return Some(spec.clone());
         }
-        // Built-in alias even if not copied into agents map.
-        if name == "explore" && self.spawn_policy.allow.iter().any(|a| a == "explore") {
-            return Some(Self::builtin_explore());
+        let key = normalize_agent_name(name);
+        if key != name {
+            if let Some(spec) = self.agents.get(&key) {
+                return Some(spec.clone());
+            }
         }
-        None
+        if !self.spawn_allowed(name) {
+            return None;
+        }
+        match key.as_str() {
+            "explore" => Some(Self::builtin_explore()),
+            "plan" => Some(Self::builtin_plan()),
+            "general" => Some(Self::builtin_general()),
+            _ => None,
+        }
     }
 
     pub fn spawn_allowed(&self, name: &str) -> bool {
-        self.spawn_policy
-            .allow
-            .iter()
-            .any(|a| a == name || a == "*")
+        let key = normalize_agent_name(name);
+        self.spawn_policy.allow.iter().any(|a| {
+            a == "*" || a == name || normalize_agent_name(a) == key
+        })
     }
 }
 
@@ -623,6 +813,9 @@ pub struct RunRequest {
     pub parent: Option<RunParent>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run_id: Option<String>,
+    /// Prior child transcript (Grok `resume_from`). Serialized `AgentMessage`s.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub seed_messages: Vec<Value>,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub meta: Value,
 }
@@ -650,6 +843,7 @@ impl RunRequest {
             },
             parent: None,
             run_id: None,
+            seed_messages: vec![],
             meta: Value::Null,
         }
     }
@@ -698,6 +892,7 @@ impl RunRequest {
             },
             parent: Some(parent),
             run_id: None,
+            seed_messages: vec![],
             meta: Value::Null,
         })
     }
@@ -783,6 +978,9 @@ pub struct RunResult {
     /// Present when this run used `isolation=worktree`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub worktree: Option<WorktreeInfo>,
+    /// Child conversation (for `resume_from`). Serialized `AgentMessage`s.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transcript: Vec<Value>,
     #[serde(default, skip_serializing_if = "Value::is_null")]
     pub meta: Value,
 }
@@ -809,6 +1007,7 @@ impl Default for RunResult {
             parent: None,
             children: vec![],
             worktree: None,
+            transcript: vec![],
             meta: Value::Null,
         }
     }
@@ -1052,5 +1251,41 @@ mod tests {
         assert!(j.get("system_prompt").is_some());
         assert!(j.get("tools").is_some());
         assert_eq!(j["spawn_policy"]["max_depth"], 0);
+    }
+
+    #[test]
+    fn normalize_agent_name_grok_aliases() {
+        assert_eq!(normalize_agent_name("general-purpose"), "general");
+        assert_eq!(normalize_agent_name("General"), "general");
+        assert_eq!(normalize_agent_name("planner"), "plan");
+        assert_eq!(normalize_agent_name("researcher"), "explore");
+    }
+
+    #[test]
+    fn builtin_main_allows_grok_types() {
+        let main = AgentSpec::builtin_main();
+        assert!(main.spawn_allowed("explore"));
+        assert!(main.spawn_allowed("plan"));
+        assert!(main.spawn_allowed("general-purpose"));
+        assert_eq!(
+            main.resolve_child("general-purpose")
+                .unwrap()
+                .display_name(),
+            "general"
+        );
+        assert_eq!(main.resolve_child("plan").unwrap().display_name(), "plan");
+    }
+
+    #[test]
+    fn capability_mode_parse() {
+        assert_eq!(
+            CapabilityMode::parse("read-only"),
+            Some(CapabilityMode::ReadOnly)
+        );
+        assert_eq!(
+            CapabilityMode::parse("read_write"),
+            Some(CapabilityMode::ReadWrite)
+        );
+        assert_eq!(CapabilityMode::parse("all"), Some(CapabilityMode::All));
     }
 }

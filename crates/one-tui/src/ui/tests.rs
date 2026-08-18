@@ -1040,3 +1040,40 @@ fn tool_group_aggregates_duplicate_names() {
     assert!(text.contains("[read]"), "{text}");
     assert!(!text.contains("  ↵") && !text.contains("↵"), "{text}");
 }
+
+#[test]
+fn tv4_frame_replaces_parent_chat() {
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.input = "should-not-show".into();
+    app.open_subagent_detail_float(
+        "job_tv4",
+        "scan codebase",
+        "explore  ·  running  ·  3s  ·  #tv4",
+        &[
+            ("▸".into(), "job job_tv4 · explore · scan codebase".into()),
+            ("→".into(), "grep · auth".into()),
+        ],
+    );
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    assert!(
+        flat.contains("scan codebase"),
+        "framed title missing:\n{flat}"
+    );
+    assert!(
+        flat.contains("observational") || flat.contains("[q]"),
+        "frame chrome missing:\n{flat}"
+    );
+    assert!(
+        !flat.contains("should-not-show"),
+        "parent prompt must be hidden under TV4:\n{flat}"
+    );
+}

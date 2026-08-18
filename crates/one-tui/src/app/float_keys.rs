@@ -54,6 +54,16 @@ impl super::App {
             }
             // Esc / ← (nav only): cancel field edit, else one level up.
             // Detail → ask CLI to reopen list with a fresh snapshot (not cache).
+            KeyCode::Char('q') | KeyCode::Char('Q')
+                if !editing
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && self
+                        .float
+                        .as_ref()
+                        .is_some_and(|f| f.kind == FloatKind::SubagentDetail) =>
+            {
+                RunOutcome::OpenSubagentList
+            }
             KeyCode::Esc => {
                 if self
                     .float

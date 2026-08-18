@@ -169,6 +169,16 @@ pub async fn run_with_control(
     };
 
     let mut agent = Agent::new(config, tools);
+    if !req.seed_messages.is_empty() {
+        for raw in &req.seed_messages {
+            match serde_json::from_value::<one_core::message::AgentMessage>(raw.clone()) {
+                Ok(msg) => agent.messages.push(msg),
+                Err(e) => {
+                    tracing::debug!(error = %e, "harness: skip invalid seed message");
+                }
+            }
+        }
+    }
     if let Some(flag) = control.abort {
         agent.set_abort_flag(flag);
     }
@@ -286,6 +296,7 @@ pub async fn run_with_control(
     result.usage = Some(usage);
     result.citations = last_assistant_citations(&agent);
     result.parent = req.parent.clone();
+    result.transcript = serialize_transcript(&agent.messages);
 
     // Free the LLM slot before agent/sink Drop (Drop must never block parent LLM).
     drop(permit.take());
@@ -383,6 +394,16 @@ fn classify_success_text(text: &str) -> TaskExitStatus {
         return TaskExitStatus::IncompleteInfo;
     }
     TaskExitStatus::Success
+}
+
+/// Persist a capped child transcript so `resume_from` can replay it.
+fn serialize_transcript(messages: &[one_core::message::AgentMessage]) -> Vec<serde_json::Value> {
+    const MAX_MSGS: usize = 40;
+    let start = messages.len().saturating_sub(MAX_MSGS);
+    messages[start..]
+        .iter()
+        .filter_map(|m| serde_json::to_value(m).ok())
+        .collect()
 }
 
 fn last_assistant_text(agent: &Agent) -> Option<String> {
