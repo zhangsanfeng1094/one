@@ -40,6 +40,8 @@ fn drain_hitl(app: &mut App, gate: &PermissionGate, hitl: &HitlChannel) {
     // Only open a dock when the UI is not already showing one.
     if app.select_kind().is_none() {
         if let Some(req) = gate.poll_request() {
+            app.notify("Permission Required", &format!("Tool: {}", req.tool));
+            app.ring_bell();
             app.set_approval_prompt(ApprovalPrompt {
                 id: req.id,
                 tool: req.tool,
@@ -48,6 +50,8 @@ fn drain_hitl(app: &mut App, gate: &PermissionGate, hitl: &HitlChannel) {
                 suggested_prefix: req.suggested_prefix,
             });
         } else if let Some(req) = hitl.poll_request() {
+            app.notify("Input Needed", "Agent asked a question");
+            app.ring_bell();
             app.set_select_prompt(SelectKind::AskUser { id: req.id }, req.prompt);
         }
     }
@@ -1836,6 +1840,7 @@ async fn run_turn_streaming(
 
     app.begin_busy();
     runtime.clear_abort();
+    let turn_start = std::time::Instant::now();
 
     // Attach MCP tools that finished loading since the last turn (same as print path).
     if runtime.mcp.is_loading() && runtime.mcp.tool_count() == 0 {
@@ -2043,6 +2048,10 @@ async fn run_turn_streaming(
                     app.append_stream(&sources);
                 }
                 app.finish_stream();
+            }
+
+            if turn_start.elapsed().as_secs() >= 5 {
+                app.notify("One", "Turn completed");
             }
 
             // Model finished planning → surface plan for review.

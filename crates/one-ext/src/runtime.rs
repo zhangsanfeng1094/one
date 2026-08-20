@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use one_core::hooks::AgentHooks;
+use one_core::hooks::{AgentHooks, StopDecision};
 use one_core::tool::{Tool, ToolCall, ToolOutput};
 use one_core::tool_gate::{ToolGate, ToolGateDecision};
 use serde_json::Value;
@@ -69,6 +69,10 @@ impl ExtensionRuntime {
 
     pub fn hooks_config(&self) -> &HooksConfig {
         &self.hooks
+    }
+
+    pub fn cwd(&self) -> &Path {
+        &self.cwd
     }
 
     pub async fn load_all(&self, ctx: &ExtensionContext<'_>) -> crate::Result<()> {
@@ -284,6 +288,23 @@ impl AgentHooks for RuntimeAgentHooks {
     async fn on_turn_end(&self, turn: usize) {
         let _ = self.runtime.emit(&ExtensionEvent::TurnEnd { turn }).await;
     }
+
+    async fn on_stop(&self, turn: usize, last_assistant_message: Option<&str>) -> StopDecision {
+        let _ = self
+            .runtime
+            .emit(&ExtensionEvent::Stop {
+                turn,
+                last_assistant_message: last_assistant_message.map(|s| s.to_string()),
+            })
+            .await;
+        hooks::run_stop_hooks(
+            self.runtime.hooks_config(),
+            turn,
+            last_assistant_message,
+            self.runtime.cwd(),
+        )
+        .await
+    }
 }
 
 struct ExtensionToolGate {
@@ -415,6 +436,58 @@ mod tests {
                 assert_eq!(arguments["path"], "/safe/file.txt");
             }
             other => panic!("expected rewrite, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_hook_exit_code_2_blocks() {
+        let hooks_raw = r#"{
+            "stop": [
+                {
+                    "name": "lint-check",
+                    "command": "echo 'linter error on line 42' >&2; exit 2"
+                }
+            ]
+        }"#;
+        let cfg: HooksConfig = serde_json::from_str(hooks_raw).unwrap();
+        let rt = Arc::new(ExtensionRuntime::from_registry(
+            ExtensionRegistryBuilder::new().build(),
+            cfg,
+            PathBuf::from("/tmp"),
+        ));
+        let agent_hooks = rt.agent_hooks();
+        let decision = agent_hooks.on_stop(1, Some("done")).await;
+        match decision {
+            StopDecision::Block { reason } => {
+                assert!(reason.contains("linter error on line 42"));
+            }
+            other => panic!("expected Block, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_hook_json_block() {
+        let hooks_raw = r#"{
+            "stop": [
+                {
+                    "name": "quality-gate",
+                    "command": "echo '{\"decision\": \"block\", \"reason\": \"unit tests missing\"}'"
+                }
+            ]
+        }"#;
+        let cfg: HooksConfig = serde_json::from_str(hooks_raw).unwrap();
+        let rt = Arc::new(ExtensionRuntime::from_registry(
+            ExtensionRegistryBuilder::new().build(),
+            cfg,
+            PathBuf::from("/tmp"),
+        ));
+        let agent_hooks = rt.agent_hooks();
+        let decision = agent_hooks.on_stop(1, Some("done")).await;
+        match decision {
+            StopDecision::Block { reason } => {
+                assert_eq!(reason, "unit tests missing");
+            }
+            other => panic!("expected Block, got {other:?}"),
         }
     }
 }

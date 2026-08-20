@@ -23,6 +23,7 @@ pub mod error;
 pub mod float;
 pub mod markdown;
 pub mod message;
+pub mod notification;
 pub mod select;
 pub mod settings;
 pub mod slash;
@@ -40,6 +41,10 @@ pub use app::{expand_at_files, App, InteractiveApp};
 pub use error::Result;
 pub use float::{FloatItem, FloatKind, FloatMenu, FloatSection};
 pub use message::{AlertLevel, ChatLineTarget, Message, MessageRole, ToolStatus};
+pub use notification::{
+    detect_notification_protocol, format_notification_sequence, ring_bell, send_notification,
+    NotificationProtocol,
+};
 pub use select::{SelectMode, SelectOption, SelectPhase, SelectPrompt, SelectResult};
 pub use slash::{ModelChoice, PopupKind, PopupRow, SlashCommand, SLASH_COMMANDS};
 pub use terminal::{emergency_restore_terminal, ForceQuit, TerminalSession};

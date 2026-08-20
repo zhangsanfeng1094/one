@@ -8,9 +8,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{OneError, Result};
 use crate::events::{AgentEvent, EventListener};
-use crate::hooks::AgentHooks;
+use crate::hooks::{AgentHooks, StopDecision};
 use crate::message::{
     now_ms, AgentMessage, AssistantMessage, ContentBlock, StopReason, ToolResultMessage,
+    UserContent, UserMessage,
 };
 use crate::tool::{resolve_tool_name, Tool, ToolCall, ToolOutput};
 use crate::tool_gate::{ToolGate, ToolGateDecision};
@@ -638,6 +639,8 @@ impl Agent {
         let start_len = self.messages.len();
         let mut final_text;
         let mut turns_done = 0usize;
+        let mut stop_continuations = 0usize;
+        const MAX_STOP_CONTINUATIONS: usize = 8;
 
         for turn in 0..self.config.max_turns {
             if self.is_aborted() {
@@ -987,6 +990,26 @@ impl Agent {
 
             if tool_calls.is_empty() {
                 final_text = extract_text(&response.content);
+                if let Some(hooks) = self.hooks.clone() {
+                    let decision = hooks.on_stop(turn, Some(&final_text)).await;
+                    match decision {
+                        StopDecision::Block { reason } if stop_continuations < MAX_STOP_CONTINUATIONS => {
+                            stop_continuations += 1;
+                            self.messages.push(AgentMessage::User(UserMessage {
+                                content: UserContent::Text(format!("[Stop Hook Feedback] {reason}")),
+                                timestamp: crate::message::now_ms(),
+                            }));
+                            self.emit(AgentEvent::TurnEnd {
+                                turn,
+                                assistant,
+                                tool_results,
+                            });
+                            hooks.on_turn_end(turn).await;
+                            continue;
+                        }
+                        StopDecision::ForceStop { .. } | StopDecision::Allow | StopDecision::Block { .. } => {}
+                    }
+                }
                 self.emit(AgentEvent::TurnEnd {
                     turn,
                     assistant,
@@ -2071,6 +2094,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::TextOrImage;
 
     #[test]
     fn system_prompt_uses_one_tool_names() {
@@ -3039,5 +3063,75 @@ mod tests {
         let err = agent.prompt(&provider, "hi").await.expect_err("must fail");
         assert!(matches!(err, OneError::EmptyResponse { attempts: 1 }));
         assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_hook_blocks_agent_turn_and_feeds_back_message() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct MultiTurnProvider {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for MultiTurnProvider {
+            fn name(&self) -> &str {
+                "multi-turn"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, req: CompletionRequest) -> Result<CompletionResponse> {
+                let n = self.calls.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    Ok(empty_resp(vec![ContentBlock::text("draft done")]))
+                } else {
+                    let has_feedback = req.messages.iter().any(|m| match m {
+                        AgentMessage::User(u) => match &u.content {
+                            UserContent::Text(t) => t.contains("tests failed, please fix"),
+                            UserContent::Blocks(blocks) => blocks.iter().any(|b| match b {
+                                TextOrImage::Text { text } => text.contains("tests failed, please fix"),
+                                _ => false,
+                            }),
+                        },
+                        _ => false,
+                    });
+                    assert!(has_feedback, "Agent must receive stop hook feedback");
+                    Ok(empty_resp(vec![ContentBlock::text("fixed and completed")]))
+                }
+            }
+        }
+
+        struct TestStopHooks {
+            stop_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl AgentHooks for TestStopHooks {
+            async fn on_stop(&self, _turn: usize, _last_assistant_message: Option<&str>) -> StopDecision {
+                let count = self.stop_calls.fetch_add(1, Ordering::SeqCst);
+                if count == 0 {
+                    StopDecision::Block {
+                        reason: "tests failed, please fix".into(),
+                    }
+                } else {
+                    StopDecision::Allow
+                }
+            }
+        }
+
+        let provider = MultiTurnProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        let stop_hooks = Arc::new(TestStopHooks {
+            stop_calls: AtomicUsize::new(0),
+        });
+        agent.set_hooks(Some(stop_hooks.clone()));
+
+        let result = agent.prompt(&provider, "do task").await.expect("agent should succeed");
+        assert_eq!(result, "fixed and completed");
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(stop_hooks.stop_calls.load(Ordering::SeqCst), 2);
     }
 }

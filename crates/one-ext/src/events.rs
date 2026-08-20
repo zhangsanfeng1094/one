@@ -22,6 +22,11 @@ pub enum ExtensionEvent {
         output: ToolOutput,
         is_error: bool,
     },
+    /// Agent turn completion gate
+    Stop {
+        turn: usize,
+        last_assistant_message: Option<String>,
+    },
     /// Compaction about to run.
     PreCompact,
     /// Compaction finished.

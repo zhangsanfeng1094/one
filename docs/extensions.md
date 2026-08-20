@@ -187,31 +187,47 @@ Manifest 路径（先匹配者）：
 
 ### 外部 Hooks（`hooks.json`）
 
-路径：`~/.one/agent/hooks.json` 或 plugin 声明文件。
+路径：`~/.one/agent/hooks.json`、`~/.one/agent/hooks/hooks.json` 或 plugin 声明文件。
+支持扁平对象与嵌套格式（`{ "hooks": { "PreToolUse": [...] } }`），兼容 Grok / Claude / Cursor 规范。
 
 ```json
 {
   "preToolUse": [
     {
       "name": "block-rm",
-      "matcher": "bash",
+      "matcher": "Bash|Write",
       "command": ["python3", "/path/to/pre_bash.py"],
       "timeoutSec": 10
     }
   ],
   "postToolUse": [],
+  "postToolUseFailure": [],
+  "stop": [
+    {
+      "name": "test-runner",
+      "command": "cargo test --quiet",
+      "timeoutSec": 60
+    }
+  ],
   "sessionStart": [],
   "sessionEnd": [],
   "userPromptSubmit": []
 }
 ```
 
-- **stdin**：JSON 请求（`hookEventName`, `toolName`, `toolInput`, `cwd`, …）  
+- **执行类型**：
+  - `command`（默认）：本地进程，通过 stdin/stdout 交互，自动注入环境变量 `ONE_HOOK_EVENT`、`ONE_HOOK_NAME`、`ONE_CWD`。
+  - `http`：向目标 `url` 发送 POST JSON 请求。
+- **Stop 门控控制**：
+  - 当 Agent 结束工具调用准备终止当前 Turn 时触发。
+  - 退出码 `2` 或返回 `{"decision": "block", "reason": "..."}` 会阻断停机，将 stderr/reason 作为 feedback 注入上下文并继续让 Agent 修复（单 Turn 最多 8 次续跑）。
+  - 返回 `{"continue": false, "stopReason": "..."}` 强制停机。
+- **stdin**：JSON 请求（`hookEventName`, `toolName`, `toolInput`, `cwd`, `turn`, `lastAssistantMessage`, …）  
 - **stdout**（PreToolUse）：  
-  - `{ "permissionDecision": "deny", "systemMessage": "…" }`  
-  - `{ "updatedInput": { … } }`  
+  - `{ "permissionDecision": "deny", "systemMessage": "…" }` / 退出码 `2`  
+  - `{ "updatedInput": { … } }`（或 `{ "hookSpecificOutput": { "updatedInput": { ... } } }`）  
   - `{ "continue": false, "systemMessage": "…" }`  
-- **matcher**：工具名 glob（`bash`、`ba*`、`*`）
+- **matcher**：工具名匹配，支持 glob、管道复合匹配（`Bash|Write`）以及常用别名映射（`Bash` ↔ `run_terminal_command`、`Edit`/`Write` ↔ `search_replace`、`Read` ↔ `read_file`、`Task` ↔ `spawn_subagent`）。
 
 ---
 

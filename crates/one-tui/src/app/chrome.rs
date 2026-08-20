@@ -404,4 +404,14 @@ impl super::App {
     pub fn set_agent_label(&mut self, label: impl Into<String>) {
         self.agent_label = label.into();
     }
+
+    /// Send desktop notification using the configured/detected protocol (OSC 9 / OSC 99 / OSC 777 / BEL).
+    pub fn notify(&self, title: &str, body: &str) {
+        let _ = crate::notification::send_notification(self.notification_protocol, title, body);
+    }
+
+    /// Ring the terminal bell (ASCII BEL chime).
+    pub fn ring_bell(&self) {
+        let _ = crate::notification::ring_bell();
+    }
 }

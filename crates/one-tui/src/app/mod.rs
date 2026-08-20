@@ -267,6 +267,8 @@ pub struct App {
     history_persist_path: Option<PathBuf>,
     /// Optional callback-less persist via path — CLI sets this after load.
     /// When set, `push_prompt_history` also appends a JSON line.
+    /// Protocol used for terminal alerts & desktop notifications (OSC 9 / OSC 99 / OSC 777 / BEL).
+    pub notification_protocol: crate::notification::NotificationProtocol,
     /// Workspace cwd used for prompt-history paths and relative path display.
     pub(crate) history_cwd: Option<PathBuf>,
     /// Interactive tool approval overlay (while busy) — metadata for gate id.
@@ -355,6 +357,7 @@ impl App {
             compaction_prune_max_chars: 2_000,
             settings_saved_auto_approve: false,
             settings_saved_sandbox: "workspace-write".into(),
+            notification_protocol: crate::notification::detect_notification_protocol(),
             mcp_chip_text: String::new(),
             mcp_chip_kind: 0,
             bg_chip_text: String::new(),

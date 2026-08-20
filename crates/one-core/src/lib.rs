@@ -30,7 +30,7 @@ pub use reminder::{
 };
 pub use error::{OneError, Result};
 pub use events::AgentEvent;
-pub use hooks::{AgentHooks, NoopHooks};
+pub use hooks::{AgentHooks, NoopHooks, StopDecision};
 pub use message::{AgentMessage, AssistantMessage, StopReason, ToolResultMessage, UserMessage};
 pub use streaming::{
     race_abort, wait_until_aborted, ServerToolStatus, StreamEvent, ABORT_POLL_INTERVAL,
