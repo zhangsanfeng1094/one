@@ -55,6 +55,32 @@ pub struct MemoryIndexEntry {
     pub body_path: Option<PathBuf>,
 }
 
+/// Extra matching controls stored in a tool-intent body's YAML frontmatter.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct ToolIntentMetadata {
+    triggers: Vec<String>,
+    negative_triggers: Vec<String>,
+    priority: i32,
+}
+
+fn normalize_metadata_items(items: impl IntoIterator<Item = String>) -> Vec<String> {
+    items
+        .into_iter()
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
+}
+
+/// One matched tool-intent rule for runtime prompt injection.
+#[derive(Debug, Clone)]
+pub struct ToolIntentHit {
+    pub score: u32,
+    pub confidence: f32,
+    pub evidence: Vec<String>,
+    pub entry: MemoryIndexEntry,
+    pub body_excerpt: Option<String>,
+}
+
 /// Result of loading memory indexes for a workspace.
 #[derive(Debug, Clone)]
 pub struct MemoryCatalog {
@@ -70,11 +96,7 @@ pub struct MemoryCatalog {
 pub fn memory_readable_roots(agent_dir: &Path, cwd: &Path) -> Vec<PathBuf> {
     let root = memory_root(agent_dir);
     let project = project_memory_dir(agent_dir, cwd);
-    vec![
-        root.clone(),
-        root.join("_global"),
-        project,
-    ]
+    vec![root.clone(), root.join("_global"), project]
 }
 
 /// Writable roots for M2 agent write path (same trees as readable).
@@ -124,8 +146,49 @@ pub fn scaffold_memory_body(
     )
 }
 
+fn render_tool_intent_frontmatter(
+    name: &str,
+    type_name: &str,
+    scope: &str,
+    tags: &str,
+    triggers: &[String],
+    negative_triggers: &[String],
+    priority: i32,
+) -> String {
+    let mut out = format!(
+        "---\nname: {name}\ntype: {type_name}\nscope: {scope}\ntags: [{}]\nupdated: {}\n",
+        normalize_tags_for_frontmatter(tags),
+        chrono_ymd_today()
+    );
+    if !triggers.is_empty() {
+        out.push_str(&format!("triggers: [{}]\n", render_metadata_list(triggers)));
+    }
+    if !negative_triggers.is_empty() {
+        out.push_str(&format!(
+            "negative_triggers: [{}]\n",
+            render_metadata_list(negative_triggers)
+        ));
+    }
+    if priority != 0 {
+        out.push_str(&format!("priority: {priority}\n"));
+    }
+    out.push_str("---\n\n");
+    out
+}
+
+fn render_metadata_list(items: &[String]) -> String {
+    items
+        .iter()
+        .map(|item| {
+            let escaped = item.replace('\\', "\\\\").replace('"', "\\\"");
+            format!("\"{escaped}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Input for atomic memory write (body + MEMORY.md index line).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct MemoryUpsertInput {
     pub id: String,
     /// `global` or `project` (default project).
@@ -140,6 +203,12 @@ pub struct MemoryUpsertInput {
     pub body: String,
     /// Optional frontmatter `name` (defaults to description or id).
     pub name: Option<String>,
+    /// Optional explicit phrases that strongly activate a tool-intent rule.
+    pub triggers: Vec<String>,
+    /// Optional phrases that veto a tool-intent rule.
+    pub negative_triggers: Vec<String>,
+    /// Optional rule priority. Higher values win ties and add a small score bonus.
+    pub priority: i32,
 }
 
 /// Result of [`upsert_memory_entry`].
@@ -183,9 +252,7 @@ fn normalize_scope(scope: &str) -> Result<String, String> {
     match scope.trim().to_ascii_lowercase().as_str() {
         "" | "project" | "proj" | "repo" => Ok("project".into()),
         "global" | "user" | "g" => Ok("global".into()),
-        other => Err(format!(
-            "scope must be global|project (got `{other}`)"
-        )),
+        other => Err(format!("scope must be global|project (got `{other}`)")),
     }
 }
 
@@ -310,17 +377,32 @@ pub fn upsert_memory_entry(
         .map(|s| s.chars().take(80).collect::<String>())
         .unwrap_or_else(|| description.chars().take(80).collect());
 
-    let body_text = scaffold_memory_body(&name, &type_name, &scope, &tags, body_core);
+    let triggers = normalize_metadata_items(input.triggers.iter().cloned());
+    let negative_triggers = normalize_metadata_items(input.negative_triggers.iter().cloned());
+    let priority = input.priority.clamp(-100, 100);
+    let body_text = if type_name == "tool_intent"
+        && (!triggers.is_empty() || !negative_triggers.is_empty() || priority != 0)
+    {
+        format!(
+            "{}{}",
+            render_tool_intent_frontmatter(
+                &name,
+                &type_name,
+                &scope,
+                &tags,
+                &triggers,
+                &negative_triggers,
+                priority,
+            ),
+            body_core
+        )
+    } else {
+        scaffold_memory_body(&name, &type_name, &scope, &tags, body_core)
+    };
     std::fs::write(&body_path, &body_text).map_err(|e| format!("write body: {e}"))?;
 
-    let index_updated = upsert_memory_index_line(
-        &index_path,
-        &id,
-        &type_name,
-        &scope,
-        &tags,
-        &description,
-    )?;
+    let index_updated =
+        upsert_memory_index_line(&index_path, &id, &type_name, &scope, &tags, &description)?;
 
     Ok(MemoryUpsertResult {
         id,
@@ -350,7 +432,8 @@ fn upsert_memory_index_line(
         String::new()
     };
 
-    let (header, mut entries) = split_index_header_and_entries(&existing, scope, index_path.parent());
+    let (header, mut entries) =
+        split_index_header_and_entries(&existing, scope, index_path.parent());
     let new_line = format_index_entry_line(id, type_name, scope, tags, description);
     let mut updated = false;
     if let Some(pos) = entries.iter().position(|(eid, _)| eid == id) {
@@ -362,7 +445,9 @@ fn upsert_memory_index_line(
 
     let mut out = String::new();
     if header.trim().is_empty() {
-        out.push_str("# Memory index (do not treat as full instructions; read bodies on demand)\n\n");
+        out.push_str(
+            "# Memory index (do not treat as full instructions; read bodies on demand)\n\n",
+        );
     } else {
         out.push_str(&header);
         if !header.ends_with('\n') {
@@ -430,13 +515,8 @@ fn split_index_header_and_entries(
         let entries: Vec<_> = parsed
             .into_iter()
             .map(|e| {
-                let line = format_index_entry_line(
-                    &e.id,
-                    &e.type_name,
-                    &e.scope,
-                    &e.tags,
-                    &e.description,
-                );
+                let line =
+                    format_index_entry_line(&e.id, &e.type_name, &e.scope, &e.tags, &e.description);
                 (e.id, line)
             })
             .collect();
@@ -547,9 +627,7 @@ fn git_origin_slug(cwd: &Path) -> Option<String> {
         return None;
     }
     // git@github.com:org/repo.git  or  https://github.com/org/repo.git
-    let stripped = url
-        .trim_end_matches('/')
-        .trim_end_matches(".git");
+    let stripped = url.trim_end_matches('/').trim_end_matches(".git");
     if let Some(rest) = stripped.strip_prefix("git@") {
         // host:org/repo
         if let Some((_, path)) = rest.split_once(':') {
@@ -594,8 +672,14 @@ pub fn load_memory_catalog_sync(
     let project_slug = project_slug(cwd);
 
     let mut entries = Vec::new();
-    entries.extend(load_index_file_sync(&global_dir.join("MEMORY.md"), "global"));
-    entries.extend(load_index_file_sync(&project_dir.join("MEMORY.md"), "project"));
+    entries.extend(load_index_file_sync(
+        &global_dir.join("MEMORY.md"),
+        "global",
+    ));
+    entries.extend(load_index_file_sync(
+        &project_dir.join("MEMORY.md"),
+        "project",
+    ));
 
     // Project entries with the same id override global (keep project last, then dedup by id).
     let mut by_id: std::collections::BTreeMap<String, MemoryIndexEntry> =
@@ -699,8 +783,8 @@ pub fn search_memory_index(
                 body_path: Some(path),
             };
             // Score id/tags/desc first; fall back to body text for L4 archives.
-            let score = score_entry(&synthetic, &terms)
-                .or_else(|| score_text_blob(&file_text, &terms));
+            let score =
+                score_entry(&synthetic, &terms).or_else(|| score_text_blob(&file_text, &terms));
             if let Some(score) = score {
                 hits.push(MemorySearchHit {
                     score,
@@ -711,7 +795,11 @@ pub fn search_memory_index(
         }
     }
 
-    hits.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.entry.id.cmp(&b.entry.id)));
+    hits.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| a.entry.id.cmp(&b.entry.id))
+    });
     let max = max_results.max(1);
     hits.truncate(max);
     hits
@@ -723,6 +811,198 @@ pub struct MemorySearchHit {
     pub score: u32,
     pub entry: MemoryIndexEntry,
     pub source: MemorySearchSource,
+}
+
+/// Match user query against tool intent memories (type=tool_intent / intent / tool).
+///
+/// Searches both global and project MEMORY.md indexes. Returns top-scoring rules
+/// along with their actionable body excerpts so the runtime can inject a JIT
+/// `<system-reminder>` before LLM execution.
+pub fn match_tool_intent_rules(
+    agent_dir: &Path,
+    cwd: &Path,
+    query: &str,
+    max_results: usize,
+) -> Vec<ToolIntentHit> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Vec::new();
+    }
+    let q_lower = q.to_ascii_lowercase();
+
+    let opts = MemoryLoadOptions {
+        enabled: true,
+        index_max_lines: 10_000,
+        ..Default::default()
+    };
+
+    let Some(cat) = load_memory_catalog_sync(agent_dir, cwd, &opts) else {
+        return Vec::new();
+    };
+
+    let mut hits = Vec::new();
+    for e in cat.entries {
+        let is_intent = e.type_name.eq_ignore_ascii_case("tool_intent")
+            || e.type_name.eq_ignore_ascii_case("intent")
+            || e.type_name.eq_ignore_ascii_case("tool")
+            || e.tags.split(',').any(|t| {
+                let t = t.trim();
+                t.eq_ignore_ascii_case("tool_intent")
+                    || t.eq_ignore_ascii_case("intent")
+                    || t.eq_ignore_ascii_case("mcp")
+                    || t.eq_ignore_ascii_case("tool")
+            });
+
+        if !is_intent {
+            continue;
+        }
+
+        let body = e
+            .body_path
+            .as_ref()
+            .and_then(|p| std::fs::read_to_string(p).ok());
+        let metadata = body
+            .as_deref()
+            .map(parse_tool_intent_metadata)
+            .unwrap_or_default();
+
+        let mut score = 0u32;
+        let mut evidence = Vec::new();
+        let id_lower = e.id.to_ascii_lowercase();
+        let tags_lower = e.tags.to_ascii_lowercase();
+        let desc_lower = e.description.to_ascii_lowercase();
+
+        // Explicit negative triggers veto a rule. This is intentionally checked
+        // before ordinary scoring so a broad rule cannot override user context.
+        if metadata
+            .negative_triggers
+            .iter()
+            .any(|trigger| contains_phrase(&q_lower, trigger))
+        {
+            continue;
+        }
+
+        // Explicit triggers are stronger than inferred tag/description matches.
+        for trigger in &metadata.triggers {
+            if contains_phrase(&q_lower, trigger) {
+                score += 30;
+                evidence.push(format!("trigger:{trigger}"));
+            }
+        }
+
+        for tag in tags_lower
+            .split(',')
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        {
+            if tag.len() >= 3 && contains_phrase(&q_lower, tag) {
+                score += 15;
+                evidence.push(format!("tag:{tag}"));
+            }
+        }
+
+        for part in id_lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|p| p.len() >= 3)
+        {
+            if contains_phrase(&q_lower, part) {
+                score += 10;
+                evidence.push(format!("id:{part}"));
+            }
+        }
+
+        for word in desc_lower
+            .split(|c: char| c.is_whitespace() || ",，;；:：|/\\()（）[]【】".contains(c))
+            .filter(|w| w.len() >= 3)
+        {
+            if contains_phrase(&q_lower, word) {
+                score += 8;
+                evidence.push(format!("description:{word}"));
+            }
+        }
+
+        // Keep legacy id/tag/description matching behavior intact. Explicit
+        // triggers add a stronger signal, while negative triggers can veto a
+        // broad legacy rule before scoring.
+        let base_score = score;
+        if base_score < 8 {
+            continue;
+        }
+
+        let score = base_score.saturating_add(metadata.priority.max(0) as u32);
+        let confidence = ((score as f32) / 70.0).clamp(0.0, 1.0);
+        let body_excerpt = body
+            .as_deref()
+            .map(|content| {
+                let trimmed = strip_memory_frontmatter(content).trim();
+                trimmed.chars().take(300).collect::<String>()
+            })
+            .filter(|text| !text.is_empty());
+
+        hits.push(ToolIntentHit {
+            score,
+            confidence,
+            evidence,
+            entry: e,
+            body_excerpt,
+        });
+    }
+
+    hits.sort_by(|a, b| {
+        b.score
+            .cmp(&a.score)
+            .then_with(|| b.confidence.total_cmp(&a.confidence))
+            .then_with(|| a.entry.id.cmp(&b.entry.id))
+    });
+    hits.truncate(max_results.max(1));
+    hits
+}
+
+fn contains_phrase(query: &str, phrase: &str) -> bool {
+    let phrase = phrase.trim().to_ascii_lowercase();
+    !phrase.is_empty() && query.contains(&phrase)
+}
+
+/// Parse the small, intentionally lenient subset of YAML used by memory bodies.
+/// Supports scalar values and inline lists such as `triggers: [foo, bar]`.
+fn parse_tool_intent_metadata(content: &str) -> ToolIntentMetadata {
+    let trimmed = content.trim_start();
+    let Some(frontmatter) = trimmed.strip_prefix("---") else {
+        return ToolIntentMetadata::default();
+    };
+    let Some(end) = frontmatter.find("\n---") else {
+        return ToolIntentMetadata::default();
+    };
+
+    let mut metadata = ToolIntentMetadata::default();
+    for line in frontmatter[..end].lines() {
+        let Some((key, raw)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = raw.trim();
+        match key {
+            "triggers" => metadata.triggers = parse_metadata_list(value),
+            "negative_triggers" | "negativeTriggers" => {
+                metadata.negative_triggers = parse_metadata_list(value)
+            }
+            "priority" => metadata.priority = value.parse::<i32>().unwrap_or(0).clamp(-100, 100),
+            _ => {}
+        }
+    }
+    metadata
+}
+
+fn parse_metadata_list(value: &str) -> Vec<String> {
+    let value = value.trim().trim_start_matches('[').trim_end_matches(']');
+    value
+        .split(',')
+        .map(|item| item.trim().trim_matches(['"', '\'']))
+        .filter(|item| !item.is_empty())
+        .map(|item| item.replace("\\\"", "\"").replace("\\\\", "\\"))
+        .map(|item| item.trim().to_ascii_lowercase())
+        .filter(|item| !item.is_empty())
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -805,7 +1085,11 @@ fn score_text_blob(text: &str, terms: &[&str]) -> Option<u32> {
     let lower = text.to_ascii_lowercase();
     // Cap scan cost for huge archives.
     let slice = if lower.len() > 16_000 {
-        &lower[..16_000]
+        let mut end = 16_000;
+        while !lower.is_char_boundary(end) {
+            end -= 1;
+        }
+        &lower[..end]
     } else {
         &lower
     };
@@ -1178,8 +1462,13 @@ mod tests {
         std::fs::create_dir_all(&cwd).unwrap();
         let proj = project_memory_dir(&tmp, &cwd);
         std::fs::create_dir_all(&proj).unwrap();
-        let line =
-            format_index_entry_line("oauth", "project", "project", "auth,oauth", "device code flow");
+        let line = format_index_entry_line(
+            "oauth",
+            "project",
+            "project",
+            "auth,oauth",
+            "device code flow",
+        );
         std::fs::write(proj.join("MEMORY.md"), format!("{line}\n")).unwrap();
         let hits = search_memory_index(&tmp, &cwd, "oauth", 10);
         assert_eq!(hits.len(), 1);
@@ -1221,6 +1510,7 @@ mod tests {
                 description: "Never use hyphens in drafts".into(),
                 body: "Prefer alternative phrasing.".into(),
                 name: Some("No hyphens".into()),
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1247,6 +1537,7 @@ mod tests {
                 description: "Avoid hyphens and em dashes".into(),
                 body: "Updated body.".into(),
                 name: None,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -1270,5 +1561,58 @@ mod tests {
     fn strip_frontmatter_keeps_body() {
         let raw = "---\nname: x\n---\n\nHello world\n";
         assert_eq!(strip_memory_frontmatter(raw), "Hello world");
+    }
+
+    #[test]
+    fn match_tool_intent_rules_finds_mcp_intents() {
+        let tmp = std::env::temp_dir().join(format!("one-mem-intent-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let cwd = tmp.join("repo");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // Write a tool_intent memory entry
+        upsert_memory_entry(
+            &tmp,
+            &cwd,
+            &MemoryUpsertInput {
+                id: "tool-intent-deepwiki".into(),
+                scope: "global".into(),
+                type_name: "tool_intent".into(),
+                tags: "docs,library,opensource,第三方库,开源库,文档".into(),
+                description: "询问开源库/第三方库文档与源码时使用 deepwiki 工具".into(),
+                body: "调用 search_tool(query=\"deepwiki\") 获取工具并查询文档".into(),
+                name: Some("DeepWiki Tool Intent".into()),
+                triggers: vec![
+                    "开源库".into(),
+                    "第三方库".into(),
+                    "opensource library".into(),
+                ],
+                negative_triggers: vec!["当前项目源码".into()],
+                priority: 5,
+            },
+        )
+        .unwrap();
+
+        // 1. Chinese query matching
+        let hits = match_tool_intent_rules(&tmp, &cwd, "这个第三方库怎么使用？", 5);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].entry.id, "tool-intent-deepwiki");
+        assert!(hits[0].confidence > 0.0);
+        assert!(!hits[0].evidence.is_empty());
+        assert!(hits[0].body_excerpt.as_ref().unwrap().contains("deepwiki"));
+
+        // 2. English query matching
+        let hits_en = match_tool_intent_rules(&tmp, &cwd, "show me the opensource library docs", 5);
+        assert_eq!(hits_en.len(), 1);
+        assert_eq!(hits_en[0].entry.id, "tool-intent-deepwiki");
+
+        // 3. Unrelated query
+        let hits_none = match_tool_intent_rules(&tmp, &cwd, "今天天气怎么样", 5);
+        assert!(hits_none.is_empty());
+
+        let vetoed = match_tool_intent_rules(&tmp, &cwd, "查看当前项目源码，不要查开源库文档", 5);
+        assert!(vetoed.is_empty());
+
+        let _ = std::fs::remove_dir_all(&tmp);
     }
 }

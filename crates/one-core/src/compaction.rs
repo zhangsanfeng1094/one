@@ -1,4 +1,73 @@
 use crate::message::{AgentMessage, ContentBlock, TextOrImage, UserContent};
+use serde::{Deserialize, Serialize};
+
+/// Mode of conversation compaction (aligns with `grok-build` CompactionMode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionMode {
+    /// LLM or extractive summary of previous messages (default).
+    Summary,
+    /// Keep raw transcript pointer with pruned tool outputs.
+    Transcript,
+    /// Split conversation into discrete persisted segments.
+    Segments,
+}
+
+impl Default for CompactionMode {
+    fn default() -> Self {
+        Self::Summary
+    }
+}
+
+/// Suppression states to avoid repeated compaction attempts or infinite loops.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CompactionSuppression {
+    /// No suppression; compaction will fire normally when threshold is reached.
+    None,
+    /// Suppress compaction for the remainder of the current turn only.
+    Turn,
+    /// Suppress compaction across turns until explicitly cleared or threshold changes.
+    Sticky,
+    /// Suppress compaction until next successful LLM sampling turn.
+    StickyUntilSuccess,
+    /// Suppress due to authentication or provider error.
+    Auth,
+}
+
+impl Default for CompactionSuppression {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
+/// Checkpoint saved during compaction to support safe cross-compaction rewinds.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactionCheckpoint {
+    pub prompt_index_at_compaction: usize,
+    pub first_kept_entry_id: String,
+    pub tokens_before: u64,
+    pub summary: String,
+    #[serde(default)]
+    pub mode: CompactionMode,
+}
+
+/// Outcome of a background prefire run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PrefireOutcome {
+    Triggered,
+    AlreadySatisfied,
+    Skipped,
+    Suppressed,
+}
+
+/// Holds pre-computed summary candidates generated during background prefire.
+#[derive(Debug, Clone, Default)]
+pub struct PrefireCandidate {
+    pub prompt_index: usize,
+    pub prefix_tokens: usize,
+    pub candidate_summary: String,
+}
 
 /// Fraction of the model context window at which auto-compact fires.
 pub const DEFAULT_COMPACT_RATIO: f64 = 0.70;
@@ -22,6 +91,10 @@ pub const DEFAULT_PREFIRE_RATIO: f64 = 0.85;
 pub struct CompactionConfig {
     /// When false, auto-compact (threshold path) is a no-op; force still works if caller allows.
     pub enabled: bool,
+    /// Compaction mode (Summary, Transcript, or Segments).
+    pub mode: CompactionMode,
+    /// Suppression policy to prevent infinite compaction loops.
+    pub suppression: CompactionSuppression,
     /// Fire auto-compact when observed/estimated tokens ≥ this.
     pub token_threshold: usize,
     /// Messages kept verbatim after summary (tail of the transcript).
@@ -47,6 +120,8 @@ impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             enabled: true,
+            mode: CompactionMode::Summary,
+            suppression: CompactionSuppression::None,
             token_threshold: FALLBACK_COMPACT_THRESHOLD,
             keep_recent_messages: 12,
             max_summary_chars: 6_000,
@@ -158,7 +233,10 @@ pub fn should_compact(messages: &[AgentMessage], config: &CompactionConfig) -> b
 /// Same as [`should_compact`] but with an already-resolved token count
 /// (e.g. from [`tokens_for_compaction`]).
 pub fn should_compact_tokens(tokens: usize, config: &CompactionConfig) -> bool {
-    config.enabled && tokens >= config.token_threshold
+    if !config.enabled || config.suppression != CompactionSuppression::None {
+        return false;
+    }
+    tokens >= config.token_threshold
 }
 
 /// Token count at which prune-only prefire may run (below full compact threshold).
@@ -371,6 +449,32 @@ pub fn extractive_summary(older: &[AgentMessage], max_chars: usize) -> String {
         older.len(),
         truncate(&body, max_chars)
     )
+}
+
+/// Split older messages into a Prefix (Pass 1) and Suffix (Pass 2) for two-pass compaction.
+///
+/// Pass 1 condenses the oldest turns into a structured note `NOTE₁`.
+/// Pass 2 combines `NOTE₁` with recent intermediate context for the final compact summary.
+pub fn split_two_pass<'a>(
+    older: &'a [AgentMessage],
+) -> Option<(&'a [AgentMessage], &'a [AgentMessage])> {
+    if older.len() < 4 {
+        return None;
+    }
+    let mid = older.len() / 2;
+    // Align split away from orphan tool results
+    let mut split = mid;
+    while split > 0 && split < older.len() {
+        if matches!(older.get(split), Some(AgentMessage::ToolResult(_))) {
+            split += 1;
+            continue;
+        }
+        break;
+    }
+    if split == 0 || split >= older.len() {
+        return None;
+    }
+    Some(older.split_at(split))
 }
 
 /// Compact messages: returns (summary text, kept recent messages).

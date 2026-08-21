@@ -18,11 +18,12 @@ pub use agent::{
 pub use compaction::{
     compact_messages, estimate_tokens, extractive_summary, is_context_overflow_error,
     prefire_threshold, prune_old_tool_outputs, should_compact, should_compact_tokens,
-    should_prefire_prune, split_for_compaction, summarization_prompt,
+    should_prefire_prune, split_for_compaction, split_two_pass, summarization_prompt,
     threshold_for_context_window, threshold_for_context_window_ratio, tokens_for_compaction,
-    CompactionConfig, DEFAULT_COMPACT_RATIO, DEFAULT_PREFIRE_RATIO, DEFAULT_PRUNE_MAX_CHARS,
-    DEFAULT_PRUNE_PROTECT_TOKENS, FALLBACK_COMPACT_THRESHOLD, MIN_COMPACT_THRESHOLD,
-    PRUNED_TOOL_PLACEHOLDER,
+    CompactionCheckpoint, CompactionConfig, CompactionMode, CompactionSuppression,
+    PrefireCandidate, PrefireOutcome, DEFAULT_COMPACT_RATIO, DEFAULT_PREFIRE_RATIO,
+    DEFAULT_PRUNE_MAX_CHARS, DEFAULT_PRUNE_PROTECT_TOKENS, FALLBACK_COMPACT_THRESHOLD,
+    MIN_COMPACT_THRESHOLD, PRUNED_TOOL_PLACEHOLDER,
 };
 pub use reminder::{
     append_system_reminder, has_system_reminder, system_reminder, SYSTEM_REMINDER_CLOSE,

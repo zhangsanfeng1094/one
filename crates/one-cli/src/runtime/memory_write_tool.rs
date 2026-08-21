@@ -34,7 +34,8 @@ impl Tool for MemoryWriteTool {
             description: "Write or update a **cross-session memory** entry atomically: body file \
 + matching MEMORY.md index line (L2 catalog). Prefer this over raw `write` to memory dirs. \
 Default **NO-OP** — only call when a future agent would clearly benefit (stable prefs, project \
-facts, hard-won lessons). Skip trivial / one-off corrections and facts already in AGENTS.md. \
+facts, hard-won lessons, learned tool intents). Skip trivial / one-off corrections and facts already in AGENTS.md. \
+Use `type=\"tool_intent\"` when learning user tool preferences and triggers. \
 Search first with `memory_search` and **update** an existing id when possible. \
 L2 in the current session is frozen — new index lines appear after `/reload` or a new session."
                 .into(),
@@ -51,7 +52,7 @@ L2 in the current session is frozen — new index lines appear after `/reload` o
                     },
                     "type": {
                         "type": "string",
-                        "description": "feedback | user | project | reference (default project)"
+                        "description": "feedback | user | project | reference | tool_intent (default project)"
                     },
                     "tags": {
                         "type": "string",
@@ -68,6 +69,20 @@ L2 in the current session is frozen — new index lines appear after `/reload` o
                     "name": {
                         "type": "string",
                         "description": "Optional human title in frontmatter (defaults to description)"
+                    },
+                    "triggers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional phrases that strongly activate a tool-intent rule"
+                    },
+                    "negative_triggers": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Optional phrases that veto the rule"
+                    },
+                    "priority": {
+                        "type": "integer",
+                        "description": "Optional rule priority; higher values win ties"
                     }
                 },
                 "required": ["id", "description", "body"]
@@ -125,6 +140,33 @@ L2 in the current session is frozen — new index lines appear after `/reload` o
             .get("name")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string());
+        let triggers = call
+            .arguments
+            .get("triggers")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let negative_triggers = call
+            .arguments
+            .get("negative_triggers")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let priority = call
+            .arguments
+            .get("priority")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0) as i32;
 
         let input = MemoryUpsertInput {
             id,
@@ -134,6 +176,9 @@ L2 in the current session is frozen — new index lines appear after `/reload` o
             description,
             body,
             name,
+            triggers,
+            negative_triggers,
+            priority,
         };
 
         // Disk I/O is small; keep off async runtime blocking concerns with spawn_blocking.

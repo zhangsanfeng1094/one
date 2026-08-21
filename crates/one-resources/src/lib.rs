@@ -12,11 +12,12 @@ pub use error::{ResourceError, Result};
 pub use loader::{skill_allowlist_roots, skill_discovery_dirs, ResourceLoader};
 pub use memory::{
     archive_session_summary, ensure_memory_dirs, format_index_entry_line, load_memory_catalog,
-    load_memory_catalog_sync, memory_readable_roots, memory_root, memory_writable_roots,
-    project_memory_dir, project_slug, scaffold_memory_body, search_memory_index,
-    sessions_memory_dir, strip_memory_frontmatter, upsert_memory_entry, validate_memory_id,
-    MemoryCatalog, MemoryIndexEntry, MemoryLoadOptions, MemorySearchHit, MemorySearchSource,
-    MemoryUpsertInput, MemoryUpsertResult, DEFAULT_INDEX_MAX_LINES, DEFAULT_MAX_LOOKUPS_PER_TURN,
+    load_memory_catalog_sync, match_tool_intent_rules, memory_readable_roots, memory_root,
+    memory_writable_roots, project_memory_dir, project_slug, scaffold_memory_body,
+    search_memory_index, sessions_memory_dir, strip_memory_frontmatter, upsert_memory_entry,
+    validate_memory_id, MemoryCatalog, MemoryIndexEntry, MemoryLoadOptions, MemorySearchHit,
+    MemorySearchSource, MemoryUpsertInput, MemoryUpsertResult, ToolIntentHit,
+    DEFAULT_INDEX_MAX_LINES, DEFAULT_MAX_LOOKUPS_PER_TURN,
 };
 pub use prompts::PromptTemplate;
 pub use skills::{
