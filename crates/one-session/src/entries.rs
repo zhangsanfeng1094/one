@@ -6,6 +6,20 @@ use uuid::Uuid;
 
 pub const SESSION_VERSION: u32 = 3;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RewindMode {
+    All,
+    ConversationOnly,
+    FilesOnly,
+}
+
+impl Default for RewindMode {
+    fn default() -> Self {
+        Self::All
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SessionLine {
@@ -89,6 +103,17 @@ pub enum SessionEntry {
         base: EntryBase,
         name: String,
     },
+    RewindMarker {
+        #[serde(flatten)]
+        base: EntryBase,
+        target_entry_id: String,
+        #[serde(default)]
+        mode: RewindMode,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        prompt_index: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reverted_files: Option<Vec<String>>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,7 +135,8 @@ impl SessionEntry {
             | SessionEntry::Label { base, .. }
             | SessionEntry::ModelChange { base, .. }
             | SessionEntry::ThinkingLevelChange { base, .. }
-            | SessionEntry::SessionInfo { base, .. } => &base.id,
+            | SessionEntry::SessionInfo { base, .. }
+            | SessionEntry::RewindMarker { base, .. } => &base.id,
         }
     }
 
@@ -124,7 +150,8 @@ impl SessionEntry {
             | SessionEntry::Label { base, .. }
             | SessionEntry::ModelChange { base, .. }
             | SessionEntry::ThinkingLevelChange { base, .. }
-            | SessionEntry::SessionInfo { base, .. } => base.parent_id.as_deref(),
+            | SessionEntry::SessionInfo { base, .. }
+            | SessionEntry::RewindMarker { base, .. } => base.parent_id.as_deref(),
         }
     }
 }

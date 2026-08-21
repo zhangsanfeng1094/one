@@ -41,6 +41,57 @@ One 实现 JSONL session **v3 子集**，文件为 JSONL（每行一个 JSON 对
 | `model_change` | 模型切换记录 | 元数据 |
 | `thinking_level_change` | 思考级别 | 元数据 |
 | `session_info` | session 显示名称 | 元数据 |
+| `rewind_marker` | 会话回退断点标记与模式 | ❌（对齐 Grok Build） |
+
+## Grok-Build 架构体系支持
+
+### 1. 回退标记（`RewindMarker` 与 `RewindMode`）
+
+对齐 Grok Build 的显式回退分支追踪机制，当发生 `/rewind` 或分支回滚时，在事件流中记录 `RewindMarker`：
+
+```json
+{
+  "type": "rewind_marker",
+  "id": "r1e2w3d4",
+  "parentId": "prev1234",
+  "timestamp": "2026-08-21T10:00:00.000Z",
+  "targetEntryId": "target_user_prompt_id",
+  "mode": "all",
+  "promptIndex": 2,
+  "revertedFiles": ["src/main.rs", "src/lib.rs"]
+}
+```
+
+- `mode` 支持三种模式：
+  - `all`：回滚对话上下文与文件变更
+  - `conversation_only`：仅回退对话上下文，保留文件修改
+  - `files_only`：仅回滚文件修改，保留对话上下文
+
+### 2. 结构化 Sidecar 体系
+
+除核心 `*.jsonl` 事件流外，会话状态通过独立 Sidecar 文件持久化，避免大型工作区状态污染对话上下文：
+
+| 文件 | 说明 |
+|------|------|
+| `<stem>.summary.json` | 索引与 Token 累计统计（快速恢复 UI 状态） |
+| `<stem>.todo.json` | 会话关联的任务列表状态（`TodoSidecar`） |
+| `<stem>.plan.json` | 架构规划与审核状态（`PlanSidecar`） |
+| `<stem>.hunks.json` | 针对各 prompt_index 的文件修改快照（`HunkSnapshotsSidecar`） |
+| `<stem>.lock` | 会话活跃锁与进程存活信息（PID / 状态机） |
+
+### 3. 会话状态生命周期（`SessionPresence`）与崩溃检测
+
+对齐 Grok Build `SessionPresence`：
+- `Resident { activity: Idle | Working }`：当前进程正在运行的活跃会话
+- `Attaching`：重连挂载中
+- `Evicted`：从内存缓存卸载
+- `Closed`：正常退出保存
+- `DeadFailed { error }`：进程异常退出/崩溃的会话（自动识别并支持一键恢复）
+- `Dormant`：磁盘休眠会话
+
+### 4. 异步持久化通道（`SessionActor`）
+
+通过 Tokio 异步 Actor（`SessionActor` + `PersistenceMsg`）将文件追加、Sidecar 写入与磁盘刷盘解耦，彻底避免 I/O 阻塞主事件循环与 TUI 渲染。
 
 ## 树结构
 

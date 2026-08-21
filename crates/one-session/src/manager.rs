@@ -11,7 +11,7 @@ use one_core::TokenUsage;
 use crate::context::{
     build_context_entries, build_session_context, first_kept_entry_id, SessionContext,
 };
-use crate::entries::{new_entry_base, new_session_header, SessionEntry, SessionHeader};
+use crate::entries::{new_entry_base, new_session_header, RewindMode, SessionEntry, SessionHeader};
 use crate::error::{Result, SessionError};
 use crate::meta::{
     ErrorMeta, PromptSnapshotMeta, ToolAuditMeta, UsageFields, UsageMeta, CUSTOM_ERROR,
@@ -19,6 +19,16 @@ use crate::meta::{
 };
 use crate::paths::session_dir_for_cwd;
 use crate::summary::{load_summary, system_prompt_path_for, write_summary_file, SessionSummary};
+
+/// Metadata about a single rewind checkpoint (one user prompt turn).
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct RewindPointInfo {
+    pub entry_id: String,
+    pub parent_id: Option<String>,
+    pub prompt_index: usize,
+    pub preview: String,
+    pub timestamp: chrono::DateTime<Utc>,
+}
 
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
@@ -313,6 +323,112 @@ impl SessionManager {
             .map(|s| s.to_string());
         self.leaf_id = parent;
         Ok(())
+    }
+
+    /// Retrieve all rewind checkpoints on the active branch (oldest to newest).
+    pub fn get_rewind_points(&self) -> Vec<RewindPointInfo> {
+        let leaf = match &self.leaf_id {
+            Some(id) => id.as_str(),
+            None => return Vec::new(),
+        };
+        let path = build_context_entries(&self.entries, leaf);
+        let mut out = Vec::new();
+        let mut prompt_index = 0;
+
+        for entry in path {
+            if let SessionEntry::Message {
+                base,
+                message: AgentMessage::User(user),
+            } = entry
+            {
+                prompt_index += 1;
+                let text = user.content.as_display_text();
+                let preview = first_line_preview(&text, 72);
+                out.push(RewindPointInfo {
+                    entry_id: base.id.clone(),
+                    parent_id: base.parent_id.clone(),
+                    prompt_index,
+                    preview,
+                    timestamp: base.timestamp,
+                });
+            }
+        }
+        out
+    }
+
+    /// Append an explicit `RewindMarker` to the session log and update leaf_id.
+    pub async fn rewind_with_mode(
+        &mut self,
+        target_entry_id: &str,
+        mode: RewindMode,
+        prompt_index: Option<usize>,
+        reverted_files: Option<Vec<String>>,
+    ) -> Result<String> {
+        // Find target parent to restore conversation
+        let target_parent = self
+            .get_entry(target_entry_id)
+            .ok_or_else(|| SessionError::EntryNotFound(target_entry_id.to_string()))?
+            .parent_id()
+            .map(|s| s.to_string());
+
+        let base = new_entry_base(self.leaf_id.clone());
+        let marker_id = base.id.clone();
+        let marker = SessionEntry::RewindMarker {
+            base,
+            target_entry_id: target_entry_id.to_string(),
+            mode,
+            prompt_index,
+            reverted_files,
+        };
+
+        self.entries.push(marker);
+        if mode != RewindMode::FilesOnly {
+            // Revert active conversation leaf to target's parent
+            self.leaf_id = target_parent;
+        }
+
+        self.append_entry(self.entries.last().unwrap()).await?;
+        Ok(marker_id)
+    }
+
+    /// Fork an existing session into a new session instance.
+    ///
+    /// Copies all entries up to `target_prompt_index` (or all entries if None)
+    /// into a brand new session file with a fresh UUID.
+    pub async fn fork_session(
+        &self,
+        target_prompt_index: Option<usize>,
+        new_cwd: Option<&Path>,
+    ) -> Result<Self> {
+        let cwd = new_cwd.unwrap_or(&self.cwd);
+        let mut forked = Self::create(cwd).await?;
+
+        // Determine which entries to copy
+        let entries_to_copy = if let Some(target_idx) = target_prompt_index {
+            let points = self.get_rewind_points();
+            if let Some(target_point) = points.iter().find(|p| p.prompt_index == target_idx) {
+                // Copy entries on the path up to target_point
+                let path_entries = build_context_entries(&self.entries, &target_point.entry_id);
+                path_entries
+            } else {
+                self.entries.clone()
+            }
+        } else if let Some(leaf) = &self.leaf_id {
+            build_context_entries(&self.entries, leaf)
+        } else {
+            self.entries.clone()
+        };
+
+        for entry in entries_to_copy {
+            forked.entries.push(entry.clone());
+            forked.append_entry(&entry).await?;
+        }
+
+        if let Some(last) = forked.entries.last() {
+            forked.leaf_id = Some(last.id().to_string());
+        }
+
+        Ok(forked)
     }
 
     /// User prompts on the active branch (newest first), for the rewind menu.
@@ -921,7 +1037,7 @@ fn list_sessions_sync(cwd: &Path) -> Vec<SessionInfo> {
 ///
 /// Prefers a valid `*.summary.json` sidecar when present (fast path); falls back
 /// to the JSONL prefix scan so old sessions keep working.
-fn scan_session_list_info(path: &Path, fs_modified: chrono::DateTime<Utc>) -> Option<SessionInfo> {
+pub(crate) fn scan_session_list_info(path: &Path, fs_modified: chrono::DateTime<Utc>) -> Option<SessionInfo> {
     if let Some(summary) = load_summary(path) {
         return Some(SessionInfo {
             path: path.to_path_buf(),
