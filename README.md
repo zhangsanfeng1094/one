@@ -75,10 +75,13 @@ docs/            架构活文档与专题设计
 
 ## 文档
 
+- **[📖 用户指南 (User Guide)](docs/user-guide/README.md)** — 快速入门、常用斜杠命令、**[MCP 添加与管理手册](docs/user-guide/07-mcp-servers.md)**
 - **[架构图（活文档）](docs/architecture.md)** — 总览、能力状态矩阵、数据流、干净度评估  
 - [CLI 参考](docs/cli.md)
 - [Session 格式](docs/session-format.md)
 - [扩展系统](docs/extensions.md)
+- [Memory 分层设计与实现状态](docs/memory.md)
+- [意图识别与工具意图匹配进度](docs/intent-recognition.md)
 - [MCP](docs/mcp.md)
 - [Provider Compat](docs/compat.md)
 - [Harness 埋点与能力对比](docs/harness-eval.md) — Langfuse `--trace` / `one bench` / 跨 agent 评测

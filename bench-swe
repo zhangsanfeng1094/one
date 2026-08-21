@@ -1,0 +1,460 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# bench-swe: One-click SWE Benchmark (DeepSWE) Runner for 'One' Agent
+#
+# Architecture:
+#   - Host Agent (One): executes in host OS with native tool-calling & credentials
+#   - Workspace: host directory bind-mounted to Docker container (/app)
+#   - Execution Sandbox: transparent PATH shim routing 'bash' to `docker exec`
+#   - Verification: executes hidden test harness (test.patch + test.sh)
+# ==============================================================================
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$SCRIPT_DIR"
+
+DEFAULT_TASKS_DIR="${DRADAR_TASKS_ROOT:-$HOME/.dradar/deep-swe/tasks}"
+DEEP_SWE_REPO="https://github.com/datacurve-ai/deep-swe"
+
+# Colors for terminal output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+BLUE='\033[0;34m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m' # No Color
+
+# Default options
+ARG_TASK=""
+ARG_TASKS_DIR="$DEFAULT_TASKS_DIR"
+ARG_PROVIDER=""
+ARG_MODEL=""
+ARG_RELEASE=false
+ARG_KEEP=false
+ARG_REBUILD=false
+ARG_TUI=false
+ARG_MAX_TURNS=""
+ARG_TIMEOUT=3600
+ARG_EXTRA_OPTS=()
+
+show_help() {
+    cat << EOF
+Usage:
+  ./bench-swe <task-name-or-path> [options]
+  ./bench-swe --list [options]
+
+Description:
+  Run DeepSWE benchmark tasks using the 'One' agent with zero-code-modification
+  Docker execution bridge (Host Agent + Docker Sandbox via PATH shim).
+
+Options:
+  -l, --list                  List available DeepSWE benchmark tasks
+  -t, --tasks-dir <path>      Path to DeepSWE tasks/ directory (default: ~/.dradar/deep-swe/tasks)
+  -p, --provider <name>       LLM provider for One (e.g. openai-codex, xai, anthropic, deepseek, mock)
+  -m, --model <name>          LLM model override
+  --tui, --interactive        Run in full interactive TUI mode (attached to foreground terminal)
+  --max-turns <n>             Max agent tool-call turns (default: 64)
+  --release                   Use release build target/release/one (default: debug build)
+  --keep                      Keep Docker container & workspace after run for manual inspection
+  --rebuild                   Force rebuild Docker image for the task
+  --timeout <sec>             Agent execution timeout in seconds (default: 3600)
+  -h, --help                  Show this help message
+
+Examples:
+  # List all available tasks
+  ./bench-swe --list
+
+  # Run in interactive TUI mode (watch live progress & interact)
+  ./bench-swe abs-stepped-slices --tui --provider anthropic
+
+  # Run with custom turns limit
+  ./bench-swe abs-stepped-slices --provider anthropic --max-turns 100
+
+  # Run a specific task with mock provider (dry run test)
+  ./bench-swe abs-stepped-slices --provider mock
+
+  # Run task using release binary and keep container for debugging
+  ./bench-swe abs-stepped-slices --release --keep
+EOF
+}
+
+ensure_tasks_repo() {
+    local target_tasks_dir="$1"
+    if [[ -d "$target_tasks_dir" ]]; then
+        return 0
+    fi
+
+    local parent_dir
+    parent_dir="$(dirname "$target_tasks_dir")"
+
+    echo -e "${YELLOW}[!] Tasks directory not found at: ${target_tasks_dir}${NC}"
+    echo -e "${CYAN}[*] Cloning DeepSWE repository from ${DEEP_SWE_REPO} → ${parent_dir}...${NC}"
+    mkdir -p "$(dirname "$parent_dir")"
+    git clone --depth 1 "$DEEP_SWE_REPO" "$parent_dir"
+
+    if [[ ! -d "$target_tasks_dir" ]]; then
+        echo -e "${RED}[✗] Failed to find tasks/ in ${parent_dir}${NC}" >&2
+        exit 1
+    fi
+    echo -e "${GREEN}[✓] DeepSWE repository ready at: ${target_tasks_dir}${NC}"
+}
+
+list_tasks() {
+    ensure_tasks_repo "$ARG_TASKS_DIR"
+    echo -e "${BOLD}${CYAN}Available DeepSWE Benchmark Tasks (${ARG_TASKS_DIR}):${NC}\n"
+    
+    local count=0
+    for task_path in "$ARG_TASKS_DIR"/*; do
+        if [[ -d "$task_path" && -f "$task_path/instruction.md" ]]; then
+            local task_name
+            task_name="$(basename "$task_path")"
+            local lang="unknown"
+            if [[ -f "$task_path/task.toml" ]]; then
+                lang="$(grep -E '^language\s*=' "$task_path/task.toml" | head -n1 | cut -d'"' -f2 || echo "unknown")"
+            fi
+            printf "  %-35s ${BLUE}[%s]${NC}\n" "$task_name" "$lang"
+            count=$((count + 1))
+        fi
+    done
+    echo ""
+    echo -e "${BOLD}Total tasks: ${count}${NC}"
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -h|--help)
+            show_help
+            exit 0
+            ;;
+        -l|--list)
+            list_tasks
+            exit 0
+            ;;
+        -t|--tasks-dir)
+            ARG_TASKS_DIR="$2"
+            shift 2
+            ;;
+        -p|--provider)
+            ARG_PROVIDER="$2"
+            shift 2
+            ;;
+        -m|--model)
+            ARG_MODEL="$2"
+            shift 2
+            ;;
+        --tui|--interactive)
+            ARG_TUI=true
+            shift
+            ;;
+        --max-turns)
+            ARG_MAX_TURNS="$2"
+            shift 2
+            ;;
+        --release)
+            ARG_RELEASE=true
+            shift
+            ;;
+        --keep)
+            ARG_KEEP=true
+            shift
+            ;;
+        --rebuild)
+            ARG_REBUILD=true
+            shift
+            ;;
+        --timeout)
+            ARG_TIMEOUT="$2"
+            shift 2
+            ;;
+        -*)
+            echo -e "${RED}Unknown option: $1${NC}" >&2
+            show_help
+            exit 1
+            ;;
+        *)
+            if [[ -z "$ARG_TASK" ]]; then
+                ARG_TASK="$1"
+            else
+                ARG_EXTRA_OPTS+=("$1")
+            fi
+            shift
+            ;;
+    esac
+done
+
+if [[ -z "$ARG_TASK" ]]; then
+    echo -e "${RED}[✗] Error: No task specified.${NC}\n" >&2
+    show_help
+    exit 1
+fi
+
+# Step 1: Resolve Task Directory
+ensure_tasks_repo "$ARG_TASKS_DIR"
+
+TASK_DIR=""
+if [[ -d "$ARG_TASK" ]]; then
+    TASK_DIR="$(cd "$ARG_TASK" && pwd)"
+elif [[ -d "$ARG_TASKS_DIR/$ARG_TASK" ]]; then
+    TASK_DIR="$(cd "$ARG_TASKS_DIR/$ARG_TASK" && pwd)"
+else
+    echo -e "${RED}[✗] Task '$ARG_TASK' not found in $ARG_TASKS_DIR${NC}" >&2
+    exit 1
+fi
+
+TASK_NAME="$(basename "$TASK_DIR")"
+echo -e "${BOLD}${CYAN}=== DeepSWE Benchmark Runner for 'One' ===${NC}"
+echo -e "• Task:         ${BOLD}${TASK_NAME}${NC}"
+echo -e "• Task Path:    ${TASK_DIR}"
+
+if [[ ! -f "$TASK_DIR/instruction.md" ]]; then
+    echo -e "${RED}[✗] Missing instruction.md in $TASK_DIR${NC}" >&2
+    exit 1
+fi
+if [[ ! -d "$TASK_DIR/environment" ]]; then
+    echo -e "${RED}[✗] Missing environment/ directory in $TASK_DIR${NC}" >&2
+    exit 1
+fi
+
+# Step 2: Build / Check 'One' Binary
+if $ARG_RELEASE; then
+    ONE_BIN="$ROOT_DIR/target/release/one"
+    BUILD_FLAG="--release"
+else
+    ONE_BIN="$ROOT_DIR/target/debug/one"
+    BUILD_FLAG=""
+fi
+
+if [[ ! -f "$ONE_BIN" ]]; then
+    echo -e "${CYAN}[*] Building 'One' binary (${BUILD_FLAG:-debug})...${NC}"
+    (cd "$ROOT_DIR" && cargo build $BUILD_FLAG -p one-cli)
+fi
+
+echo -e "• One Binary:   ${ONE_BIN}"
+
+# Step 3: Build Task Docker Image
+IMAGE_TAG="swe-eval-${TASK_NAME}:latest"
+if $ARG_REBUILD || ! docker image inspect "$IMAGE_TAG" >/dev/null 2>&1; then
+    echo -e "${CYAN}[*] Building Docker image for task: ${IMAGE_TAG}...${NC}"
+    
+    # Automatically propagate proxy settings & host network to docker build if proxy is detected
+    BUILD_OPTS=(--network=host)
+    PROXY_ADDR=""
+    if [[ -n "${HTTP_PROXY:-${http_proxy:-}}" ]]; then
+        PROXY_ADDR="${HTTP_PROXY:-$http_proxy}"
+    elif [[ -n "${HTTPS_PROXY:-${https_proxy:-}}" ]]; then
+        PROXY_ADDR="${HTTPS_PROXY:-$https_proxy}"
+    elif curl -sI -x http://127.0.0.1:7890 http://www.google.com >/dev/null 2>&1; then
+        PROXY_ADDR="http://127.0.0.1:7890"
+    fi
+
+    if [[ -n "$PROXY_ADDR" ]]; then
+        BUILD_OPTS+=(
+            --build-arg "HTTP_PROXY=$PROXY_ADDR"
+            --build-arg "http_proxy=$PROXY_ADDR"
+            --build-arg "HTTPS_PROXY=$PROXY_ADDR"
+            --build-arg "https_proxy=$PROXY_ADDR"
+            --build-arg "ALL_PROXY=$PROXY_ADDR"
+            --build-arg "all_proxy=$PROXY_ADDR"
+        )
+    fi
+
+    docker build "${BUILD_OPTS[@]}" -t "$IMAGE_TAG" "$TASK_DIR/environment"
+else
+    echo -e "• Docker Image: ${IMAGE_TAG} (cached)"
+fi
+
+# Step 4: Setup Evaluation Sandbox Directory & Container
+RUN_ID="${TASK_NAME}-$(date +%Y%m%d_%H%M%S)_$$"
+OUT_DIR="/tmp/one-swe-eval/$RUN_ID"
+WORKSPACE_DIR="$OUT_DIR/workspace"
+SHIM_DIR="$OUT_DIR/shim"
+CONTAINER_NAME="one_swe_${RUN_ID//[^a-zA-Z0-9_]/_}"
+
+mkdir -p "$WORKSPACE_DIR" "$SHIM_DIR" "$OUT_DIR/logs"
+
+echo -e "• Run Output:   ${OUT_DIR}"
+echo -e "• Container:    ${CONTAINER_NAME}"
+
+# Cleanup handler on exit
+cleanup() {
+    if ! $ARG_KEEP; then
+        echo -e "${CYAN}[*] Cleaning up container ${CONTAINER_NAME}...${NC}"
+        docker rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+        rm -rf "$SHIM_DIR"
+    else
+        echo -e "${YELLOW}[!] Container ${CONTAINER_NAME} and workspace ${WORKSPACE_DIR} kept (--keep).${NC}"
+    fi
+}
+trap cleanup EXIT INT TERM
+
+# Start Container
+echo -e "${CYAN}[*] Initializing workspace files from image...${NC}"
+INIT_CONTAINER="init_${CONTAINER_NAME}"
+docker rm -f "$INIT_CONTAINER" >/dev/null 2>&1 || true
+docker create --name "$INIT_CONTAINER" "$IMAGE_TAG" >/dev/null
+docker cp "$INIT_CONTAINER:/app/." "$WORKSPACE_DIR/"
+docker rm -f "$INIT_CONTAINER" >/dev/null
+
+echo -e "${CYAN}[*] Starting sandbox container with workspace mount...${NC}"
+docker run -d --name "$CONTAINER_NAME" \
+  -v "$WORKSPACE_DIR:/app" \
+  "$IMAGE_TAG" sleep infinity >/dev/null
+
+# Configure git inside container to trust /app workspace (prevent dubious ownership error)
+docker exec "$CONTAINER_NAME" git config --global --add safe.directory "*" >/dev/null 2>&1 || true
+
+# Step 5: Setup Transparent PATH Shim
+cat << 'EOF' > "$SHIM_DIR/bash"
+#!/bin/sh
+if [ -z "$SWE_CONTAINER" ]; then
+    echo "Error: SWE_CONTAINER environment variable is not set" >&2
+    exit 1
+fi
+exec docker exec -w /app "$SWE_CONTAINER" /bin/bash -c '
+    [ -f /etc/profile ] && . /etc/profile 2>/dev/null || true
+    [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null || true
+    export PATH="/root/go/bin:/usr/local/go/bin:/root/.cargo/bin:/root/.local/bin:$PATH"
+    export GIT_TERMINAL_PROMPT=0
+    export GIT_PAGER=cat
+    export PAGER=cat
+    export CI=1
+    export DEBIAN_FRONTEND=noninteractive
+    exec /bin/bash "$@"
+' -- "$@" < /dev/null
+EOF
+chmod +x "$SHIM_DIR/bash"
+
+cat << 'EOF' > "$SHIM_DIR/sh"
+#!/bin/sh
+if [ -z "$SWE_CONTAINER" ]; then
+    echo "Error: SWE_CONTAINER environment variable is not set" >&2
+    exit 1
+fi
+exec docker exec -w /app "$SWE_CONTAINER" /bin/bash -c '
+    [ -f /etc/profile ] && . /etc/profile 2>/dev/null || true
+    [ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc" 2>/dev/null || true
+    export PATH="/root/go/bin:/usr/local/go/bin:/root/.cargo/bin:/root/.local/bin:$PATH"
+    export GIT_TERMINAL_PROMPT=0
+    export GIT_PAGER=cat
+    export PAGER=cat
+    export CI=1
+    export DEBIAN_FRONTEND=noninteractive
+    exec /bin/sh "$@"
+' -- "$@" < /dev/null
+EOF
+chmod +x "$SHIM_DIR/sh"
+
+# Step 6: Execute Agent 'One'
+INSTRUCTION="$(cat "$TASK_DIR/instruction.md")"
+
+echo -e "\n${BOLD}${GREEN}=== Starting Agent 'One' Execution ===${NC}"
+START_TIME=$(date +%s)
+
+AGENT_CMD=(
+    "$ONE_BIN"
+    --full-access
+    --cwd "$WORKSPACE_DIR"
+    --yes
+)
+
+if $ARG_TUI; then
+    AGENT_CMD+=(--tui)
+fi
+if [[ -n "$ARG_MAX_TURNS" ]]; then
+    AGENT_CMD+=(--max-turns "$ARG_MAX_TURNS")
+fi
+if [[ -n "$ARG_PROVIDER" ]]; then
+    AGENT_CMD+=(--provider "$ARG_PROVIDER")
+fi
+if [[ -n "$ARG_MODEL" ]]; then
+    AGENT_CMD+=(--model "$ARG_MODEL")
+fi
+if [[ ${#ARG_EXTRA_OPTS[@]} -gt 0 ]]; then
+    AGENT_CMD+=("${ARG_EXTRA_OPTS[@]}")
+fi
+
+AGENT_CMD+=(-p "$INSTRUCTION")
+
+# Run agent with transparent docker shim in PATH
+export SWE_CONTAINER="$CONTAINER_NAME"
+export PATH="$SHIM_DIR:$PATH"
+
+set +e
+if $ARG_TUI; then
+    # Interactive TUI mode: attach directly to foreground terminal (TTY)
+    "${AGENT_CMD[@]}"
+    AGENT_EXIT_CODE=$?
+else
+    # Streaming foreground mode with log capture
+    "${AGENT_CMD[@]}" 2>&1 | tee "$OUT_DIR/logs/agent.log"
+    AGENT_EXIT_CODE=$?
+fi
+set -e
+
+END_TIME=$(date +%s)
+ELAPSED=$((END_TIME - START_TIME))
+echo -e "${CYAN}[*] Agent completed in ${ELAPSED}s (exit code: ${AGENT_EXIT_CODE})${NC}"
+
+# Step 7: Run Verifier & Grading
+echo -e "\n${BOLD}${CYAN}=== Running DeepSWE Verifier ===${NC}"
+
+# Generate model.patch from current workspace state
+docker exec -i "$CONTAINER_NAME" /bin/bash -c "mkdir -p /logs/artifacts && git diff --binary HEAD > /logs/artifacts/model.patch 2>/dev/null || git diff --binary > /logs/artifacts/model.patch 2>/dev/null || true"
+
+# Copy verification test harness into container
+if [[ -d "$TASK_DIR/tests" ]]; then
+    docker cp "$TASK_DIR/tests/." "$CONTAINER_NAME:/tests/"
+fi
+
+# Run test.sh in container with bash
+set +e
+docker exec -i "$CONTAINER_NAME" /bin/bash -c "cd /app && if [ -f /tests/test.sh ]; then /bin/bash /tests/test.sh; elif [ -f test.sh ]; then /bin/bash test.sh; else echo 'No test.sh found' >&2; exit 1; fi" 2>&1 | tee "$OUT_DIR/logs/verifier.log"
+VERIFIER_EXIT_CODE=$?
+set -e
+
+# Extract model.patch
+docker exec -i "$CONTAINER_NAME" /bin/bash -c "cat /logs/artifacts/model.patch 2>/dev/null || true" > "$OUT_DIR/model.patch" || true
+
+# Extract reward (DeepSWE standard: /logs/verifier/reward.json or /logs/verifier/reward.txt)
+REWARD=$(docker exec -i "$CONTAINER_NAME" /bin/bash -c "
+    if [ -f /logs/verifier/reward.json ]; then
+        python3 -c \"import json; print(json.load(open('/logs/verifier/reward.json')).get('reward', 0))\" 2>/dev/null || grep -o '\"reward\"[[:space:]]*:[[:space:]]*[0-9.]*' /logs/verifier/reward.json | cut -d: -f2
+    elif [ -f /logs/verifier/reward.txt ]; then
+        cat /logs/verifier/reward.txt
+    fi
+" 2>/dev/null | tr -d ' \r\n' || echo '0')
+
+if [[ -z "$REWARD" || "$REWARD" == "-1" ]]; then
+    if [[ $VERIFIER_EXIT_CODE -eq 0 ]]; then
+        REWARD="0"
+    else
+        REWARD="0"
+    fi
+fi
+
+# Step 8: Final Summary
+echo -e "\n${BOLD}====================================================${NC}"
+echo -e "${BOLD}                EVALUATION RESULT                   ${NC}"
+echo -e "${BOLD}====================================================${NC}"
+echo -e "• Task ID:       ${BOLD}${TASK_NAME}${NC}"
+echo -e "• Duration:      ${ELAPSED} seconds"
+
+if [[ "$REWARD" == "1" ]]; then
+    echo -e "• Verdict:       ${BOLD}${GREEN}✓ PASSED (reward = 1)${NC}"
+else
+    echo -e "• Verdict:       ${BOLD}${RED}✗ FAILED (reward = ${REWARD:-0})${NC}"
+fi
+
+echo -e "• Patch File:    ${OUT_DIR}/model.patch"
+echo -e "• Agent Log:     ${OUT_DIR}/logs/agent.log"
+echo -e "• Verifier Log:  ${OUT_DIR}/logs/verifier.log"
+echo -e "${BOLD}====================================================${NC}\n"
+
+if [[ "$REWARD" == "1" ]]; then
+    exit 0
+else
+    exit 1
+fi

@@ -1,0 +1,33 @@
+# One 用户指南 (User Guide)
+
+欢迎阅读 One 编程 Agent 的官方使用手册与实战指南。
+
+---
+
+## 目录导航
+
+- [01. 快速入门与安装](./01-getting-started.md)
+  - 源码编译与安装
+  - 账号登录与 API Key 配置
+  - 交互模式、单次执行与会话恢复
+- [04. 斜杠命令与快捷键](./04-slash-commands.md)
+  - TUI 常用斜杠命令（`/mcp`、`/plan`、`/login`、`/reload` 等）
+  - 键盘操作与快捷键
+- [07. MCP 服务器集成与管理](./07-mcp-servers.md)
+  - MCP 核心机制与架构
+  - JSON 配置文件格式（用户级与项目级）
+  - 本地 stdio 与远程 Streamable HTTP 服务添加
+  - CLI 命令全集（`list` / `add` / `remove` / `doctor` / `import`）
+  - 从 Claude / Codex / Cursor 一键迁移配置
+  - 性能调优、超时控制与输出截断保护
+
+---
+
+## 更多架构与技术规范
+
+深入了解底层实现与协议规范，请参考项目核心文档：
+- [系统架构图与核心设计](../architecture.md)
+- [CLI 完整参数参考](../cli.md)
+- [MCP 平台能力技术专题](../mcp.md)
+- [会话格式与分支机制](../session-format.md)
+- [Subagent 与任务调度](../subagents.md)
