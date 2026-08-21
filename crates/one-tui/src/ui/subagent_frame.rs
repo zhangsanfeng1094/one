@@ -102,11 +102,7 @@ fn frame_status_icon(menu: &FloatMenu, spinner_frame: usize) -> (&'static str, S
     }
 }
 
-fn frame_title_spans<'a>(
-    menu: &'a FloatMenu,
-    icon: &'a str,
-    icon_style: Style,
-) -> Line<'a> {
+fn frame_title_spans<'a>(menu: &'a FloatMenu, icon: &'a str, icon_style: Style) -> Line<'a> {
     let desc = menu.title.trim().trim_start_matches(['▸', '◆', ' ']);
     Line::from(vec![
         Span::styled(format!(" {icon} "), icon_style),
@@ -162,9 +158,7 @@ fn draw_frame_log(frame: &mut Frame<'_>, area: Rect, menu: &FloatMenu) {
                     Span::styled(rule, Theme::hairline()),
                 ]));
             }
-            FloatRenderRow::Item {
-                label, detail, ..
-            } => {
+            FloatRenderRow::Item { label, detail, .. } => {
                 lines.push(frame_log_line(label, detail, col_w));
             }
         }

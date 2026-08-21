@@ -61,18 +61,43 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "set thinking level (or Ctrl+G Settings)",
     },
     SlashCommand {
+        name: "/always-approve",
+        usage: "/always-approve",
+        description: "toggle always-approve (YOLO) mode (Ctrl+O)",
+    },
+    SlashCommand {
+        name: "/yolo",
+        usage: "/yolo",
+        description: "alias for /always-approve",
+    },
+    SlashCommand {
+        name: "/auto",
+        usage: "/auto",
+        description: "toggle auto permission mode (smart safe allow)",
+    },
+    SlashCommand {
+        name: "/permission-mode",
+        usage: "/permission-mode [default|acceptEdits|auto|dontAsk|bypassPermissions]",
+        description: "get or set permission mode",
+    },
+    SlashCommand {
+        name: "/permissions",
+        usage: "/permissions [default|acceptEdits|auto|dontAsk|bypassPermissions]",
+        description: "alias for /permission-mode",
+    },
+    SlashCommand {
         name: "/plan",
         usage: "/plan",
         description: "enter plan mode (read-only + plan file)",
     },
     SlashCommand {
         name: "/act",
-        usage: "/act",
-        description: "approve plan and implement (Build mode)",
+        usage: "/act [fresh|current|edit]",
+        description: "approve plan · [fresh|current|edit] (bare = options/view)",
     },
     SlashCommand {
         name: "/build",
-        usage: "/build",
+        usage: "/build [fresh|current|edit]",
         description: "alias for /act",
     },
     SlashCommand {
@@ -171,6 +196,14 @@ impl ModelChoice {
     }
 }
 
+/// A subcommand choice (e.g. `/act fresh`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubcommandChoice {
+    pub parent: String,
+    pub name: String,
+    pub description: String,
+}
+
 /// A single row in the popup list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PopupRow {
@@ -180,6 +213,8 @@ pub enum PopupRow {
     Command(&'static SlashCommand),
     /// Selectable model under a provider group.
     Model(ModelChoice),
+    /// Selectable subcommand option under a command.
+    Subcommand(SubcommandChoice),
 }
 
 impl PopupRow {
@@ -192,6 +227,7 @@ impl PopupRow {
             PopupRow::Header(p) => p.clone(),
             PopupRow::Command(c) => c.name.to_string(),
             PopupRow::Model(m) => m.id.clone(),
+            PopupRow::Subcommand(s) => format!("{} {}", s.parent, s.name),
         }
     }
 
@@ -206,6 +242,7 @@ impl PopupRow {
                     format!("{} · {}", m.provider, m.id)
                 }
             }
+            PopupRow::Subcommand(s) => s.description.clone(),
         }
     }
 }
@@ -213,10 +250,12 @@ impl PopupRow {
 /// Popup mode derived from current input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PopupKind {
-    /// Typing `/…` command name (no space yet, and not deep into /model args).
+    /// Typing `/…` command name (no space yet, and not deep into /model or /act args).
     Commands,
     /// Typing `/model …` — show models grouped by provider.
     Models,
+    /// Typing `/act …` or `/build …` — show subcommands (fresh, current, edit).
+    Act,
 }
 
 /// What the input is doing for completion purposes.
@@ -233,6 +272,23 @@ pub fn popup_kind(input: &str) -> Option<PopupKind> {
     if "/model".starts_with(&s.to_ascii_lowercase()) || s.eq_ignore_ascii_case("/model") {
         // "/m", "/mo", "/mod" … show commands (including /model)
         // but if it's exactly "/model" handled above
+    }
+    // Exact /act or /act + args → act subcommands (also /build)
+    if s == "/act"
+        || s.starts_with("/act ")
+        || s.starts_with("/act\t")
+        || s == "/build"
+        || s.starts_with("/build ")
+        || s.starts_with("/build\t")
+    {
+        return Some(PopupKind::Act);
+    }
+    if "/act".starts_with(&s.to_ascii_lowercase())
+        || s.eq_ignore_ascii_case("/act")
+        || "/build".starts_with(&s.to_ascii_lowercase())
+        || s.eq_ignore_ascii_case("/build")
+    {
+        // "/a", "/ac", "/b", "/bu" … show commands (including /act and /build)
     }
     // Any other slash with a space: command token done, no popup
     if s[1..].contains(' ') || s[1..].contains('\t') {
@@ -327,6 +383,39 @@ pub fn command_rows(prefix: &str) -> Vec<PopupRow> {
         .collect()
 }
 
+/// Build subcommand rows for `/act` / `/build`.
+pub fn filter_act_subcommands(parent: &str, query: &str) -> Vec<PopupRow> {
+    let q = query.trim().to_ascii_lowercase();
+    let choices = [
+        SubcommandChoice {
+            parent: parent.to_string(),
+            name: "fresh".into(),
+            description: "新上下文开始执行 · clean context, max tokens (推荐)".into(),
+        },
+        SubcommandChoice {
+            parent: parent.to_string(),
+            name: "current".into(),
+            description: "当前上下文继续执行 · keep chat history".into(),
+        },
+        SubcommandChoice {
+            parent: parent.to_string(),
+            name: "edit".into(),
+            description: "展示 Plan 视图并留在 Plan 模式修改".into(),
+        },
+    ];
+
+    choices
+        .into_iter()
+        .filter(|c| {
+            if q.is_empty() {
+                return true;
+            }
+            c.name.starts_with(&q) || c.description.to_ascii_lowercase().contains(&q)
+        })
+        .map(PopupRow::Subcommand)
+        .collect()
+}
+
 /// Full popup rows for current input + catalog.
 pub fn popup_rows(input: &str, catalog: &[ModelChoice]) -> Vec<PopupRow> {
     match popup_kind(input) {
@@ -334,6 +423,20 @@ pub fn popup_rows(input: &str, catalog: &[ModelChoice]) -> Vec<PopupRow> {
         Some(PopupKind::Models) => {
             let query = input.strip_prefix("/model").unwrap_or("").trim_start();
             filter_models_grouped(catalog, query)
+        }
+        Some(PopupKind::Act) => {
+            let (parent, query) = if input.starts_with("/build") {
+                (
+                    "/build",
+                    input.strip_prefix("/build").unwrap_or("").trim_start(),
+                )
+            } else {
+                (
+                    "/act",
+                    input.strip_prefix("/act").unwrap_or("").trim_start(),
+                )
+            };
+            filter_act_subcommands(parent, query)
         }
         None => Vec::new(),
     }
@@ -363,6 +466,7 @@ pub fn completion_for_row(row: &PopupRow) -> Option<String> {
             })
         }
         PopupRow::Model(m) => Some(format!("/model {}", m.spec())),
+        PopupRow::Subcommand(s) => Some(format!("{} {}", s.parent, s.name)),
     }
 }
 
@@ -397,7 +501,27 @@ mod tests {
         assert_eq!(popup_kind("/model"), Some(PopupKind::Models));
         assert_eq!(popup_kind("/model "), Some(PopupKind::Models));
         assert_eq!(popup_kind("/model openai"), Some(PopupKind::Models));
+        assert_eq!(popup_kind("/act"), Some(PopupKind::Act));
+        assert_eq!(popup_kind("/act "), Some(PopupKind::Act));
+        assert_eq!(popup_kind("/act fr"), Some(PopupKind::Act));
+        assert_eq!(popup_kind("/build"), Some(PopupKind::Act));
         assert_eq!(popup_kind("/help x"), None);
+    }
+
+    #[test]
+    fn filter_act_subcommands_test() {
+        let rows = filter_act_subcommands("/act", "");
+        assert_eq!(rows.len(), 3);
+        assert_eq!(completion_for_row(&rows[0]), Some("/act fresh".into()));
+        assert_eq!(completion_for_row(&rows[1]), Some("/act current".into()));
+        assert_eq!(completion_for_row(&rows[2]), Some("/act edit".into()));
+
+        let rows_filtered = filter_act_subcommands("/act", "fre");
+        assert_eq!(rows_filtered.len(), 1);
+        assert_eq!(
+            completion_for_row(&rows_filtered[0]),
+            Some("/act fresh".into())
+        );
     }
 
     #[test]

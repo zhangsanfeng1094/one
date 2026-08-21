@@ -44,6 +44,19 @@ impl super::App {
 
         // Docked select (model / field edit / ask) captures keys before float.
         if self.select.is_some() {
+            if matches!(self.select_kind, Some(crate::state::SelectKind::Approval { .. }))
+                && (matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
+                    && key.modifiers.contains(KeyModifiers::CONTROL))
+            {
+                let res = crate::select::SelectResult::Confirmed {
+                    ids: vec!["always".to_string()],
+                    other: None,
+                };
+                if let Some(outcome) = self.apply_select_result(res) {
+                    return outcome;
+                }
+                return RunOutcome::Noop;
+            }
             if let Some(prompt) = self.select.as_mut() {
                 if let Some(result) = prompt.handle_key(key) {
                     if let Some(outcome) = self.apply_select_result(result) {
@@ -127,10 +140,14 @@ impl super::App {
                 self.clear_notice();
                 RunOutcome::Noop
             }
-            // Ctrl+O → expand/collapse last tool output body
+            // Ctrl+O → Toggle always-approve (YOLO) mode, or toggle tool expand if chat focused
             KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                self.toggle_last_tool_expand();
-                RunOutcome::Noop
+                if self.chat_focus.is_some() {
+                    self.toggle_last_tool_expand();
+                    RunOutcome::Noop
+                } else {
+                    RunOutcome::ToggleAlwaysApprove
+                }
             }
             // Ctrl+T → show/hide thinking body (Pi-style)
             KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -282,6 +299,16 @@ impl super::App {
                 self.move_chat_focus(-1);
                 RunOutcome::Noop
             }
+            KeyCode::Char('G')
+                if self.transcript_browse_focused()
+                    && !self.busy
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.clear_chat_focus();
+                self.scroll_to_bottom();
+                RunOutcome::Noop
+            }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
@@ -350,13 +377,11 @@ impl super::App {
             && !key.modifiers.contains(KeyModifiers::ALT)
     }
 
-    /// Shift+G jumps to the live transcript without stealing Ctrl+G Settings.
+    /// Alt+G jumps to the live transcript without stealing Ctrl+G Settings or Shift+G uppercase typing.
     pub(crate) fn is_goto_bottom_key(key: KeyEvent) -> bool {
         matches!(key.code, KeyCode::Char('G') | KeyCode::Char('g'))
-            && key.modifiers.contains(KeyModifiers::SHIFT)
-            && !key
-                .modifiers
-                .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
     }
 
     /// Ctrl+F — fetch remote models. Also accept legacy ASCII ACK (0x06).
@@ -515,5 +540,4 @@ impl super::App {
         self.last_esc_at = None;
         RunOutcome::OpenRewind
     }
-
 }

@@ -505,9 +505,7 @@ impl Theme {
     }
 
     pub fn tool_name_running() -> Style {
-        Style::default()
-            .fg(Self::INFO)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::INFO).add_modifier(Modifier::BOLD)
     }
 
     pub fn tool_name_done() -> Style {

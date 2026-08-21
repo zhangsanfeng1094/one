@@ -1224,15 +1224,7 @@ impl FloatMenu {
             sections: vec![
                 FloatSection {
                     title: String::new(),
-                    items: vec![
-                        item("models", "Models", &models_detail, "→"),
-                        action_item(
-                            "fetch_models",
-                            "Fetch & import remote models",
-                            "GET /models → batch add · Ctrl+F",
-                            "fetch",
-                        ),
-                    ],
+                    items: vec![item("models", "Models", &models_detail, "→")],
                 },
                 FloatSection {
                     title: "Connection".into(),
@@ -1521,16 +1513,13 @@ impl FloatMenu {
     /// `rows` are `(spec, detail, in_ctrl_l)` where `in_ctrl_l` is whether the
     /// model appears in the Ctrl+L switcher. Space toggles that flag; Enter
     /// opens model detail.
-    pub fn settings_models_for_provider(
-        provider: &str,
-        rows: &[(String, String, bool)],
-    ) -> Self {
+    pub fn settings_models_for_provider(provider: &str, rows: &[(String, String, bool)]) -> Self {
         let prefix = format!("{provider}:");
         let mut items: Vec<FloatItem> = vec![action_item(
             "fetch_models",
             "Fetch & import remote models",
             "GET /models → batch write models.json",
-            "fetch",
+            "",
         )];
         let model_items: Vec<FloatItem> = rows
             .iter()
@@ -1557,9 +1546,7 @@ impl FloatMenu {
         let n = model_items.len();
         let n_on = rows
             .iter()
-            .filter(|(spec, _, on)| {
-                (spec == provider || spec.starts_with(&prefix)) && *on
-            })
+            .filter(|(spec, _, on)| (spec == provider || spec.starts_with(&prefix)) && *on)
             .count();
         items.extend(model_items);
         items.push(item(
@@ -1573,9 +1560,7 @@ impl FloatMenu {
             title: format!("Models · {provider}"),
             search: String::new(),
             sections: vec![FloatSection {
-                title: format!(
-                    "{n_on}/{n} in Ctrl+L · Space toggle · Enter detail · Esc/← back"
-                ),
+                title: format!("{n_on}/{n} in Ctrl+L · Space toggle · Enter detail · Esc/← back"),
                 items,
             }],
             selected: 0,

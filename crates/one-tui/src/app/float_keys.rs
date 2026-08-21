@@ -202,10 +202,11 @@ impl super::App {
                         .as_ref()
                         .is_some_and(|f| f.kind == FloatKind::SettingsModels) =>
             {
-                let id = self
-                    .float
-                    .as_ref()
-                    .and_then(|f| f.filtered_entries().get(f.selected).map(|e| e.item.id.clone()));
+                let id = self.float.as_ref().and_then(|f| {
+                    f.filtered_entries()
+                        .get(f.selected)
+                        .map(|e| e.item.id.clone())
+                });
                 match id.as_deref() {
                     Some(id) if id.starts_with("m:") => self.toggle_model_ctrl_l_visibility(id),
                     _ => RunOutcome::Noop,
@@ -543,5 +544,4 @@ impl super::App {
             }
         }
     }
-
 }

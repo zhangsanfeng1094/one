@@ -62,7 +62,10 @@ pub(super) fn pad_or_truncate(s: &str, width: usize) -> String {
     out
 }
 
-pub(super) fn wrap_styled_segments(segments: &[(String, bool)], width: usize) -> Vec<Vec<(String, bool)>> {
+pub(super) fn wrap_styled_segments(
+    segments: &[(String, bool)],
+    width: usize,
+) -> Vec<Vec<(String, bool)>> {
     if width == 0 {
         return vec![segments.to_vec()];
     }
@@ -99,6 +102,57 @@ pub(super) fn wrap_styled_segments(segments: &[(String, bool)], width: usize) ->
                 continue;
             }
             push_chunk(&mut cur, take.to_string(), *emp);
+            col = col.saturating_add(advance);
+            rest = &rest[take.len()..];
+            if col >= width && !rest.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+                col = 0;
+            }
+        }
+    }
+    if !cur.is_empty() || rows.is_empty() {
+        rows.push(cur);
+    }
+    rows
+}
+
+pub(super) fn wrap_styled_spans(
+    spans: &[ratatui::text::Span<'static>],
+    width: usize,
+) -> Vec<Vec<ratatui::text::Span<'static>>> {
+    if width == 0 {
+        return vec![spans.to_vec()];
+    }
+    let mut rows: Vec<Vec<ratatui::text::Span<'static>>> = Vec::new();
+    let mut cur: Vec<ratatui::text::Span<'static>> = Vec::new();
+    let mut col = 0usize;
+
+    for span in spans {
+        let style = span.style;
+        let mut rest = span.content.as_ref();
+        while !rest.is_empty() {
+            if col >= width {
+                rows.push(std::mem::take(&mut cur));
+                col = 0;
+            }
+            let room = width.saturating_sub(col).max(1);
+            let (take, advance) = take_prefix_cols(rest, room);
+            if take.is_empty() {
+                rows.push(std::mem::take(&mut cur));
+                col = 0;
+                continue;
+            }
+            if let Some(last) = cur.last_mut() {
+                if last.style == style {
+                    let mut s = last.content.to_string();
+                    s.push_str(take);
+                    *last = ratatui::text::Span::styled(s, style);
+                } else {
+                    cur.push(ratatui::text::Span::styled(take.to_string(), style));
+                }
+            } else {
+                cur.push(ratatui::text::Span::styled(take.to_string(), style));
+            }
             col = col.saturating_add(advance);
             rest = &rest[take.len()..];
             if col >= width && !rest.is_empty() {
@@ -305,4 +359,3 @@ pub(super) fn scrollbar_thumb_geometry(
     };
     (thumb_start.min(travel), thumb_h)
 }
-

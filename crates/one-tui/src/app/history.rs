@@ -19,7 +19,10 @@ pub(crate) fn one_session_prompt_history_path(cwd: &std::path::Path) -> PathBuf 
         .join("prompt_history.jsonl")
 }
 
-pub(crate) fn persist_append_prompt_history(cwd: &std::path::Path, text: &str) -> std::io::Result<()> {
+pub(crate) fn persist_append_prompt_history(
+    cwd: &std::path::Path,
+    text: &str,
+) -> std::io::Result<()> {
     // Inline minimal append so one-tui stays free of one-session if needed.
     // Format matches one_session::prompt_history (JSON string per line).
     use std::fs::{self, OpenOptions};

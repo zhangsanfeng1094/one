@@ -150,8 +150,10 @@ pub enum RunOutcome {
     Prompt(String),
     FollowUp(String),
     Steer(String),
-    /// Cycle agent mode Plan ↔ Build (Shift+Tab / BackTab).
+    /// Cycle agent mode Normal → Plan → Always-approve (Shift+Tab / BackTab).
     CycleAgentMode,
+    /// Toggle always-approve (YOLO) mode (Ctrl+O / /always-approve).
+    ToggleAlwaysApprove,
     /// Esc Esc on empty input — CLI should open the rewind menu.
     OpenRewind,
     /// Model select confirmed — CLI switches provider/model.
@@ -197,6 +199,7 @@ impl RunOutcome {
             RunOutcome::Prompt(_) => true,
             RunOutcome::FollowUp(t) | RunOutcome::Steer(t) => !t.is_empty(),
             RunOutcome::CycleAgentMode
+            | RunOutcome::ToggleAlwaysApprove
             | RunOutcome::OpenRewind
             | RunOutcome::OpenMcpPanel
             | RunOutcome::OpenMcpImportPanel
@@ -364,8 +367,10 @@ pub enum SelectKind {
     Approval { id: u64 },
     /// Agent `ask_user` question (sequential multi-question uses one at a time).
     AskUser { id: u64 },
-    /// Model switcher docked above the input (Ctrl+L).
-    Model,
+    /// Model switcher docked above the input (Ctrl+L): first choose provider.
+    ModelProvider,
+    /// Model switcher docked above the input (Ctrl+L): then choose model under provider.
+    Model { provider: String },
     /// Multi-select which catalog models appear in the Ctrl+L switcher.
     EnabledModels,
 }

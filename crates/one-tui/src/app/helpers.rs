@@ -23,10 +23,10 @@ pub(crate) fn path_token_at_end(input: &str) -> Option<(String, String)> {
         return None;
     }
     // Find last whitespace-separated token.
-    let start = trimmed_end
-        .rfind(|c: char| c.is_whitespace())
-        .map(|i| i + 1)
-        .unwrap_or(0);
+    let start = match trimmed_end.char_indices().rfind(|(_, c)| c.is_whitespace()) {
+        Some((i, c)) => i + c.len_utf8(),
+        None => 0,
+    };
     let token = &trimmed_end[start..];
     if token.is_empty() {
         return None;
@@ -41,7 +41,7 @@ pub(crate) fn path_token_at_end(input: &str) -> Option<(String, String)> {
     {
         return None;
     }
-    let prefix = input[..input.len() - token.len()].to_string();
+    let prefix = input[..start].to_string();
     let partial = if is_at {
         format!("@{path_part}")
     } else {

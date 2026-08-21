@@ -148,16 +148,21 @@ pub fn format_notification_sequence(
             };
             Some(format!("\x1b]99;i=one;{}\x1b\\", msg))
         }
-        NotificationProtocol::Osc777 => {
-            Some(format!("\x1b]777;notify;{};{}\x1b\\", title_clean, body_clean))
-        }
+        NotificationProtocol::Osc777 => Some(format!(
+            "\x1b]777;notify;{};{}\x1b\\",
+            title_clean, body_clean
+        )),
         NotificationProtocol::Bel => Some("\x07".to_string()),
         NotificationProtocol::None => None,
     }
 }
 
 /// Send a terminal notification directly to standard output.
-pub fn send_notification(protocol: NotificationProtocol, title: &str, body: &str) -> io::Result<()> {
+pub fn send_notification(
+    protocol: NotificationProtocol,
+    title: &str,
+    body: &str,
+) -> io::Result<()> {
     if let Some(seq) = format_notification_sequence(protocol, title, body) {
         let mut stdout = io::stdout().lock();
         stdout.write_all(seq.as_bytes())?;
@@ -218,11 +223,26 @@ mod tests {
 
     #[test]
     fn test_protocol_parse() {
-        assert_eq!(NotificationProtocol::parse("osc9"), Some(NotificationProtocol::Osc9));
-        assert_eq!(NotificationProtocol::parse("kitty"), Some(NotificationProtocol::Osc99));
-        assert_eq!(NotificationProtocol::parse("ghostty"), Some(NotificationProtocol::Osc777));
-        assert_eq!(NotificationProtocol::parse("bel"), Some(NotificationProtocol::Bel));
-        assert_eq!(NotificationProtocol::parse("0"), Some(NotificationProtocol::None));
+        assert_eq!(
+            NotificationProtocol::parse("osc9"),
+            Some(NotificationProtocol::Osc9)
+        );
+        assert_eq!(
+            NotificationProtocol::parse("kitty"),
+            Some(NotificationProtocol::Osc99)
+        );
+        assert_eq!(
+            NotificationProtocol::parse("ghostty"),
+            Some(NotificationProtocol::Osc777)
+        );
+        assert_eq!(
+            NotificationProtocol::parse("bel"),
+            Some(NotificationProtocol::Bel)
+        );
+        assert_eq!(
+            NotificationProtocol::parse("0"),
+            Some(NotificationProtocol::None)
+        );
         assert_eq!(NotificationProtocol::parse("unknown_xyz"), None);
     }
 }

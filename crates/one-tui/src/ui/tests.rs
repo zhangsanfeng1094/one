@@ -263,7 +263,10 @@ fn scrollbar_thumb_tracks_offset() {
     assert_eq!(start0, 0);
     let (start_mid, h_mid) = scrollbar_thumb_geometry(100, 10, 45, 10);
     assert_eq!(h_mid, 1);
-    assert!(start_mid > 0 && start_mid < 9, "mid offset → mid thumb, got {start_mid}");
+    assert!(
+        start_mid > 0 && start_mid < 9,
+        "mid offset → mid thumb, got {start_mid}"
+    );
     let (start_end, _) = scrollbar_thumb_geometry(100, 10, 90, 10);
     assert_eq!(start_end, 9);
     // Fits: full track.
@@ -798,7 +801,12 @@ fn tool_paths_render_relative_to_cwd() {
     app.finish_tool_with_output(
         "read",
         false,
-        Some((0..66).map(|i| format!("line {i}")).collect::<Vec<_>>().join("\n")),
+        Some(
+            (0..66)
+                .map(|i| format!("line {i}"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+        ),
     );
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let flat: String = terminal
@@ -842,11 +850,7 @@ fn bash_command_paths_shorten_and_middle_truncate() {
         "bash",
         r#"{"command":"cd /home/fxh/tools/one/benches/out/tb-regex-checker && ls"}"#,
     );
-    app.finish_tool_with_output(
-        "bash",
-        false,
-        Some("exit 0\na\nb\nc\nd\ne\n".into()),
-    );
+    app.finish_tool_with_output("bash", false, Some("exit 0\na\nb\nc\nd\ne\n".into()));
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let flat: String = terminal
         .backend()
@@ -879,8 +883,9 @@ fn thinking_header_has_no_inline_click_hint() {
     let backend = TestBackend::new(80, 14);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut app = App::new("test");
-    app.messages
-        .push(crate::message::Message::thinking("Analyzing bash command flags carefully"));
+    app.messages.push(crate::message::Message::thinking(
+        "Analyzing bash command flags carefully",
+    ));
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let flat: String = terminal
         .backend()
@@ -910,8 +915,7 @@ fn thinking_collapsed_uses_full_width_end_truncate() {
     let body = "The user wants me to produce all legal next positions. \
                 I will explore the workspace and understand the Regex Chess task, \
                 then generate re.json myself and self-test with the local checkers.";
-    app.messages
-        .push(crate::message::Message::thinking(body));
+    app.messages.push(crate::message::Message::thinking(body));
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
     let flat: String = terminal
         .backend()
@@ -926,9 +930,7 @@ fn thinking_collapsed_uses_full_width_end_truncate() {
     );
     // Middle-truncate pattern like "me …uce" / "me...uce" must not appear.
     assert!(
-        !flat.contains("me …uce")
-            && !flat.contains("me...uce")
-            && !flat.contains("wants me …"),
+        !flat.contains("me …uce") && !flat.contains("me...uce") && !flat.contains("wants me …"),
         "must not middle-truncate natural language:\n{flat}"
     );
     // On a 120-col terminal the start should not be clipped to ~20 chars only.

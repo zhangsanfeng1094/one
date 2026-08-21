@@ -21,9 +21,7 @@ static MEDIA_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Run `f` with image media store under a unique `/tmp` dir (bwrap-writable).
 fn with_temp_media<T>(f: impl FnOnce(&Path) -> T) -> T {
-    let _guard = MEDIA_TEST_LOCK
-        .lock()
-        .unwrap_or_else(|e| e.into_inner());
+    let _guard = MEDIA_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = std::env::temp_dir().join(format!(
         "one-tui-media-{}-{}",
         std::process::id(),
@@ -647,7 +645,7 @@ fn drag_select_outside_chat_still_extends() {
     app.chat_view_start = 10;
 
     app.select_begin(2, 1); // absolute line 12
-    // Mouse over the prompt area (row >= chat_h).
+                            // Mouse over the prompt area (row >= chat_h).
     app.select_drag(15, 5, 10);
     assert_eq!(app.chat_scroll, 11, "below-chat drag scrolls newer");
     let span = app.selection_span().expect("selection");
@@ -684,21 +682,33 @@ fn page_up_disables_follow() {
 }
 
 #[test]
-fn shift_g_restores_live_follow_in_idle_and_busy_input() {
+fn alt_g_restores_live_follow_in_idle_and_busy_input() {
     let mut app = App::new("test");
     app.chat_total_lines = 20;
     app.chat_view_height = 5;
     app.scroll_to_top();
     assert!(!app.follow_bottom);
 
-    let outcome = app.handle_key(key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+    let outcome = app.handle_key(key(KeyCode::Char('g'), KeyModifiers::ALT));
     assert!(matches!(outcome, RunOutcome::Noop));
     assert!(app.follow_bottom);
 
     app.scroll_to_top();
     assert!(!app.follow_bottom);
-    app.handle_busy_key(key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+    app.handle_busy_key(key(KeyCode::Char('g'), KeyModifiers::ALT));
     assert!(app.follow_bottom);
+}
+
+#[test]
+fn typing_capital_g_inserts_into_input() {
+    let mut app = App::new("test");
+    app.handle_key(key(KeyCode::Char('G'), KeyModifiers::SHIFT));
+    assert_eq!(app.input, "G");
+
+    app.handle_key(key(KeyCode::Char('r'), KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Char('o'), KeyModifiers::NONE));
+    app.handle_key(key(KeyCode::Char('k'), KeyModifiers::NONE));
+    assert_eq!(app.input, "Grok");
 }
 
 #[test]
@@ -822,7 +832,10 @@ fn transcript_browse_unfocuses_prompt_caret_until_typing() {
     // Blink tick while unfocused must not leave caret mid-off.
     app.cursor_on = false;
     app.toggle_cursor();
-    assert!(app.cursor_on, "unfocused blink keeps caret ready for refocus");
+    assert!(
+        app.cursor_on,
+        "unfocused blink keeps caret ready for refocus"
+    );
     assert!(!app.prompt_focused());
 
     // Typing returns to the composer and clears row focus.
@@ -1408,6 +1421,14 @@ fn path_token_detects_at_and_slash() {
     assert!(path_token_at_end("see @src/").is_some());
     assert!(path_token_at_end("open ./foo").is_some());
     assert!(path_token_at_end("just words").is_none());
+    assert_eq!(
+        path_token_at_end("请查看 @crates/one-tui"),
+        Some(("请查看 ".to_string(), "@crates/one-tui".to_string()))
+    );
+    assert_eq!(
+        path_token_at_end("你好\u{3000}@crates/one-tui"),
+        Some(("你好\u{3000}".to_string(), "@crates/one-tui".to_string()))
+    );
 }
 
 #[test]
@@ -1650,10 +1671,7 @@ fn finish_task_tool_from_job_seals_running_row() {
     assert_eq!(last.tool_status, Some(ToolStatus::Error));
     assert_eq!(last.tool_job_id.as_deref(), Some("job_abc"));
     assert!(
-        last.tool_summary
-            .as_deref()
-            .unwrap_or("")
-            .contains("error"),
+        last.tool_summary.as_deref().unwrap_or("").contains("error"),
         "summary={:?}",
         last.tool_summary
     );
@@ -1686,7 +1704,10 @@ fn finish_task_tool_from_job_seals_sole_running_without_binding() {
     assert_eq!(last.tool_status, Some(ToolStatus::Done));
     assert_eq!(last.tool_job_id.as_deref(), Some("job_xyz"));
     assert!(
-        last.tool_output.as_deref().unwrap_or("").contains("all good"),
+        last.tool_output
+            .as_deref()
+            .unwrap_or("")
+            .contains("all good"),
         "output={:?}",
         last.tool_output
     );
@@ -1718,7 +1739,13 @@ fn finish_tool_upgrades_already_sealed_task_row() {
             .count(),
         1
     );
-    let out = app.messages.last().unwrap().tool_output.as_deref().unwrap_or("");
+    let out = app
+        .messages
+        .last()
+        .unwrap()
+        .tool_output
+        .as_deref()
+        .unwrap_or("");
     assert!(out.contains("full detail"), "{out}");
 }
 
@@ -1879,12 +1906,105 @@ fn ctrl_l_model_select_respects_enabled_models_filter() {
 
     app.open_model_select();
     let prompt = app.select_prompt().expect("model select open");
+    assert_eq!(app.select_kind(), Some(&SelectKind::ModelProvider));
     let ids: Vec<_> = prompt.options.iter().map(|o| o.id.as_str()).collect();
-    // Current model always visible + enabled mock.
-    assert!(ids.contains(&"openai:gpt-4o"));
-    assert!(ids.contains(&"mock:mock-v1"));
-    assert!(!ids.contains(&"xai:grok-4.5"));
+    // Current provider always visible + enabled mock provider.
+    assert!(ids.contains(&"openai"));
+    assert!(ids.contains(&"mock"));
+    assert!(!ids.contains(&"xai"));
     assert_eq!(ids.len(), 2);
+}
+
+#[test]
+fn ctrl_l_model_select_cascades_provider_then_model() {
+    use crate::slash::ModelChoice;
+
+    let mut app = App::new("test");
+    app.set_model_catalog(vec![
+        ModelChoice {
+            provider: "openai".into(),
+            id: "gpt-4o".into(),
+            name: "GPT-4o".into(),
+        },
+        ModelChoice {
+            provider: "openai".into(),
+            id: "o3".into(),
+            name: "o3".into(),
+        },
+        ModelChoice {
+            provider: "xai".into(),
+            id: "grok-4.5".into(),
+            name: "Grok".into(),
+        },
+    ]);
+    app.set_current_model("openai", "gpt-4o");
+
+    app.open_model_select();
+    assert_eq!(app.select_kind(), Some(&SelectKind::ModelProvider));
+    let providers: Vec<_> = app
+        .select_prompt()
+        .expect("provider select")
+        .options
+        .iter()
+        .map(|o| o.id.as_str())
+        .collect();
+    assert_eq!(providers, vec!["openai", "xai"]);
+
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+        RunOutcome::Noop => {}
+        other => panic!("provider Enter should open model level, got {other:?}"),
+    }
+    assert_eq!(
+        app.select_kind(),
+        Some(&SelectKind::Model {
+            provider: "openai".into()
+        })
+    );
+    let models: Vec<_> = app
+        .select_prompt()
+        .expect("model select")
+        .options
+        .iter()
+        .map(|o| o.id.as_str())
+        .collect();
+    assert_eq!(models, vec!["gpt-4o", "o3"]);
+
+    app.handle_key(key(KeyCode::Down, KeyModifiers::NONE));
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+        RunOutcome::SwitchModel { provider, model } => {
+            assert_eq!(provider, "openai");
+            assert_eq!(model.as_deref(), Some("o3"));
+        }
+        other => panic!("expected SwitchModel, got {other:?}"),
+    }
+}
+
+#[test]
+fn ctrl_l_model_select_esc_from_model_level_goes_back_to_providers() {
+    use crate::slash::ModelChoice;
+
+    let mut app = App::new("test");
+    app.set_model_catalog(vec![
+        ModelChoice {
+            provider: "openai".into(),
+            id: "gpt-4o".into(),
+            name: "GPT-4o".into(),
+        },
+        ModelChoice {
+            provider: "xai".into(),
+            id: "grok-4.5".into(),
+            name: "Grok".into(),
+        },
+    ]);
+    app.set_current_model("openai", "gpt-4o");
+
+    app.open_model_select_for_provider("openai");
+    assert!(matches!(app.select_kind(), Some(SelectKind::Model { .. })));
+    match app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)) {
+        RunOutcome::Noop => {}
+        other => panic!("model Esc should return to providers, got {other:?}"),
+    }
+    assert_eq!(app.select_kind(), Some(&SelectKind::ModelProvider));
 }
 
 #[test]

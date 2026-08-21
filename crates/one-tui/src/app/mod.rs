@@ -6,13 +6,13 @@
 //! Public types live in [`crate::state`]; Settings / MCP / skills float
 //! navigation lives in [`crate::settings`].
 
+mod busy_keys;
 mod chrome;
+mod float_keys;
 mod helpers;
 mod history;
 mod hitl;
 mod input;
-mod busy_keys;
-mod float_keys;
 mod keys;
 mod submit;
 mod transcript;
@@ -282,7 +282,6 @@ pub struct App {
     /// Completed select result (ask_user path); approval maps into `approval_answer`.
     select_result: Option<(SelectKind, crate::select::SelectResult)>,
 }
-
 
 fn classify_toast_level(text: &str) -> AlertLevel {
     let t = text.trim().to_ascii_lowercase();

@@ -1,10 +1,10 @@
 //! Slash-command and HITL select docks above the prompt.
 
-use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
-use ratatui::Frame;
 use ratatui::layout::Rect;
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use crate::app::App;
@@ -51,7 +51,7 @@ pub(super) fn draw_slash_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     Theme::slash_title(),
                 )));
             }
-            PopupRow::Command(_) | PopupRow::Model(_) => {
+            PopupRow::Command(_) | PopupRow::Model(_) | PopupRow::Subcommand(_) => {
                 // name left · description right (image layout)
                 let name_w = UnicodeWidthStr::width(name.as_str()).clamp(10, 22);
                 let name_col = format!(" {:<width$}", name, width = name_w);
@@ -92,12 +92,19 @@ pub(super) fn draw_select_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(Theme::slash_panel()), area);
+
     let title = format!(" {} ", prompt.title);
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(Color::Yellow))
-        .style(Theme::bg());
+        .border_type(BorderType::Rounded)
+        .title(Span::styled(title, Theme::title()))
+        .title_bottom(Span::styled(
+            format!(" {} ", prompt.footer()),
+            Theme::float_footer(),
+        ))
+        .border_style(Style::default().fg(Theme::PRIMARY).bg(Theme::PANEL))
+        .style(Theme::slash_panel());
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -107,33 +114,38 @@ pub(super) fn draw_select_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
     for (i, line) in prompt.body.lines().enumerate() {
         let text = truncate_mid(line, max_w);
         let style = if i == 0 {
-            // Tool / headline
+            // Headline / question.
             Style::default()
-                .fg(Color::Cyan)
+                .fg(Theme::INFO)
+                .bg(Theme::PANEL)
                 .add_modifier(Modifier::BOLD)
         } else if line.starts_with("Why:") {
             // Escalation justification — make it readable, not dark-gray.
-            Style::default().fg(Color::Yellow)
+            Style::default().fg(Theme::WARNING).bg(Theme::PANEL)
         } else if line.starts_with("$ ") {
-            // Command preview
-            Style::default().fg(Color::White)
+            // Command preview.
+            Style::default().fg(Theme::FG).bg(Theme::PANEL)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Style::default().fg(Theme::MUTED).bg(Theme::PANEL)
         };
         lines.push(Line::from(Span::styled(text, style)));
     }
     if !prompt.body.is_empty() {
-        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            " ".repeat(max_w.max(1)),
+            Theme::slash_panel(),
+        )));
     }
 
-    // Scroll window if too many options for the dock height.
+    // Scroll window if too many options for the dock height. The footer lives on
+    // the bottom border, so the list gets one more visual row than before.
     let opt_n = prompt.option_count();
     let typing_rows = if matches!(prompt.phase, SelectPhase::Typing { .. }) {
         2
     } else {
         0
     };
-    let fixed = lines.len() + 1 + typing_rows; // + footer
+    let fixed = lines.len() + typing_rows;
     let avail = (inner.height as usize).saturating_sub(fixed).max(1);
     let start = if opt_n > avail {
         prompt
@@ -151,21 +163,34 @@ pub(super) fn draw_select_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
     if let SelectPhase::Typing { buffer } = &prompt.phase {
         lines.push(Line::from(Span::styled(
             truncate_mid(&prompt.other_label, max_w),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(Theme::MUTED).bg(Theme::PANEL),
         )));
         let input = format!("> {buffer}█");
         lines.push(Line::from(Span::styled(
             truncate_mid(&input, max_w),
-            Style::default().fg(Color::White),
+            Style::default()
+                .fg(Theme::FG)
+                .bg(Theme::ELEMENT)
+                .add_modifier(Modifier::BOLD),
         )));
     }
 
-    lines.push(Line::from(Span::styled(
-        truncate_mid(&prompt.footer(), max_w),
-        Style::default().fg(Color::DarkGray),
-    )));
+    while lines.len() < inner.height as usize {
+        lines.push(Line::from(Span::styled(
+            " ".repeat(max_w.max(1)),
+            Theme::slash_panel(),
+        )));
+    }
 
-    frame.render_widget(Paragraph::new(lines), inner);
+    frame.render_widget(
+        Paragraph::new(lines).style(Theme::slash_panel()),
+        Rect {
+            x: inner.x.saturating_add(1),
+            y: inner.y,
+            width: inner.width.saturating_sub(2),
+            height: inner.height,
+        },
+    );
 }
 
 fn select_option_line(
@@ -180,16 +205,16 @@ fn select_option_line(
         let mark = match prompt.mode {
             SelectMode::Single => {
                 if focused {
-                    "(•)"
+                    "●"
                 } else {
-                    "( )"
+                    "○"
                 }
             }
             SelectMode::Multi => {
                 if focused {
-                    "[•]"
+                    "◉"
                 } else {
-                    "[ ]"
+                    "□"
                 }
             }
         };
@@ -199,36 +224,73 @@ fn select_option_line(
         let mark = match prompt.mode {
             SelectMode::Single => {
                 if focused {
-                    "(•)"
+                    "●"
                 } else {
-                    "( )"
+                    "○"
                 }
             }
             SelectMode::Multi => {
                 if prompt.checked.contains(&idx) {
-                    "[x]"
+                    "■"
                 } else {
-                    "[ ]"
+                    "□"
                 }
             }
         };
         (mark, opt.label.as_str(), opt.description.as_str())
     };
 
-    let num = idx + 1;
-    let main = if desc.is_empty() {
-        format!("{num} {mark} {label}")
+    let row_bg = if focused {
+        Theme::ELEMENT
     } else {
-        // Keep description on same line when short; truncate together.
-        format!("{num} {mark} {label}")
+        Theme::PANEL
     };
-    let style = if focused {
-        Style::default()
-            .bg(Color::Rgb(48, 48, 48))
-            .fg(Color::White)
-            .add_modifier(Modifier::BOLD)
+    let marker_style = Style::default()
+        .fg(if focused {
+            Theme::PRIMARY
+        } else {
+            Theme::BORDER_ACTIVE
+        })
+        .bg(row_bg)
+        .add_modifier(Modifier::BOLD);
+    let label_style = Style::default()
+        .fg(if focused { Theme::FG } else { Theme::FG })
+        .bg(row_bg)
+        .add_modifier(if focused {
+            Modifier::BOLD
+        } else {
+            Modifier::empty()
+        });
+    let desc_style = Style::default()
+        .fg(if focused { Theme::INFO } else { Theme::MUTED })
+        .bg(row_bg);
+    let num_style = Style::default().fg(Theme::MUTED).bg(row_bg);
+
+    let num = format!(" {:>2} ", idx + 1);
+    let prefix_w = UnicodeWidthStr::width(num.as_str()) + UnicodeWidthStr::width(mark) + 1;
+    let desc_gap = if desc.is_empty() { 0 } else { 2 };
+    let desc_w = if desc.is_empty() {
+        0
     } else {
-        Style::default().fg(Color::Gray)
+        UnicodeWidthStr::width(desc).min(28)
     };
-    Line::from(Span::styled(truncate_mid(&main, max_w), style))
+    let label_budget = max_w.saturating_sub(prefix_w + desc_gap + desc_w).max(1);
+    let label = truncate_mid(label, label_budget);
+    let used = prefix_w + UnicodeWidthStr::width(label.as_str());
+    let desc_budget = max_w.saturating_sub(used + desc_gap);
+    let desc = if desc_budget > 2 && !desc.is_empty() {
+        format!("  {}", truncate_mid(desc, desc_budget.saturating_sub(2)))
+    } else {
+        String::new()
+    };
+
+    let mut line = Line::from(vec![
+        Span::styled(num, num_style),
+        Span::styled(mark.to_string(), marker_style),
+        Span::styled(" ".to_string(), Style::default().bg(row_bg)),
+        Span::styled(label, label_style),
+        Span::styled(desc, desc_style),
+    ]);
+    line.style = Style::default().bg(row_bg);
+    line
 }

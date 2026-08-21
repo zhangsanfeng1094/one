@@ -311,7 +311,9 @@ impl super::App {
     }
 
     /// Resolve pasted text to an imported media image `(mime, path, name)`.
-    pub(crate) fn load_image_from_pasted_path_static(text: &str) -> Option<(String, PathBuf, String)> {
+    pub(crate) fn load_image_from_pasted_path_static(
+        text: &str,
+    ) -> Option<(String, PathBuf, String)> {
         if let Some(v) = one_core::image::try_load_image_path_paste(text) {
             return Some(v);
         }
@@ -482,9 +484,7 @@ impl super::App {
     /// - empty-prompt j/k transcript browse (`chat_focus`) owns visual focus
     ///   (blue rail on a history row — typing returns to the prompt).
     pub fn prompt_focused(&self) -> bool {
-        self.select.is_none()
-            && !self.float_open()
-            && !self.transcript_browse_focused()
+        self.select.is_none() && !self.float_open() && !self.transcript_browse_focused()
     }
 
     /// Empty-prompt transcript browse (j/k / click focus rail). Keys like j/k

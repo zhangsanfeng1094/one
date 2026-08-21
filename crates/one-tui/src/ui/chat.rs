@@ -453,7 +453,8 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
                 .add_modifier(Modifier::BOLD),
         ),
     ]));
-    lines.push(tip_line("Shift+Tab", "Plan ↔ Build"));
+    lines.push(tip_line("Shift+Tab", "Cycle mode (Normal/Plan/YOLO)"));
+    lines.push(tip_line("Ctrl+O", "Toggle always-approve (YOLO)"));
     lines.push(tip_line("Ctrl+J", "newline"));
     lines.push(tip_line(
         "Ctrl+V",
@@ -508,7 +509,11 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
 ///     ├ ✓ grep  …
 ///     └ ✓ read  …
 /// ```
-pub(super) fn render_tool_group(tools: &[Message], wrap_width: usize, expanded: bool) -> Vec<Line<'static>> {
+pub(super) fn render_tool_group(
+    tools: &[Message],
+    wrap_width: usize,
+    expanded: bool,
+) -> Vec<Line<'static>> {
     let n = tools.len();
     let names: Vec<String> = tools
         .iter()
@@ -639,7 +644,11 @@ pub(super) const THINKING_STREAM_TAIL_LINES: usize = 3;
 ///
 /// Collapsed previews fill the remaining line width and **end-truncate** so
 /// history does not look mid-cropped (`The user wants me …l next positions`).
-pub(super) fn render_thinking(message: &Message, app: &App, wrap_width: usize) -> Vec<Line<'static>> {
+pub(super) fn render_thinking(
+    message: &Message,
+    app: &App,
+    wrap_width: usize,
+) -> Vec<Line<'static>> {
     // Live stream always shows a short tail; finished blocks honor per-message
     // expand (click) or the global Ctrl+T default (`show_thinking`).
     let expanded = message.streaming || message.thinking_expanded;
@@ -689,10 +698,7 @@ pub(super) fn render_thinking(message: &Message, app: &App, wrap_width: usize) -
         ];
         if !preview.is_empty() {
             // Quoted-ish preview: italic muted body, distinct from the badge.
-            spans.push(Span::styled(
-                format!("  {preview}"),
-                Theme::thinking_body(),
-            ));
+            spans.push(Span::styled(format!("  {preview}"), Theme::thinking_body()));
         }
         lines.push(Line::from(spans));
     }
@@ -704,10 +710,7 @@ pub(super) fn render_thinking(message: &Message, app: &App, wrap_width: usize) -
 /// Uses **display-width end-ellipsis** (not middle-truncate): natural language
 /// should read from the start. `max_cols` is the remaining line budget.
 fn thinking_preview(content: &str, max_cols: usize) -> String {
-    let flat = content
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let flat = content.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.is_empty() {
         return String::new();
     }
@@ -873,10 +876,7 @@ fn render_tool(
     let summary_clean = if summary_raw.is_empty() {
         String::new()
     } else {
-        tool_view::single_line_preview(
-            &tool_view::shorten_paths_in_text(summary_raw, cwd),
-            48,
-        )
+        tool_view::single_line_preview(&tool_view::shorten_paths_in_text(summary_raw, cwd), 48)
     };
     let dur = duration_label(message);
     let metrics = {
@@ -1310,4 +1310,3 @@ fn render_alert(message: &Message, wrap_width: usize) -> Vec<Line<'static>> {
 fn pretty_tool_args(s: &str, cwd: Option<&std::path::Path>) -> String {
     tool_view::pretty_tool_detail(s, cwd)
 }
-

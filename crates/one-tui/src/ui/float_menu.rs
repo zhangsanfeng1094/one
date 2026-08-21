@@ -33,10 +33,7 @@ pub(super) fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMen
     // remaining safe on narrow/short terminals. `u16::clamp` panics when its
     // lower bound exceeds the upper bound, which used to make Settings crash
     // below ~48 columns or ~12 rows.
-    let is_subagent = matches!(
-        menu.kind,
-        FloatKind::Subagent | FloatKind::SubagentDetail
-    );
+    let is_subagent = matches!(menu.kind, FloatKind::Subagent | FloatKind::SubagentDetail);
     let max_w = full.width.saturating_sub(2);
     // Subagent panels get a touch more width for status + activity meta.
     let min_w = if is_subagent {
@@ -297,7 +294,6 @@ fn draw_float_scrollbar(
     }
     frame.render_widget(Paragraph::new(lines).style(Theme::slash_panel()), area);
 }
-
 
 fn float_footer_text(menu: &FloatMenu) -> String {
     if menu.edit_mode {
@@ -565,13 +561,21 @@ fn subagent_log_line(label: &str, detail: &str, col_w: usize) -> Line<'static> {
         "✓" => ("✓", Theme::subagent_log_ok(), Theme::subagent_log_muted()),
         "✗" | "!" => ("✗", Theme::subagent_log_err(), Theme::subagent_log_err()),
         "▸" => ("▸", Theme::subagent_log_meta(), Theme::subagent_log_meta()),
-        "◂" => ("◂", Theme::subagent_log_muted(), Theme::subagent_log_muted()),
+        "◂" => (
+            "◂",
+            Theme::subagent_log_muted(),
+            Theme::subagent_log_muted(),
+        ),
         "──" => (
             "─",
             Theme::hairline(),
             Theme::subagent_log_muted().add_modifier(Modifier::ITALIC),
         ),
-        "·" => ("·", Theme::subagent_log_muted(), Theme::subagent_log_muted()),
+        "·" => (
+            "·",
+            Theme::subagent_log_muted(),
+            Theme::subagent_log_muted(),
+        ),
         "" => (" ", Theme::slash_panel(), Theme::subagent_log_body()),
         other => {
             // Unknown marker: show as muted prefix.
@@ -611,7 +615,11 @@ fn subagent_log_line(label: &str, detail: &str, col_w: usize) -> Line<'static> {
     } else {
         pad_or_truncate(detail, body_w)
     };
-    let pad = " ".repeat(col_w.saturating_sub(prefix.width()).saturating_sub(body.width()));
+    let pad = " ".repeat(
+        col_w
+            .saturating_sub(prefix.width())
+            .saturating_sub(body.width()),
+    );
     Line::from(vec![
         Span::styled(prefix, g_style),
         Span::styled(body, body_style),
@@ -790,4 +798,3 @@ fn format_float_action(hint: &str) -> String {
         h.to_string()
     }
 }
-

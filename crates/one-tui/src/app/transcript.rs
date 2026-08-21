@@ -51,8 +51,12 @@ impl super::App {
         // (otherwise deltas keep appending into the same buffer and the next
         // bubble re-shows the previous segment's full text).
         self.seal_stream_segment();
-        self.messages
-            .push(Message::tool_with_id(name, args, ToolStatus::Running, call_id));
+        self.messages.push(Message::tool_with_id(
+            name,
+            args,
+            ToolStatus::Running,
+            call_id,
+        ));
     }
 
     /// Finalize in-progress thinking / assistant stream bubbles and reset
@@ -322,17 +326,16 @@ impl super::App {
         msg.tool_ungroup = true;
         let args = msg.content.clone();
         let mut stored = truncate_tool_output_for_ui(&output, 4_000);
-        let (summary, expand) =
-            if let Some((s, e, better)) =
-                tool_view::summarize_tool_special("task", &args, &stored, error)
-            {
-                if let Some(b) = better {
-                    stored = truncate_tool_output_for_ui(&b, 4_000);
-                }
-                (s, e)
-            } else {
-                summarize_tool_output(&stored, error)
-            };
+        let (summary, expand) = if let Some((s, e, better)) =
+            tool_view::summarize_tool_special("task", &args, &stored, error)
+        {
+            if let Some(b) = better {
+                stored = truncate_tool_output_for_ui(&b, 4_000);
+            }
+            (s, e)
+        } else {
+            summarize_tool_output(&stored, error)
+        };
         msg.tool_output = Some(stored);
         msg.tool_summary = Some(summary);
         msg.tool_expanded = expand;
@@ -425,14 +428,11 @@ impl super::App {
         if let Some(msg) = self.messages.get(msg_index) {
             if msg.tool_name.as_deref() == Some("task") {
                 let running = msg.tool_status == Some(ToolStatus::Running);
-                let has_body = msg
-                    .tool_output
-                    .as_deref()
-                    .is_some_and(|s| {
-                        s.lines()
-                            .skip_while(|l| l.starts_with('[') || l.trim().is_empty())
-                            .any(|l| !l.trim().is_empty())
-                    });
+                let has_body = msg.tool_output.as_deref().is_some_and(|s| {
+                    s.lines()
+                        .skip_while(|l| l.starts_with('[') || l.trim().is_empty())
+                        .any(|l| !l.trim().is_empty())
+                });
                 if running {
                     if let Some(id) = msg.tool_job_id.clone() {
                         self.queue_busy_ui(RunOutcome::OpenSubagentDetail { id });
@@ -729,8 +729,7 @@ impl super::App {
         self.stream_buffer.clear();
         self.thinking_buffer.clear();
         while let Some(last) = self.messages.last() {
-            if last.streaming
-                && matches!(last.role, MessageRole::Assistant | MessageRole::Thinking)
+            if last.streaming && matches!(last.role, MessageRole::Assistant | MessageRole::Thinking)
             {
                 self.messages.pop();
             } else {
