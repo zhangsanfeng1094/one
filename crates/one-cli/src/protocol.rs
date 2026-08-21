@@ -413,8 +413,9 @@ impl McpInheritance {
 /// Canonical child role name (`explore` / `plan` / `general`).
 pub fn normalize_agent_name(name: &str) -> String {
     match name.trim().to_ascii_lowercase().as_str() {
-        "general-purpose" | "general_purpose" | "generalpurpose" | "general"
-        | "implementer" => "general".into(),
+        "general-purpose" | "general_purpose" | "generalpurpose" | "general" | "implementer" => {
+            "general".into()
+        }
         "explore" | "researcher" | "research" => "explore".into(),
         "plan" | "planner" | "planning" => "plan".into(),
         other => other.trim().to_string(),
@@ -749,9 +750,10 @@ and open questions (as statements, not questions to the user).\n\
 
     pub fn spawn_allowed(&self, name: &str) -> bool {
         let key = normalize_agent_name(name);
-        self.spawn_policy.allow.iter().any(|a| {
-            a == "*" || a == name || normalize_agent_name(a) == key
-        })
+        self.spawn_policy
+            .allow
+            .iter()
+            .any(|a| a == "*" || a == name || normalize_agent_name(a) == key)
     }
 }
 

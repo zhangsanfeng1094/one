@@ -87,8 +87,15 @@ impl AppRuntime {
         Ok(())
     }
 
-    /// Approve plan and return a user prompt that starts implementation.
+    /// Approve plan and return a user prompt that starts implementation in current session.
     pub async fn approve_plan_prompt(&mut self) -> Result<String, Box<dyn std::error::Error>> {
+        self.approve_plan_prompt_current().await
+    }
+
+    /// Approve plan and return a user prompt that starts implementation in current session.
+    pub async fn approve_plan_prompt_current(
+        &mut self,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let plan_path = self
             .plan_path
             .clone()
@@ -106,6 +113,43 @@ impl AppRuntime {
 
         Ok(format!(
             "The plan below was approved. Implement it now. Follow the steps; \
+             do not re-plan unless blocked.\n\n\
+             Plan file: {}\n\n\
+             # Approved plan\n\n\
+             {content}",
+            plan_path.display()
+        ))
+    }
+
+    /// Approve plan and return a user prompt that starts implementation in a fresh session.
+    pub async fn approve_plan_prompt_fresh(
+        &mut self,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let plan_path = self
+            .plan_path
+            .clone()
+            .ok_or("no plan file — enter /plan first")?;
+        let content = tokio::fs::read_to_string(&plan_path)
+            .await
+            .unwrap_or_default();
+        if content.trim().is_empty()
+            || content.trim() == "# Plan\n\n_Write the implementation plan here._"
+        {
+            return Err("plan file is empty — finish the plan before /act".into());
+        }
+
+        // Start a fresh session to clear exploration context.
+        self.new_session().await?;
+        self.mode = AgentMode::Act;
+        self.apply_act_tools_and_prompt().await?;
+        {
+            let mut state = self.plan_exit.lock().expect("plan exit lock");
+            state.clear();
+        }
+        self.persist_mode().await?;
+
+        Ok(format!(
+            "The plan below was approved. Implement it in this fresh session. Follow the steps; \
              do not re-plan unless blocked.\n\n\
              Plan file: {}\n\n\
              # Approved plan\n\n\

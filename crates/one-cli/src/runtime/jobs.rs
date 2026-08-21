@@ -1033,7 +1033,8 @@ impl AgentJobRegistry {
         job.state = state;
         job.finished = Some(Instant::now());
         job.event_log.set_activity(activity);
-        job.event_log.push_line(format!("▸ {activity} · {}", reason.as_str()));
+        job.event_log
+            .push_line(format!("▸ {activity} · {}", reason.as_str()));
         job.event_log.write_end(
             activity,
             json!({
@@ -1042,7 +1043,8 @@ impl AgentJobRegistry {
                 "reason": reason.as_str(),
             }),
         );
-        let mut rr = RunResult::failure(ProtocolError::new(code, msg), duration_ms).with_status(status);
+        let mut rr =
+            RunResult::failure(ProtocolError::new(code, msg), duration_ms).with_status(status);
         if matches!(reason, KillReason::WallTimeout) {
             rr.stop_reason = Some("wall_timeout".into());
         } else {
@@ -1999,8 +2001,11 @@ mod tests {
         );
     }
 
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn wall_timeout_env_parsing() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("ONE_JOB_MAX_WALL_MS", "1");
         assert_eq!(job_max_wall_ms(), Some(1));
         std::env::remove_var("ONE_JOB_MAX_WALL_MS");
@@ -2016,6 +2021,7 @@ mod tests {
 
     #[test]
     fn wall_ms_zero_disables() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("ONE_JOB_MAX_WALL_MS", "0");
         assert_eq!(job_max_wall_ms(), None);
         std::env::remove_var("ONE_JOB_MAX_WALL_MS");

@@ -9,7 +9,7 @@ use one_tui::{
     RunOutcome, SelectKind, TerminalSession,
 };
 
-use crate::approval::{ApprovalChoice, PermissionGate};
+use crate::approval::{ApprovalChoice, PermissionGate, PermissionMode};
 use crate::hitl::HitlChannel;
 use crate::provider::ProviderSet;
 use crate::runtime::{AgentMode, AppRuntime};
@@ -322,10 +322,7 @@ fn refresh_bg_chip(app: &mut App, runtime: &AppRuntime) {
 /// Live chip for **subagents** (`task:1 · explore…`). Open `/tasks`.
 fn refresh_task_chip(app: &mut App, runtime: &AppRuntime) {
     let jobs = runtime.agent_jobs().map(|j| j.list()).unwrap_or_default();
-    let running = jobs
-        .iter()
-        .filter(|j| j.state.is_live())
-        .count();
+    let running = jobs.iter().filter(|j| j.state.is_live()).count();
     let failed = jobs.iter().any(|j| {
         matches!(j.state, crate::runtime::jobs::JobState::Failed)
             || (matches!(j.state, crate::runtime::jobs::JobState::Completed) && !j.ok)
@@ -1569,23 +1566,59 @@ pub async fn run_interactive(
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
             RunOutcome::CycleAgentMode => {
-                // Shift+Tab: Plan ↔ Build (thinking lives in /settings).
-                match runtime.mode() {
-                    AgentMode::Act => match runtime.enter_plan_mode().await {
+                // Shift+Tab: Normal (Ask) → Plan → Always-approve (YOLO) → Normal (Ask)
+                if runtime.mode() == AgentMode::Plan {
+                    runtime.leave_plan_mode().await?;
+                    match runtime.permission_gate.set_permission_mode(PermissionMode::BypassPermissions) {
+                        Ok(()) => {
+                            app.set_agent_label("YOLO");
+                            app.set_notice("Always-approve (YOLO) mode · S-Tab to switch to Ask");
+                        }
+                        Err(err) => {
+                            app.set_agent_label(AgentMode::Act.label());
+                            app.set_notice(format!("Build mode · {err}"));
+                        }
+                    }
+                } else if runtime.permission_gate.permission_mode().is_always_approve() {
+                    let _ = runtime.permission_gate.set_permission_mode(PermissionMode::Default);
+                    app.set_agent_label(AgentMode::Act.label());
+                    app.set_notice("Build mode (Ask) · S-Tab to switch to Plan");
+                } else {
+                    match runtime.enter_plan_mode().await {
                         Ok(path) => {
                             app.set_agent_label(AgentMode::Plan.label());
                             app.set_notice(format!(
-                                "plan mode · {} · S-Tab or /act to leave",
+                                "Plan mode · {} · S-Tab or /act to leave",
                                 path.display()
                             ));
                         }
                         Err(err) => app.set_notice(format!("plan: {err}")),
-                    },
-                    AgentMode::Plan => {
-                        // Toggle off without auto-implement (use /act to approve + run).
-                        runtime.leave_plan_mode().await?;
-                        app.set_agent_label(AgentMode::Act.label());
-                        app.set_notice("Build mode · /act to implement an approved plan");
+                    }
+                }
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
+            RunOutcome::ToggleAlwaysApprove => {
+                match runtime.permission_gate.toggle_always_approve() {
+                    Ok(PermissionMode::BypassPermissions) => {
+                        if runtime.mode() == AgentMode::Plan {
+                            runtime.leave_plan_mode().await?;
+                        }
+                        app.set_agent_label("YOLO");
+                        app.set_notice("Always-approve (YOLO) mode enabled · Ctrl+O to disable");
+                    }
+                    Ok(m) => {
+                        let label = if runtime.mode() == AgentMode::Plan {
+                            AgentMode::Plan.label()
+                        } else {
+                            AgentMode::Act.label()
+                        };
+                        app.set_agent_label(label);
+                        app.set_notice(format!("Always-approve disabled · current mode: {}", m.label()));
+                    }
+                    Err(err) => {
+                        app.set_notice(format!("{err}"));
                     }
                 }
                 terminal
@@ -1869,6 +1902,8 @@ async fn run_turn_streaming(
         app.set_notice(format!("skill → {skill}"));
     }
     let text = resolved.text;
+    runtime.inject_mcp_reminder().await;
+    runtime.inject_tool_intent_reminder(&text).await;
     runtime.maybe_compact(provider.as_ref(), false).await?;
     let _ = runtime
         .extensions
@@ -2373,6 +2408,84 @@ async fn handle_slash(
             }
             Ok(SlashAction::Consumed)
         }
+        Some("/always-approve") | Some("/yolo") => {
+            match runtime.permission_gate.toggle_always_approve() {
+                Ok(PermissionMode::BypassPermissions) => {
+                    if runtime.mode() == AgentMode::Plan {
+                        runtime.leave_plan_mode().await?;
+                    }
+                    app.set_agent_label("YOLO");
+                    app.set_notice("Always-approve (YOLO) mode enabled · all tool calls auto-run");
+                }
+                Ok(m) => {
+                    let label = if runtime.mode() == AgentMode::Plan {
+                        AgentMode::Plan.label()
+                    } else {
+                        AgentMode::Act.label()
+                    };
+                    app.set_agent_label(label);
+                    app.set_notice(format!("Always-approve disabled · current mode: {}", m.label()));
+                }
+                Err(err) => {
+                    app.set_notice(format!("{err}"));
+                }
+            }
+            Ok(SlashAction::Consumed)
+        }
+        Some("/auto") => {
+            match runtime.permission_gate.toggle_auto() {
+                Ok(PermissionMode::Auto) => {
+                    if runtime.mode() == AgentMode::Plan {
+                        runtime.leave_plan_mode().await?;
+                    }
+                    app.set_agent_label("Auto");
+                    app.set_notice("Auto mode enabled · classifier approves safe tools");
+                }
+                Ok(m) => {
+                    let label = if runtime.mode() == AgentMode::Plan {
+                        AgentMode::Plan.label()
+                    } else {
+                        AgentMode::Act.label()
+                    };
+                    app.set_agent_label(label);
+                    app.set_notice(format!("Auto mode disabled · current mode: {}", m.label()));
+                }
+                Err(err) => {
+                    app.set_notice(format!("{err}"));
+                }
+            }
+            Ok(SlashAction::Consumed)
+        }
+        Some("/permission-mode") | Some("/permissions") => {
+            if let Some(target) = parts.get(1) {
+                if let Some(mode) = PermissionMode::parse(target) {
+                    match runtime.permission_gate.set_permission_mode(mode) {
+                        Ok(()) => {
+                            let label = match mode {
+                                PermissionMode::BypassPermissions => "YOLO",
+                                PermissionMode::Auto => "Auto",
+                                PermissionMode::AcceptEdits => "AcceptEdits",
+                                PermissionMode::DontAsk => "DontAsk",
+                                PermissionMode::Default => "Build",
+                            };
+                            if runtime.mode() != AgentMode::Plan {
+                                app.set_agent_label(label);
+                            }
+                            app.set_notice(format!("Permission mode set to {}", mode.label()));
+                        }
+                        Err(err) => {
+                            app.set_notice(format!("{err}"));
+                        }
+                    }
+                } else {
+                    app.set_notice("Usage: /permission-mode <default|acceptEdits|auto|dontAsk|bypassPermissions>");
+                }
+            } else {
+                let curr = runtime.permission_gate.permission_mode();
+                app.set_notice(format!("Current permission mode: {} ({})", curr.label(), curr.as_str()));
+            }
+            Ok(SlashAction::Consumed)
+        }
         Some("/plan") => {
             match runtime.enter_plan_mode().await {
                 Ok(path) => {
@@ -2387,38 +2500,103 @@ async fn handle_slash(
             Ok(SlashAction::Consumed)
         }
         Some("/act") | Some("/build") => {
-            if runtime.mode() == AgentMode::Act && runtime.plan_path().is_none() {
-                app.set_agent_label(AgentMode::Act.label());
-                app.set_notice("already in Build mode");
-                return Ok(SlashAction::Consumed);
-            }
-            // Leave plan without implementing if user only wants tools back and no plan yet.
-            if parts
-                .get(1)
-                .is_some_and(|s| *s == "skip" || *s == "--no-run")
-            {
-                runtime.leave_plan_mode().await?;
-                app.set_agent_label(AgentMode::Act.label());
-                app.set_notice("Build mode (plan not auto-run)");
-                return Ok(SlashAction::Consumed);
-            }
-            match runtime.approve_plan_prompt().await {
-                Ok(prompt) => {
+            let arg = parts.get(1).map(|s| s.to_ascii_lowercase());
+            match arg.as_deref() {
+                Some("skip") | Some("--no-run") => {
+                    runtime.leave_plan_mode().await?;
                     app.set_agent_label(AgentMode::Act.label());
-                    app.set_notice("plan approved · implementing…");
-                    Ok(SlashAction::Prompt(prompt))
+                    app.set_notice("Build mode (plan not auto-run)");
+                    Ok(SlashAction::Consumed)
                 }
-                Err(err) => {
-                    // No plan file yet — just switch to Build tools.
-                    if runtime.mode() == AgentMode::Plan {
-                        runtime.leave_plan_mode().await?;
+                Some("fresh") | Some("--fresh") | Some("-n") | Some("new") => {
+                    match runtime.approve_plan_prompt_fresh().await {
+                        Ok(prompt) => {
+                            app.messages.clear();
+                            app.chat_scroll = 0;
+                            app.set_agent_label(AgentMode::Act.label());
+                            refresh_features_rows(app, runtime);
+                            app.set_notice("plan approved (fresh context) · implementing…");
+                            Ok(SlashAction::Prompt(prompt))
+                        }
+                        Err(err) => {
+                            app.set_notice(format!("act fresh: {err}"));
+                            Ok(SlashAction::Consumed)
+                        }
+                    }
+                }
+                Some("current") | Some("--current") | Some("-c") => {
+                    match runtime.approve_plan_prompt_current().await {
+                        Ok(prompt) => {
+                            app.set_agent_label(AgentMode::Act.label());
+                            app.set_notice("plan approved (current context) · implementing…");
+                            Ok(SlashAction::Prompt(prompt))
+                        }
+                        Err(err) => {
+                            app.set_notice(format!("act current: {err}"));
+                            Ok(SlashAction::Consumed)
+                        }
+                    }
+                }
+                Some("edit") | Some("view") | Some("show") | Some("plan") => {
+                    let path_s = runtime
+                        .plan_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "(plan file)".into());
+                    let plan_text = runtime.read_plan().await.unwrap_or_default();
+                    if plan_text.trim().is_empty() {
+                        app.set_notice("plan file is empty");
+                    } else {
+                        app.push_assistant(format!(
+                            "### 📋 Plan 视图\n\n**文件路径**: `{path_s}`\n\n```markdown\n{}\n```\n\n—\n可在本地直接编辑该文件，或在当前对话继续输入指令修改方案。\n准备好后使用 `/act fresh` 或 `/act current` 开始执行。",
+                            plan_text.trim()
+                        ));
+                        app.set_notice(format!("plan view · {path_s}"));
+                    }
+                    Ok(SlashAction::Consumed)
+                }
+                None => {
+                    if let Some(plan_text) =
+                        runtime.read_plan().await.filter(|t| !t.trim().is_empty())
+                    {
+                        let path_s = runtime
+                            .plan_path()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_else(|| "(plan file)".into());
+                        app.push_assistant(format!(
+                            "### 📋 Plan 视图\n\n**文件路径**: `{path_s}`\n\n```markdown\n{}\n```\n\n—\n**请选择执行方式：**\n· `/act fresh` — **新上下文开始执行**（推荐，清空探索上下文，获得最大 Token 窗口）\n· `/act current` — **当前上下文继续执行**（保留历史对话）\n· `/act edit` — **继续修改方案**（留在 Plan 模式）",
+                            plan_text.trim()
+                        ));
+                        app.set_notice("choose: /act fresh | /act current | /act edit");
+                        Ok(SlashAction::Consumed)
+                    } else if runtime.mode() == AgentMode::Act && runtime.plan_path().is_none() {
                         app.set_agent_label(AgentMode::Act.label());
-                        app.set_notice(format!("Build mode · {err}"));
+                        app.set_notice("already in Build mode");
                         Ok(SlashAction::Consumed)
                     } else {
-                        app.set_notice(format!("act: {err}"));
-                        Ok(SlashAction::Consumed)
+                        match runtime.approve_plan_prompt_current().await {
+                            Ok(prompt) => {
+                                app.set_agent_label(AgentMode::Act.label());
+                                app.set_notice("plan approved · implementing…");
+                                Ok(SlashAction::Prompt(prompt))
+                            }
+                            Err(err) => {
+                                if runtime.mode() == AgentMode::Plan {
+                                    runtime.leave_plan_mode().await?;
+                                    app.set_agent_label(AgentMode::Act.label());
+                                    app.set_notice(format!("Build mode · {err}"));
+                                } else {
+                                    app.set_notice(format!("act: {err}"));
+                                }
+                                Ok(SlashAction::Consumed)
+                            }
+                        }
                     }
+                }
+                Some(unknown) => {
+                    app.set_notice(format!(
+                        "unknown act option `{unknown}` (use: fresh, current, edit)"
+                    ));
+                    Ok(SlashAction::Consumed)
                 }
             }
         }
@@ -2703,6 +2881,7 @@ async fn handle_slash(
                         SessionEntry::ModelChange { .. } => "model",
                         SessionEntry::ThinkingLevelChange { .. } => "thinking",
                         SessionEntry::Label { .. } => "label",
+                        SessionEntry::RewindMarker { .. } => "rewind",
                         SessionEntry::Custom { .. } | SessionEntry::CustomMessage { .. } => {
                             "custom"
                         }
@@ -2967,8 +3146,9 @@ async fn notify_plan_ready(app: &mut App, runtime: &AppRuntime) {
         .map(|c| {
             let trimmed = c.trim();
             let max = 1200usize;
-            if trimmed.len() > max {
-                format!("{}…", &trimmed[..max])
+            if trimmed.chars().count() > max {
+                let head: String = trimmed.chars().take(max).collect();
+                format!("{head}…")
             } else {
                 trimmed.to_string()
             }
@@ -2980,10 +3160,13 @@ async fn notify_plan_ready(app: &mut App, runtime: &AppRuntime) {
              Path: `{path}`\n\n\
              {preview}\n\n\
              —\n\
-             `/act` to implement · keep chatting to refine · edit the plan file directly"
+             **Options to proceed:**\n\
+             · `/act fresh` — 新上下文开始执行（推荐：干净会话，最大 Token 窗口）\n\
+             · `/act current` — 当前上下文继续执行（保留历史对话）\n\
+             · `/act edit` — 查看完整 Plan 视图并继续在 Plan 模式修改"
         ));
     }
-    app.set_notice(format!("plan ready · /act to implement · {path}"));
+    app.set_notice(format!("plan ready · /act [fresh|current|edit] · {path}"));
 }
 
 /// Resolve `/resume <spec>` (shared ranking with `one resume <spec>`).

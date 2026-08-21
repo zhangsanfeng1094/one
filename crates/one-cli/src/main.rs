@@ -3,6 +3,7 @@ mod approval;
 mod auth_cmd;
 mod bench_cmd;
 mod cli;
+mod governance;
 mod hitl;
 mod langfuse;
 mod mcp_cmd;
@@ -278,6 +279,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
     let run_mode = resolve_run_mode(&cli, &matches);
+    cli.mode = run_mode.clone();
 
     // Interactive TUI owns the terminal — never print tracing to stderr
     // (MCP background connect would otherwise corrupt the alternate screen).
@@ -483,7 +485,10 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
 }
 
 /// `one acp` — apply yolo / mode flags and enter ACP stdio server.
-async fn run_acp_command(mut cli: Cli, acp: AcpCli) -> Result<ExitCode, Box<dyn std::error::Error>> {
+async fn run_acp_command(
+    mut cli: Cli,
+    acp: AcpCli,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
     cli.mode = RunMode::Acp;
     if acp.yolo {
         cli.auto_approve = true;

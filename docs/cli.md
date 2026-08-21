@@ -72,6 +72,9 @@ one --provider xai -p "hello"
 one --provider opencode-go --model deepseek-v4-flash -p "hello"
 
 # 其它常用 flags
+one --always-approve         # 开启 Always-Approve / YOLO 模式（自动批准所有工具调用）
+one --yolo                   # --always-approve 的别名
+one --permission-mode <MODE> # 权限模式：default | acceptEdits | auto | dontAsk | bypassPermissions
 one --no-mcp                 # 本 session 不连 MCP
 one --no-skills              # 不注入 skills catalog（评测隔离）
 one --no-subagent            # 关闭 subagent 能力包（task/job 工具 + 提示词）
@@ -727,7 +730,7 @@ cargo run -p one-cli --features http-providers -- --provider openai -m gpt-4o
 - `Ctrl+L`：模型 select（输入框上方）
 - `Ctrl+G`：Settings 居中面板
 - `PageUp` / `PageDown` / 鼠标滚轮：滚动对话记录；生成中向上滚动会进入稳定的历史浏览，不会被后续输出拉回底部
-- `Shift+G`（或 `End`）：跳到最新输出并恢复实时跟随；向下滚到最底部也会恢复跟随
+- `Alt+G`（或 `End`）：跳到最新输出并恢复实时跟随；向下滚到最底部也会恢复跟随
 - `Esc`：中止生成（运行中）；关闭浮层
 - `Ctrl+C`：渐进退出（防误触）——浮层打开时先关浮层；输入非空时先清空；其余情况需再按一次才退出（busy 下第二次为强制退出，不会当成“取消生成”）
 - `/quit`：强制退出

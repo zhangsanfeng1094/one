@@ -70,7 +70,8 @@ impl TaskToolHost {
         parent_path_policy: PathPolicy,
     ) -> Arc<Self> {
         let max_c = parent_agent.spawn_policy.max_concurrent.max(1) as usize;
-        let coordinator = SubagentCoordinator::new(jobs.clone(), CoordinatorConfig::from_env(max_c));
+        let coordinator =
+            SubagentCoordinator::new(jobs.clone(), CoordinatorConfig::from_env(max_c));
         Arc::new(Self {
             provider: RwLock::new(None),
             opts: RwLock::new(opts),
@@ -554,11 +555,7 @@ Do not re-delegate git workflows to explore.";
             let mut rr = RunResult::success(msg, 0).with_status(TaskExitStatus::IncompleteInfo);
             rr.stop_reason = Some("incomplete_info".into());
             rr.error = Some(ProtocolError::new(error_code::INVALID_REQUEST, msg));
-            return Ok(format_task_output(
-                &agent_name,
-                description.as_deref(),
-                &rr,
-            ));
+            return Ok(format_task_output(&agent_name, description.as_deref(), &rr));
         }
 
         // Validate tools can materialize before spending a slot on LLM work.
@@ -1490,7 +1487,10 @@ mod tests {
             .unwrap();
         let text = out.as_text();
         assert!(text.contains("status=incomplete_info"), "{text}");
-        assert!(text.contains("need bash") || text.contains("ERROR:"), "{text}");
+        assert!(
+            text.contains("need bash") || text.contains("ERROR:"),
+            "{text}"
+        );
         assert!(!text.contains("should not run"), "{text}");
     }
 
@@ -1499,9 +1499,13 @@ mod tests {
         assert!(prompt_looks_like_vcs_workflow(
             "Categorize repository changes for feature commits"
         ));
-        assert!(prompt_looks_like_vcs_workflow("run git status and group diffs"));
+        assert!(prompt_looks_like_vcs_workflow(
+            "run git status and group diffs"
+        ));
         assert!(prompt_looks_like_vcs_workflow("split commit by feature"));
-        assert!(!prompt_looks_like_vcs_workflow("find auth middleware callers"));
+        assert!(!prompt_looks_like_vcs_workflow(
+            "find auth middleware callers"
+        ));
         assert!(!prompt_looks_like_vcs_workflow("how does Agent::run work?"));
     }
 
@@ -1964,7 +1968,10 @@ mod tests {
             })
             .await
             .unwrap();
-        let job_id = first.details.unwrap()["job_id"].as_str().unwrap().to_string();
+        let job_id = first.details.unwrap()["job_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
         for _ in 0..100 {
             if host
                 .jobs()

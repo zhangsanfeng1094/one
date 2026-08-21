@@ -11,8 +11,8 @@ use one_resources::ResourceLoader;
 use one_session::{agent_dir, SessionManager};
 use one_tools::{
     coding_tools_with_options, plan_mode_system_overlay, plan_mode_tools_with_policy,
-    read_only_tools_with_ask, AskUserHandler, BackgroundTaskRegistry, OsSandbox, PermissionRules,
-    PlanExitState, ToolBuildOptions,
+    read_only_tools_with_ask, AskUserHandler, BackgroundTaskRegistry, OsSandbox, PermissionMode,
+    PermissionRules, PlanExitState, ToolBuildOptions,
 };
 
 use super::features::{env_no_subagent, FeatureState};
@@ -100,7 +100,28 @@ impl AppRuntime {
         if no_memory_process {
             tracing::info!("memory feature disabled (--no-memory / ONE_NO_MEMORY)");
         }
-        let auto_approve = cli.auto_approve || user_settings.auto_approve.unwrap_or(false);
+        let mut perm_mode = if cli.always_approve {
+            PermissionMode::BypassPermissions
+        } else if let Some(m_str) = &cli.permission_mode {
+            PermissionMode::parse(m_str).unwrap_or(PermissionMode::Default)
+        } else if cli.auto_approve {
+            PermissionMode::BypassPermissions
+        } else if let Some(m_str) = &user_settings.permission_mode {
+            PermissionMode::parse(m_str).unwrap_or(PermissionMode::Default)
+        } else if user_settings.auto_approve == Some(true) {
+            PermissionMode::BypassPermissions
+        } else {
+            PermissionMode::Default
+        };
+
+        if perm_mode.is_always_approve() {
+            if let Err(err) = crate::governance::check_bypass_permissions_allowed() {
+                tracing::warn!("{err}; falling back to default permission mode");
+                perm_mode = PermissionMode::Default;
+            }
+        }
+
+        let auto_approve = perm_mode.is_always_approve();
 
         // agentskills.io: allowlist skill dirs so progressive disclosure `read` works
         // (Codex-compatible: ~/.agents/skills + client skill homes + package dirs).
@@ -121,15 +142,14 @@ impl AppRuntime {
 
         // ACP needs the same interactive PermissionGate / HitlChannel so tool
         // approvals and ask_user can be bridged to the client over JSON-RPC.
-        let interactive = matches!(cli.mode, RunMode::Interactive | RunMode::Acp)
-            && cli.print.is_none();
+        let interactive = matches!(cli.mode, RunMode::Interactive | RunMode::Acp);
         let perm_rules = user_settings
             .permissions
             .clone()
             .unwrap_or_else(PermissionRules::default);
-        let permission_gate = PermissionGate::with_auto_approve_and_policy(
+        let permission_gate = PermissionGate::with_permission_mode_and_policy(
             perm_rules,
-            auto_approve,
+            perm_mode,
             interactive,
             Some(path_policy.clone()),
         );
@@ -359,8 +379,7 @@ impl AppRuntime {
         } else if matches!(
             cli.mode,
             crate::cli::RunMode::Interactive | crate::cli::RunMode::Acp
-        ) && cli.print.is_none()
-        {
+        ) {
             // Interactive TUI and ACP both get a durable session by default
             // (ACP `session/load` / `session/list` need real session files).
             Some(SessionManager::create(&cwd).await?)

@@ -130,11 +130,8 @@ impl SpawnReply {
 
     fn rejected(message: impl Into<String>) -> Self {
         let msg = message.into();
-        let mut rr = RunResult::failure(
-            ProtocolError::new(error_code::SPAWN_NOT_ALLOWED, msg),
-            0,
-        )
-        .with_status(TaskExitStatus::RuntimeError);
+        let mut rr = RunResult::failure(ProtocolError::new(error_code::SPAWN_NOT_ALLOWED, msg), 0)
+            .with_status(TaskExitStatus::RuntimeError);
         rr.stop_reason = Some("admission_rejected".into());
         Self {
             job_id: String::new(),
@@ -225,7 +222,13 @@ impl SubagentCoordinator {
             Ok(tx) => tx,
             Err(e) => return SpawnReply::rejected(e),
         };
-        if tx.send(Event::Spawn { spec, reply: reply_tx }).is_err() {
+        if tx
+            .send(Event::Spawn {
+                spec,
+                reply: reply_tx,
+            })
+            .is_err()
+        {
             return SpawnReply::rejected("subagent coordinator is shut down");
         }
         reply_rx
@@ -235,7 +238,10 @@ impl SubagentCoordinator {
 
     pub fn resize(&self, max_concurrent: usize) {
         let max_concurrent = max_concurrent.max(1);
-        self.config.lock().expect("coordinator config").max_concurrent = max_concurrent;
+        self.config
+            .lock()
+            .expect("coordinator config")
+            .max_concurrent = max_concurrent;
         if let Ok(tx) = self.sender() {
             let _ = tx.send(Event::Resize { max_concurrent });
         }
@@ -474,9 +480,7 @@ mod tests {
     use super::*;
     use crate::protocol::AgentSpec;
     use async_trait::async_trait;
-    use one_core::agent::{
-        CompletionRequest, CompletionResponse, LlmProvider, TokenUsage,
-    };
+    use one_core::agent::{CompletionRequest, CompletionResponse, LlmProvider, TokenUsage};
     use one_core::error::Result as CoreResult;
     use one_core::message::{ContentBlock, StopReason};
     use tokio::sync::Notify;
@@ -533,7 +537,11 @@ mod tests {
         }
     }
 
-    fn coord(max: usize, budget_ms: u64, behavior: LimitBehavior) -> (Arc<SubagentCoordinator>, Arc<AgentJobRegistry>) {
+    fn coord(
+        max: usize,
+        budget_ms: u64,
+        behavior: LimitBehavior,
+    ) -> (Arc<SubagentCoordinator>, Arc<AgentJobRegistry>) {
         let jobs = AgentJobRegistry::new(Arc::new(std::sync::Mutex::new(Vec::new())));
         let c = SubagentCoordinator::new(
             jobs.clone(),
@@ -562,7 +570,10 @@ mod tests {
         released.notified().await;
 
         let second = c.spawn(spec("second", true, p2)).await;
-        assert_eq!(second.queued, true, "second must park, not block the caller");
+        assert_eq!(
+            second.queued, true,
+            "second must park, not block the caller"
+        );
         assert_eq!(second.backgrounded, false);
         assert_eq!(jobs.get(&second.job_id).unwrap().state, JobState::Queued);
 
@@ -639,7 +650,11 @@ mod tests {
         let second = c
             .spawn(spec("nope", true, Arc::new(one_ai::MockProvider::new())))
             .await;
-        assert!(second.rejected, "expected reject, got job={}", second.job_id);
+        assert!(
+            second.rejected,
+            "expected reject, got job={}",
+            second.job_id
+        );
         hold.notify_one();
         let _ = jobs.wait_until_done(&first.job_id).await;
     }

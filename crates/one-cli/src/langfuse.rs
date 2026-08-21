@@ -571,10 +571,6 @@ impl LangfuseTraceSink {
                 }
                 if let Some(preview) = input_preview {
                     attrs.push(KeyValue::new("langfuse.observation.input", preview.clone()));
-                    // Trace-level input only for top-level runs (not nested subagents).
-                    if self.parent_for_root.is_none() {
-                        attrs.push(KeyValue::new("langfuse.trace.input", preview.clone()));
-                    }
                 }
                 attrs = Self::with_propagated(&state, attrs);
 
@@ -652,10 +648,6 @@ impl LangfuseTraceSink {
                             .unwrap_or_else(|| json!({"status": status_str}).to_string())
                     };
                     span.set_attribute(KeyValue::new("langfuse.observation.output", output));
-                    // Also set trace-level output for the whole run.
-                    if let Some(preview) = final_text_preview {
-                        span.set_attribute(KeyValue::new("langfuse.trace.output", preview.clone()));
-                    }
                     match status {
                         TraceRunStatus::Ok => span.set_status(Status::Ok),
                         TraceRunStatus::Error => span.set_status(Status::error(

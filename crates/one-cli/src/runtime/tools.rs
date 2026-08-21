@@ -199,6 +199,43 @@ impl AppRuntime {
         agent.push_notification(text);
     }
 
+    /// Match user query against learned tool intents and inject JIT `<system-reminder>` if matched.
+    pub(crate) async fn inject_tool_intent_reminder(&mut self, query: &str) {
+        if self.mode == AgentMode::Plan {
+            return;
+        }
+        let hits =
+            one_resources::match_tool_intent_rules(&self.resources.agent_dir, &self.cwd, query, 3);
+        if hits.is_empty() {
+            return;
+        }
+
+        let mut reminder_text =
+            String::from("### Learned Tool Intent & Preferences (已学习的工具意图规则)\n");
+        reminder_text.push_str(
+            "\n这些是可选的工具调用建议，不是强制路由；以用户的明确要求、当前模式和安全权限策略为准。\n",
+        );
+        for hit in hits {
+            reminder_text.push_str(&format!(
+                "- **[{}]** confidence={:.2} score={} evidence={} · {}\n",
+                hit.entry.id,
+                hit.confidence,
+                hit.score,
+                hit.evidence.join(", "),
+                hit.entry.description
+            ));
+            if let Some(body) = hit.body_excerpt {
+                reminder_text.push_str(&format!("  可参考策略: {}\n", body.trim()));
+            }
+        }
+        reminder_text
+            .push_str("\n若建议与用户显式指令冲突，不要调用推荐工具；必要时先解释或澄清。");
+
+        let text = one_core::system_reminder(reminder_text);
+        let agent = self.agent.lock().await;
+        agent.push_notification(text);
+    }
+
     /// Preview resolved main tool names (for status / debug).
     pub fn main_tool_names_preview(&self) -> Vec<String> {
         let spec = self.effective_main_tools_spec();

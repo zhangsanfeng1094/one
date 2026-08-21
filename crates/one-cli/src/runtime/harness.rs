@@ -13,7 +13,7 @@ use one_tools::{ExportedReadGrants, PathPolicy};
 use super::tool_materialize::{
     harness_build_context, harness_registry, materialize_tools, resolve_names,
 };
-use crate::approval::{ApprovalMode, PermissionGate};
+use crate::approval::{PermissionGate, PermissionMode};
 use crate::protocol::{
     error_code, AgentRunEcho, AgentSpec, MemoryResourceMode, RunParent, RunRequest, RunResult,
     SessionMode, TaskExitStatus, UsageSnapshot,
@@ -200,9 +200,14 @@ pub async fn run_with_control(
 
     // Fail-closed permissions for non-interactive harness (subagent / agent run).
     // Map permission_mode when present; else fall back to opts.auto_approve.
-    let gate = PermissionGate::new(
+    let harness_cwd = resolve_cwd(&req.agent, &effective_opts);
+    let harness_policy = build_policy(&harness_cwd, &effective_opts, &req.agent);
+    let perm_mode = resolve_permission_mode(&req.agent, effective_opts.auto_approve);
+    let gate = PermissionGate::with_permission_mode_and_policy(
         one_tools::PermissionRules::default(),
-        resolve_approval_mode(&req.agent, effective_opts.auto_approve),
+        perm_mode,
+        false,
+        Some(harness_policy),
     );
     agent.set_tool_gate(Some(gate));
 
@@ -476,24 +481,16 @@ fn resolve_thinking(spec: &AgentSpec) -> ThinkingLevel {
     ThinkingLevel::Off
 }
 
-fn resolve_approval_mode(spec: &AgentSpec, auto_approve: bool) -> ApprovalMode {
-    match spec.permission_mode.as_deref() {
-        Some("bypass") | Some("accept_edits") => ApprovalMode::Auto,
-        Some("dont_ask") | Some("plan") => ApprovalMode::FailClosed,
-        Some("default") => {
-            if auto_approve {
-                ApprovalMode::Auto
-            } else {
-                ApprovalMode::FailClosed
-            }
+fn resolve_permission_mode(spec: &AgentSpec, auto_approve: bool) -> PermissionMode {
+    if let Some(pm) = &spec.permission_mode {
+        if let Some(parsed) = PermissionMode::parse(pm) {
+            return parsed;
         }
-        _ => {
-            if auto_approve {
-                ApprovalMode::Auto
-            } else {
-                ApprovalMode::FailClosed
-            }
-        }
+    }
+    if auto_approve {
+        PermissionMode::BypassPermissions
+    } else {
+        PermissionMode::Default
     }
 }
 

@@ -133,12 +133,10 @@ impl OneAcpAgent {
 
     fn mode_state(current: AgentMode) -> SessionModeState {
         let modes = vec![
-            SessionMode::new(SessionModeId::new("act"), "Act").description(
-                "Full coding tools: read, edit, bash, MCP, subagents.",
-            ),
-            SessionMode::new(SessionModeId::new("plan"), "Plan").description(
-                "Read-only exploration + plan file; no code edits until Act.",
-            ),
+            SessionMode::new(SessionModeId::new("act"), "Act")
+                .description("Full coding tools: read, edit, bash, MCP, subagents."),
+            SessionMode::new(SessionModeId::new("plan"), "Plan")
+                .description("Read-only exploration + plan file; no code edits until Act."),
         ];
         let id = match current {
             AgentMode::Act => SessionModeId::new("act"),
@@ -253,10 +251,11 @@ impl OneAcpAgent {
                                 name,
                                 arguments,
                             } => {
-                                let call = AcpToolCall::new(ToolCallId::new(id.as_str()), name.clone())
-                                    .kind(tool_kind(name))
-                                    .status(ToolCallStatus::Completed)
-                                    .raw_input(arguments.clone());
+                                let call =
+                                    AcpToolCall::new(ToolCallId::new(id.as_str()), name.clone())
+                                        .kind(tool_kind(name))
+                                        .status(ToolCallStatus::Completed)
+                                        .raw_input(arguments.clone());
                                 self.notify(session_id, SessionUpdate::ToolCall(call)).await;
                             }
                             _ => {}
@@ -300,11 +299,7 @@ impl AcpAgentTrait for OneAcpAgent {
 
         let caps = AgentCapabilities::new()
             .load_session(true)
-            .prompt_capabilities(
-                PromptCapabilities::new()
-                    .image(true)
-                    .embedded_context(true),
-            )
+            .prompt_capabilities(PromptCapabilities::new().image(true).embedded_context(true))
             .mcp_capabilities(McpCapabilities::default())
             .session_capabilities(session_caps);
 
@@ -474,8 +469,7 @@ impl AcpAgentTrait for OneAcpAgent {
         let model_id = args.model_id.0.to_string();
         let mut cli = self.cli.lock().expect("cli").clone();
         cli.model = Some(model_id);
-        let set = ProviderSet::build(&cli)
-            .map_err(|e| err_params(format!("model switch: {e}")))?;
+        let set = ProviderSet::build(&cli).map_err(|e| err_params(format!("model switch: {e}")))?;
         {
             let mut rt = handle.runtime.lock().await;
             rt.set_context_window(set.context_window());
@@ -768,8 +762,7 @@ async fn build_session_components(
     cli: Cli,
     cwd: PathBuf,
 ) -> Result<(SessionId, Arc<SessionHandle>), String> {
-    let mut providers =
-        ProviderSet::build(&cli).map_err(|e| format!("provider: {e}"))?;
+    let mut providers = ProviderSet::build(&cli).map_err(|e| format!("provider: {e}"))?;
     let mut runtime = AppRuntime::build(&cli)
         .await
         .map_err(|e| format!("runtime: {e}"))?;
@@ -1035,10 +1028,14 @@ fn truncate_output(output: &ToolOutput) -> String {
     if text.len() <= MAX {
         text.to_string()
     } else {
+        let mut end = MAX;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
         format!(
             "{}…\n\n[truncated {} bytes]",
-            &text[..MAX],
-            text.len().saturating_sub(MAX)
+            &text[..end],
+            text.len().saturating_sub(end)
         )
     }
 }
