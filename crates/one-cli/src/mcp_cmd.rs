@@ -31,7 +31,7 @@ pub enum McpAction {
         /// Server name (letters, numbers, `_`, `-`)
         name: String,
         /// Transport kind
-        #[arg(long, value_enum, default_value_t = McpTransport::Stdio)]
+        #[arg(short = 't', long, value_enum, default_value_t = McpTransport::Stdio)]
         transport: McpTransport,
         /// HTTP URL (when --transport http)
         #[arg(long)]
@@ -39,10 +39,10 @@ pub enum McpAction {
         /// Env KEY=VALUE (repeatable, stdio)
         #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
         env: Vec<String>,
-        /// Header KEY=VALUE (repeatable, http)
-        #[arg(long = "header", value_name = "KEY=VALUE")]
+        /// Header KEY=VALUE or KEY: VALUE (repeatable, http)
+        #[arg(short = 'H', long = "header", value_name = "HEADER")]
         headers: Vec<String>,
-        /// Command and args after `--` for stdio
+        /// Command and args after `--` for stdio, or URL for http
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
     },
@@ -117,7 +117,7 @@ async fn cmd_import(
             ConfigSourceKind::parse(s)
                 .filter(|k| k.is_foreign())
                 .ok_or_else(|| {
-                    format!("unknown source `{s}` (use: codex, claude, cursor, mcp.json)")
+                    format!("unknown source `{s}` (use: grok, codex, claude, cursor, mcp.json)")
                 })?,
         ),
     };
@@ -263,7 +263,7 @@ async fn cmd_list(cwd: &std::path::Path, as_json: bool) -> Result<(), Box<dyn st
 
 async fn cmd_add(
     name: String,
-    transport: McpTransport,
+    mut transport: McpTransport,
     url: Option<String>,
     env: Vec<String>,
     headers: Vec<String>,
@@ -271,6 +271,20 @@ async fn cmd_add(
 ) -> Result<(), Box<dyn std::error::Error>> {
     validate_name(&name)?;
     let mut cfg = load_user_or_empty()?;
+
+    // Resolve URL from --url or positional argument
+    let resolved_url = if let Some(u) = url {
+        Some(u)
+    } else if matches!(transport, McpTransport::Http) && !command.is_empty() {
+        Some(command.join(" "))
+    } else if command.len() == 1
+        && (command[0].starts_with("http://") || command[0].starts_with("https://"))
+    {
+        transport = McpTransport::Http;
+        Some(command[0].clone())
+    } else {
+        None
+    };
 
     let server = match transport {
         McpTransport::Stdio => {
@@ -300,17 +314,17 @@ async fn cmd_add(
             }
         }
         McpTransport::Http => {
-            let url = url.ok_or("--url is required for --transport http")?;
+            let url_str = resolved_url.ok_or("URL is required for --transport http (e.g. one mcp add --transport http <NAME> <URL>)")?;
             let mut header_map = BTreeMap::new();
             for pair in headers {
-                let (k, v) = split_kv(&pair)?;
+                let (k, v) = split_header_kv(&pair)?;
                 header_map.insert(k, v);
             }
             McpServerConfig {
                 command: None,
                 args: vec![],
                 env: BTreeMap::new(),
-                url: Some(url),
+                url: Some(url_str),
                 transport_type: None,
                 headers: header_map,
                 auth_token: None,
@@ -441,7 +455,21 @@ fn split_kv(pair: &str) -> Result<(String, String), Box<dyn std::error::Error>> 
         .split_once('=')
         .ok_or_else(|| format!("expected KEY=VALUE, got `{pair}`"))?;
     if k.is_empty() {
-        return Err("empty env/header key".into());
+        return Err("empty env key".into());
+    }
+    Ok((k.trim().to_string(), v.trim().to_string()))
+}
+
+fn split_header_kv(pair: &str) -> Result<(String, String), Box<dyn std::error::Error>> {
+    let (k, v) = if let Some((k, v)) = pair.split_once(':') {
+        (k.trim(), v.trim())
+    } else if let Some((k, v)) = pair.split_once('=') {
+        (k.trim(), v.trim())
+    } else {
+        return Err(format!("expected HEADER: VALUE or KEY=VALUE, got `{pair}`").into());
+    };
+    if k.is_empty() {
+        return Err("empty header key".into());
     }
     Ok((k.to_string(), v.to_string()))
 }

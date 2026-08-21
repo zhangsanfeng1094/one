@@ -35,6 +35,7 @@ pub enum ConfigSourceKind {
     OneProject,
     /// Contributed by a local plugin.json `mcpServers` block.
     Plugin,
+    Grok,
     Codex,
     Claude,
     Cursor,
@@ -47,6 +48,7 @@ impl ConfigSourceKind {
             Self::OneUser => "one-user",
             Self::OneProject => "one-project",
             Self::Plugin => "plugin",
+            Self::Grok => "grok",
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Cursor => "cursor",
@@ -57,7 +59,7 @@ impl ConfigSourceKind {
     pub fn is_foreign(self) -> bool {
         matches!(
             self,
-            Self::Codex | Self::Claude | Self::Cursor | Self::StandardMcpJson
+            Self::Grok | Self::Codex | Self::Claude | Self::Cursor | Self::StandardMcpJson
         )
     }
 
@@ -65,6 +67,7 @@ impl ConfigSourceKind {
         match s.trim().to_ascii_lowercase().as_str() {
             "one" | "one-user" | "user" => Some(Self::OneUser),
             "one-project" | "project" => Some(Self::OneProject),
+            "grok" => Some(Self::Grok),
             "codex" => Some(Self::Codex),
             "claude" => Some(Self::Claude),
             "cursor" => Some(Self::Cursor),
@@ -506,6 +509,47 @@ fn scan_foreign_layers(cwd: &Path) -> Vec<ForeignLayer> {
                     path: claude_path,
                     config,
                 });
+            }
+        }
+    }
+
+    // Grok
+    let grok_path = dirs_home().join(".grok").join("config.toml");
+    if grok_path.is_file() {
+        match load_codex_toml(&grok_path) {
+            Ok(config) if !config.mcp_servers.is_empty() => {
+                out.push(ForeignLayer {
+                    kind: ConfigSourceKind::Grok,
+                    path: grok_path,
+                    config,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    path = %grok_path.display(),
+                    error = %e,
+                    "grok MCP scan skipped"
+                );
+            }
+        }
+    }
+    for path in walk_chain_files(cwd, |dir| dir.join(".grok").join("config.toml")) {
+        match load_codex_toml(&path) {
+            Ok(config) if !config.mcp_servers.is_empty() => {
+                out.push(ForeignLayer {
+                    kind: ConfigSourceKind::Grok,
+                    path,
+                    config,
+                });
+            }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::debug!(
+                    path = %path.display(),
+                    error = %e,
+                    "grok project MCP scan skipped"
+                );
             }
         }
     }

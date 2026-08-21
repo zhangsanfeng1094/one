@@ -239,7 +239,7 @@ impl McpStatusFingerprint {
 fn render_full_mcp_reminder(snapshot: &McpStatusSnapshot) -> String {
     let mut out = String::new();
     if snapshot.ready > 0 {
-        out.push_str("Connected MCP servers:\n");
+        out.push_str("MCP servers connected:\n");
         for server in snapshot
             .servers
             .iter()
@@ -371,15 +371,19 @@ fn append_unavailable_servers(out: &mut String, snapshot: &McpStatusSnapshot) {
     if !out.is_empty() {
         out.push('\n');
     }
-    out.push_str("MCP servers that are not currently usable:\n");
+    out.push_str("MCP servers that failed to connect:\n");
     for server in unavailable {
-        let detail = server
-            .detail
-            .as_deref()
-            .filter(|d| !d.trim().is_empty())
-            .map(|d| format!(" — {d}"))
-            .unwrap_or_default();
-        out.push_str(&format!("- {}: {}{}\n", server.name, server.status, detail));
+        let label = match server.status {
+            "auth_required" => "auth required".to_string(),
+            "disabled" => "disabled".to_string(),
+            _ => server
+                .detail
+                .as_deref()
+                .filter(|d| !d.trim().is_empty())
+                .unwrap_or("unavailable")
+                .to_string(),
+        };
+        out.push_str(&format!("- {} ({})\n", server.name, label));
     }
 }
 
@@ -405,7 +409,7 @@ fn format_mcp_server_summary_line(server: &McpServerStatus) -> String {
 }
 
 fn mcp_runtime_usage_hint() -> &'static str {
-    "\nTo use MCP tools, you MUST call `search_tool` first to retrieve the tool's input schema before calling `use_tool`. NEVER guess parameter names — always use the exact schema returned by `search_tool`.\nMCP tool schemas and per-tool descriptions are not preloaded into this reminder; use `search_tool` for details and call MCP tools only through `use_tool` with the qualified `server__tool` name.\n"
+    "\nTo use MCP tools, you MUST call `search_tool` first to retrieve the tool's input schema before calling `use_tool`. NEVER guess parameter names — always use the exact schema returned by `search_tool`.\n"
 }
 
 #[cfg(test)]
@@ -486,7 +490,7 @@ mod reminder_tests {
             None,
         )]);
         let text = render_full_mcp_reminder(&snap);
-        assert!(text.contains("Connected MCP servers:"), "{text}");
+        assert!(text.contains("MCP servers connected:"), "{text}");
         assert!(
             text.contains("- deepwiki (3 tools): DeepWiki MCP provides"),
             "{text}"
@@ -497,6 +501,18 @@ mod reminder_tests {
         );
         assert!(text.contains("search_tool"), "{text}");
         assert!(text.contains("use_tool"), "{text}");
+    }
+
+    #[test]
+    fn full_reminder_formats_failed_and_auth_servers() {
+        let snap = snapshot(vec![
+            server("figma", "auth_required", 0, &[], None, Some("auth required")),
+            server("bad_server", "unavailable", 0, &[], None, Some("connection refused")),
+        ]);
+        let text = render_full_mcp_reminder(&snap);
+        assert!(text.contains("MCP servers that failed to connect:"), "{text}");
+        assert!(text.contains("- figma (auth required)"), "{text}");
+        assert!(text.contains("- bad_server (connection refused)"), "{text}");
     }
 
     #[test]

@@ -27,26 +27,26 @@ impl Tool for SearchTool {
         ToolDefinition {
             name: "search_tool".into(),
             description:
-                "Search for MCP integration tools by keyword and retrieve their input schemas.\n\n\
-                If status is \"partial\", some servers may still be connecting.\n\
-                Include the server name and action for best results (e.g. \"linear create issue\")."
+                "Search for MCP tools by keyword and retrieve their input schemas.\n\n\
+                If status is \"partial\", some servers may still be connecting."
                     .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Keywords to match against tool names, server names, and descriptions."
+                        "description": "Keywords to match against tool names, server names, and descriptions.\n\
+                        Include the server name and action for best results\n\
+                        (e.g. \"linear create issue\", \"slack read thread history\")."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of results to return (default 5, max 20).",
-                        "minimum": 1,
-                        "maximum": 20
+                        "description": "Maximum number of results to return (default 5).",
+                        "minimum": 0,
+                        "maximum": 255
                     }
                 },
-                "required": ["query"],
-                "additionalProperties": false
+                "required": ["query"]
             }),
         }
     }
@@ -212,26 +212,25 @@ impl Tool for UseTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "use_tool".into(),
-            description: "Call an MCP integration tool discovered via `search_tool`.\n\n\
-                The `tool_name` must be the qualified `server__tool` name (e.g. `linear__save_issue`).\n\
-                The `tool_input` must conform exactly to the input schema returned by `search_tool`.\n\
-                Do not use this for built-in tools (read, write, bash, …) — call those directly."
+            description: "Call an MCP integration tool.\n\n\
+                The `tool_name` must be the qualified `server__tool` name (e.g., `linear__save_issue`).\n\
+                The `tool_input` must conform exactly to the tool's input schema as returned by `search_tool`."
                 .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "tool_name": {
                         "type": "string",
-                        "description": "Qualified MCP tool name, e.g. linear__save_issue"
+                        "description": "The qualified name of the integration tool to call (e.g., \"linear__save_issue\").\n\
+                        Must be a tool previously discovered via `search_tool`."
                     },
                     "tool_input": {
                         "type": "object",
-                        "description": "Arguments object matching the tool's input_schema from search_tool",
-                        "additionalProperties": true
+                        "description": "The arguments to pass to the tool, as a JSON object.\n\
+                        Use the parameter schema returned by `search_tool` to construct this."
                     }
                 },
-                "required": ["tool_name", "tool_input"],
-                "additionalProperties": false
+                "required": ["tool_name", "tool_input"]
             }),
         }
     }
@@ -291,7 +290,7 @@ impl Tool for UseTool {
                 "use_tool",
                 format!(
                     "MCP tool `{tool_name}` not found. Call search_tool first with a keyword query \
-                     and use the exact tool_name from results. Catalog has {} tool(s).",
+                     and use the exact schema returned by search_tool. Available tool count: {}.",
                     self.catalog.tool_count()
                 ),
             ));
@@ -313,4 +312,80 @@ pub fn meta_tools(catalog: McpCatalog) -> Vec<Arc<dyn Tool>> {
         Arc::new(UseTool::new(catalog.clone())) as Arc<dyn Tool>,
         Arc::new(McpStatusTool::new(catalog)) as Arc<dyn Tool>,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::manager::McpManager;
+
+    #[tokio::test]
+    async fn search_tool_requires_query() {
+        let mgr = McpManager::empty();
+        let search = SearchTool::new(mgr.catalog());
+        let call = ToolCall {
+            id: "call-1".into(),
+            name: "search_tool".into(),
+            arguments: json!({}),
+        };
+        let err = search.execute(&call).await.unwrap_err();
+        assert!(err.to_string().contains("query"));
+    }
+
+    #[tokio::test]
+    async fn search_tool_returns_json_on_empty_catalog() {
+        let mgr = McpManager::empty();
+        let search = SearchTool::new(mgr.catalog());
+        let call = ToolCall {
+            id: "call-2".into(),
+            name: "search_tool".into(),
+            arguments: json!({ "query": "linear" }),
+        };
+        let out = search.execute(&call).await.unwrap();
+        let val: Value = serde_json::from_str(&out.as_text()).unwrap();
+        assert_eq!(val["status"], "ready");
+        assert_eq!(val["results"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn use_tool_rejects_unqualified_and_meta_names() {
+        let mgr = McpManager::empty();
+        let use_tool = UseTool::new(mgr.catalog());
+
+        // Bare name without '__'
+        let call_bare = ToolCall {
+            id: "call-3".into(),
+            name: "use_tool".into(),
+            arguments: json!({ "tool_name": "bash", "tool_input": {} }),
+        };
+        let err = use_tool.execute(&call_bare).await.unwrap_err();
+        assert!(err.to_string().contains("expected server__tool"));
+
+        // Meta tool name
+        let call_meta = ToolCall {
+            id: "call-4".into(),
+            name: "use_tool".into(),
+            arguments: json!({ "tool_name": "search_tool", "tool_input": {} }),
+        };
+        let err_meta = use_tool.execute(&call_meta).await.unwrap_err();
+        assert!(err_meta.to_string().contains("meta-tool"));
+    }
+
+    #[tokio::test]
+    async fn use_tool_handles_stringified_json_and_reports_missing() {
+        let mgr = McpManager::empty();
+        let use_tool = UseTool::new(mgr.catalog());
+
+        let call_missing = ToolCall {
+            id: "call-5".into(),
+            name: "use_tool".into(),
+            arguments: json!({
+                "tool_name": "linear__create_issue",
+                "tool_input": "{\"title\": \"Bug fix\"}"
+            }),
+        };
+        let err = use_tool.execute(&call_missing).await.unwrap_err();
+        assert!(err.to_string().contains("not found"));
+        assert!(err.to_string().contains("Call search_tool first"));
+    }
 }
