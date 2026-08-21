@@ -168,6 +168,8 @@ impl ProviderSet {
             list_models: false,
             list_providers: false,
             auto_approve: false,
+            always_approve: false,
+            permission_mode: None,
             share: false,
             no_mcp: false,
             no_skills: false,

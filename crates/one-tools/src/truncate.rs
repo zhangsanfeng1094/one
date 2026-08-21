@@ -897,7 +897,10 @@ mod tests {
     }
 
     /// Point spill root at a unique `/tmp` dir (writable under agent bwrap).
+    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn with_temp_spill_root<T>(f: impl FnOnce(&Path) -> T) -> T {
+        let _guard = TEST_LOCK.lock().unwrap();
         let root = std::env::temp_dir().join(format!(
             "one-spill-root-{}-{}",
             std::process::id(),

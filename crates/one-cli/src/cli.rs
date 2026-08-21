@@ -173,6 +173,14 @@ pub struct Cli {
     #[arg(short = 'y', long = "yes", global = true)]
     pub auto_approve: bool,
 
+    /// Auto-approve all tool executions without interactive permission prompts (alias: `--yolo`).
+    #[arg(long = "always-approve", alias = "yolo", global = true)]
+    pub always_approve: bool,
+
+    /// Permission mode: `default` (ask) | `acceptEdits` | `auto` | `dontAsk` | `bypassPermissions` (always-approve).
+    #[arg(long = "permission-mode", value_name = "MODE", global = true)]
+    pub permission_mode: Option<String>,
+
     /// Upload session export to GitHub Gist (requires GITHUB_TOKEN).
     #[arg(long)]
     pub share: bool,

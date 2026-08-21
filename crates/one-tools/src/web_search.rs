@@ -272,11 +272,19 @@ fn parse_ddg_html(html: &str, count: usize) -> Vec<(String, String, String)> {
             .find('>')
             .map(|i| &after_href[end_href + i + 1..]);
         let Some(title_src) = after_tag else {
-            rest = &rest[1..];
+            if let Some(ch) = rest.chars().next() {
+                rest = &rest[ch.len_utf8()..];
+            } else {
+                break;
+            }
             continue;
         };
         let Some(end_a) = title_src.find("</a>") else {
-            rest = &rest[1..];
+            if let Some(ch) = rest.chars().next() {
+                rest = &rest[ch.len_utf8()..];
+            } else {
+                break;
+            }
             continue;
         };
         let title = strip_tags(&title_src[..end_a]).trim().to_string();
@@ -285,11 +293,11 @@ fn parse_ddg_html(html: &str, count: usize) -> Vec<(String, String, String)> {
         let snippet = rest
             .find("result__snippet")
             .and_then(|s| {
-                let chunk = &rest[s..s.saturating_add(800).min(rest.len())];
-                let start = chunk.find('>')? + 1;
-                let end = chunk.find("</")?;
-                if end > start {
-                    Some(strip_tags(&chunk[start..end]).trim().to_string())
+                let after = &rest[s..];
+                let start = after.find('>')? + 1;
+                let end = after[start..].find("</")?;
+                if end > 0 {
+                    Some(strip_tags(&after[start..start + end]).trim().to_string())
                 } else {
                     None
                 }
@@ -299,7 +307,7 @@ fn parse_ddg_html(html: &str, count: usize) -> Vec<(String, String, String)> {
         if !title.is_empty() && link.starts_with("http") {
             results.push((title, link, snippet));
         }
-        rest = &rest[10.min(rest.len())..];
+        rest = &title_src[end_a + 4..];
     }
     results
 }

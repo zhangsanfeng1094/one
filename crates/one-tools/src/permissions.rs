@@ -22,6 +22,67 @@ pub enum PermissionVerdict {
     },
 }
 
+/// Standardized permission modes aligned with Grok Build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum PermissionMode {
+    /// Interactive / default: Read-only safe tools run without asking; file write / bash require approval.
+    #[default]
+    #[serde(alias = "default", alias = "ask", alias = "Ask")]
+    Default,
+    /// Automatically accept file edits (write / edit), but bash / dangerous ops still prompt.
+    #[serde(alias = "acceptEdits", alias = "accept_edits", alias = "AcceptEdits")]
+    AcceptEdits,
+    /// Auto classifier: Routine safe operations proceed without prompt; risky operations prompt.
+    #[serde(alias = "auto", alias = "Auto")]
+    Auto,
+    /// Non-interactive strict CI: only allow-listed and built-in safe tools proceed; any Ask fails closed.
+    #[serde(alias = "dontAsk", alias = "dont_ask", alias = "DontAsk")]
+    DontAsk,
+    /// Always-approve (YOLO): tools proceed automatically without interactive prompts. Deny rules still block.
+    #[serde(alias = "bypassPermissions", alias = "bypass_permissions", alias = "always-approve", alias = "always_approve", alias = "yolo", alias = "BypassPermissions")]
+    BypassPermissions,
+}
+
+impl PermissionMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "acceptEdits",
+            Self::Auto => "auto",
+            Self::DontAsk => "dontAsk",
+            Self::BypassPermissions => "bypassPermissions",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Default => "Ask",
+            Self::AcceptEdits => "AcceptEdits",
+            Self::Auto => "Auto",
+            Self::DontAsk => "DontAsk",
+            Self::BypassPermissions => "Always-Approve",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().replace('_', "-").as_str() {
+            "default" | "ask" => Some(Self::Default),
+            "acceptedits" | "accept-edits" => Some(Self::AcceptEdits),
+            "auto" => Some(Self::Auto),
+            "dontask" | "dont-ask" => Some(Self::DontAsk),
+            "bypasspermissions" | "bypass-permissions" | "always-approve" | "alwaysapprove" | "yolo" => {
+                Some(Self::BypassPermissions)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn is_always_approve(self) -> bool {
+        matches!(self, Self::BypassPermissions)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RuleAction {
@@ -412,6 +473,33 @@ pub fn call_summary(call: &ToolCall) -> String {
     }
 }
 
+/// Routine commands safe to auto-approve in Auto mode.
+pub fn is_auto_mode_safe_command(command: &str) -> bool {
+    let cmd = command.trim();
+    if cmd.is_empty() {
+        return true;
+    }
+    if cmd.contains(';') || cmd.contains("&&") || cmd.contains("||") || cmd.contains('|') || cmd.contains('`') || cmd.contains("$(") {
+        return false;
+    }
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    if tokens.is_empty() {
+        return true;
+    }
+    let head = tokens[0];
+    let second = tokens.get(1).copied().unwrap_or("");
+
+    match head {
+        "git" => matches!(second, "status" | "diff" | "log" | "show" | "branch" | "rev-parse" | "describe" | "tag" | "grep" | "remote"),
+        "cargo" => matches!(second, "check" | "test" | "build" | "clippy" | "bench" | "fmt" | "doc" | "tree"),
+        "npm" | "pnpm" | "yarn" | "bun" => matches!(second, "test" | "run" | "build" | "lint" | "check" | "list"),
+        "go" => matches!(second, "test" | "build" | "vet" | "fmt" | "list"),
+        "pytest" | "tree" | "ls" | "pwd" | "which" | "whereis" | "echo" | "cat" | "head" | "tail" | "wc" | "uname" | "stat" | "file" | "date" => true,
+        "python" | "python3" => second == "-m" || second == "--version" || second == "-V",
+        _ => false,
+    }
+}
+
 /// Evaluate configured rules + safe defaults.
 ///
 /// `auto_approve` skips **soft** high-risk bash asks (`sudo`, plain `git push`, …)
@@ -424,7 +512,20 @@ pub fn evaluate(
     rules: &[PermissionRule],
     auto_approve: bool,
 ) -> PermissionVerdict {
-    // Separate by action while preserving config order within each class.
+    let mode = if auto_approve {
+        PermissionMode::BypassPermissions
+    } else {
+        PermissionMode::Default
+    };
+    evaluate_with_mode(call, rules, mode)
+}
+
+/// Evaluate rules and safe defaults under a specific [`PermissionMode`].
+pub fn evaluate_with_mode(
+    call: &ToolCall,
+    rules: &[PermissionRule],
+    mode: PermissionMode,
+) -> PermissionVerdict {
     let mut denials = Vec::new();
     let mut asks = Vec::new();
     let mut allows = Vec::new();
@@ -436,6 +537,7 @@ pub fn evaluate(
         }
     }
 
+    // 1. Denials always win.
     for r in denials {
         if let Some(parsed) = ParsedRule::parse(&r.rule) {
             if parsed.matches(call) {
@@ -445,11 +547,25 @@ pub fn evaluate(
             }
         }
     }
+
+    // 2. Mode specific early shortcuts:
+    if mode == PermissionMode::AcceptEdits
+        && matches!(call.name.as_str(), "write" | "edit" | "memory_write")
+    {
+        return PermissionVerdict::Allow;
+    }
+
+    // 3. User Ask rules.
     for r in asks {
         if let Some(parsed) = ParsedRule::parse(&r.rule) {
             if parsed.matches(call) {
-                if auto_approve {
+                if mode.is_always_approve() {
                     return PermissionVerdict::Allow;
+                }
+                if mode == PermissionMode::DontAsk {
+                    return PermissionVerdict::Deny {
+                        reason: format!("dontAsk mode blocked rule `{}`", r.rule),
+                    };
                 }
                 return PermissionVerdict::Ask {
                     reason: format!("ask rule `{}`", r.rule),
@@ -457,6 +573,8 @@ pub fn evaluate(
             }
         }
     }
+
+    // 4. User Allow rules.
     for r in allows {
         if let Some(parsed) = ParsedRule::parse(&r.rule) {
             if parsed.matches(call) {
@@ -465,11 +583,20 @@ pub fn evaluate(
         }
     }
 
-    // Built-in defaults.
-    default_verdict(call, auto_approve)
+    // 5. Built-in defaults.
+    let verdict = default_verdict_with_mode(call, mode);
+    if mode == PermissionMode::DontAsk {
+        if let PermissionVerdict::Ask { reason } = verdict {
+            return PermissionVerdict::Deny {
+                reason: format!("dontAsk mode blocked: {reason}"),
+            };
+        }
+    }
+    verdict
 }
 
-fn default_verdict(call: &ToolCall, auto_approve: bool) -> PermissionVerdict {
+fn default_verdict_with_mode(call: &ToolCall, mode: PermissionMode) -> PermissionVerdict {
+    let auto_approve = mode.is_always_approve();
     match call.name.as_str() {
         "read" | "grep" | "find" | "ls" | "bash_output" | "bash_kill" | "web_search"
         | "web_fetch" | "exit_plan_mode" | "memory_search" | "todo_write" => {
@@ -506,6 +633,10 @@ fn default_verdict(call: &ToolCall, auto_approve: bool) -> PermissionVerdict {
                 return PermissionVerdict::Ask {
                     reason: format!("sandbox escalation: {just}"),
                 };
+            }
+
+            if mode == PermissionMode::Auto && is_auto_mode_safe_command(command) {
+                return PermissionVerdict::Allow;
             }
 
             if !auto_approve {
@@ -607,6 +738,67 @@ mod tests {
     fn default_blocks_rm_root() {
         let v = evaluate(&bash("rm -rf /"), &[], true);
         assert!(matches!(v, PermissionVerdict::Deny { .. }), "{v:?}");
+    }
+
+    #[test]
+    fn permission_modes_evaluation() {
+        let rules = vec![
+            PermissionRule::parse(RuleAction::Deny, "Bash(rm -rf /critical*)").unwrap(),
+            PermissionRule::parse(RuleAction::Ask, "Write(**/.secret*)").unwrap(),
+        ];
+
+        // 1. BypassPermissions (Always-Approve)
+        assert_eq!(
+            evaluate_with_mode(&bash("cargo check"), &rules, PermissionMode::BypassPermissions),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            evaluate_with_mode(&bash("sudo apt update"), &rules, PermissionMode::BypassPermissions),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            evaluate_with_mode(&write("app/.secret.json"), &rules, PermissionMode::BypassPermissions),
+            PermissionVerdict::Allow
+        );
+        // Deny still denies in BypassPermissions
+        assert!(matches!(
+            evaluate_with_mode(&bash("rm -rf /critical"), &rules, PermissionMode::BypassPermissions),
+            PermissionVerdict::Deny { .. }
+        ));
+
+        // 2. AcceptEdits
+        assert_eq!(
+            evaluate_with_mode(&write("src/main.rs"), &rules, PermissionMode::AcceptEdits),
+            PermissionVerdict::Allow
+        );
+        assert!(matches!(
+            evaluate_with_mode(&bash("sudo apt update"), &rules, PermissionMode::AcceptEdits),
+            PermissionVerdict::Ask { .. }
+        ));
+
+        // 3. Auto
+        assert_eq!(
+            evaluate_with_mode(&bash("cargo check"), &rules, PermissionMode::Auto),
+            PermissionVerdict::Allow
+        );
+        assert_eq!(
+            evaluate_with_mode(&bash("git status"), &rules, PermissionMode::Auto),
+            PermissionVerdict::Allow
+        );
+        assert!(matches!(
+            evaluate_with_mode(&bash("sudo apt update"), &rules, PermissionMode::Auto),
+            PermissionVerdict::Ask { .. }
+        ));
+
+        // 4. DontAsk
+        assert_eq!(
+            evaluate_with_mode(&bash("cargo check"), &[], PermissionMode::DontAsk),
+            PermissionVerdict::Allow
+        );
+        assert!(matches!(
+            evaluate_with_mode(&bash("sudo apt update"), &rules, PermissionMode::DontAsk),
+            PermissionVerdict::Deny { .. }
+        ));
     }
 
     #[test]

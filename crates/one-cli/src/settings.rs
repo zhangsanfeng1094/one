@@ -217,6 +217,14 @@ pub struct Settings {
     pub thinking: Option<String>,
     /// Skip bash danger prompts.
     pub auto_approve: Option<bool>,
+    /// Standardized permission mode: default / ask, acceptEdits, auto, dontAsk, bypassPermissions (always-approve).
+    #[serde(
+        default,
+        rename = "permissionMode",
+        alias = "permission_mode",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub permission_mode: Option<String>,
     /// Optional context window override for footer %.
     pub context_window: Option<usize>,
     /// Path sandbox: `workspace-write` (default) | `full-access`.
@@ -461,6 +469,13 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
         "auto_approve" | "auto-approve" | "yes" => {
             let v = value.trim().to_ascii_lowercase();
             settings.auto_approve = Some(matches!(v.as_str(), "1" | "true" | "yes" | "on"));
+        }
+        "permission_mode" | "permission-mode" | "permissionmode" | "permissions_mode" => {
+            if let Some(m) = one_tools::PermissionMode::parse(value) {
+                settings.permission_mode = Some(m.as_str().to_string());
+            } else {
+                return Err("permission_mode must be default|acceptEdits|auto|dontAsk|bypassPermissions".into());
+            }
         }
         "context_window" | "context-window" | "context" => {
             let n: usize = value
@@ -814,6 +829,13 @@ pub fn rows(settings: &Settings) -> Vec<(String, String)> {
                 .into(),
         ),
         (
+            "permission_mode".into(),
+            settings
+                .permission_mode
+                .clone()
+                .unwrap_or_else(|| "default (ask)".into()),
+        ),
+        (
             "context_window".into(),
             settings
                 .context_window
@@ -915,12 +937,25 @@ mod tests {
     }
 
     #[test]
+    fn set_key_permission_mode() {
+        let mut s = Settings::default();
+        set_key(&mut s, "permission_mode", "always-approve").unwrap();
+        assert_eq!(s.permission_mode.as_deref(), Some("bypassPermissions"));
+        set_key(&mut s, "permission_mode", "auto").unwrap();
+        assert_eq!(s.permission_mode.as_deref(), Some("auto"));
+        set_key(&mut s, "permission_mode", "acceptEdits").unwrap();
+        assert_eq!(s.permission_mode.as_deref(), Some("acceptEdits"));
+        assert!(set_key(&mut s, "permission_mode", "invalid-mode").is_err());
+    }
+
+    #[test]
     fn roundtrip_json() {
         let s = Settings {
             provider: Some("deepseek".into()),
             model: Some("deepseek-chat".into()),
             thinking: Some("low".into()),
             auto_approve: Some(true),
+            permission_mode: Some("bypassPermissions".into()),
             context_window: Some(128_000),
             sandbox: Some("workspace-write".into()),
             additional_directories: Some(vec!["/tmp/extra".into()]),

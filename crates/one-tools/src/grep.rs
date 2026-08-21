@@ -606,9 +606,9 @@ fn display_path(path: &Path, cwd: &Path) -> String {
 }
 
 fn byte_to_line_idx(content: &str, byte_offset: usize) -> usize {
-    content[..byte_offset.min(content.len())]
-        .bytes()
-        .filter(|&b| b == b'\n')
+    content.as_bytes()[..byte_offset.min(content.len())]
+        .iter()
+        .filter(|&&b| b == b'\n')
         .count()
 }
 

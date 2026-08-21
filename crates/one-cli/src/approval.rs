@@ -15,10 +15,12 @@ use async_trait::async_trait;
 use one_core::tool::ToolCall;
 use one_core::tool_gate::{ToolGate, ToolGateDecision};
 use one_tools::{
-    bash_command, call_fingerprint, call_summary, command_matches_prefix, evaluate_permissions,
+    bash_command, call_fingerprint, call_summary, command_matches_prefix, evaluate_with_mode,
     requires_escalation, suggested_command_prefix, tool_args::path_arg, AccessKind, PathPolicy,
     PermissionRule, PermissionRules, PermissionVerdict,
 };
+
+pub use one_tools::PermissionMode;
 use tokio::sync::oneshot;
 
 static REQ_SEQ: AtomicU64 = AtomicU64::new(1);
@@ -97,6 +99,7 @@ struct Pending {
 pub struct PermissionGate {
     rules: Vec<PermissionRule>,
     mode: Mutex<ApprovalMode>,
+    permission_mode: Mutex<PermissionMode>,
     /// Set by ApprovalChoice::Always for the rest of the process.
     session_auto: AtomicBool,
     /// TUI (or other) can poll [`Self::poll_request`] and answer.
@@ -130,9 +133,15 @@ impl PermissionGate {
         path_policy: Option<PathPolicy>,
         interactive: bool,
     ) -> Arc<Self> {
+        let perm_mode = if matches!(mode, ApprovalMode::Auto) {
+            PermissionMode::BypassPermissions
+        } else {
+            PermissionMode::Default
+        };
         Arc::new(Self {
             rules: rules.compiled(),
             mode: Mutex::new(mode),
+            permission_mode: Mutex::new(perm_mode),
             session_auto: AtomicBool::new(matches!(mode, ApprovalMode::Auto)),
             interactive,
             session_allows: Mutex::new(HashSet::new()),
@@ -162,6 +171,24 @@ impl PermissionGate {
         Self::new_with_policy_interactive(rules, mode, path_policy, interactive)
     }
 
+    pub fn with_permission_mode_and_policy(
+        rules: PermissionRules,
+        perm_mode: PermissionMode,
+        interactive: bool,
+        path_policy: Option<PathPolicy>,
+    ) -> Arc<Self> {
+        let app_mode = if perm_mode.is_always_approve() {
+            ApprovalMode::Auto
+        } else if interactive {
+            ApprovalMode::Interactive
+        } else {
+            ApprovalMode::FailClosed
+        };
+        let gate = Self::new_with_policy_interactive(rules, app_mode, path_policy, interactive);
+        *gate.permission_mode.lock().expect("permission mode") = perm_mode;
+        gate
+    }
+
     /// Shared policy handle (for wiring asserts / tests).
     pub fn path_policy(&self) -> Option<&PathPolicy> {
         self.path_policy.as_ref()
@@ -171,6 +198,51 @@ impl PermissionGate {
         *self.mode.lock().expect("mode lock")
     }
 
+    pub fn permission_mode(&self) -> PermissionMode {
+        *self.permission_mode.lock().expect("permission mode lock")
+    }
+
+    pub fn set_permission_mode(&self, mode: PermissionMode) -> Result<(), String> {
+        if mode.is_always_approve() {
+            crate::governance::check_bypass_permissions_allowed()?;
+        }
+        *self.permission_mode.lock().expect("permission mode lock") = mode;
+        if mode.is_always_approve() {
+            self.session_auto.store(true, Ordering::Relaxed);
+            *self.mode.lock().expect("mode lock") = ApprovalMode::Auto;
+        } else {
+            self.session_auto.store(false, Ordering::Relaxed);
+            if self.interactive {
+                *self.mode.lock().expect("mode lock") = ApprovalMode::Interactive;
+            } else {
+                *self.mode.lock().expect("mode lock") = ApprovalMode::FailClosed;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn toggle_always_approve(&self) -> Result<PermissionMode, String> {
+        let current = self.permission_mode();
+        let next = if current.is_always_approve() || self.session_auto() {
+            PermissionMode::Default
+        } else {
+            PermissionMode::BypassPermissions
+        };
+        self.set_permission_mode(next)?;
+        Ok(next)
+    }
+
+    pub fn toggle_auto(&self) -> Result<PermissionMode, String> {
+        let current = self.permission_mode();
+        let next = if current == PermissionMode::Auto {
+            PermissionMode::Default
+        } else {
+            PermissionMode::Auto
+        };
+        self.set_permission_mode(next)?;
+        Ok(next)
+    }
+
     /// True when Always-approve was chosen (or started in Auto).
     pub fn session_auto(&self) -> bool {
         self.session_auto.load(Ordering::Relaxed)
@@ -178,8 +250,7 @@ impl PermissionGate {
 
     /// Enable process-wide auto-approve (permission option / Ctrl+O).
     pub fn enable_session_auto(&self) {
-        self.session_auto.store(true, Ordering::Relaxed);
-        *self.mode.lock().expect("mode lock") = ApprovalMode::Auto;
+        let _ = self.set_permission_mode(PermissionMode::BypassPermissions);
     }
 
     /// Non-blocking poll for a pending interactive approval (TUI).
@@ -407,17 +478,29 @@ impl ToolGate for PermissionGate {
             == Some("1");
 
         let mode = self.mode();
-        let auto = env_auto || self.session_auto() || matches!(mode, ApprovalMode::Auto);
-        let perm = evaluate_permissions(call, &self.rules, auto);
+        let perm_mode = self.permission_mode();
+        let auto = env_auto
+            || self.session_auto()
+            || matches!(mode, ApprovalMode::Auto)
+            || perm_mode.is_always_approve();
+        let effective_mode = if auto {
+            PermissionMode::BypassPermissions
+        } else {
+            perm_mode
+        };
+        let perm = evaluate_with_mode(call, &self.rules, effective_mode);
         match perm {
             PermissionVerdict::Deny { reason } => {
                 return ToolGateDecision::Deny { message: reason };
             }
             PermissionVerdict::Ask { reason } => {
                 // Destructive shapes (git checkout/restore/reset, rm -r, …) always
-                // need a real confirmation. auto_approve / Always / -y must not
-                // silently allow them.
-                let force = one_tools::sandbox::is_destructive_ask_reason(&reason);
+                // need a real confirmation unless --full-access is explicitly enabled.
+                let is_full_access = self
+                    .path_policy
+                    .as_ref()
+                    .is_some_and(|p| p.is_full_access());
+                let force = one_tools::sandbox::is_destructive_ask_reason(&reason) && !is_full_access;
                 if auto && !force {
                     // Soft high-risk / ask-rule: auto_approve allows.
                 } else if force && !self.interactive {

@@ -50,8 +50,9 @@ pub use os_sandbox::OsSandbox;
 pub use path_policy::{AccessKind, DynamicGrants, ExportedReadGrants, PathPolicy, SandboxMode};
 pub use permissions::{
     bash_command, call_fingerprint, call_summary, command_matches_prefix,
-    evaluate as evaluate_permissions, suggested_command_prefix, suggested_command_prefix_from_cmd,
-    PermissionRule, PermissionRules, PermissionVerdict, RuleAction,
+    evaluate as evaluate_permissions, evaluate_with_mode, suggested_command_prefix,
+    suggested_command_prefix_from_cmd, PermissionMode, PermissionRule, PermissionRules,
+    PermissionVerdict, RuleAction,
 };
 pub use plan::{
     plan_mode_system_overlay, plan_mode_tools, plan_mode_tools_with_policy, ExitPlanModeTool,

@@ -406,6 +406,7 @@ fn default_skill_readable_roots() -> Vec<PathBuf> {
         agent.clone(),
         agent.join("skills"),
         agent.join("builtin-skills"),
+        home.join(".one").join("docs"),
         // Cross-client shared install location (agentskills.io).
         home.join(".agents").join("skills"),
         // Client-native / compat harnesses (lower discovery precedence, still readable).
