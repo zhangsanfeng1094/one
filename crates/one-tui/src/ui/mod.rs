@@ -16,7 +16,7 @@ mod float_menu;
 mod prompt;
 mod status;
 mod subagent_frame;
-mod text;
+pub(crate) mod text;
 mod toast;
 
 #[cfg(test)]

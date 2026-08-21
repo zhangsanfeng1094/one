@@ -12,6 +12,7 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use crate::theme::Theme;
+use crate::ui::text::expand_tabs;
 
 /// Render markdown into display lines that fit `width` terminal columns.
 ///
@@ -557,7 +558,8 @@ impl Writer {
             ]));
         } else {
             for line in self.code_lines.drain(..) {
-                let shown = truncate_display(&line, inner_w);
+                let clean = expand_tabs(&line, 4);
+                let shown = truncate_display(&clean, inner_w);
                 let pad = inner_w.saturating_sub(display_width(&shown));
                 self.lines.push(Line::from(vec![
                     Span::raw(bq.clone()),

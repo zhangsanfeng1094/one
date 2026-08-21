@@ -44,9 +44,11 @@ impl super::App {
 
         // Docked select (model / field edit / ask) captures keys before float.
         if self.select.is_some() {
-            if matches!(self.select_kind, Some(crate::state::SelectKind::Approval { .. }))
-                && (matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
-                    && key.modifiers.contains(KeyModifiers::CONTROL))
+            if matches!(
+                self.select_kind,
+                Some(crate::state::SelectKind::Approval { .. })
+            ) && (matches!(key.code, KeyCode::Char('o') | KeyCode::Char('O'))
+                && key.modifiers.contains(KeyModifiers::CONTROL))
             {
                 let res = crate::select::SelectResult::Confirmed {
                     ids: vec!["always".to_string()],

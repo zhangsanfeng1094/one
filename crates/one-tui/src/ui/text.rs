@@ -69,6 +69,11 @@ pub(super) fn wrap_styled_segments(
     if width == 0 {
         return vec![segments.to_vec()];
     }
+    let clean_segments: Vec<(String, bool)> = segments
+        .iter()
+        .map(|(text, emp)| (expand_tabs(text, 4), *emp))
+        .collect();
+    let segments = &clean_segments;
     let mut rows: Vec<Vec<(String, bool)>> = Vec::new();
     let mut cur: Vec<(String, bool)> = Vec::new();
     let mut col = 0usize;
@@ -280,7 +285,8 @@ pub(super) fn wrap_str(text: &str, width: usize) -> Vec<String> {
     if width == 0 {
         return vec![text.to_string()];
     }
-    if text.is_empty() {
+    let clean = expand_tabs(text, 4);
+    if clean.is_empty() {
         return Vec::new();
     }
 
@@ -289,7 +295,7 @@ pub(super) fn wrap_str(text: &str, width: usize) -> Vec<String> {
     let mut cur_w = 0usize;
 
     // Prefer breaking on spaces when possible.
-    for word in text.split_inclusive(' ') {
+    for word in clean.split_inclusive(' ') {
         let ww = display_width(word);
         if cur_w > 0 && cur_w + ww > width {
             out.push(std::mem::take(&mut current));
@@ -318,6 +324,36 @@ pub(super) fn wrap_str(text: &str, width: usize) -> Vec<String> {
     if !current.is_empty() {
         // Trim trailing spaces from visual lines for cleaner look.
         out.push(current.trim_end().to_string());
+    }
+    out
+}
+
+/// Expand tabs `\t` into spaces according to tab stops (default 4 columns).
+/// Also strips `\r` so CRLF line endings never jump the hardware cursor to column 0.
+pub(crate) fn expand_tabs(s: &str, tab_size: usize) -> String {
+    if !s.contains('\t') && !s.contains('\r') {
+        return s.to_string();
+    }
+    let tab_size = tab_size.max(1);
+    let mut out = String::with_capacity(s.len() + 8);
+    let mut col = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let spaces = tab_size - (col % tab_size);
+            for _ in 0..spaces {
+                out.push(' ');
+            }
+            col += spaces;
+        } else if ch == '\r' {
+            // Drop bare CR to prevent cursor reset in terminal
+            continue;
+        } else if ch == '\n' {
+            out.push(ch);
+            col = 0;
+        } else {
+            out.push(ch);
+            col += char_width(ch);
+        }
     }
     out
 }

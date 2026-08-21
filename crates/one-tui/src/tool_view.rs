@@ -6,6 +6,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::message::{Message, MessageRole, ToolStatus};
+use crate::ui::text::expand_tabs;
 
 /// Max tools shown as a single collapsed “N tools” chip before forcing expand.
 pub const COLLAPSE_GROUP_MIN: usize = 3;
@@ -693,7 +694,7 @@ pub fn parse_ide_diff_rows(text: &str) -> Vec<IdeDiffRow> {
         }
 
         if line.starts_with('+') && !line.starts_with("+++") {
-            let text = line[1..].to_string();
+            let text = expand_tabs(&line[1..], 4);
             rows.push(IdeDiffRow {
                 kind: DiffLineKind::Add,
                 line_no: Some(new_ln),
@@ -702,7 +703,7 @@ pub fn parse_ide_diff_rows(text: &str) -> Vec<IdeDiffRow> {
             new_ln = new_ln.saturating_add(1);
             in_hunk = true;
         } else if line.starts_with('-') && !line.starts_with("---") {
-            let text = line[1..].to_string();
+            let text = expand_tabs(&line[1..], 4);
             rows.push(IdeDiffRow {
                 kind: DiffLineKind::Del,
                 line_no: Some(old_ln),
@@ -712,11 +713,12 @@ pub fn parse_ide_diff_rows(text: &str) -> Vec<IdeDiffRow> {
             in_hunk = true;
         } else if line.starts_with(' ') || (in_hunk && !line.is_empty() && !line.starts_with('@')) {
             // Context: leading space in unified diff, or bare context after a hunk.
-            let text = if line.starts_with(' ') {
-                line[1..].to_string()
+            let raw = if line.starts_with(' ') {
+                &line[1..]
             } else {
-                line.to_string()
+                line
             };
+            let text = expand_tabs(raw, 4);
             rows.push(IdeDiffRow {
                 kind: DiffLineKind::Context,
                 line_no: Some(old_ln),
@@ -1778,5 +1780,34 @@ Updated src/a.rs
         let formatted = better.unwrap();
         assert!(formatted.contains('\n'), "formatted={formatted}");
         assert!(formatted.contains("\"count\": 42"), "formatted={formatted}");
+    }
+
+    #[test]
+    fn ide_diff_rows_expands_tabs_and_strips_cr() {
+        let text = "\
+Updated parser/parser_test.go
+--- a/parser/parser_test.go
++++ b/parser/parser_test.go
+@@ -1740,3 +1740,3 @@
+ \tif indexExp.End != nil {\r
+-\t\ttestPrefixExpression(t, indexExp.Step, \"-\", 1)\r
++\t\tprefixExp, ok := indexExp.Step.(*ast.PrefixExpression)\r
+";
+        let rows = parse_ide_diff_rows(text);
+        assert_eq!(rows.len(), 3);
+        // Ensure tabs are expanded to 4 spaces per tab level
+        assert_eq!(rows[0].text, "    if indexExp.End != nil {");
+        assert_eq!(
+            rows[1].text,
+            "        testPrefixExpression(t, indexExp.Step, \"-\", 1)"
+        );
+        assert_eq!(
+            rows[2].text,
+            "        prefixExp, ok := indexExp.Step.(*ast.PrefixExpression)"
+        );
+        // Ensure carriage returns are eliminated
+        assert!(!rows[0].text.contains('\r'));
+        assert!(!rows[1].text.contains('\r'));
+        assert!(!rows[2].text.contains('\r'));
     }
 }

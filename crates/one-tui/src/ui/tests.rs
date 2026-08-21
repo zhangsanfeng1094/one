@@ -4,7 +4,7 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use crate::app::App;
-use crate::message::ChatLineTarget;
+use crate::message::{ChatLineTarget, Message, ToolStatus};
 use crate::tool_view;
 use crate::ui::draw;
 
@@ -1077,5 +1077,44 @@ fn tv4_frame_replaces_parent_chat() {
     assert!(
         !flat.contains("should-not-show"),
         "parent prompt must be hidden under TV4:\n{flat}"
+    );
+}
+
+#[test]
+fn tab_indented_diff_renders_clean_without_ghosting() {
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    let mut tool_msg = Message::tool(
+        "edit",
+        r#"{"path":"parser/parser_test.go"}"#,
+        ToolStatus::Done,
+    );
+    tool_msg.tool_output = Some(
+        "\
+Updated parser/parser_test.go
+--- a/parser/parser_test.go
++++ b/parser/parser_test.go
+@@ -1740,2 +1740,2 @@
+-\t\ttestPrefixExpression(t, indexExp.Step, \"-\", 1)
++\t\tprefixExp, ok := indexExp.Step.(*ast.PrefixExpression)
+"
+        .into(),
+    );
+    tool_msg.tool_expanded = true;
+    app.messages.push(tool_msg);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    // Verify that tabs were cleanly rendered as spaces, not raw tabs
+    assert!(!flat.contains('\t'), "buffer must not contain raw tabs");
+    assert!(
+        flat.contains("prefixExp, ok :="),
+        "diff row must be rendered"
     );
 }
