@@ -1030,11 +1030,16 @@ fn render_tool(
             if is_diff && status != ToolStatus::Error {
                 // Paint recovered args first (│ continues into the diff block).
                 for (text, style) in visual {
-                    lines.push(Line::from(vec![
+                    let mut spans = vec![
                         Span::raw(body_indent.to_string()),
                         Span::styled("│ ", rail_style),
-                        Span::styled(text, style),
-                    ]));
+                    ];
+                    if status != ToolStatus::Error && tool_view::is_json_line(&text) {
+                        spans.extend(tool_view::highlight_json_line(&text));
+                    } else {
+                        spans.push(Span::styled(text, style));
+                    }
+                    lines.push(Line::from(spans));
                 }
                 let mut diff_lines = render_ide_diff(output, wrap_width.saturating_sub(nest));
                 // Prefix group spine so diffs stay nested under the parent tool.
@@ -1092,11 +1097,16 @@ fn render_tool(
             let last = visual.len().saturating_sub(1);
             for (i, (text, style)) in visual.into_iter().enumerate() {
                 let branch = if i == last { "└ " } else { "│ " };
-                lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::raw(body_indent.to_string()),
                     Span::styled(branch, rail_style),
-                    Span::styled(text, style),
-                ]));
+                ];
+                if status != ToolStatus::Error && tool_view::is_json_line(&text) {
+                    spans.extend(tool_view::highlight_json_line(&text));
+                } else {
+                    spans.push(Span::styled(text, style));
+                }
+                lines.push(Line::from(spans));
             }
         }
     }

@@ -717,4 +717,33 @@ impl Theme {
     pub fn badge_muted() -> Style {
         Style::default().fg(Self::MUTED).bg(Self::ELEMENT)
     }
+
+    // JSON syntax highlighting palette (VS Code / Grok / TUI style)
+    pub fn json_key() -> Style {
+        Style::default()
+            .fg(Color::Rgb(156, 220, 254))
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn json_string() -> Style {
+        Style::default().fg(Color::Rgb(206, 145, 120))
+    }
+
+    pub fn json_number() -> Style {
+        Style::default().fg(Color::Rgb(181, 206, 168))
+    }
+
+    pub fn json_bool() -> Style {
+        Style::default().fg(Color::Rgb(86, 156, 214))
+    }
+
+    pub fn json_null() -> Style {
+        Style::default()
+            .fg(Self::MUTED)
+            .add_modifier(Modifier::ITALIC)
+    }
+
+    pub fn json_punct() -> Style {
+        Style::default().fg(Self::BORDER_ACTIVE)
+    }
 }

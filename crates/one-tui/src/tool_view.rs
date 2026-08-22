@@ -3,9 +3,11 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+use ratatui::text::Span;
 use serde_json::Value;
 
 use crate::message::{Message, MessageRole, ToolStatus};
+use crate::theme::Theme;
 use crate::ui::text::expand_tabs;
 
 /// Max tools shown as a single collapsed “N tools” chip before forcing expand.
@@ -465,8 +467,16 @@ pub fn pretty_tool_detail_full(args: &str, cwd: Option<&Path>) -> String {
         if let Ok(val) = serde_json::from_str::<Value>(t) {
             // If it is use_tool, pretty print the inner tool_input
             if let Some(inner) = val.get("tool_input") {
-                if let Ok(pretty) = serde_json::to_string_pretty(inner) {
-                    return pretty;
+                if let Value::Object(_) = inner {
+                    if let Ok(pretty) = serde_json::to_string_pretty(inner) {
+                        return pretty;
+                    }
+                } else if let Value::String(s) = inner {
+                    if let Ok(parsed) = serde_json::from_str::<Value>(s) {
+                        if let Ok(pretty) = serde_json::to_string_pretty(&parsed) {
+                            return pretty;
+                        }
+                    }
                 }
             }
             for key in ["command", "pattern", "query"] {
@@ -485,6 +495,234 @@ pub fn pretty_tool_detail_full(args: &str, cwd: Option<&Path>) -> String {
         }
     }
     shorten_paths_in_text(t, cwd)
+}
+
+/// If a string is valid JSON (object or array), format with standard indentation (Grok style).
+pub fn maybe_pretty_json(s: &str) -> Option<String> {
+    let trimmed = s.trim();
+    if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+        || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+    {
+        if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+            return serde_json::to_string_pretty(&val).ok();
+        }
+    }
+    None
+}
+
+/// Extract use_tool arguments into flat key-value pairs (Grok Build style).
+/// Nested objects/arrays are compact JSON representations.
+pub fn extract_use_tool_args(args: &str) -> Vec<(String, String)> {
+    let trimmed = args.trim();
+    let mut result = Vec::new();
+    let val: Value = match serde_json::from_str(trimmed) {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+
+    let target_obj: Option<serde_json::Map<String, Value>> =
+        if let Some(inner) = val.get("tool_input") {
+            if let Value::Object(m) = inner {
+                Some(m.clone())
+            } else if let Value::String(s) = inner {
+                if let Ok(Value::Object(m)) = serde_json::from_str(s) {
+                    Some(m)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else if let Value::Object(m) = val {
+            Some(m)
+        } else {
+            None
+        };
+
+    if let Some(obj) = target_obj {
+        for (k, v) in obj {
+            let repr = match &v {
+                Value::String(s) => s.clone(),
+                Value::Number(n) => n.to_string(),
+                Value::Bool(b) => b.to_string(),
+                Value::Null => "null".to_string(),
+                Value::Array(_) | Value::Object(_) => serde_json::to_string(&v).unwrap_or_default(),
+            };
+            result.push((k, repr));
+        }
+    }
+    result
+}
+
+/// True when a line looks like formatted/indented JSON or JSON token.
+pub fn is_json_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    if t.starts_with('{') || t.starts_with('}') || t.starts_with('[') || t.starts_with(']') {
+        return true;
+    }
+    if t.starts_with('"') {
+        if t.contains("\":") || t.ends_with("\",") || t.ends_with('"') {
+            return true;
+        }
+    }
+    if t.starts_with("true") || t.starts_with("false") || t.starts_with("null") {
+        return true;
+    }
+    if t.chars()
+        .next()
+        .map(|c| c.is_ascii_digit() || c == '-')
+        .unwrap_or(false)
+    {
+        let first_word = t
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        if first_word.parse::<f64>().is_ok() || first_word.parse::<i64>().is_ok() {
+            return true;
+        }
+    }
+    false
+}
+
+/// Tokenize and syntax-highlight a single line of formatted JSON (VS Code / Grok style).
+pub fn highlight_json_line(line: &str) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    if indent_len > 0 {
+        spans.push(Span::raw(line[..indent_len].to_string()));
+    }
+    if trimmed.is_empty() {
+        return spans;
+    }
+
+    let mut rest = trimmed;
+    while !rest.is_empty() {
+        let cur = rest.trim_start();
+        let ws = rest.len() - cur.len();
+        if ws > 0 {
+            spans.push(Span::raw(rest[..ws].to_string()));
+        }
+        if cur.is_empty() {
+            break;
+        }
+
+        // 1. Quoted string (JSON key or JSON string value)
+        if cur.starts_with('"') {
+            if let Some(q_end) = find_matching_quote(cur) {
+                let quote_str = &cur[..=q_end];
+                let after = &cur[q_end + 1..];
+                let after_trimmed = after.trim_start();
+
+                if after_trimmed.starts_with(':') {
+                    // It's a JSON key
+                    spans.push(Span::styled(quote_str.to_string(), Theme::json_key()));
+                    let space_len = after.len() - after_trimmed.len();
+                    if space_len > 0 {
+                        spans.push(Span::raw(after[..space_len].to_string()));
+                    }
+                    let colon_and_space = if after_trimmed.starts_with(": ") {
+                        ": "
+                    } else {
+                        ":"
+                    };
+                    spans.push(Span::styled(
+                        colon_and_space.to_string(),
+                        Theme::json_punct(),
+                    ));
+                    rest = &after_trimmed[colon_and_space.len()..];
+                    continue;
+                } else {
+                    // String value
+                    spans.push(Span::styled(quote_str.to_string(), Theme::json_string()));
+                    rest = after;
+                    continue;
+                }
+            } else {
+                // Unterminated quote
+                spans.push(Span::styled(cur.to_string(), Theme::json_string()));
+                break;
+            }
+        }
+
+        // 2. Structural punctuation
+        if cur.starts_with('{')
+            || cur.starts_with('}')
+            || cur.starts_with('[')
+            || cur.starts_with(']')
+            || cur.starts_with(',')
+        {
+            spans.push(Span::styled(cur[..1].to_string(), Theme::json_punct()));
+            rest = &cur[1..];
+            continue;
+        }
+
+        // 3. Keywords: true / false / null
+        if let Some(after) = cur.strip_prefix("true") {
+            spans.push(Span::styled("true".to_string(), Theme::json_bool()));
+            rest = after;
+            continue;
+        }
+        if let Some(after) = cur.strip_prefix("false") {
+            spans.push(Span::styled("false".to_string(), Theme::json_bool()));
+            rest = after;
+            continue;
+        }
+        if let Some(after) = cur.strip_prefix("null") {
+            spans.push(Span::styled("null".to_string(), Theme::json_null()));
+            rest = after;
+            continue;
+        }
+
+        // 4. Numbers
+        let num_len = cur
+            .find(|c: char| {
+                !(c.is_ascii_digit() || c == '-' || c == '+' || c == '.' || c == 'e' || c == 'E')
+            })
+            .unwrap_or(cur.len());
+        if num_len > 0 {
+            let num_candidate = &cur[..num_len];
+            if num_candidate.parse::<f64>().is_ok() || num_candidate.parse::<i64>().is_ok() {
+                spans.push(Span::styled(
+                    num_candidate.to_string(),
+                    Theme::json_number(),
+                ));
+                rest = &cur[num_len..];
+                continue;
+            }
+        }
+
+        // 5. Fallback for unclassified tokens
+        let token_len = cur
+            .find(|c: char| c.is_whitespace() || c == ',' || c == '}' || c == ']' || c == ':')
+            .unwrap_or(cur.len())
+            .max(1);
+        spans.push(Span::raw(cur[..token_len].to_string()));
+        rest = &cur[token_len..];
+    }
+
+    spans
+}
+
+fn find_matching_quote(s: &str) -> Option<usize> {
+    if !s.starts_with('"') {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let mut i = 1;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => {
+                i = i.saturating_add(2);
+            }
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 /// Extract a JSON string field without full serde (args may be partial).
@@ -1809,5 +2047,57 @@ Updated parser/parser_test.go
         assert!(!rows[0].text.contains('\r'));
         assert!(!rows[1].text.contains('\r'));
         assert!(!rows[2].text.contains('\r'));
+    }
+
+    #[test]
+    fn test_maybe_pretty_json_and_extract_args() {
+        let compact = r#"{"name":"test","count":10,"enabled":true}"#;
+        let pretty = maybe_pretty_json(compact).unwrap();
+        assert!(pretty.contains('\n'));
+        assert!(pretty.contains("\"name\": \"test\""));
+
+        let not_json = "plain text output";
+        assert!(maybe_pretty_json(not_json).is_none());
+
+        let use_tool_args = r#"{"tool_name":"deepwiki__ask_question","tool_input":{"repoName":"xai/grok","question":"what is grok?","nested":{"a":1}}}"#;
+        let extracted = extract_use_tool_args(use_tool_args);
+        assert!(extracted
+            .iter()
+            .any(|(k, v)| k == "repoName" && v == "xai/grok"));
+        assert!(extracted
+            .iter()
+            .any(|(k, v)| k == "question" && v == "what is grok?"));
+        assert!(extracted
+            .iter()
+            .any(|(k, v)| k == "nested" && v.contains("\"a\":1")));
+    }
+
+    #[test]
+    fn test_highlight_json_line_and_is_json() {
+        assert!(is_json_line("  {"));
+        assert!(is_json_line("  },"));
+        assert!(is_json_line("  \"repoName\": \"xai/grok\","));
+        assert!(is_json_line("  \"count\": 42,"));
+        assert!(is_json_line("  \"enabled\": true,"));
+        assert!(is_json_line("  \"data\": null"));
+        assert!(!is_json_line("plain bash output"));
+
+        let spans = highlight_json_line("  \"key\": \"value\",");
+        assert_eq!(spans[0].content, "  ");
+        assert_eq!(spans[1].content, "\"key\"");
+        assert_eq!(spans[2].content, ": ");
+        assert_eq!(spans[3].content, "\"value\"");
+        assert_eq!(spans[4].content, ",");
+
+        let spans_num = highlight_json_line("    \"timeout\": 30");
+        assert_eq!(spans_num[0].content, "    ");
+        assert_eq!(spans_num[1].content, "\"timeout\"");
+        assert_eq!(spans_num[2].content, ": ");
+        assert_eq!(spans_num[3].content, "30");
+
+        let spans_bool = highlight_json_line("    \"active\": true,");
+        assert_eq!(spans_bool[1].content, "\"active\"");
+        assert_eq!(spans_bool[3].content, "true");
+        assert_eq!(spans_bool[4].content, ",");
     }
 }
