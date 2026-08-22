@@ -935,7 +935,16 @@ pub fn match_tool_intent_rules(
             .as_deref()
             .map(|content| {
                 let trimmed = strip_memory_frontmatter(content).trim();
-                trimmed.chars().take(300).collect::<String>()
+                if trimmed.chars().count() <= 800 {
+                    trimmed.to_string()
+                } else {
+                    let mut excerpt: String = trimmed.chars().take(800).collect();
+                    if let Some(last_nl) = excerpt.rfind('\n') {
+                        excerpt.truncate(last_nl);
+                    }
+                    excerpt.push_str("...");
+                    excerpt
+                }
             })
             .filter(|text| !text.is_empty());
 

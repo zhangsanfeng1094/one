@@ -1,6 +1,8 @@
 pub mod agents;
 pub mod builtin_skills;
 pub mod error;
+pub mod intent_graph;
+mod intent_match;
 pub mod loader;
 pub mod memory;
 pub mod prompts;
@@ -9,6 +11,11 @@ pub mod skills;
 pub use agents::AgentsFile;
 pub use builtin_skills::builtin_skill_names;
 pub use error::{ResourceError, Result};
+pub use intent_graph::{
+    is_conceptual_clarification, strip_xml_and_meta, ActiveReminder, EdgeEntry, GraphEdge,
+    GraphInferenceResult, GraphNode, InferOptions, IntentGraph, LearnedRuleSummary, MatchMode,
+    MatchedIntent, ReminderLevel, SuggestedTool,
+};
 pub use loader::{skill_allowlist_roots, skill_discovery_dirs, ResourceLoader};
 pub use memory::{
     archive_session_summary, ensure_memory_dirs, format_index_entry_line, load_memory_catalog,
