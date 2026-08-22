@@ -130,6 +130,12 @@ pub struct AppRuntime {
     tool_audit: Vec<ToolAuditItem>,
     /// tool_call_id → (name, started_at_ms) for duration calculation.
     tool_starts: HashMap<String, (String, u64)>,
+    /// Graph-based intent recognition and dynamic reminder engine.
+    pub intent_graph: Arc<tokio::sync::RwLock<one_resources::IntentGraph>>,
+    /// Monotonic user-turn index for intent-reminder cooldown.
+    intent_turn: u32,
+    /// reminder_id → last `intent_turn` it was injected.
+    intent_reminder_last_turn: HashMap<String, u32>,
 }
 
 impl AppRuntime {

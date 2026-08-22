@@ -34,8 +34,8 @@ impl Tool for MemoryWriteTool {
             description: "Write or update a **cross-session memory** entry atomically: body file \
 + matching MEMORY.md index line (L2 catalog). Prefer this over raw `write` to memory dirs. \
 Default **NO-OP** — only call when a future agent would clearly benefit (stable prefs, project \
-facts, hard-won lessons, learned tool intents). Skip trivial / one-off corrections and facts already in AGENTS.md. \
-Use `type=\"tool_intent\"` when learning user tool preferences and triggers. \
+facts, hard-won lessons). Skip trivial / one-off corrections and facts already in AGENTS.md. \
+(Note: Workflow rules and tool preferences are managed by Intent Graph via `/learn`). \
 Search first with `memory_search` and **update** an existing id when possible. \
 L2 in the current session is frozen — new index lines appear after `/reload` or a new session."
                 .into(),

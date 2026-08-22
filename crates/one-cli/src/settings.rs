@@ -474,7 +474,10 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             if let Some(m) = one_tools::PermissionMode::parse(value) {
                 settings.permission_mode = Some(m.as_str().to_string());
             } else {
-                return Err("permission_mode must be default|acceptEdits|auto|dontAsk|bypassPermissions".into());
+                return Err(
+                    "permission_mode must be default|acceptEdits|auto|dontAsk|bypassPermissions"
+                        .into(),
+                );
             }
         }
         "context_window" | "context-window" | "context" => {

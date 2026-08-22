@@ -500,7 +500,8 @@ impl ToolGate for PermissionGate {
                     .path_policy
                     .as_ref()
                     .is_some_and(|p| p.is_full_access());
-                let force = one_tools::sandbox::is_destructive_ask_reason(&reason) && !is_full_access;
+                let force =
+                    one_tools::sandbox::is_destructive_ask_reason(&reason) && !is_full_access;
                 if auto && !force {
                     // Soft high-risk / ask-rule: auto_approve allows.
                 } else if force && !self.interactive {

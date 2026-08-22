@@ -2,8 +2,8 @@
 //!
 //! Checks system and user policy locks (such as disabling always-approve / YOLO mode).
 
-use std::path::PathBuf;
 use serde::Deserialize;
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct RequirementsFile {
@@ -73,7 +73,10 @@ mod tests {
         disable_bypass_permissions_mode = true
         "#;
         let parsed: RequirementsFile = toml::from_str(toml_str).unwrap();
-        assert_eq!(parsed.ui.unwrap().disable_bypass_permissions_mode, Some(true));
+        assert_eq!(
+            parsed.ui.unwrap().disable_bypass_permissions_mode,
+            Some(true)
+        );
 
         let legacy_str = r#"
         [ui]

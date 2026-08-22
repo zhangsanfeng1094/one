@@ -106,6 +106,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "manually compact context",
     },
     SlashCommand {
+        name: "/learn",
+        usage: "/learn [rule|session|list|status|reset]",
+        description: "learn & update intent graph (bare = learn from current turn)",
+    },
+    SlashCommand {
         name: "/skills",
         usage: "/skills [enable|disable <name>]",
         description: "manage skills · enable/disable (bare = panel)",

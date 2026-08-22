@@ -6,6 +6,7 @@ mod cli;
 mod governance;
 mod hitl;
 mod langfuse;
+mod learn_cmd;
 mod mcp_cmd;
 mod modes;
 mod preferences;
@@ -311,6 +312,11 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     }
     if let Some(Commands::Bench(bench)) = cli.command {
         bench_cmd::run_bench(bench).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(Commands::Learn(learn)) = cli.command {
+        let cwd = cli.cwd.canonicalize().unwrap_or_else(|_| cli.cwd.clone());
+        learn_cmd::run_learn(learn, &cwd).await?;
         return Ok(ExitCode::SUCCESS);
     }
     // `one resume …` rewrites into the normal agent path (session open + TUI/print).

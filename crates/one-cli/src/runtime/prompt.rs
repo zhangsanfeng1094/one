@@ -36,7 +36,7 @@ impl AppRuntime {
         self.inject_mcp_reminder().await;
 
         let text = self.resources.resolve_prompt(text);
-        self.inject_tool_intent_reminder(&text).await;
+        self.inject_graph_intent_reminder(&text).await;
         self.maybe_compact(provider, false).await?;
 
         // M3: memory read/grep budget is per user turn.

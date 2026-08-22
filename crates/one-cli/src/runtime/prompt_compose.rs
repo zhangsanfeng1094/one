@@ -11,17 +11,16 @@ use super::AgentMode;
 
 /// Short write policy when feature `memory` is on and L2 catalog is present.
 pub const MEMORY_WRITE_PROMPT_HINT: &str = "\
-## Memory write & Self-Learning Tool Intent
+## Memory write (跨会话知识备忘录)
 
 Use `memory_write` to persist cross-session notes (atomic body + MEMORY.md index). \
-Default NO-OP — only when a future agent would clearly benefit. Prefer updating an \
+Default NO-OP — only when a future agent would clearly benefit from persistent project knowledge \
+(architecture decisions, conventions, environment details, domain facts). Prefer updating an \
 existing id after `memory_search`. Do not use raw `write` under memory dirs unless \
 `memory_write` is unavailable. New L2 index lines apply after `/reload` or a new session.
 
-### Tool Intent Self-Learning (自学习工具意图):
-When the user teaches a tool preference, corrects tool choice (e.g., 'for open source library docs use deepwiki', 'search web for real-time news'), or when you discover an effective tool mapping:
-- Automatically call `memory_write` with `type=\"tool_intent\"` (e.g. `id=\"tool-intent-<name>\"`, `scope=\"global\"`, `tags=\"<intent keywords>\"`, `description=\"<intent> -> <tool>\"`, `body=\"trigger condition and concrete action\"`).
-- When a `<system-reminder>` with `[Learned Tool Intent Rule]` is injected into your turn, you must proactively apply it by searching or invoking the indicated tool.
+Intent recognition, tool preferences, safety guardrails, and dynamic reminders are managed by \
+the Intent Graph engine (LPG). Custom rules can be taught via `/learn <rule>` or `one learn \"<rule>\"`.
 ";
 
 /// One-style output guidance (always injected for high quality)

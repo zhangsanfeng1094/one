@@ -5,6 +5,7 @@
 
 use std::sync::Arc;
 
+use one_core::message::{ContentBlock, TextOrImage, UserContent};
 use one_core::tool::Tool;
 use one_tools::{ToolBuildContext, ToolRegistry};
 
@@ -199,41 +200,179 @@ impl AppRuntime {
         agent.push_notification(text);
     }
 
-    /// Match user query against learned tool intents and inject JIT `<system-reminder>` if matched.
-    pub(crate) async fn inject_tool_intent_reminder(&mut self, query: &str) {
-        if self.mode == AgentMode::Plan {
-            return;
-        }
-        let hits =
-            one_resources::match_tool_intent_rules(&self.resources.agent_dir, &self.cwd, query, 3);
-        if hits.is_empty() {
-            return;
+    /// Match user query against graph-based intent and reminder rules, injecting JIT `<system-reminder>`.
+    ///
+    /// Plan mode still injects **Mandatory** safety reminders (e.g. git force-push).
+    pub(crate) async fn inject_graph_intent_reminder(
+        &mut self,
+        query: &str,
+    ) -> Option<one_resources::GraphInferenceResult> {
+        self.intent_turn = self.intent_turn.saturating_add(1);
+
+        let mut available_tools = Vec::new();
+        let mcp_names = self.mcp.server_names();
+        if self.mcp.is_disabled() || !mcp_names.is_empty() {
+            available_tools.extend(self.main_tool_names_preview());
+            available_tools.extend(mcp_names);
         }
 
-        let mut reminder_text =
-            String::from("### Learned Tool Intent & Preferences (已学习的工具意图规则)\n");
-        reminder_text.push_str(
-            "\n这些是可选的工具调用建议，不是强制路由；以用户的明确要求、当前模式和安全权限策略为准。\n",
-        );
-        for hit in hits {
-            reminder_text.push_str(&format!(
-                "- **[{}]** confidence={:.2} score={} evidence={} · {}\n",
-                hit.entry.id,
-                hit.confidence,
-                hit.score,
-                hit.evidence.join(", "),
-                hit.entry.description
-            ));
-            if let Some(body) = hit.body_excerpt {
-                reminder_text.push_str(&format!("  可参考策略: {}\n", body.trim()));
+        let opts = one_resources::InferOptions {
+            entity_params: std::collections::HashMap::new(),
+            available_tools,
+            turn_index: self.intent_turn,
+            reminder_last_turn: self.intent_reminder_last_turn.clone(),
+            mandatory_only: self.mode == AgentMode::Plan,
+        };
+
+        let graph = self.intent_graph.read().await;
+        let result = graph.infer_with(query, &opts);
+        drop(graph);
+
+        if let Some(rendered) = result.render_reminder_markdown() {
+            for rem in &result.active_reminders {
+                self.intent_reminder_last_turn
+                    .insert(rem.reminder_id.clone(), self.intent_turn);
+            }
+            let text = one_core::system_reminder(rendered);
+            let agent = self.agent.lock().await;
+            agent.push_notification(text);
+            Some(result)
+        } else {
+            None
+        }
+    }
+
+    /// Path to user-global custom intent graph JSON file.
+    pub fn custom_intent_graph_path(&self) -> std::path::PathBuf {
+        one_session::agent_dir()
+            .join("intent_graph")
+            .join("custom.json")
+    }
+
+    /// Learn and persist a new intent rule from user instruction or structured text.
+    pub async fn learn_intent_from_text(
+        &mut self,
+        text: &str,
+    ) -> Result<one_resources::LearnedRuleSummary, Box<dyn std::error::Error>> {
+        let mut graph = self.intent_graph.write().await;
+        let summary = graph
+            .learn_from_text(text)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let path = self.custom_intent_graph_path();
+        graph.save_custom_to_file(&path)?;
+        Ok(summary)
+    }
+
+    /// Learn and persist a new intent rule from the current session's latest turn trajectory.
+    pub async fn learn_intent_from_session(
+        &mut self,
+    ) -> Result<one_resources::LearnedRuleSummary, Box<dyn std::error::Error>> {
+        let agent = self.agent.lock().await;
+        let mut last_user_query = None;
+        let mut tools_used = Vec::new();
+
+        for msg in agent.messages.iter().rev() {
+            match msg {
+                one_core::AgentMessage::User(u) => {
+                    let extracted = match &u.content {
+                        UserContent::Text(t) => Some(t.clone()),
+                        UserContent::Blocks(b) => {
+                            let mut txt = String::new();
+                            for block in b {
+                                if let TextOrImage::Text { text } = block {
+                                    txt.push_str(text);
+                                }
+                            }
+                            if !txt.is_empty() {
+                                Some(txt)
+                            } else {
+                                None
+                            }
+                        }
+                    };
+
+                    if let Some(text) = extracted {
+                        let trimmed = text.trim();
+                        // Skip internal system notifications/reminders pushed as user messages
+                        let is_system_meta = trimmed.starts_with("<system-reminder>")
+                            || trimmed.starts_with("<env>")
+                            || trimmed.starts_with("<context>")
+                            || trimmed.starts_with("<memory-catalog>")
+                            || trimmed.contains("### Learned Tool Intent")
+                            || trimmed.contains("### Graph Intent Guidance");
+
+                        if !is_system_meta && !trimmed.is_empty() {
+                            last_user_query = Some(trimmed.to_string());
+                            break;
+                        }
+                    }
+                }
+                one_core::AgentMessage::Assistant(a) => {
+                    for block in &a.content {
+                        if let ContentBlock::ToolCall { name, .. } = block {
+                            if !tools_used.contains(name) {
+                                tools_used.push(name.clone());
+                            }
+                        }
+                    }
+                }
+                one_core::AgentMessage::ToolResult(tr) => {
+                    if !tools_used.contains(&tr.tool_name) {
+                        tools_used.push(tr.tool_name.clone());
+                    }
+                }
             }
         }
-        reminder_text
-            .push_str("\n若建议与用户显式指令冲突，不要调用推荐工具；必要时先解释或澄清。");
+        drop(agent);
 
-        let text = one_core::system_reminder(reminder_text);
-        let agent = self.agent.lock().await;
-        agent.push_notification(text);
+        let query = match last_user_query {
+            Some(q) if !q.trim().is_empty() => q,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "当前会话中未找到用户提问，请先进行对话或直接输入规则文本：/learn <规则>",
+                )
+                .into());
+            }
+        };
+
+        let mut graph = self.intent_graph.write().await;
+        let summary = graph
+            .learn_from_interaction(&query, &tools_used, None)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let path = self.custom_intent_graph_path();
+        graph.save_custom_to_file(&path)?;
+        Ok(summary)
+    }
+
+    /// List all custom learned rules currently loaded in the intent graph.
+    pub async fn list_learned_intent_rules(&self) -> Vec<one_resources::LearnedRuleSummary> {
+        self.intent_graph.read().await.list_custom_rules()
+    }
+
+    /// Clear all custom learned rules and reset graph back to built-ins.
+    pub async fn reset_custom_intent_rules(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut graph = self.intent_graph.write().await;
+        graph.clear_custom_rules();
+        let path = self.custom_intent_graph_path();
+        if path.exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+        Ok(())
+    }
+
+    /// Get current intent graph statistics (nodes, edges, custom_rules, triggers).
+    pub async fn intent_graph_stats(&self) -> (usize, usize, usize, usize) {
+        let graph = self.intent_graph.read().await;
+        let total_nodes = graph.nodes.len();
+        let total_edges = graph.edges.len();
+        let custom_rules = graph.list_custom_rules().len();
+        let triggers = graph
+            .nodes
+            .values()
+            .filter(|n| matches!(n, one_resources::GraphNode::Trigger { .. }))
+            .count();
+        (total_nodes, total_edges, custom_rules, triggers)
     }
 
     /// Preview resolved main tool names (for status / debug).

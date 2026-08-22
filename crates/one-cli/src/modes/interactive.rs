@@ -5,8 +5,8 @@ use one_core::error::OneError;
 use one_core::events::AgentEvent;
 use one_core::message::AgentMessage;
 use one_tui::{
-    App, ApprovalAnswer, ApprovalPrompt, ConfigOp, FloatKind, FloatMenu, ForceQuit, ModelChoice,
-    RunOutcome, SelectKind, TerminalSession,
+    AlertLevel, App, ApprovalAnswer, ApprovalPrompt, ConfigOp, FloatKind, FloatMenu, ForceQuit,
+    ModelChoice, RunOutcome, SelectKind, TerminalSession,
 };
 
 use crate::approval::{ApprovalChoice, PermissionGate, PermissionMode};
@@ -1569,7 +1569,10 @@ pub async fn run_interactive(
                 // Shift+Tab: Normal (Ask) → Plan → Always-approve (YOLO) → Normal (Ask)
                 if runtime.mode() == AgentMode::Plan {
                     runtime.leave_plan_mode().await?;
-                    match runtime.permission_gate.set_permission_mode(PermissionMode::BypassPermissions) {
+                    match runtime
+                        .permission_gate
+                        .set_permission_mode(PermissionMode::BypassPermissions)
+                    {
                         Ok(()) => {
                             app.set_agent_label("YOLO");
                             app.set_notice("Always-approve (YOLO) mode · S-Tab to switch to Ask");
@@ -1579,8 +1582,14 @@ pub async fn run_interactive(
                             app.set_notice(format!("Build mode · {err}"));
                         }
                     }
-                } else if runtime.permission_gate.permission_mode().is_always_approve() {
-                    let _ = runtime.permission_gate.set_permission_mode(PermissionMode::Default);
+                } else if runtime
+                    .permission_gate
+                    .permission_mode()
+                    .is_always_approve()
+                {
+                    let _ = runtime
+                        .permission_gate
+                        .set_permission_mode(PermissionMode::Default);
                     app.set_agent_label(AgentMode::Act.label());
                     app.set_notice("Build mode (Ask) · S-Tab to switch to Plan");
                 } else {
@@ -1615,7 +1624,10 @@ pub async fn run_interactive(
                             AgentMode::Act.label()
                         };
                         app.set_agent_label(label);
-                        app.set_notice(format!("Always-approve disabled · current mode: {}", m.label()));
+                        app.set_notice(format!(
+                            "Always-approve disabled · current mode: {}",
+                            m.label()
+                        ));
                     }
                     Err(err) => {
                         app.set_notice(format!("{err}"));
@@ -1903,7 +1915,26 @@ async fn run_turn_streaming(
     }
     let text = resolved.text;
     runtime.inject_mcp_reminder().await;
-    runtime.inject_tool_intent_reminder(&text).await;
+    if let Some(res) = runtime.inject_graph_intent_reminder(&text).await {
+        for rem in &res.active_reminders {
+            let alert_level = match rem.level {
+                one_resources::ReminderLevel::Mandatory => AlertLevel::Warn,
+                _ => AlertLevel::Info,
+            };
+            let card_text = format!(
+                "🧠 意图图谱命中 · {}\n• 匹配意图: `{}` (置信度: {:.2})\n• 注入提醒: {}\n• 指引策略: {}",
+                rem.level.badge(),
+                rem.source_intent_id,
+                rem.confidence,
+                rem.title,
+                rem.rendered_content
+            );
+            app.push_alert(alert_level, card_text);
+        }
+        if let Some(top_rem) = res.active_reminders.first() {
+            app.set_notice(format!("🧠 提醒: {}", top_rem.title));
+        }
+    }
     runtime.maybe_compact(provider.as_ref(), false).await?;
     let _ = runtime
         .extensions
@@ -2267,6 +2298,152 @@ async fn handle_slash(
             app.set_notice("chat cleared");
             Ok(SlashAction::Consumed)
         }
+        Some("/learn") => {
+            let arg = parts.get(1).copied().unwrap_or_default();
+            if arg == "help" || arg == "--help" || arg == "-h" {
+                let help_text = format!(
+                    "### 🎓 Intent Graph 意图学习与规则管理 (`/learn`)\n\n\
+                    **支持命令用法：**\n\
+                    - `/learn` — **从当前会话交互中自动学习**（提取最近一轮提问、意图特征与推荐工具并持久化）\n\
+                    - `/learn <规则文本>` — **手动添加规则**（支持自然语言或结构化格式）\n\
+                      - *自然语言示例*：`/learn 当用户询问架构或源码实现时，建议优先使用 find 和 deepwiki 定位与查阅`\n\
+                      - *约束规范示例*：`/learn 遇到 git push -f 等高危操作时，必须向用户确认风险`\n\
+                      - *结构化格式示例*：`/learn 意图: 数据库迁移 | 触发: 迁移,执行 + 数据库,db | 提醒: 务必先备份数据 | 级别: 强制 | 工具: bash`\n\
+                    - `/learn list` — 列出当前所有已生效的自定义学习规则\n\
+                    - `/learn status` — 查看意图图谱的节点、边与规则统计\n\
+                    - `/learn reset` — 清除自定义规则并重置为内置图谱\n\n\
+                    *持久化文件*: `{}`",
+                    runtime.custom_intent_graph_path().display()
+                );
+                app.push_assistant(help_text);
+                app.set_notice("learn help");
+            } else if arg == "list" || arg == "-l" {
+                let rules = runtime.list_learned_intent_rules().await;
+                if rules.is_empty() {
+                    app.push_assistant("### 🎓 自定义学习规则列表\n\n暂无自定义学习规则（当前使用内置基础图谱）。\n可通过 `/learn <规则文本>` 或直接在对话后执行 `/learn` 提取新规则。");
+                    app.set_notice("no custom rules");
+                } else {
+                    let mut body = format!("### 🎓 自定义学习规则列表 (共 {} 条)\n\n", rules.len());
+                    for (i, r) in rules.iter().enumerate() {
+                        let tools_str = if r.suggested_tools.is_empty() {
+                            "-".to_string()
+                        } else {
+                            format!("`{}`", r.suggested_tools.join("`, `"))
+                        };
+                        body.push_str(&format!(
+                            "{}. **{}** (`{}`) · {}\n   - **触发特征**: `{}`\n   - **约束提醒**: {}\n   - **推荐工具**: {}\n\n",
+                            i + 1,
+                            r.intent_name,
+                            r.intent_id,
+                            r.reminder_level.badge(),
+                            r.triggers.join(", "),
+                            r.reminder_content,
+                            tools_str,
+                        ));
+                    }
+                    app.push_assistant(body);
+                    app.set_notice(format!("listed {} custom rules", rules.len()));
+                }
+            } else if arg == "status" {
+                let (nodes, edges, custom, triggers) = runtime.intent_graph_stats().await;
+                let rows = vec![
+                    ("total_nodes".into(), nodes.to_string()),
+                    ("total_edges".into(), edges.to_string()),
+                    ("triggers".into(), triggers.to_string()),
+                    ("custom_rules".into(), custom.to_string()),
+                    (
+                        "custom_file".into(),
+                        runtime.custom_intent_graph_path().display().to_string(),
+                    ),
+                ];
+                app.open_info_float("Intent Graph Status", &rows);
+                app.set_notice("graph status");
+            } else if arg == "reset" {
+                match runtime.reset_custom_intent_rules().await {
+                    Ok(_) => {
+                        app.push_alert(
+                            one_tui::AlertLevel::Info,
+                            "✅ 已清除自定义意图规则，重置为内置图谱。",
+                        );
+                        app.set_notice("intent graph reset to builtin");
+                    }
+                    Err(e) => {
+                        app.push_alert(one_tui::AlertLevel::Error, format!("❌ 重置失败: {e}"));
+                        app.set_notice(format!("reset failed: {e}"));
+                    }
+                }
+            } else if arg.is_empty() || arg == "session" || arg == "last" {
+                // Learn from recent session trajectory
+                match runtime.learn_intent_from_session().await {
+                    Ok(summary) => {
+                        let tools_str = if summary.suggested_tools.is_empty() {
+                            "无".to_string()
+                        } else {
+                            format!("`{}`", summary.suggested_tools.join("`, `"))
+                        };
+                        let text = format!(
+                            "### 🎓 意图图谱已从会话学习新规则\n\n\
+                            - **意图名称**: `{}` (`{}`)\n\
+                            - **触发特征**: `{}`\n\
+                            - **约束等级**: {}\n\
+                            - **提醒指引**: {}\n\
+                            - **推荐工具**: {}\n\
+                            - **持久化路径**: `{}`\n\n\
+                            *该规则已立即生效，未来匹配到类似意图时将动态注入 System Reminder 指引。*",
+                            summary.intent_name,
+                            summary.intent_id,
+                            summary.triggers.join(", "),
+                            summary.reminder_level.badge(),
+                            summary.reminder_content,
+                            tools_str,
+                            runtime.custom_intent_graph_path().display()
+                        );
+                        app.push_assistant(text);
+                        app.set_notice(format!("learned rule → {}", summary.intent_name));
+                    }
+                    Err(e) => {
+                        app.push_alert(one_tui::AlertLevel::Warn, format!("⚠️ 学习失败: {e}\n可直接输入规则内容进行手动学习：`/learn 当遇到...时，...`"));
+                        app.set_notice("learn failed");
+                    }
+                }
+            } else {
+                // Learn from user-provided rule text
+                let rule_text = parts.get(1..).map(|p| p.join(" ")).unwrap_or_default();
+                match runtime.learn_intent_from_text(&rule_text).await {
+                    Ok(summary) => {
+                        let tools_str = if summary.suggested_tools.is_empty() {
+                            "无".to_string()
+                        } else {
+                            format!("`{}`", summary.suggested_tools.join("`, `"))
+                        };
+                        let text = format!(
+                            "### 🎓 意图图谱已录入新规则\n\n\
+                            - **意图名称**: `{}` (`{}`)\n\
+                            - **触发特征**: `{}`\n\
+                            - **约束等级**: {}\n\
+                            - **提醒指引**: {}\n\
+                            - **推荐工具**: {}\n\
+                            - **持久化路径**: `{}`\n\n\
+                            *该规则已立即生效，未来匹配到类似意图时将动态注入 System Reminder 指引。*",
+                            summary.intent_name,
+                            summary.intent_id,
+                            summary.triggers.join(", "),
+                            summary.reminder_level.badge(),
+                            summary.reminder_content,
+                            tools_str,
+                            runtime.custom_intent_graph_path().display()
+                        );
+                        app.push_assistant(text);
+                        app.set_notice(format!("learned rule → {}", summary.intent_name));
+                    }
+                    Err(e) => {
+                        app.push_alert(one_tui::AlertLevel::Error, format!("❌ 学习规则失败: {e}"));
+                        app.set_notice(format!("learn error: {e}"));
+                    }
+                }
+            }
+            Ok(SlashAction::Consumed)
+        }
         Some("/session") => {
             // Key/value info float.
             let summary = runtime.session_summary_line();
@@ -2424,7 +2601,10 @@ async fn handle_slash(
                         AgentMode::Act.label()
                     };
                     app.set_agent_label(label);
-                    app.set_notice(format!("Always-approve disabled · current mode: {}", m.label()));
+                    app.set_notice(format!(
+                        "Always-approve disabled · current mode: {}",
+                        m.label()
+                    ));
                 }
                 Err(err) => {
                     app.set_notice(format!("{err}"));
@@ -2482,7 +2662,11 @@ async fn handle_slash(
                 }
             } else {
                 let curr = runtime.permission_gate.permission_mode();
-                app.set_notice(format!("Current permission mode: {} ({})", curr.label(), curr.as_str()));
+                app.set_notice(format!(
+                    "Current permission mode: {} ({})",
+                    curr.label(),
+                    curr.as_str()
+                ));
             }
             Ok(SlashAction::Consumed)
         }

@@ -423,6 +423,10 @@ impl AppRuntime {
         let followup_queue = agent.followup_queue_handle();
         let abort_flag = agent.abort_handle();
 
+        let intent_graph = Arc::new(tokio::sync::RwLock::new(
+            one_resources::IntentGraph::load_merged(&cwd, &agent_dir),
+        ));
+
         let mut runtime = Self {
             agent: Arc::new(tokio::sync::Mutex::new(agent)),
             abort_flag,
@@ -467,6 +471,9 @@ impl AppRuntime {
             prompt_index: 0,
             tool_audit: Vec::new(),
             tool_starts: HashMap::new(),
+            intent_graph,
+            intent_turn: 0,
+            intent_reminder_last_turn: HashMap::new(),
         };
 
         // Seed session id for task parent metadata.

@@ -246,11 +246,45 @@ pub enum Commands {
     Run(crate::agent_cmd::RunCli),
     /// Resume a session after quitting (`one resume` / `one resume <id|name|path>`)
     Resume(ResumeCli),
+    /// Manually teach, list, or reset intent graph rules (`one learn`)
+    Learn(LearnCli),
     /// Speak Agent Client Protocol (ACP) over stdio for IDE embedding
     ///
     /// JSON-RPC 2.0 on stdin/stdout. Configure editors as:
     /// `one acp --cwd /path/to/project --provider …`
     Acp(AcpCli),
+}
+
+/// CLI: `one learn [RULE]` — manually teach or manage intent graph rules.
+///
+/// ```text
+/// one learn "当用户询问架构时，建议优先使用 find 和 deepwiki"
+/// one learn --list
+/// one learn --status
+/// one learn --reset
+/// one learn --test "帮我查一下 reqwest 的用法"
+/// ```
+#[derive(Debug, Clone, clap::Args)]
+pub struct LearnCli {
+    /// Rule text to learn (natural language or structured format `意图: ... | 触发: ... | 提醒: ...`).
+    #[arg(value_name = "RULE")]
+    pub rule: Option<String>,
+
+    /// List all custom learned rules.
+    #[arg(long = "list", short = 'l')]
+    pub list: bool,
+
+    /// Show intent graph statistics.
+    #[arg(long = "status", short = 's')]
+    pub status: bool,
+
+    /// Reset all custom rules and revert to built-in graph.
+    #[arg(long = "reset")]
+    pub reset: bool,
+
+    /// Dry-run inference against QUERY (prints matched intents / reminders / tools).
+    #[arg(long = "test", value_name = "QUERY")]
+    pub test: Option<String>,
 }
 
 /// CLI: `one acp` — Agent Client Protocol server (stdio).
