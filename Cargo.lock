@@ -1477,6 +1477,7 @@ dependencies = [
  "one-session",
  "one-tools",
  "one-tui",
+ "one-web",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
@@ -1594,6 +1595,19 @@ dependencies = [
  "serde_json",
  "tokio",
  "unicode-width 0.2.0",
+]
+
+[[package]]
+name = "one-web"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "futures",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-util",
+ "tracing",
 ]
 
 [[package]]

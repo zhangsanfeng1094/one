@@ -10,6 +10,9 @@ one --mode interactive -p "…"  # 同上（显式 mode）
 one acp                      # Agent Client Protocol（IDE 嵌入；JSON-RPC stdio）
 one acp --cwd /proj --provider xai -y
 one --mode acp               # 同上
+one web                      # Web 网页模式（ACP over WebSocket；默认 http://127.0.0.1:3000）
+one web --port 3000 --open   # 启动并自动在浏览器打开 Web UI
+one --mode web               # 同上
 one --continue / -c          # 继续最近 session
 one --resume / -r            # 交互：打开 session 选择器；非交互：最近 session
 one resume                   # 退出后恢复：同 `one -r`（TUI 选择器）
@@ -54,6 +57,13 @@ one -p "hello" --provider mock -y --output-format json   # 主会话 RunResult e
 # 槽满：background 立即返回 queued=true（独立 coordinator 队列，不堵 caller）
 # 前台等槽超时：ONE_TASK_FOREGROUND_BUDGET_MS（默认 1000；0=一直等槽）
 # 子 job 事件落盘：~/.one/agent/jobs/<job_id>.jsonl（ONE_JOB_LOG_DIR / ONE_JOB_LOG=0）
+
+# 意图图谱与规则学习（LPG 意图识别，见 docs/user-guide/09-intent-learning.md）
+one learn "当用户询问架构或源码时，建议优先使用 find 和 deepwiki"  # 录入新规则
+one learn --list             # 列出所有已学习的自定义意图规则
+one learn --status           # 查看意图图谱统计信息
+one learn --test "查一下 grok-build 的源码实现"  # 模拟推理测试（Reminders/推荐工具）
+one learn --reset            # 重置为内置默认图谱
 
 # 订阅 / OAuth 登录（catalog：Codex · xAI · OpenCode Zen/Go）
 one login                    # 交互选择

@@ -26,6 +26,7 @@ one-resources.workspace = true
 one-ext.workspace = true
 one-mcp.workspace = true
 one-tui.workspace = true
+one-web.workspace = true
 # ACP agent mode (JSON-RPC over stdio for IDE clients). Trait API is stable for
 # implementers; enable session list/model/usage unstable methods we already support.
 agent-client-protocol = { version = "0.9.5", features = [

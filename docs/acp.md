@@ -1,18 +1,34 @@
 # Agent Client Protocol (ACP)
 
-> **状态**：已实现（`one acp` / `--mode acp`）
+> **状态**：已实现（`one acp` / `--mode acp` / `one web`）
 > **协议**：[Agent Client Protocol v1](https://agentclientprotocol.com/protocol/v1/overview)
 > **SDK**：[`agent-client-protocol` 0.9](https://crates.io/crates/agent-client-protocol)（官方 trait API）
 
-ACP 让 IDE / 编辑器把 One 当作子进程驱动的 coding agent（类似 LSP 之于语言服务器）。
-传输：**JSON-RPC 2.0 over stdio**（stdout 仅用于协议帧；日志走 stderr / `~/.one/agent/logs/`）。
+ACP 让 IDE / 编辑器 / Web 客户端把 One 当作驱动的 coding agent。
+- **stdio 传输**：`one acp`（JSON-RPC 2.0 over stdio，用于 IDE 嵌入）；
+- **WebSocket 传输**：`one web`（内置现代 Web UI，浏览器通过 WebSocket 建立 ACP 连接交互）。
 
 ---
 
 ## 快速开始
 
+### 1. Web 网页模式（推荐体验）
+
 ```bash
-# IDE / 客户端配置的命令（推荐）
+# 启动内置 Web UI（默认监听 127.0.0.1:3000）
+one web
+
+# 指定端口并自动打开默认浏览器
+one web --port 3000 --open
+
+# 启用自动审批
+one web --yolo --provider xai
+```
+
+### 2. IDE 嵌入模式 (stdio)
+
+```bash
+# IDE / 客户端配置的命令
 one acp --cwd /path/to/project --provider xai -y
 
 # 等价

@@ -66,6 +66,9 @@ pub enum RunMode {
     /// Agent Client Protocol over stdio (IDE / external clients).
     /// Prefer the `one acp` subcommand for editor configs.
     Acp,
+    /// Web UI server (ACP over WebSocket).
+    /// Accessible via browser at `http://127.0.0.1:3000/`.
+    Web,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -253,6 +256,26 @@ pub enum Commands {
     /// JSON-RPC 2.0 on stdin/stdout. Configure editors as:
     /// `one acp --cwd /path/to/project --provider …`
     Acp(AcpCli),
+    /// Web UI server (ACP over WebSocket).
+    ///
+    /// Open the web interface to interact with One via browser.
+    Web(WebCli),
+}
+
+/// CLI: `one web` — Web UI server (ACP over WebSocket).
+#[derive(Debug, Clone, clap::Args)]
+pub struct WebCli {
+    /// Port to listen on (default: 3000).
+    #[arg(long, default_value_t = 3000)]
+    pub port: u16,
+
+    /// Host address to bind to (default: 127.0.0.1).
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Automatically open the Web UI in the default browser.
+    #[arg(long)]
+    pub open: bool,
 }
 
 /// CLI: `one learn [RULE]` — manually teach or manage intent graph rules.
@@ -288,14 +311,8 @@ pub struct LearnCli {
 }
 
 /// CLI: `one acp` — Agent Client Protocol server (stdio).
-#[derive(Debug, Clone, clap::Args)]
-pub struct AcpCli {
-    /// Auto-approve tool permission requests (yolo).
-    ///
-    /// Equivalent to `--yes` for the ACP process.
-    #[arg(long = "yolo")]
-    pub yolo: bool,
-}
+#[derive(Debug, Clone, clap::Args, Default)]
+pub struct AcpCli {}
 
 /// CLI: `one resume [SPEC]` — re-open a project session from the shell.
 ///

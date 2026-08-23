@@ -9,6 +9,7 @@ members = [
     "crates/one-ext",
     "crates/one-mcp",
     "crates/one-tui",
+    "crates/one-web",
     "crates/one-cli",
 ]
 # Eval fixtures under benches/projects/* are standalone crates.
@@ -31,6 +32,7 @@ one-resources = { path = "crates/one-resources" }
 one-ext = { path = "crates/one-ext" }
 one-mcp = { path = "crates/one-mcp" }
 one-tui = { path = "crates/one-tui" }
+one-web = { path = "crates/one-web" }
 
 async-trait = "0.1"
 base64 = "0.22"

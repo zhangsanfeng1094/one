@@ -7,6 +7,10 @@
 .env
 .env.local
 
+# Web frontend dependencies
+node_modules/
+**/node_modules/
+
 # --- harness / bench (generated; never commit) ---
 benches/out/
 benches/**/target/

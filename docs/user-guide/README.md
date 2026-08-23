@@ -20,6 +20,12 @@
   - CLI 命令全集（`list` / `add` / `remove` / `doctor` / `import`）
   - 从 Claude / Codex / Cursor 一键迁移配置
   - 性能调优、超时控制与输出截断保护
+- [09. 意图识别与规则自学习](./09-intent-learning.md)
+  - LPG (Labeled Property Graph) 意图图谱架构与工作原理
+  - CLI 管理全集（`one learn` 录入、`--list` 查询、`--test` 推理测试与 `--reset`）
+  - 交互式 TUI 会话自学习与管理（`/learn` 系列命令）
+  - 动态 `<system-reminder>` 上下文注入与最优工具推荐
+  - 跨会话持久化存储与 Memory 知识库协作机制
 
 ---
 

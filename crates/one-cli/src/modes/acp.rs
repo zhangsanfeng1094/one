@@ -77,7 +77,7 @@ pub async fn run_acp(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
-struct OneAcpAgent {
+pub(crate) struct OneAcpAgent {
     cli: StdMutex<Cli>,
     client: StdMutex<Option<Rc<AgentSideConnection>>>,
     sessions: tokio::sync::Mutex<HashMap<SessionId, Arc<SessionHandle>>>,
@@ -101,7 +101,7 @@ struct SessionHandle {
 }
 
 impl OneAcpAgent {
-    fn new(cli: Cli) -> Self {
+    pub(crate) fn new(cli: Cli) -> Self {
         Self {
             cli: StdMutex::new(cli),
             client: StdMutex::new(None),
@@ -110,7 +110,7 @@ impl OneAcpAgent {
         }
     }
 
-    fn set_client(&self, conn: Rc<AgentSideConnection>) {
+    pub(crate) fn set_client(&self, conn: Rc<AgentSideConnection>) {
         *self.client.lock().expect("client lock") = Some(conn);
     }
 
@@ -122,7 +122,7 @@ impl OneAcpAgent {
             .ok_or_else(|| err_internal("acp client not ready"))
     }
 
-    async fn shutdown(&self) {
+    pub(crate) async fn shutdown(&self) {
         let mut sessions = self.sessions.lock().await;
         for (_, handle) in sessions.drain() {
             let rt = handle.runtime.lock().await;
@@ -164,6 +164,15 @@ impl OneAcpAgent {
         let n = SessionNotification::new(session_id.clone(), update);
         if let Err(err) = client.session_notification(n).await {
             tracing::debug!(error = %err, "acp session_notification failed");
+        }
+    }
+
+    fn resolve_cwd(&self, requested: &Path) -> PathBuf {
+        if requested.as_os_str().is_empty() || requested == Path::new("/") {
+            let cli_cwd = self.cli.lock().expect("cli lock").cwd.clone();
+            canonicalize_cwd(&cli_cwd)
+        } else {
+            canonicalize_cwd(requested)
         }
     }
 
@@ -329,7 +338,7 @@ impl AcpAgentTrait for OneAcpAgent {
             );
         }
 
-        let cwd = canonicalize_cwd(&args.cwd);
+        let cwd = self.resolve_cwd(&args.cwd);
         let (session_id, handle) = self.build_handle(cwd, None).await?;
         let mode = {
             let rt = handle.runtime.lock().await;
@@ -353,7 +362,7 @@ impl AcpAgentTrait for OneAcpAgent {
         &self,
         args: LoadSessionRequest,
     ) -> agent_client_protocol::Result<LoadSessionResponse> {
-        let cwd = canonicalize_cwd(&args.cwd);
+        let cwd = self.resolve_cwd(&args.cwd);
         let sid = args.session_id.clone();
 
         if let Ok(existing) = self.get_session(&sid).await {
@@ -386,7 +395,7 @@ impl AcpAgentTrait for OneAcpAgent {
         &self,
         args: ResumeSessionRequest,
     ) -> agent_client_protocol::Result<ResumeSessionResponse> {
-        let cwd = canonicalize_cwd(&args.cwd);
+        let cwd = self.resolve_cwd(&args.cwd);
         let sid = args.session_id.clone();
         if self.sessions.lock().await.contains_key(&sid) {
             return Ok(ResumeSessionResponse::new());
@@ -404,7 +413,7 @@ impl AcpAgentTrait for OneAcpAgent {
         args: ListSessionsRequest,
     ) -> agent_client_protocol::Result<ListSessionsResponse> {
         let cwd = match args.cwd.as_ref() {
-            Some(p) => canonicalize_cwd(p),
+            Some(p) => self.resolve_cwd(p),
             None => {
                 let cli = self.cli.lock().expect("cli");
                 cli.cwd.canonicalize().unwrap_or_else(|_| cli.cwd.clone())

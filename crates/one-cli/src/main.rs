@@ -298,6 +298,13 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     }
 
+    // `one web` — Web UI server (ACP over WebSocket).
+    if matches!(&cli.command, Some(Commands::Web(_))) {
+        if let Some(Commands::Web(web)) = cli.command.take() {
+            return run_web_command(cli, web).await;
+        }
+    }
+
     if let Some(Commands::Mcp(mcp)) = cli.command {
         mcp_cmd::run_mcp(mcp).await?;
         return Ok(ExitCode::SUCCESS);
@@ -377,6 +384,12 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // ACP manages its own sessions — skip default AppRuntime assembly.
     if matches!(run_mode, RunMode::Acp) {
         modes::run_acp(cli).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Web mode runs ACP server over WebSocket.
+    if matches!(run_mode, RunMode::Web) {
+        modes::run_web_server(cli, "127.0.0.1", 3000, false).await?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -475,6 +488,10 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             // Handled before AppRuntime::build.
             unreachable!("acp mode exits earlier");
         }
+        RunMode::Web => {
+            // Handled before AppRuntime::build.
+            unreachable!("web mode exits earlier");
+        }
         RunMode::Interactive => {
             // `-p` / `--tui -p` seeds the first user turn inside the TUI.
             modes::run_interactive(&mut runtime, &mut providers, cli.print.clone()).await?;
@@ -490,13 +507,26 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     Ok(exit)
 }
 
+/// `one web` — start ACP Web server.
+async fn run_web_command(
+    mut cli: Cli,
+    web: crate::cli::WebCli,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    cli.mode = RunMode::Web;
+    if cli.always_approve {
+        cli.auto_approve = true;
+    }
+    modes::run_web_server(cli, &web.host, web.port, web.open).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
 /// `one acp` — apply yolo / mode flags and enter ACP stdio server.
 async fn run_acp_command(
     mut cli: Cli,
-    acp: AcpCli,
+    _acp: AcpCli,
 ) -> Result<ExitCode, Box<dyn std::error::Error>> {
     cli.mode = RunMode::Acp;
-    if acp.yolo {
+    if cli.always_approve {
         cli.auto_approve = true;
     }
     // Do not build a default TUI/print runtime first — ACP owns session lifecycle.
