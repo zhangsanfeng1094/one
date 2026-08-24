@@ -106,6 +106,26 @@ impl ExtensionRuntime {
         hooks::run_session_hooks(&self.hooks.session_end, "SessionEnd", &self.cwd).await;
     }
 
+    /// Fire PreCompact (extensions + hooks.json). `trigger` is `manual` or `auto`.
+    pub async fn notify_pre_compact(&self, trigger: &str) {
+        let _ = self
+            .emit(&ExtensionEvent::PreCompact {
+                trigger: trigger.to_string(),
+            })
+            .await;
+        hooks::run_compact_hooks(&self.hooks.pre_compact, "PreCompact", trigger, &self.cwd).await;
+    }
+
+    /// Fire PostCompact (extensions + hooks.json). `trigger` is `manual` or `auto`.
+    pub async fn notify_post_compact(&self, trigger: &str) {
+        let _ = self
+            .emit(&ExtensionEvent::PostCompact {
+                trigger: trigger.to_string(),
+            })
+            .await;
+        hooks::run_compact_hooks(&self.hooks.post_compact, "PostCompact", trigger, &self.cwd).await;
+    }
+
     pub fn make_context<'a>(
         &'a self,
         cwd: &'a Path,

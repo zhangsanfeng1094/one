@@ -107,7 +107,7 @@ impl Extension for MyExtension {
 | `TurnStart` / `TurnEnd` | 每个 LLM turn |
 | `ToolStart` / `ToolEnd` | 工具前后（`ToolEnd` 由 runtime 在 after 路径发出） |
 | `UserPromptSubmit` | CLI 收到用户输入、进入 model 前 |
-| `PreCompact` / `PostCompact` | 预留（compaction 挂钩） |
+| `PreCompact` / `PostCompact` | compact 前后；hooks.json matcher 为 `manual` / `auto` |
 
 ### PreTool 管道（执行顺序）
 
@@ -326,4 +326,4 @@ one-ext = { path = "...", features = ["dylib"] }
 2. ~~plugin MCP 片段合并进 `McpManager`~~ ✅ build/reload 已合并  
 3. TUI 挂接 `ExtensionCommand`  
 4. Package / Suite 通过 `extensions.load` 引用（见 [package-suites.md](./package-suites.md)）  
-5. Compaction 真正发出 `PreCompact` / `PostCompact`
+5. ~~Compaction 真正发出 `PreCompact` / `PostCompact`~~ ✅

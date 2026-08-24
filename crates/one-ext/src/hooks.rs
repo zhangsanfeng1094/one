@@ -37,6 +37,10 @@ pub struct HooksConfig {
     pub session_end: Vec<HookHandler>,
     #[serde(default)]
     pub user_prompt_submit: Vec<HookHandler>,
+    #[serde(default)]
+    pub pre_compact: Vec<HookHandler>,
+    #[serde(default)]
+    pub post_compact: Vec<HookHandler>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,22 +132,74 @@ fn flatten_raw_hooks(items: Vec<RawHookItem>) -> Vec<HookHandler> {
 
 #[derive(Debug, Clone, Deserialize, Default)]
 struct RawHooksMap {
-    #[serde(default, alias = "PreToolUse", alias = "preToolUse", alias = "pre_tool_use")]
+    #[serde(
+        default,
+        alias = "PreToolUse",
+        alias = "preToolUse",
+        alias = "pre_tool_use"
+    )]
     pre_tool_use: Vec<RawHookItem>,
-    #[serde(default, alias = "PostToolUse", alias = "postToolUse", alias = "post_tool_use")]
+    #[serde(
+        default,
+        alias = "PostToolUse",
+        alias = "postToolUse",
+        alias = "post_tool_use"
+    )]
     post_tool_use: Vec<RawHookItem>,
-    #[serde(default, alias = "PostToolUseFailure", alias = "postToolUseFailure", alias = "post_tool_use_failure")]
+    #[serde(
+        default,
+        alias = "PostToolUseFailure",
+        alias = "postToolUseFailure",
+        alias = "post_tool_use_failure"
+    )]
     post_tool_use_failure: Vec<RawHookItem>,
     #[serde(default, alias = "Stop", alias = "stop")]
     stop: Vec<RawHookItem>,
-    #[serde(default, alias = "SubagentStop", alias = "subagentStop", alias = "subagent_stop", alias = "SubagentEnd", alias = "subagent_end")]
+    #[serde(
+        default,
+        alias = "SubagentStop",
+        alias = "subagentStop",
+        alias = "subagent_stop",
+        alias = "SubagentEnd",
+        alias = "subagent_end"
+    )]
     subagent_stop: Vec<RawHookItem>,
-    #[serde(default, alias = "SessionStart", alias = "sessionStart", alias = "session_start")]
+    #[serde(
+        default,
+        alias = "SessionStart",
+        alias = "sessionStart",
+        alias = "session_start"
+    )]
     session_start: Vec<RawHookItem>,
-    #[serde(default, alias = "SessionEnd", alias = "sessionEnd", alias = "session_end")]
+    #[serde(
+        default,
+        alias = "SessionEnd",
+        alias = "sessionEnd",
+        alias = "session_end"
+    )]
     session_end: Vec<RawHookItem>,
-    #[serde(default, alias = "UserPromptSubmit", alias = "userPromptSubmit", alias = "user_prompt_submit", alias = "beforeSubmitPrompt")]
+    #[serde(
+        default,
+        alias = "UserPromptSubmit",
+        alias = "userPromptSubmit",
+        alias = "user_prompt_submit",
+        alias = "beforeSubmitPrompt"
+    )]
     user_prompt_submit: Vec<RawHookItem>,
+    #[serde(
+        default,
+        alias = "PreCompact",
+        alias = "preCompact",
+        alias = "pre_compact"
+    )]
+    pre_compact: Vec<RawHookItem>,
+    #[serde(
+        default,
+        alias = "PostCompact",
+        alias = "postCompact",
+        alias = "post_compact"
+    )]
+    post_compact: Vec<RawHookItem>,
 }
 
 impl<'de> Deserialize<'de> for HooksConfig {
@@ -175,6 +231,8 @@ impl<'de> Deserialize<'de> for HooksConfig {
             session_start: flatten_raw_hooks(raw.session_start),
             session_end: flatten_raw_hooks(raw.session_end),
             user_prompt_submit: flatten_raw_hooks(raw.user_prompt_submit),
+            pre_compact: flatten_raw_hooks(raw.pre_compact),
+            post_compact: flatten_raw_hooks(raw.post_compact),
         })
     }
 }
@@ -191,12 +249,15 @@ impl HooksConfig {
     pub fn merge(mut self, other: Self) -> Self {
         self.pre_tool_use.extend(other.pre_tool_use);
         self.post_tool_use.extend(other.post_tool_use);
-        self.post_tool_use_failure.extend(other.post_tool_use_failure);
+        self.post_tool_use_failure
+            .extend(other.post_tool_use_failure);
         self.stop.extend(other.stop);
         self.subagent_stop.extend(other.subagent_stop);
         self.session_start.extend(other.session_start);
         self.session_end.extend(other.session_end);
         self.user_prompt_submit.extend(other.user_prompt_submit);
+        self.pre_compact.extend(other.pre_compact);
+        self.post_compact.extend(other.post_compact);
         self
     }
 
@@ -209,6 +270,8 @@ impl HooksConfig {
             && self.session_start.is_empty()
             && self.session_end.is_empty()
             && self.user_prompt_submit.is_empty()
+            && self.pre_compact.is_empty()
+            && self.post_compact.is_empty()
     }
 }
 
@@ -466,7 +529,9 @@ pub async fn run_stop_hooks(
                 if let Ok(resp) = serde_json::from_str::<StopResponse>(&exec_res.stdout) {
                     if let Some(dec) = resp.decision.as_deref() {
                         if dec.eq_ignore_ascii_case("block") {
-                            let reason = resp.reason.unwrap_or_else(|| "Blocked by Stop hook".to_string());
+                            let reason = resp
+                                .reason
+                                .unwrap_or_else(|| "Blocked by Stop hook".to_string());
                             return StopDecision::Block { reason };
                         }
                     }
@@ -492,6 +557,36 @@ pub async fn run_stop_hooks(
         }
     }
     StopDecision::Allow
+}
+
+/// Fire PreCompact / PostCompact hooks. Matcher tests `manual` or `auto`.
+/// Fail-open: hook errors are logged, compaction is never blocked.
+pub async fn run_compact_hooks(hooks: &[HookHandler], event: &str, trigger: &str, cwd: &Path) {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Req {
+        hook_event_name: String,
+        trigger: String,
+        cwd: String,
+    }
+    let req = Req {
+        hook_event_name: event.into(),
+        trigger: trigger.into(),
+        cwd: cwd.display().to_string(),
+    };
+    for handler in hooks {
+        if !matcher_hits(handler.matcher.as_deref(), trigger) {
+            continue;
+        }
+        if let Err(e) = run_handler_raw(handler, &req, event, cwd).await {
+            tracing::warn!(
+                hook = %handler.name.as_deref().unwrap_or(event),
+                trigger,
+                error = %e,
+                "compact hook failed"
+            );
+        }
+    }
 }
 
 pub async fn run_session_hooks(hooks: &[HookHandler], event: &str, cwd: &Path) {
@@ -726,5 +821,21 @@ mod tests {
         let cfg2: HooksConfig = serde_json::from_str(raw_nested).unwrap();
         assert_eq!(cfg2.pre_tool_use.len(), 1);
         assert_eq!(cfg2.pre_tool_use[0].matcher.as_deref(), Some("Bash|Write"));
+    }
+
+    #[test]
+    fn parse_compact_hooks() {
+        let raw = r#"{
+            "hooks": {
+                "PreCompact": [{ "matcher": "manual", "command": "echo pre" }],
+                "PostCompact": [{ "matcher": "auto", "command": "echo post" }]
+            }
+        }"#;
+        let cfg: HooksConfig = serde_json::from_str(raw).unwrap();
+        assert_eq!(cfg.pre_compact.len(), 1);
+        assert_eq!(cfg.pre_compact[0].matcher.as_deref(), Some("manual"));
+        assert_eq!(cfg.post_compact.len(), 1);
+        assert!(matcher_hits(Some("manual"), "manual"));
+        assert!(!matcher_hits(Some("manual"), "auto"));
     }
 }

@@ -27,10 +27,10 @@ pub enum ExtensionEvent {
         turn: usize,
         last_assistant_message: Option<String>,
     },
-    /// Compaction about to run.
-    PreCompact,
-    /// Compaction finished.
-    PostCompact,
+    /// Compaction about to run. `trigger` is `manual` or `auto` (hooks.json matcher).
+    PreCompact { trigger: String },
+    /// Compaction finished. `trigger` is `manual` or `auto`.
+    PostCompact { trigger: String },
     /// User submitted a prompt (before model).
     UserPromptSubmit { text: String },
 }
