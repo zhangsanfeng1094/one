@@ -411,7 +411,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
         }
     }
-    // Drive auto-compact threshold from model/settings context_window (~70%).
+    // Drive auto-compact threshold from model/settings context_window (~85%).
     runtime.set_context_window(providers.context_window());
     // Pi/Grok agentic search: hosted inject on main request when capable.
     runtime.refresh_web_search_backend(&providers).await?;

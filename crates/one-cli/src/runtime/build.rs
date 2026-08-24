@@ -474,6 +474,8 @@ impl AppRuntime {
             intent_graph,
             intent_turn: 0,
             intent_reminder_last_turn: HashMap::new(),
+            compact_suppression: one_core::compaction::CompactionSuppression::None,
+            prefire: super::PrefireState::default(),
         };
 
         // Seed session id for task parent metadata.

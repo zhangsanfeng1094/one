@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use one_core::agent::{Agent, LlmProvider};
+use one_core::compaction::{CompactionSuppression, PrefireCandidate};
 use one_ext::ExtensionRuntime;
 use one_mcp::{McpManager, McpReminderState};
 use one_resources::ResourceLoader;
@@ -136,6 +137,17 @@ pub struct AppRuntime {
     intent_turn: u32,
     /// reminder_id → last `intent_turn` it was injected.
     intent_reminder_last_turn: HashMap<String, u32>,
+    /// Auto-compact suppression (Grok sticky-until-success).
+    compact_suppression: CompactionSuppression,
+    /// Background two-pass Pass-1 cache.
+    prefire: PrefireState,
+}
+
+/// In-flight / cached two-pass Pass-1 NOTE₁.
+#[derive(Default)]
+struct PrefireState {
+    in_flight: Option<tokio::task::JoinHandle<Option<PrefireCandidate>>>,
+    cached: Option<PrefireCandidate>,
 }
 
 impl AppRuntime {

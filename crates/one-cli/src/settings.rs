@@ -39,30 +39,43 @@ pub struct ToolOutputSettings {
 
 /// Context compaction strategy (settings key `compaction`).
 ///
-/// Main path: auto threshold + keep_recent summary (OpenCode/Claude-style).
-/// `prune` (default **on**): clear old tool bodies outside the keep_recent tail
-/// as a cheap pre-pass and as **prefire** (~85% of threshold) before full LLM compact.
+/// Main path: auto threshold + keep_recent summary (Grok-style).
+/// `prune` (default **on**): every turn, trim old tool bodies by user-turn age.
+/// `two_pass` (default **off**): Pass-1 NOTE₁ + Pass-2 final; background prefire
+/// starts `prefire_lead_ratio` of the window below the auto-compact limit.
 /// Omitted fields use defaults in [`CompactionSettings::to_config`].
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CompactionSettings {
     /// Auto-compact when over threshold before a turn (default true).
     pub auto: Option<bool>,
-    /// Fraction of context_window that triggers compact (0.0–1.0, default 0.70).
+    /// Fraction of context_window that triggers compact (0.0–1.0, default 0.85).
     /// Ignored when [`Self::threshold`] is set.
     pub ratio: Option<f64>,
     /// Absolute token threshold override (takes precedence over ratio).
     pub threshold: Option<usize>,
     /// Recent messages kept after LLM/extractive summary (default 12).
-    /// These turns (including their tool outputs) are never pruned.
     pub keep_recent: Option<usize>,
-    /// Pre-pass + prefire: clear **old** tool bodies outside keep_recent (default true).
+    /// Prune old tool bodies by user-turn age every compact check (default true).
     pub prune: Option<bool>,
-    /// Within pre-tail only: soft-protect this many tokens of the newest old tools.
+    /// Legacy: unused by turn-age prune (kept for settings.json compat).
     pub prune_protect_tokens: Option<usize>,
-    /// Max chars of original text kept on a pruned tool result (default 2000).
+    /// Legacy: unused by turn-age prune (kept for settings.json compat).
     pub prune_max_chars: Option<usize>,
-    /// Fraction of compact threshold at which prune-only prefire runs (default 0.85).
+    /// Recent user turns whose tool results are never pruned (default 3).
+    pub prune_keep_last_n_turns: Option<usize>,
+    /// Char threshold for soft-trim of older tool results (default 4000).
+    pub prune_soft_trim_threshold: Option<usize>,
+    pub prune_soft_trim_head: Option<usize>,
+    pub prune_soft_trim_tail: Option<usize>,
+    /// User-turn age after which tool results become a placeholder (default 10).
+    pub prune_hard_clear_age_turns: Option<usize>,
+    /// Opt-in two-pass summarization + background Pass-1 prefire (default false).
+    pub two_pass: Option<bool>,
+    /// Fraction of context_window below the auto-compact limit at which Pass-1
+    /// prefires (default 0.10). Grok `GROK_PREFIRE_LEAD_PERCENT`.
+    pub prefire_lead_ratio: Option<f64>,
+    /// Deprecated: fraction of compact threshold. Converted to lead if lead unset.
     pub prefire_ratio: Option<f64>,
 }
 
@@ -88,16 +101,39 @@ impl CompactionSettings {
         if let Some(n) = self.prune_max_chars {
             cfg.prune_max_chars = n;
         }
-        if let Some(r) = self
+        if let Some(n) = self.prune_keep_last_n_turns.filter(|n| *n > 0) {
+            cfg.prune_keep_last_n_turns = n;
+        }
+        if let Some(n) = self.prune_soft_trim_threshold {
+            cfg.prune_soft_trim_threshold = n;
+        }
+        if let Some(n) = self.prune_soft_trim_head {
+            cfg.prune_soft_trim_head = n;
+        }
+        if let Some(n) = self.prune_soft_trim_tail {
+            cfg.prune_soft_trim_tail = n;
+        }
+        if let Some(n) = self.prune_hard_clear_age_turns.filter(|n| *n > 0) {
+            cfg.prune_hard_clear_age_turns = n;
+        }
+        cfg.two_pass = self.two_pass.unwrap_or(false);
+        if let Some(lead) = self
+            .prefire_lead_ratio
+            .filter(|r| r.is_finite() && *r > 0.0 && *r < 1.0)
+        {
+            cfg.prefire_lead_ratio = lead;
+        } else if let Some(r) = self
             .prefire_ratio
             .filter(|r| r.is_finite() && *r > 0.0 && *r < 1.0)
         {
+            // Old meaning: fire at r × threshold. Approximate as lead = 1 − r.
+            cfg.prefire_lead_ratio = (1.0 - r).clamp(0.01, 0.49);
             cfg.prefire_ratio = r;
         }
         cfg
     }
 
-    /// One-line summary for Settings UI, e.g. `auto 70% · keep 12 · prune · prefire 85%`.
+    /// One-line summary for Settings UI, e.g. `auto 85% · keep 12 · prune · 2-pass`.
     pub fn summary_line(&self) -> String {
         let auto = if self.auto.unwrap_or(true) {
             "auto"
@@ -119,15 +155,20 @@ impl CompactionSettings {
         };
         let keep = self.keep_recent.unwrap_or(12);
         let prune = if self.prune.unwrap_or(true) {
-            let pf = self
-                .prefire_ratio
-                .filter(|r| r.is_finite() && *r > 0.0 && *r < 1.0)
-                .unwrap_or(one_core::DEFAULT_PREFIRE_RATIO);
-            format!("prune · prefire {}%", (pf * 100.0).round() as u32)
+            "prune"
         } else {
-            "no prune".into()
+            "no prune"
         };
-        format!("{auto} {thresh} · keep {keep} · {prune}")
+        let two = if self.two_pass.unwrap_or(false) {
+            let lead = self
+                .prefire_lead_ratio
+                .filter(|r| r.is_finite() && *r > 0.0 && *r < 1.0)
+                .unwrap_or(one_core::DEFAULT_PREFIRE_LEAD_RATIO);
+            format!(" · 2-pass lead {}%", (lead * 100.0).round() as u32)
+        } else {
+            String::new()
+        };
+        format!("{auto} {thresh} · keep {keep} · {prune}{two}")
     }
 }
 
@@ -624,6 +665,46 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             }
             settings.compaction_mut().prefire_ratio = Some(r);
         }
+        "compaction.two_pass" | "compaction.two-pass" | "compaction_two_pass" => {
+            let v = value.trim().to_ascii_lowercase();
+            let c = settings.compaction_mut();
+            match v.as_str() {
+                "1" | "true" | "yes" | "on" => c.two_pass = Some(true),
+                "0" | "false" | "no" | "off" => c.two_pass = Some(false),
+                "toggle" => c.two_pass = Some(!c.two_pass.unwrap_or(false)),
+                other => {
+                    return Err(format!(
+                        "compaction.two_pass must be on|off|toggle (got `{other}`)"
+                    ));
+                }
+            }
+        }
+        "compaction.prefire_lead"
+        | "compaction.prefire-lead"
+        | "compaction.prefire_lead_ratio"
+        | "compaction.lead" => {
+            let r: f64 = value.trim().trim_end_matches('%').parse().map_err(|_| {
+                "compaction.prefire_lead must be a number (0–1 or percent)".to_string()
+            })?;
+            let r = if r > 1.0 && r <= 100.0 { r / 100.0 } else { r };
+            if !(r > 0.0 && r < 1.0) {
+                return Err(
+                    "compaction.prefire_lead must be in (0, 1) (or 1–99 as percent)".into(),
+                );
+            }
+            settings.compaction_mut().prefire_lead_ratio = Some(r);
+        }
+        "compaction.prune_keep_last_n_turns"
+        | "compaction.keep_last_n_turns"
+        | "compaction.prune-keep-turns" => {
+            let n: usize = value.trim().parse().map_err(|_| {
+                "compaction.prune_keep_last_n_turns must be a positive number".to_string()
+            })?;
+            if n < 1 {
+                return Err("compaction.prune_keep_last_n_turns must be >= 1".into());
+            }
+            settings.compaction_mut().prune_keep_last_n_turns = Some(n);
+        }
         "compaction.prune_protect_tokens"
         | "compaction.prune-protect-tokens"
         | "compaction_prune_protect" => {
@@ -796,7 +877,8 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                 "unknown setting `{other}` · known: provider model thinking auto_approve \
                  context_window sandbox add_dir bash_sandbox tool_output.max_lines \
                  tool_output.max_bytes compaction.auto|ratio|threshold|keep_recent|prune \
-                 |prefire_ratio|prune_protect_tokens|prune_max_chars \
+                 |two_pass|prefire_lead|prefire_ratio|prune_keep_last_n_turns \
+                 |prune_protect_tokens|prune_max_chars \
                  memory.enabled|index_max_lines|write|max_lookups_per_turn|subagent|archive_compaction \
                  empty_response_retries \
                  feature.<id> allow deny ask"
@@ -985,6 +1067,13 @@ mod tests {
                 prune: Some(true),
                 prune_protect_tokens: Some(20_000),
                 prune_max_chars: Some(1000),
+                prune_keep_last_n_turns: Some(3),
+                prune_soft_trim_threshold: None,
+                prune_soft_trim_head: None,
+                prune_soft_trim_tail: None,
+                prune_hard_clear_age_turns: None,
+                two_pass: Some(false),
+                prefire_lead_ratio: Some(0.10),
                 prefire_ratio: Some(0.85),
             }),
             memory: Some(MemorySettings {
@@ -1063,6 +1152,13 @@ mod tests {
         set_key(&mut s, "compaction.auto", "off").unwrap();
         assert!(!s.compaction_config(100_000).enabled);
         assert!(s.compaction_or_default().summary_line().contains("prune"));
+        set_key(&mut s, "compaction.two_pass", "on").unwrap();
+        set_key(&mut s, "compaction.prefire_lead", "10").unwrap();
+        set_key(&mut s, "compaction.prune_keep_last_n_turns", "4").unwrap();
+        let cfg3 = s.compaction_config(100_000);
+        assert!(cfg3.two_pass);
+        assert!((cfg3.prefire_lead_ratio - 0.10).abs() < f64::EPSILON);
+        assert_eq!(cfg3.prune_keep_last_n_turns, 4);
     }
 
     #[test]

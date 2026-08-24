@@ -16,23 +16,28 @@ pub use agent::{
     ThinkingLevel, TokenUsage, TraceRunMeta,
 };
 pub use compaction::{
-    compact_messages, estimate_tokens, extractive_summary, is_context_overflow_error,
-    prefire_threshold, prune_old_tool_outputs, should_compact, should_compact_tokens,
-    should_prefire_prune, split_for_compaction, split_two_pass, summarization_prompt,
+    attach_compaction_reminder, compact_messages, compacted_live_messages,
+    edited_paths_from_messages, estimate_tokens, extractive_summary, format_compaction_reminder,
+    format_transcript, is_context_overflow_error, prefire_threshold, prefix_fingerprint,
+    prune_old_tool_outputs, should_compact, should_compact_tokens, should_prefire_prune,
+    should_prefire_two_pass, split_for_compaction, split_two_pass, summarization_prompt,
     threshold_for_context_window, threshold_for_context_window_ratio, tokens_for_compaction,
-    CompactionCheckpoint, CompactionConfig, CompactionMode, CompactionSuppression,
-    PrefireCandidate, PrefireOutcome, DEFAULT_COMPACT_RATIO, DEFAULT_PREFIRE_RATIO,
-    DEFAULT_PRUNE_MAX_CHARS, DEFAULT_PRUNE_PROTECT_TOKENS, FALLBACK_COMPACT_THRESHOLD,
-    MIN_COMPACT_THRESHOLD, PRUNED_TOOL_PLACEHOLDER,
-};
-pub use reminder::{
-    append_system_reminder, has_system_reminder, system_reminder, SYSTEM_REMINDER_CLOSE,
-    SYSTEM_REMINDER_OPEN,
+    two_pass_pass1_prompt, two_pass_pass2_prompt, CompactRequest, CompactTrigger,
+    CompactionCheckpoint, CompactionConfig, CompactionMode, CompactionStateContext,
+    CompactionSuppression, PrefireCandidate, PrefireOutcome, DEFAULT_COMPACT_RATIO,
+    DEFAULT_PREFIRE_LEAD_RATIO, DEFAULT_PREFIRE_RATIO, DEFAULT_PRUNE_HARD_CLEAR_AGE_TURNS,
+    DEFAULT_PRUNE_KEEP_LAST_N_TURNS, DEFAULT_PRUNE_MAX_CHARS, DEFAULT_PRUNE_PROTECT_TOKENS,
+    DEFAULT_PRUNE_SOFT_TRIM_HEAD, DEFAULT_PRUNE_SOFT_TRIM_TAIL, DEFAULT_PRUNE_SOFT_TRIM_THRESHOLD,
+    FALLBACK_COMPACT_THRESHOLD, MIN_COMPACT_THRESHOLD, PRUNED_TOOL_PLACEHOLDER, SOFT_TRIM_MARKER,
 };
 pub use error::{OneError, Result};
 pub use events::AgentEvent;
 pub use hooks::{AgentHooks, NoopHooks, StopDecision};
 pub use message::{AgentMessage, AssistantMessage, StopReason, ToolResultMessage, UserMessage};
+pub use reminder::{
+    append_system_reminder, has_system_reminder, system_reminder, SYSTEM_REMINDER_CLOSE,
+    SYSTEM_REMINDER_OPEN,
+};
 pub use streaming::{
     race_abort, wait_until_aborted, ServerToolStatus, StreamEvent, ABORT_POLL_INTERVAL,
 };

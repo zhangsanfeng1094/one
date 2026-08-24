@@ -76,7 +76,7 @@ fn settings_tool_output_panel_opens() {
 #[test]
 fn settings_compaction_panel_opens() {
     let mut app = App::new("test");
-    app.set_compaction_settings(true, 0.8, None, 10, true, 20_000, 1000);
+    app.set_compaction_settings(true, 0.8, None, 10, true, 3, false, 0.10);
     app.open_settings_compaction();
     let f = app.float.as_ref().unwrap();
     assert_eq!(f.kind, FloatKind::SettingsCompaction);
@@ -208,21 +208,21 @@ fn settings_tool_output_reopen_restores_selected_row() {
 #[test]
 fn settings_compaction_reopen_restores_selected_row() {
     let mut app = App::new("test");
-    app.set_compaction_settings(true, 0.8, None, 10, true, 20_000, 1000);
+    app.set_compaction_settings(true, 0.8, None, 10, true, 3, false, 0.10);
     app.open_settings_compaction();
     let f = app.float.as_mut().expect("compaction");
     f.selected = f
         .filtered_entries()
         .iter()
-        .position(|entry| entry.item.id == "prune_max_chars")
-        .expect("prune max chars row");
+        .position(|entry| entry.item.id == "two_pass")
+        .expect("two_pass row");
 
-    app.set_compaction_settings(true, 0.8, None, 10, true, 20_000, 2000);
+    app.set_compaction_settings(true, 0.8, None, 10, true, 3, true, 0.10);
     app.reopen_settings_compaction();
 
     let f = app.float.as_ref().expect("compaction");
     assert_eq!(f.kind, FloatKind::SettingsCompaction);
-    assert_eq!(f.selected_entry().unwrap().item.id, "prune_max_chars");
+    assert_eq!(f.selected_entry().unwrap().item.id, "two_pass");
 }
 
 #[test]

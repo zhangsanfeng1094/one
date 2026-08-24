@@ -18,7 +18,7 @@
 | **`/logout`** | 退出当前服务商登录态 | `/logout` |
 | **`/model`** | 查看或切换当前使用的模型 | `/model anthropic:claude-3-7-sonnet-20250219` |
 | **`/learn`** | 意图学习与规则管理（自动从会话学习或手动录入） | `/learn` / `/learn list` / `/learn status` |
-| **`/compact`** | 手动触发上下文压缩与历史摘要 | `/compact` |
+| **`/compact`** | 手动触发上下文压缩与历史摘要 | `/compact` · `/compact keep the auth details` |
 | **`/clear`** 或 **`/new`** | 清空当前对话并开始新会话（保持 MCP 连接池） | `/clear` |
 | **`/reload`** | 热重载磁盘配置（MCP、Skills、Prompt 模板、Plugins） | `/reload` |
 | **`/help`** | 显示帮助手册与命令列表 | `/help` |

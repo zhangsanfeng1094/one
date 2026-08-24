@@ -576,11 +576,13 @@ spill 目录在 `~/.one/agent/tool-outputs/` 下，默认对模型 **只读**，
 
 | 规则 | 默认 |
 |------|------|
-| 自动压缩阈值 | **模型 `context_window` 的 70%**（未知窗口时回退 **80 000** tokens） |
+| 自动压缩阈值 | **模型 `context_window` 的 85%**（未知窗口时回退 **80 000** tokens） |
 | Token 估算 | 优先用上次 API 返回的 prompt size；否则 messages 字符数 / 4 |
 | 保留最近消息 | 12 条（不拆断 tool_call / tool_result 对） |
-| 手动 | `/compact [instructions]` |
-| Overflow 恢复 | API 报 context 过长 → force compact 后重试一次 |
+| Prune | 每轮按 user-turn 年龄 soft-trim / hard-clear（最近 3 turn 不裁） |
+| 两遍摘要 | 默认关；开启后阈值前 10% 窗口后台 Pass-1 |
+| 手动 | `/compact [instructions]`（指令进入摘要 prompt） |
+| Overflow 恢复 | API 报 context 过长 → force compact 后重试一次；失败后抑制到下一轮成功采样 |
 
 **模型字段 `reasoning: true`**：声明支持 extended thinking；影响 `developer` role 与部分 reasoning 回放逻辑。交互里可用 `/model-add … reasoning=true`。
 

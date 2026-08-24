@@ -91,7 +91,7 @@ flowchart TB
 | Skills progressive disclosure | ✅ | `one-resources/skills` | catalog + read |
 | 分层 Memory（跨 session） | 🟨 | [memory.md](./memory.md) + `one-resources/memory` | **M1–M6**：feature `memory` 整包；L2+写+age/budget；`memory_search`/`memory_write`；compact→L4；子 agent 默认 off |
 | Prompt 模板 `/name` | ✅ | `one-resources/prompts` | |
-| Compaction | ✅ | `one-core/compaction` + runtime | 默认 prune 旧 tool body + prefire（~85% 阈值）+ LLM 摘要 + overflow 重试；`<system-reminder>` 用于空读/spill/后台完成 |
+| Compaction | ✅ | `one-core/compaction` + runtime | 默认 85% 阈值 + 每轮 turn-age prune + `/compact` 指令进 prompt + overflow 重试 + sticky suppression；two-pass/prefire 可选；`<system-reminder>` 用于空读/spill/后台完成/compact 状态 |
 | 五模式 Interactive/Print/JSON/RPC/ACP | ✅ | `one-cli/modes` | ACP：`one acp` / `--mode acp`，见 [acp.md](./acp.md) |
 | 执行轨迹 / harness 评测 | ✅ | `one-core/trace` + Langfuse `--trace` / `one bench` | 可选 TraceSink → Langfuse；见 [harness-eval.md](./harness-eval.md) |
 | Plan / Act 模式 | ✅ | runtime + tools/plan | 硬工具门控 |

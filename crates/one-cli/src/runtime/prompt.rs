@@ -1,9 +1,15 @@
 //! User prompt path and context compaction.
 
+use std::sync::Arc;
+
 use one_core::agent::{CompletionRequest, LlmProvider, ThinkingLevel};
 use one_core::compaction::{
-    compact_messages, prune_old_tool_outputs, should_compact_tokens, should_prefire_prune,
-    split_for_compaction, summarization_prompt, tokens_for_compaction, CompactionConfig,
+    attach_compaction_reminder, compact_messages, compacted_live_messages,
+    edited_paths_from_messages, estimate_tokens, prefix_fingerprint, prune_old_tool_outputs,
+    should_compact_tokens, should_prefire_two_pass, split_for_compaction, split_two_pass,
+    summarization_prompt, tokens_for_compaction, two_pass_pass1_prompt, two_pass_pass2_prompt,
+    CompactRequest, CompactionConfig, CompactionStateContext, CompactionSuppression,
+    PrefireCandidate,
 };
 use one_core::error::OneError;
 use one_core::message::AgentMessage;
@@ -37,7 +43,7 @@ impl AppRuntime {
 
         let text = self.resources.resolve_prompt(text);
         self.inject_graph_intent_reminder(&text).await;
-        self.maybe_compact(provider, false).await?;
+        self.maybe_compact(provider, CompactRequest::auto()).await?;
 
         // M3: memory read/grep budget is per user turn.
         self.memory_lookups.reset_turn();
@@ -65,7 +71,8 @@ impl AppRuntime {
                 Ok(out) => Ok(out),
                 Err(err) if is_overflow_err(&err) => {
                     drop(err);
-                    self.maybe_compact(provider, true).await?;
+                    self.maybe_compact(provider, CompactRequest::overflow())
+                        .await?;
                     // Buffer shrank. Re-base so we (1) don't panic on `[before..]` and
                     // (2) still persist the in-flight user turn (never written yet) without
                     // re-appending already-on-disk kept history.
@@ -114,6 +121,9 @@ impl AppRuntime {
             }
         }
 
+        if result.is_ok() {
+            self.note_sampling_success();
+        }
         result
     }
 
@@ -135,30 +145,57 @@ impl AppRuntime {
         Ok(())
     }
 
-    /// Compact when over threshold, or when `force` (e.g. context overflow recovery / `/compact`).
+    /// Clear auto-compact suppression after a successful LLM sampling turn.
+    pub fn note_sampling_success(&mut self) {
+        if matches!(
+            self.compact_suppression,
+            CompactionSuppression::StickyUntilSuccess | CompactionSuppression::Turn
+        ) {
+            self.compact_suppression = CompactionSuppression::None;
+        }
+    }
+
+    /// Compact with an owned provider so two-pass Pass-1 can prefire in the background.
+    pub async fn maybe_compact_with(
+        &mut self,
+        provider: Arc<dyn LlmProvider>,
+        request: CompactRequest,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let prefire = Arc::clone(&provider);
+        self.maybe_compact_inner(provider.as_ref(), request, Some(prefire))
+            .await
+    }
+
+    /// Compact when over threshold, or when `request` forces (`/compact`, overflow).
     ///
-    /// Strategy from `settings.compaction` (auto / ratio|threshold / keep_recent;
-    /// prune default **on** + prefire at ~85% of threshold).
-    /// Token pressure prefers last provider-reported prompt size over char/4 estimate.
-    ///
-    /// Flow:
-    /// 1. **Prefire** (tokens ≥ prefire_ratio × threshold, prune on): clear old tool
-    ///    bodies outside keep_recent. If that alone drops under the full threshold,
-    ///    stop — no LLM summary yet.
-    /// 2. **Full compact** (tokens ≥ threshold, or force): prune again if needed, then
-    ///    LLM/extractive summary of older messages; keep_recent tail kept verbatim.
+    /// Flow (Grok-aligned):
+    /// 1. **Prune** every check when enabled (turn-age soft-trim / hard-clear).
+    /// 2. **Prefire Pass-1** when `two_pass` and tokens are within the lead band.
+    /// 3. **Full compact** at threshold (or force): LLM summary (two-pass if
+    ///    enabled / cached NOTE₁), keep_recent tail, session compaction entry,
+    ///    live buffer rebuilt the same way resume does.
     pub async fn maybe_compact(
         &mut self,
         provider: &dyn LlmProvider,
-        force: bool,
+        request: CompactRequest,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        self.maybe_compact_inner(provider, request, None).await
+    }
+
+    async fn maybe_compact_inner(
+        &mut self,
+        provider: &dyn LlmProvider,
+        request: CompactRequest,
+        prefire_provider: Option<Arc<dyn LlmProvider>>,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let settings = crate::settings::load();
-        let config = settings.compaction_config(self.context_window);
-
-        // Manual force (/compact, API overflow) always proceeds; auto respects `enabled`.
-        if !force && !config.enabled {
-            return Ok(());
+        let mut config = settings.compaction_config(self.context_window);
+        if request.trigger.ignore_suppression() {
+            config.suppression = CompactionSuppression::None;
+        } else {
+            config.suppression = self.compact_suppression;
         }
+        let force = request.force();
 
         let (mut messages, last_prompt) = {
             let agent = self.agent.lock().await;
@@ -171,54 +208,66 @@ impl AppRuntime {
         };
         let mut tokens = tokens_for_compaction(&messages, observed);
 
-        let over_full = force || should_compact_tokens(tokens, &config);
-        let over_prefire = !force && should_prefire_prune(tokens, &config);
-        if !over_full && !over_prefire {
-            return Ok(());
-        }
-
-        // 1) Prune old tool outputs (prefire and full path). Cheap; may be enough alone.
-        let mut did_prune = false;
+        // 1) Prune old tool outputs every check (independent of auto-compact).
         if config.prune {
             let n = prune_old_tool_outputs(&mut messages, &config);
             if n > 0 {
-                did_prune = true;
-                // After prune, re-estimate (provider last_prompt is stale for size).
                 tokens = tokens_for_compaction(&messages, None);
                 let mut agent = self.agent.lock().await;
                 agent.messages = messages.clone();
-                // Stale API size no longer matches pruned buffer.
                 agent.last_prompt_tokens = 0;
             }
         }
 
-        // Prefire / prune-only: if under full threshold, skip LLM summary unless forced.
-        if !force && !should_compact_tokens(tokens, &config) {
-            if did_prune || over_prefire {
-                tracing::debug!(
-                    tokens,
-                    threshold = config.token_threshold,
-                    "compaction prefire/prune-only; skipping LLM summary"
-                );
+        // Manual / overflow always proceed; auto respects `enabled`.
+        if !force && !config.enabled {
+            return Ok(());
+        }
+
+        self.collect_prefire_if_ready().await;
+        if !force {
+            if let Some(arc) = prefire_provider.as_ref() {
+                self.spawn_prefire_pass1(arc.clone(), &messages, &config, tokens);
             }
+        }
+
+        let suppressed = !request.trigger.ignore_suppression()
+            && config.suppression != CompactionSuppression::None;
+        let over_full = force || (!suppressed && should_compact_tokens(tokens, &config));
+        if !over_full {
             return Ok(());
         }
         if split_for_compaction(&messages, &config).is_none() {
-            // Nothing left to summarize (too few messages); prune may still have applied.
             return Ok(());
         }
+
+        let matcher = request.trigger.hook_matcher();
+        self.extensions.notify_pre_compact(matcher).await;
 
         let tokens_before = tokens as u64;
         let summary = self
-            .summarize_for_compaction(provider, &messages, &config)
+            .summarize_for_compaction(
+                provider,
+                &messages,
+                &config,
+                request.instructions.as_deref(),
+            )
             .await;
         let (fallback, kept) = compact_messages(&messages, &config);
-        let summary = summary.unwrap_or(fallback);
+        let mut summary = summary.unwrap_or(fallback);
         if summary.is_empty() {
+            self.compact_suppression = CompactionSuppression::StickyUntilSuccess;
             return Ok(());
         }
 
-        // first_kept = oldest kept context message entry (not the current leaf).
+        let reminder_ctx = CompactionStateContext {
+            cwd: self.cwd.display().to_string(),
+            plan_active: self.mode == super::AgentMode::Plan,
+            plan_path: self.plan_path.as_ref().map(|p| p.display().to_string()),
+            edited_paths: edited_paths_from_messages(&messages),
+        };
+        summary = attach_compaction_reminder(&summary, &reminder_ctx);
+
         let first_kept = self
             .session
             .as_ref()
@@ -231,8 +280,6 @@ impl AppRuntime {
                 .await?;
         }
 
-        // M5: optional L4 archive under memory/sessions/ (not injected into L2).
-        // Whole package must be on (feature `memory`).
         if self.applied_features.memory_enabled()
             && settings.memory_or_default().archive_compaction_enabled()
         {
@@ -255,53 +302,138 @@ impl AppRuntime {
             }
         }
 
-        let mut agent = self.agent.lock().await;
-        agent.messages = kept;
-        // After compact the buffer is much smaller; clear stale API size so the
-        // next turn re-estimates until a new completion reports usage.
-        agent.last_prompt_tokens = 0;
-        agent.messages.insert(
-            0,
-            AgentMessage::assistant_text(provider.name(), provider.model(), &summary),
-        );
+        {
+            let mut agent = self.agent.lock().await;
+            agent.messages = if let Some(session) = &self.session {
+                session.build_session_context().messages
+            } else {
+                compacted_live_messages(&summary, kept)
+            };
+            agent.last_prompt_tokens = 0;
+        }
+
+        self.prefire.cached = None;
+        if let Some(handle) = self.prefire.in_flight.take() {
+            handle.abort();
+        }
+        self.compact_suppression = CompactionSuppression::StickyUntilSuccess;
+        self.extensions.notify_post_compact(matcher).await;
         Ok(())
     }
 
+    async fn collect_prefire_if_ready(&mut self) {
+        let Some(handle) = self.prefire.in_flight.take() else {
+            return;
+        };
+        if !handle.is_finished() {
+            self.prefire.in_flight = Some(handle);
+            return;
+        }
+        match handle.await {
+            Ok(Some(candidate)) => self.prefire.cached = Some(candidate),
+            Ok(None) => {}
+            Err(e) => tracing::debug!(error = %e, "compaction prefire join failed"),
+        }
+    }
+
+    fn spawn_prefire_pass1(
+        &mut self,
+        provider: Arc<dyn LlmProvider>,
+        messages: &[AgentMessage],
+        config: &CompactionConfig,
+        tokens: usize,
+    ) {
+        if !should_prefire_two_pass(tokens, config) {
+            return;
+        }
+        if self.prefire.in_flight.is_some() {
+            return;
+        }
+        let Some((older, _)) = split_for_compaction(messages, config) else {
+            return;
+        };
+        let Some((prefix, _)) = split_two_pass(older) else {
+            return;
+        };
+        let fp = prefix_fingerprint(prefix);
+        if self
+            .prefire
+            .cached
+            .as_ref()
+            .is_some_and(|c| c.prefix_fingerprint == fp && c.prefix_len == prefix.len())
+        {
+            return;
+        }
+        let prefix = prefix.to_vec();
+        let prefix_len = prefix.len();
+        let prefix_tokens = estimate_tokens(&prefix);
+        let prompt = two_pass_pass1_prompt(&prefix);
+        let handle = tokio::spawn(async move {
+            let text = sample_summary(provider.as_ref(), prompt).await?;
+            Some(PrefireCandidate {
+                prefix_len,
+                prefix_fingerprint: fp,
+                prefix_tokens,
+                candidate_summary: text,
+            })
+        });
+        self.prefire.in_flight = Some(handle);
+        tracing::debug!(
+            prefix_len,
+            prefix_tokens,
+            "compaction prefire Pass-1 started"
+        );
+    }
+
     async fn summarize_for_compaction(
-        &self,
+        &mut self,
         provider: &dyn LlmProvider,
         messages: &[AgentMessage],
         config: &CompactionConfig,
+        instructions: Option<&str>,
     ) -> Option<String> {
         let (older, _) = split_for_compaction(messages, config)?;
         if older.is_empty() {
             return None;
         }
-        let prompt = summarization_prompt(older, None);
-        let request = CompletionRequest {
-            system_prompt: "You summarize coding-agent conversations for context compaction."
-                .into(),
-            messages: vec![AgentMessage::user_text(prompt)],
-            tools: Vec::new(),
-            server_tools: Vec::new(),
-            thinking_level: ThinkingLevel::Off,
-        };
-        match provider.complete(request).await {
-            Ok(response) => {
-                let text = one_core::agent::extract_text(&response.content);
-                let text = text.trim().to_string();
-                if text.is_empty() {
-                    None
+
+        if config.two_pass {
+            if let Some((prefix, suffix)) = split_two_pass(older) {
+                // Wait for in-flight Pass-1 if it is the matching prefix.
+                if let Some(handle) = self.prefire.in_flight.take() {
+                    match handle.await {
+                        Ok(Some(candidate)) => self.prefire.cached = Some(candidate),
+                        Ok(None) => {}
+                        Err(e) => tracing::debug!(error = %e, "compaction prefire join failed"),
+                    }
+                }
+                let fp = prefix_fingerprint(prefix);
+                let note1 = if let Some(cached) = self
+                    .prefire
+                    .cached
+                    .as_ref()
+                    .filter(|c| c.prefix_fingerprint == fp && c.prefix_len == prefix.len())
+                {
+                    Some(cached.candidate_summary.clone())
                 } else {
-                    Some(format!(
-                        "Earlier conversation summary ({} messages):\n{}",
-                        older.len(),
-                        text
-                    ))
+                    sample_summary(provider, two_pass_pass1_prompt(prefix)).await
+                };
+                if let Some(note1) = note1 {
+                    if let Some(final_sum) = sample_summary(
+                        provider,
+                        two_pass_pass2_prompt(&note1, suffix, instructions),
+                    )
+                    .await
+                    {
+                        return Some(final_sum);
+                    }
+                    return Some(note1);
                 }
             }
-            Err(_) => None,
         }
+
+        let prompt = summarization_prompt(older, instructions);
+        sample_summary(provider, prompt).await
     }
 
     pub async fn persist_extension_state(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -312,5 +444,31 @@ impl AppRuntime {
             }
         }
         Ok(())
+    }
+}
+
+async fn sample_summary(provider: &dyn LlmProvider, prompt: String) -> Option<String> {
+    let request = CompletionRequest {
+        system_prompt: "You summarize coding-agent conversations for context compaction.".into(),
+        messages: vec![AgentMessage::user_text(prompt)],
+        tools: Vec::new(),
+        server_tools: Vec::new(),
+        thinking_level: ThinkingLevel::Off,
+    };
+    match provider.complete(request).await {
+        Ok(response) => {
+            let text = one_core::agent::extract_text(&response.content)
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text)
+            }
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "compaction summarizer failed");
+            None
+        }
     }
 }

@@ -600,14 +600,14 @@ impl FloatMenu {
             "workspace-write",
             "open /mcp",
             "2000 · 50KB",
-            "auto 70% · keep 12 · no prune",
+            "auto 85% · keep 12 · prune",
         )
     }
 
     /// Settings root with live MCP status, tool_output, and compaction summaries.
     ///
     /// `tool_output_summary` is e.g. `"2000 lines · 50.0KB"`.
-    /// `compaction_summary` is e.g. `"auto 70% · keep 12 · no prune"`.
+    /// `compaction_summary` is e.g. `"auto 85% · keep 12 · prune"`.
     pub fn settings_root_with_mcp(
         thinking: &str,
         provider: &str,
@@ -746,8 +746,9 @@ impl FloatMenu {
         threshold: Option<usize>,
         keep_recent: usize,
         prune: bool,
-        prune_protect: usize,
-        prune_max_chars: usize,
+        prune_keep_last_n_turns: usize,
+        two_pass: bool,
+        prefire_lead_pct: u32,
     ) -> Self {
         let thresh_detail = match threshold {
             Some(n) => format!("{n} tokens (overrides ratio)"),
@@ -777,51 +778,59 @@ impl FloatMenu {
                             &format!("{ratio_pct}% of context window"),
                             "edit",
                         ),
-                        item(
-                            "threshold",
-                            "Absolute threshold",
-                            &thresh_detail,
-                            "edit",
-                        ),
+                        item("threshold", "Absolute threshold", &thresh_detail, "edit"),
                         item(
                             "keep_recent",
                             "Keep recent messages",
-                            &format!(
-                                "{keep_recent} turns kept verbatim (incl. their tools)"
-                            ),
+                            &format!("{keep_recent} messages kept verbatim after summary"),
                             "edit",
                         ),
                     ],
                 },
                 FloatSection {
-                    title: "Optional pre-pass (default off)".into(),
+                    title: "Prune (every turn, default on)".into(),
                     items: vec![
                         item(
                             "prune",
                             "Prune old tool bodies",
                             if prune {
-                                "on · before summary, only outside keep_recent"
+                                "on · soft-trim then hard-clear by user-turn age"
                             } else {
-                                "off · recommended; use tool_output for live caps"
+                                "off · use tool_output for live caps"
                             },
                             "toggle",
                         ),
                         item(
-                            "prune_protect",
-                            "Pre-tail soft protect",
-                            &format!("~{prune_protect} tok of newest *old* tools"),
+                            "keep_turns",
+                            "Keep last N turns",
+                            &format!("{prune_keep_last_n_turns} user turns never pruned"),
                             "edit",
                         ),
+                    ],
+                },
+                FloatSection {
+                    title: "Two-pass (default off)".into(),
+                    items: vec![
                         item(
-                            "prune_max_chars",
-                            "Pruned preview chars",
-                            &format!("{prune_max_chars} chars + placeholder"),
+                            "two_pass",
+                            "Two-pass summary",
+                            if two_pass {
+                                "on · Pass-1 NOTE₁ then Pass-2 final"
+                            } else {
+                                "off · single LLM summary"
+                            },
+                            "toggle",
+                        ),
+                        item(
+                            "prefire_lead",
+                            "Prefire lead",
+                            &format!("{prefire_lead_pct}% of window before auto-compact"),
                             "edit",
                         ),
                         item(
                             "hint",
-                            "When prune runs",
-                            "only if on + over threshold: clear old tool dumps, never the keep_recent tail",
+                            "How it runs",
+                            "prune every turn · /compact [note] · overflow retries once",
                             "info",
                         ),
                     ],

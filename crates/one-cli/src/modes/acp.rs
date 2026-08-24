@@ -727,9 +727,17 @@ impl OneAcpAgent {
             "compact" => {
                 let mut rt = handle.runtime.lock().await;
                 let provider = handle.provider.lock().await;
-                rt.maybe_compact(provider.as_llm(), true)
-                    .await
-                    .map_err(|e| err_internal(e.to_string()))?;
+                let instructions = if rest.is_empty() {
+                    None
+                } else {
+                    Some(rest.to_string())
+                };
+                rt.maybe_compact_with(
+                    provider.as_arc(),
+                    one_core::compaction::CompactRequest::manual(instructions),
+                )
+                .await
+                .map_err(|e| err_internal(e.to_string()))?;
                 drop(provider);
                 drop(rt);
                 self.notify(

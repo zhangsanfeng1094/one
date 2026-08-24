@@ -223,21 +223,37 @@ async fn handle(
             }
         }
 
-        "compact" => match runtime.maybe_compact(provider, true).await {
-            Ok(()) => {
-                let (tokens, estimated) = runtime.context_tokens().await;
-                json!({
-                    "id": id,
-                    "ok": true,
-                    "result": {
-                        "estimated_tokens": tokens,
-                        "context_tokens": tokens,
-                        "context_tokens_estimated": estimated,
-                    }
-                })
+        "compact" => {
+            let instructions = request
+                .params
+                .get("instructions")
+                .or_else(|| request.params.get("text"))
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
+            match runtime
+                .maybe_compact(
+                    provider,
+                    one_core::compaction::CompactRequest::manual(instructions),
+                )
+                .await
+            {
+                Ok(()) => {
+                    let (tokens, estimated) = runtime.context_tokens().await;
+                    json!({
+                        "id": id,
+                        "ok": true,
+                        "result": {
+                            "estimated_tokens": tokens,
+                            "context_tokens": tokens,
+                            "context_tokens_estimated": estimated,
+                        }
+                    })
+                }
+                Err(e) => json!({"id": id, "ok": false, "error": e.to_string()}),
             }
-            Err(e) => json!({"id": id, "ok": false, "error": e.to_string()}),
-        },
+        }
 
         "spawn" => match spawn_rpc(runtime, &request.params).await {
             Ok(result) => json!({"id": id, "ok": true, "result": result}),

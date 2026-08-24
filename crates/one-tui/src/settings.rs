@@ -80,20 +80,29 @@ impl App {
         threshold: Option<usize>,
         keep_recent: usize,
         prune: bool,
-        prune_protect: usize,
-        prune_max_chars: usize,
+        prune_keep_last_n_turns: usize,
+        two_pass: bool,
+        prefire_lead_ratio: f64,
     ) {
         self.compaction_auto = auto;
         self.compaction_ratio = if ratio.is_finite() && ratio > 0.0 && ratio <= 1.0 {
             ratio
         } else {
-            0.70
+            0.85
         };
         self.compaction_threshold = threshold.filter(|n| *n > 0);
         self.compaction_keep_recent = keep_recent.max(1);
         self.compaction_prune = prune;
-        self.compaction_prune_protect = prune_protect;
-        self.compaction_prune_max_chars = prune_max_chars;
+        self.compaction_prune_keep_last_n_turns = prune_keep_last_n_turns.max(1);
+        self.compaction_two_pass = two_pass;
+        self.compaction_prefire_lead_ratio = if prefire_lead_ratio.is_finite()
+            && prefire_lead_ratio > 0.0
+            && prefire_lead_ratio < 1.0
+        {
+            prefire_lead_ratio
+        } else {
+            0.10
+        };
     }
 
     fn tool_output_summary(&self) -> String {
@@ -122,12 +131,20 @@ impl App {
             format!("{}%", (self.compaction_ratio * 100.0).round() as u32)
         };
         let prune = if self.compaction_prune {
-            "old-tools prune"
+            "prune"
         } else {
             "no prune"
         };
+        let two = if self.compaction_two_pass {
+            format!(
+                " · 2-pass lead {}%",
+                (self.compaction_prefire_lead_ratio * 100.0).round() as u32
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "{auto} {thresh} · keep {} · {prune}",
+            "{auto} {thresh} · keep {} · {prune}{two}",
             self.compaction_keep_recent
         )
     }
@@ -157,8 +174,9 @@ impl App {
             self.compaction_threshold,
             self.compaction_keep_recent,
             self.compaction_prune,
-            self.compaction_prune_protect,
-            self.compaction_prune_max_chars,
+            self.compaction_prune_keep_last_n_turns,
+            self.compaction_two_pass,
+            (self.compaction_prefire_lead_ratio * 100.0).round() as u32,
         ));
         self.clear_notice();
     }
@@ -1211,7 +1229,7 @@ impl App {
                 let pct = (self.compaction_ratio * 100.0).round() as u32;
                 self.start_settings_inline_edit(
                     "setting:compaction.ratio",
-                    "threshold % (e.g. 70 or 0.7)",
+                    "threshold % (e.g. 85 or 0.85)",
                     pct.to_string(),
                 );
                 RunOutcome::Noop
@@ -1240,25 +1258,30 @@ impl App {
                 key: "compaction.prune".into(),
                 value: "toggle".into(),
             }),
-            "prune_protect" => {
+            "keep_turns" => {
                 self.start_settings_inline_edit(
-                    "setting:compaction.prune_protect_tokens",
-                    "protect recent tool tokens",
-                    self.compaction_prune_protect.to_string(),
+                    "setting:compaction.prune_keep_last_n_turns",
+                    "keep last N user turns' tools",
+                    self.compaction_prune_keep_last_n_turns.to_string(),
                 );
                 RunOutcome::Noop
             }
-            "prune_max_chars" => {
+            "two_pass" => RunOutcome::ConfigOp(ConfigOp::SettingSet {
+                key: "compaction.two_pass".into(),
+                value: "toggle".into(),
+            }),
+            "prefire_lead" => {
+                let pct = (self.compaction_prefire_lead_ratio * 100.0).round() as u32;
                 self.start_settings_inline_edit(
-                    "setting:compaction.prune_max_chars",
-                    "pruned preview chars",
-                    self.compaction_prune_max_chars.to_string(),
+                    "setting:compaction.prefire_lead",
+                    "prefire lead % of window",
+                    pct.to_string(),
                 );
                 RunOutcome::Noop
             }
             "hint" => {
                 self.set_notice(
-                    "Main: summarize older turns, keep recent N intact. Prune (off by default): only clears tool bodies outside that tail before summary.",
+                    "Auto-compact at threshold. Prune trims old tool bodies by turn age. Two-pass (off): background NOTE₁ then final summary.",
                 );
                 RunOutcome::Noop
             }

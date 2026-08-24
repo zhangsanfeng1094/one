@@ -118,7 +118,12 @@ async fn apply_switch_model(
                 tracing::warn!(error = %e, "hosted search refresh after model switch failed");
             }
             if ctx < previous_context_window {
-                runtime.maybe_compact(providers.as_llm(), false).await?;
+                runtime
+                    .maybe_compact_with(
+                        providers.as_arc(),
+                        one_core::compaction::CompactRequest::model_switch(),
+                    )
+                    .await?;
             }
             app.set_notice(format!(
                 "model → {} / {}",
@@ -1819,10 +1824,11 @@ fn sync_compaction_settings(app: &mut App, s: &crate::settings::Settings) {
         c.threshold,
         c.keep_recent.unwrap_or(12),
         c.prune.unwrap_or(true),
-        c.prune_protect_tokens
-            .unwrap_or(one_core::DEFAULT_PRUNE_PROTECT_TOKENS),
-        c.prune_max_chars
-            .unwrap_or(one_core::DEFAULT_PRUNE_MAX_CHARS),
+        c.prune_keep_last_n_turns
+            .unwrap_or(one_core::DEFAULT_PRUNE_KEEP_LAST_N_TURNS),
+        c.two_pass.unwrap_or(false),
+        c.prefire_lead_ratio
+            .unwrap_or(one_core::DEFAULT_PREFIRE_LEAD_RATIO),
     );
 }
 
@@ -1955,7 +1961,12 @@ async fn run_turn_streaming(
             app.set_notice(format!("🧠 提醒: {}", top_rem.title));
         }
     }
-    runtime.maybe_compact(provider.as_ref(), false).await?;
+    runtime
+        .maybe_compact_with(
+            provider.clone(),
+            one_core::compaction::CompactRequest::auto(),
+        )
+        .await?;
     let _ = runtime
         .extensions
         .emit(&one_ext::ExtensionEvent::UserPromptSubmit { text: text.clone() })
@@ -2033,7 +2044,12 @@ async fn run_turn_streaming(
         Err(err) if is_overflow(&err) => {
             app.set_notice("context overflow · compacting…");
             let _ = terminal.draw(app);
-            runtime.maybe_compact(provider.as_ref(), true).await?;
+            runtime
+                .maybe_compact_with(
+                    provider.clone(),
+                    one_core::compaction::CompactRequest::overflow(),
+                )
+                .await?;
             // Buffer shrank: avoid `[before..]` panic; keep the in-flight user turn
             // for session append without re-writing already-persisted kept history.
             before = {
@@ -2124,6 +2140,7 @@ async fn run_turn_streaming(
 
     match prompt_result {
         Ok(reply) => {
+            runtime.note_sampling_success();
             if app.stream_buffer.is_empty() {
                 let reply = format!("{reply}{sources}");
                 if !reply.is_empty() {
@@ -2806,13 +2823,18 @@ async fn handle_slash(
         }
         Some("/compact") => {
             let custom = parts.get(1..).map(|p| p.join(" "));
-            // Temporarily lower threshold by force-compacting.
-            if let Some(instr) = custom.filter(|s| !s.is_empty()) {
+            let instructions = custom.filter(|s| !s.is_empty());
+            if let Some(instr) = instructions.as_deref() {
                 app.set_notice(format!("compacting… ({instr})"));
             } else {
                 app.set_notice("compacting…");
             }
-            runtime.maybe_compact(providers.as_llm(), true).await?;
+            runtime
+                .maybe_compact_with(
+                    providers.as_arc(),
+                    one_core::compaction::CompactRequest::manual(instructions),
+                )
+                .await?;
             refresh_usage(app, runtime).await;
             let (toks, estimated) = runtime.context_tokens().await;
             app.set_notice(format!(
@@ -3445,7 +3467,12 @@ async fn load_session_into_app(
         tracing::warn!(error = %err, "hosted search refresh after session resume failed");
     }
     if ctx < previous_context_window {
-        runtime.maybe_compact(providers.as_llm(), false).await?;
+        runtime
+            .maybe_compact_with(
+                providers.as_arc(),
+                one_core::compaction::CompactRequest::model_switch(),
+            )
+            .await?;
     }
     let msgs = runtime.agent.lock().await.messages.clone();
     let durations = session_tool_durations(runtime);
