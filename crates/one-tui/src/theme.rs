@@ -124,6 +124,63 @@ impl Theme {
         Style::default().fg(Self::BORDER_ACTIVE)
     }
 
+    /// Top bar elevated strip background + default text style.
+    pub fn top_bar_bg() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::FG)
+    }
+
+    /// Grok-build style Top Header Strip base style.
+    pub fn top_bar() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::MUTED)
+    }
+
+    /// Top bar path separator slash `/`.
+    pub fn top_bar_sep() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::BORDER_ACTIVE)
+    }
+
+    /// Current workspace / project folder name in top header (bold / highlighted).
+    pub fn top_bar_folder() -> Style {
+        Style::default()
+            .bg(Self::PANEL)
+            .fg(Self::FG)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Status dot on top bar: ready / idle green, busy amber.
+    pub fn top_bar_status(busy: bool) -> Style {
+        if busy {
+            Style::default().bg(Self::PANEL).fg(Self::WARNING)
+        } else {
+            Style::default().bg(Self::PANEL).fg(Self::SUCCESS)
+        }
+    }
+
+    /// Context Pill capsule background and container style.
+    pub fn top_bar_pill() -> Style {
+        Style::default().bg(Self::ELEMENT).fg(Self::FG)
+    }
+
+    pub fn top_bar_pill_muted() -> Style {
+        Style::default().bg(Self::ELEMENT).fg(Self::MUTED)
+    }
+
+    /// Context usage highlight depending on fill percentage.
+    pub fn context_usage_style(pct: usize) -> Style {
+        let fg = if pct >= 90 {
+            Self::ERROR
+        } else if pct >= 70 {
+            Self::WARNING
+        } else {
+            Self::INFO
+        };
+        let mut st = Style::default().bg(Self::ELEMENT).fg(fg);
+        if pct >= 90 {
+            st = st.add_modifier(Modifier::BOLD);
+        }
+        st
+    }
+
     /// Base style for the prompt panel (applied via Paragraph::style).
     pub fn input() -> Style {
         Style::default().fg(Self::FG).bg(Self::ELEMENT)

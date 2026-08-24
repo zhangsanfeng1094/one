@@ -223,16 +223,28 @@ impl ProviderSet {
         ids
     }
 
-    /// Context window for the active model (settings override > registry).
+    /// Context window for the active model (settings override > models.json > registry > heuristic).
     pub fn context_window(&self) -> usize {
         let s = settings::load();
         if let Some(n) = s.context_window {
             return n;
         }
-        self.registry
-            .find(&self.provider_id, self.as_llm().model())
+        let model = self.as_llm().model();
+        if let Some(n) = self
+            .models_config
+            .find_model(&self.provider_id, model)
             .and_then(|m| m.context_window)
-            .unwrap_or(0) as usize
+        {
+            return n as usize;
+        }
+        if let Some(n) = self
+            .registry
+            .find(&self.provider_id, model)
+            .and_then(|m| m.context_window)
+        {
+            return n as usize;
+        }
+        heuristic_context_window(model)
     }
 
     /// Config for a separate Responses web-search hop used by the `web_search` tool.
@@ -1825,5 +1837,33 @@ fn build_provider_llm(
                  (rebuild with --features http-providers)"
         )
         .into())
+    }
+}
+
+/// Fallback context window deduction for popular models when not configured.
+pub(crate) fn heuristic_context_window(model: &str) -> usize {
+    let lower = model.to_ascii_lowercase();
+    if lower.contains("claude") {
+        200_000
+    } else if lower.contains("gemini") {
+        1_000_000
+    } else if lower.contains("grok") {
+        if lower.contains("grok-3") || lower.contains("grok-4") {
+            256_000
+        } else {
+            128_000
+        }
+    } else if lower.contains("deepseek") {
+        64_000
+    } else if lower.contains("qwen") {
+        128_000
+    } else if lower.contains("gpt-4o") || lower.contains("gpt-4.5") || lower.contains("o1") || lower.contains("o3") {
+        128_000
+    } else if lower.contains("gpt-5") {
+        272_000
+    } else if lower.contains("llama-3") || lower.contains("llama3") {
+        128_000
+    } else {
+        0
     }
 }

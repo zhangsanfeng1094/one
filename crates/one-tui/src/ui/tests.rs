@@ -1268,3 +1268,36 @@ Updated parser/parser_test.go
         "diff row must be rendered"
     );
 }
+
+#[test]
+fn top_header_renders_grok_style_path_and_context() {
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.history_cwd = Some(std::path::PathBuf::from("/home/user/awesome-project"));
+    app.set_usage_tokens(32_000);
+    app.set_usage_tokens_estimated(false);
+    app.set_context_window(128_000);
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+
+    assert!(
+        flat.contains("awesome-project"),
+        "top header must render project folder: {flat}"
+    );
+    assert!(
+        flat.contains("32k") && flat.contains("128k") && flat.contains("25%"),
+        "top header must render context usage and window: {flat}"
+    );
+    assert!(
+        flat.contains("●"),
+        "top header must render status indicator: {flat}"
+    );
+}

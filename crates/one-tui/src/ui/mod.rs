@@ -13,6 +13,7 @@
 mod chat;
 mod dock;
 mod float_menu;
+mod header;
 mod prompt;
 mod status;
 mod subagent_frame;
@@ -33,6 +34,7 @@ use crate::theme::Theme;
 use chat::draw_chat;
 use dock::{draw_select_dock, draw_slash_dock};
 use float_menu::draw_float_menu;
+use header::draw_header;
 use prompt::draw_prompt;
 use status::draw_status;
 use subagent_frame::draw_subagent_frame;
@@ -72,6 +74,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
+            Constraint::Length(1),        // grok-build top header (path + context)
             Constraint::Min(3),           // transcript
             Constraint::Length(dock_h),   // select or `/` menu (0 when closed)
             Constraint::Length(prompt_h), // prompt box + agent meta
@@ -79,14 +82,15 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         ])
         .split(frame.area());
 
-    draw_chat(frame, chunks[0], app);
+    draw_header(frame, chunks[0], app);
+    draw_chat(frame, chunks[1], app);
     if select_h > 0 {
-        draw_select_dock(frame, chunks[1], app);
+        draw_select_dock(frame, chunks[2], app);
     } else if slash_h > 0 {
-        draw_slash_dock(frame, chunks[1], app);
+        draw_slash_dock(frame, chunks[2], app);
     }
-    draw_prompt(frame, chunks[2], app);
-    draw_status(frame, chunks[3], app);
+    draw_prompt(frame, chunks[3], app);
+    draw_status(frame, chunks[4], app);
 
     // Top-right toast sits above chat (not the footer).
     draw_toast(frame, frame.area(), app);
