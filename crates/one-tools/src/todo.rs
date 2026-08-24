@@ -1,6 +1,7 @@
 //! Session-scoped todo list (Grok `todo_write` / Claude TodoWrite style).
 //!
-//! Keeps multi-step work visible in the conversation without flooding chat.
+//! Keeps genuinely multi-step work visible without flooding chat. The tool
+//! description steers the model away from trivial/operational checklists.
 //! State lives in process memory for the agent session (not disk).
 
 use std::sync::{Arc, Mutex};
@@ -104,10 +105,17 @@ impl Tool for TodoWriteTool {
         ToolDefinition {
             name: "todo_write".into(),
             description: "\
-Create and manage a structured task list for multi-step work. The user sees this list live. \
-Use for any task with 3+ steps; skip for trivial single-step work. \
-Pass `todos` with id/content/status. When `merge` is true (default), update by id; \
-when false, replace the whole list. Status: pending | in_progress | completed | cancelled."
+Create and update a short task list for genuinely multi-step work. \
+The user already sees the list - do not recap it in chat. \
+Use only for 3+ distinct deliverables or user-requested items where tracking \
+prevents skipped work. Several tool calls for one conceptual task (search, \
+read, edit) is still one task: just do it; skip the list. \
+Skip single straightforward actions, Q&A, and filler/operational steps. \
+Do not list exploration, search, lint, or \"read file X\". Keep 2-7 \
+outcome-level items; at most one in_progress. Batch updates with the real \
+work rather than a dedicated turn. \
+Pass `todos` with id/content/status. merge=true (default) updates by id; \
+false replaces the list. Status: pending | in_progress | completed | cancelled."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -246,6 +254,34 @@ mod tests {
     use super::*;
     use one_core::tool::ToolCall;
     use serde_json::json;
+
+    #[test]
+    fn description_skips_trivial_and_operational_work() {
+        let desc = TodoWriteTool::new(TodoListState::new())
+            .definition()
+            .description;
+        let lower = desc.to_ascii_lowercase();
+        assert!(
+            !lower.contains("use for any task with 3+ steps"),
+            "old Grok-style nudge over-fires todo_write: {desc}"
+        );
+        assert!(
+            lower.contains("several tool calls") && lower.contains("one conceptual task"),
+            "must distinguish deliverables from tool-call count: {desc}"
+        );
+        assert!(
+            lower.contains("do not list exploration, search, lint"),
+            "must forbid operational todos: {desc}"
+        );
+        assert!(
+            lower.contains("skip single straightforward"),
+            "must tell the model when not to call: {desc}"
+        );
+        assert!(
+            lower.contains("batch updates with the real work"),
+            "must discourage a dedicated todo-only turn: {desc}"
+        );
+    }
 
     #[tokio::test]
     async fn merge_and_replace() {
