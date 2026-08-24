@@ -517,7 +517,10 @@ pub(super) fn render_tool_group(
     let n = tools.len();
     let names: Vec<String> = tools
         .iter()
-        .map(|t| t.tool_name.clone().unwrap_or_else(|| "tool".into()))
+        .map(|t| {
+            let raw = t.tool_name.as_deref().unwrap_or("tool");
+            tool_view::tool_display_name(raw, &t.content)
+        })
         .collect();
     let mut joined = tool_view::aggregate_tool_names(&names);
     let budget = wrap_width.saturating_sub(16).max(12);
@@ -838,8 +841,9 @@ fn render_tool(
     wrap_width: usize,
     group_child: Option<GroupChild>,
 ) -> Vec<Line<'static>> {
-    let name = message.tool_name.clone().unwrap_or_else(|| "tool".into());
+    let raw_name = message.tool_name.clone().unwrap_or_else(|| "tool".into());
     let detail = message.content.trim();
+    let name = tool_view::tool_display_name(&raw_name, detail);
     let status = message.tool_status.unwrap_or(ToolStatus::Done);
     let cwd = app.history_cwd.as_deref();
     let is_error = status == ToolStatus::Error;
@@ -1001,15 +1005,19 @@ fn render_tool(
 
         // Recover full args (paths shortened, no char cap) when the header
         // truncated a long bash/heredoc — otherwise history looks permanently cropped.
+        // For delegated MCP calls (`use_tool`), keep the pretty argument block visible
+        // when expanded so the user sees the real target/input instead of the wrapper JSON.
         let full_args = if detail.is_empty() {
             String::new()
         } else {
             tool_view::pretty_tool_detail_full(detail, cwd)
         };
         let show_full_args = !full_args.is_empty()
-            && (pretty.contains('…')
-                || full_args.lines().count() > 1
-                || display_width(&full_args) > budget);
+            && ((raw_name == "use_tool" && full_args != detail)
+                || (matches!(raw_name.as_str(), "bash" | "sh" | "exec")
+                    && (pretty.contains('…')
+                        || full_args.lines().count() > 1
+                        || display_width(&full_args) > budget)));
 
         let mut visual: Vec<(String, Style)> = Vec::new();
         if show_full_args {
@@ -1018,14 +1026,24 @@ fn render_tool(
                     visual.push((wrapped, Theme::tool_detail_done()));
                 }
             }
+            if message
+                .tool_output
+                .as_deref()
+                .is_some_and(|s| !s.trim().is_empty())
+            {
+                visual.push((String::new(), Theme::tool_detail_done()));
+            }
         }
 
-        if let Some(output) = message.tool_output.as_deref() {
+        if let Some(raw_output) = message.tool_output.as_deref() {
+            // Format leftover JSON at paint time (search_tool schemas, MCP
+            // structuredContent) so expand never dumps the raw payload.
+            let output = tool_view::display_tool_output(&raw_name, detail, raw_output, is_error);
             // IDE red/green gutter is only for edit/write patches. `read` / grep / bash
             // / etc. always render as ordinary plain text — never the modification UI
             // (markdown bullets and other `+/-` lines used to false-trigger looks_like_diff).
             let is_edit_write = matches!(name.as_str(), "edit" | "write" | "search_replace");
-            let is_diff = is_edit_write && tool_view::looks_like_diff(output);
+            let is_diff = is_edit_write && tool_view::looks_like_diff(&output);
             // Edit/write: Cursor-style numbered red/green rows (no unified +/- chrome).
             if is_diff && status != ToolStatus::Error {
                 // Paint recovered args first (│ continues into the diff block).
@@ -1041,7 +1059,7 @@ fn render_tool(
                     }
                     lines.push(Line::from(spans));
                 }
-                let mut diff_lines = render_ide_diff(output, wrap_width.saturating_sub(nest));
+                let mut diff_lines = render_ide_diff(&output, wrap_width.saturating_sub(nest));
                 // Prefix group spine so diffs stay nested under the parent tool.
                 if group_child.is_some() {
                     for line in &mut diff_lines {
@@ -1101,8 +1119,14 @@ fn render_tool(
                     Span::raw(body_indent.to_string()),
                     Span::styled(branch, rail_style),
                 ];
-                if status != ToolStatus::Error && tool_view::is_json_line(&text) {
-                    spans.extend(tool_view::highlight_json_line(&text));
+                if status != ToolStatus::Error {
+                    if let Some(custom) = tool_view::highlight_tool_output_line(&text) {
+                        spans.extend(custom);
+                    } else if tool_view::is_json_line(&text) {
+                        spans.extend(tool_view::highlight_json_line(&text));
+                    } else {
+                        spans.push(Span::styled(text, style));
+                    }
                 } else {
                     spans.push(Span::styled(text, style));
                 }

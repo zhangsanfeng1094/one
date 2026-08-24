@@ -1,3 +1,4 @@
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -93,6 +94,23 @@ impl Tool for ReadTool {
             .resolve(path, AccessKind::Read)
             .map_err(|err| tool_error("read", err))?;
 
+        let metadata = tokio::fs::metadata(&resolved).await.map_err(|err| {
+            tool_error(
+                "read",
+                format_read_io_error(path, &resolved, self.policy.cwd(), &err),
+            )
+        })?;
+        if metadata.is_dir() {
+            return Err(tool_error(
+                "read",
+                format!(
+                    "is a directory, not a file: `{}` (resolved to `{}`). Use `ls` or `find` to inspect directories.",
+                    path,
+                    resolved.display()
+                ),
+            ));
+        }
+
         let is_mem = is_memory_path(&resolved);
         if is_mem {
             if let Err(msg) = self.memory_lookups.try_consume() {
@@ -112,9 +130,12 @@ impl Tool for ReadTool {
             return read_image(path, &resolved).await;
         }
 
-        let content = tokio::fs::read_to_string(&resolved)
-            .await
-            .map_err(|err| tool_error("read", err.to_string()))?;
+        let content = tokio::fs::read_to_string(&resolved).await.map_err(|err| {
+            tool_error(
+                "read",
+                format_read_io_error(path, &resolved, self.policy.cwd(), &err),
+            )
+        })?;
 
         // Empty files still "succeed" — remind the model not to invent contents.
         if content.is_empty() {
@@ -211,8 +232,35 @@ impl Tool for ReadTool {
                 "fileLines": lines.len(),
                 "truncated": presented.truncated || more_in_file,
                 "memory": is_mem,
+                "resolvedPath": resolved.display().to_string(),
             }),
         ))
+    }
+}
+
+fn format_read_io_error(path: &str, resolved: &Path, cwd: &Path, err: &std::io::Error) -> String {
+    match err.kind() {
+        ErrorKind::NotFound => {
+            let mut msg = format!(
+                "file not found: `{path}` (resolved to `{}`). Current working directory: `{}`.",
+                resolved.display(),
+                cwd.display()
+            );
+            msg.push_str(
+                "\nIf this path came from a guess, use `find`, `grep`, or `ls` to locate the file before retrying.",
+            );
+            msg
+        }
+        ErrorKind::PermissionDenied => format!(
+            "permission denied reading `{path}` (resolved to `{}`). Current working directory: `{}`.",
+            resolved.display(),
+            cwd.display()
+        ),
+        _ => format!(
+            "failed to read `{path}` (resolved to `{}`): {err}. Current working directory: `{}`.",
+            resolved.display(),
+            cwd.display()
+        ),
     }
 }
 
@@ -265,6 +313,7 @@ async fn read_image(path: &str, resolved: &Path) -> Result<ToolOutput> {
             "mimeType": mime,
             "bytes": bytes.len(),
             "kind": "image",
+            "resolvedPath": resolved.display().to_string(),
         }),
     ))
 }
@@ -327,6 +376,49 @@ mod tests {
         assert!(text.contains("hello"), "{text}");
         assert!(text.contains("world"), "{text}");
         assert!(!out.has_images());
+        assert_eq!(
+            out.details.as_ref().and_then(|d| d.get("resolvedPath")),
+            Some(&json!(path.display().to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_file_error_includes_resolved_path_and_cwd() {
+        let dir = tempfile_dir();
+        let tool = ReadTool::new(dir.clone());
+        let err = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": "missing.rs" }),
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("file not found"), "{msg}");
+        assert!(msg.contains("missing.rs"), "{msg}");
+        assert!(msg.contains(&dir.display().to_string()), "{msg}");
+        assert!(msg.contains("find") && msg.contains("grep"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn directory_error_suggests_directory_tools() {
+        let dir = tempfile_dir();
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        let tool = ReadTool::new(dir.clone());
+        let err = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": "src" }),
+            })
+            .await
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("is a directory"), "{msg}");
+        assert!(msg.contains("ls") && msg.contains("find"), "{msg}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

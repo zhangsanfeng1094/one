@@ -458,6 +458,8 @@ pub fn pretty_tool_detail(args: &str, cwd: Option<&Path>) -> String {
 ///
 /// Collapsed headers middle-truncate long bash/heredocs; expand must recover the
 /// middle so transcript history is not permanently cropped.
+///
+/// `use_tool` is formatted as labeled fields (Grok-style), never as a JSON dump.
 pub fn pretty_tool_detail_full(args: &str, cwd: Option<&Path>) -> String {
     let t = args.trim();
     if t.is_empty() {
@@ -465,19 +467,8 @@ pub fn pretty_tool_detail_full(args: &str, cwd: Option<&Path>) -> String {
     }
     if t.starts_with('{') && t.ends_with('}') {
         if let Ok(val) = serde_json::from_str::<Value>(t) {
-            // If it is use_tool, pretty print the inner tool_input
-            if let Some(inner) = val.get("tool_input") {
-                if let Value::Object(_) = inner {
-                    if let Ok(pretty) = serde_json::to_string_pretty(inner) {
-                        return pretty;
-                    }
-                } else if let Value::String(s) = inner {
-                    if let Ok(parsed) = serde_json::from_str::<Value>(s) {
-                        if let Ok(pretty) = serde_json::to_string_pretty(&parsed) {
-                            return pretty;
-                        }
-                    }
-                }
+            if val.get("tool_name").is_some() && val.get("tool_input").is_some() {
+                return format_use_tool_args_view(t).unwrap_or_default();
             }
             for key in ["command", "pattern", "query"] {
                 if let Some(v) = val.get(key).and_then(|v| v.as_str()) {
@@ -489,8 +480,8 @@ pub fn pretty_tool_detail_full(args: &str, cwd: Option<&Path>) -> String {
                     return shorten_display_path(v, cwd);
                 }
             }
-            if let Ok(pretty) = serde_json::to_string_pretty(&val) {
-                return pretty;
+            if let Some(fields) = format_object_fields(&val, 0) {
+                return fields;
             }
         }
     }
@@ -513,34 +504,11 @@ pub fn maybe_pretty_json(s: &str) -> Option<String> {
 /// Extract use_tool arguments into flat key-value pairs (Grok Build style).
 /// Nested objects/arrays are compact JSON representations.
 pub fn extract_use_tool_args(args: &str) -> Vec<(String, String)> {
-    let trimmed = args.trim();
-    let mut result = Vec::new();
-    let val: Value = match serde_json::from_str(trimmed) {
-        Ok(v) => v,
-        Err(_) => return result,
+    let Some(obj) = use_tool_input_object(args) else {
+        return Vec::new();
     };
-
-    let target_obj: Option<serde_json::Map<String, Value>> =
-        if let Some(inner) = val.get("tool_input") {
-            if let Value::Object(m) = inner {
-                Some(m.clone())
-            } else if let Value::String(s) = inner {
-                if let Ok(Value::Object(m)) = serde_json::from_str(s) {
-                    Some(m)
-                } else {
-                    None
-                }
-            } else {
-                None
-            }
-        } else if let Value::Object(m) = val {
-            Some(m)
-        } else {
-            None
-        };
-
-    if let Some(obj) = target_obj {
-        for (k, v) in obj {
+    obj.into_iter()
+        .map(|(k, v)| {
             let repr = match &v {
                 Value::String(s) => s.clone(),
                 Value::Number(n) => n.to_string(),
@@ -548,10 +516,138 @@ pub fn extract_use_tool_args(args: &str) -> Vec<(String, String)> {
                 Value::Null => "null".to_string(),
                 Value::Array(_) | Value::Object(_) => serde_json::to_string(&v).unwrap_or_default(),
             };
-            result.push((k, repr));
+            (k, repr)
+        })
+        .collect()
+}
+
+fn use_tool_input_object(args: &str) -> Option<serde_json::Map<String, Value>> {
+    let val: Value = serde_json::from_str(args.trim()).ok()?;
+    if let Some(inner) = val.get("tool_input") {
+        return match inner {
+            Value::Object(m) => Some(m.clone()),
+            Value::String(s) => match serde_json::from_str(s) {
+                Ok(Value::Object(m)) => Some(m),
+                _ => None,
+            },
+            _ => None,
+        };
+    }
+    match val {
+        Value::Object(m) => Some(m),
+        _ => None,
+    }
+}
+
+/// Human-readable `use_tool` argument block: labeled fields, never a JSON dump.
+pub fn format_use_tool_args_view(args: &str) -> Option<String> {
+    let obj = use_tool_input_object(args)?;
+    if obj.is_empty() {
+        return None;
+    }
+    format_object_fields(&Value::Object(obj), 0)
+}
+
+fn format_object_fields(value: &Value, indent: usize) -> Option<String> {
+    let obj = value.as_object()?;
+    if obj.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for (key, val) in obj {
+        push_field_line(&mut out, key, val, indent);
+    }
+    let text = out.trim_end().to_string();
+    if text.is_empty() {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+fn push_field_line(out: &mut String, key: &str, value: &Value, indent: usize) {
+    let pad = "  ".repeat(indent);
+    match value {
+        Value::String(s) => {
+            if s.contains('\n') {
+                out.push_str(&format!("{pad}- {key}:\n"));
+                for line in s.lines() {
+                    out.push_str(&format!("{pad}    {line}\n"));
+                }
+            } else {
+                out.push_str(&format!("{pad}- {key}: {s}\n"));
+            }
+        }
+        Value::Number(n) => out.push_str(&format!("{pad}- {key}: {n}\n")),
+        Value::Bool(b) => out.push_str(&format!("{pad}- {key}: {b}\n")),
+        Value::Null => out.push_str(&format!("{pad}- {key}: null\n")),
+        Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str(&format!("{pad}- {key}: (empty)\n"));
+            } else {
+                out.push_str(&format!("{pad}- {key}:\n"));
+                for (k, v) in map {
+                    push_field_line(out, k, v, indent + 1);
+                }
+            }
+        }
+        Value::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str(&format!("{pad}- {key}: (empty list)\n"));
+                return;
+            }
+            let scalars = arr.iter().all(|item| {
+                matches!(
+                    item,
+                    Value::String(_) | Value::Number(_) | Value::Bool(_) | Value::Null
+                )
+            });
+            if scalars {
+                let items: Vec<String> = arr.iter().map(|v| scalar_preview(v, 80)).collect();
+                let joined = items.join(", ");
+                if joined.chars().count() <= 90 {
+                    out.push_str(&format!("{pad}- {key}: {joined}\n"));
+                } else {
+                    out.push_str(&format!("{pad}- {key}:\n"));
+                    for item in items {
+                        out.push_str(&format!("{pad}    - {item}\n"));
+                    }
+                }
+            } else {
+                out.push_str(&format!("{pad}- {key}:\n"));
+                for (idx, item) in arr.iter().enumerate() {
+                    match item {
+                        Value::Object(map) => {
+                            out.push_str(&format!("{pad}    - #{idx}\n"));
+                            for (k, v) in map {
+                                push_field_line(out, k, v, indent + 2);
+                            }
+                        }
+                        Value::Array(_) => {
+                            out.push_str(&format!("{pad}    - #{idx}\n"));
+                            push_json_outline_value(out, item, indent + 2, 5);
+                        }
+                        _ => out.push_str(&format!("{pad}    - {}\n", scalar_preview(item, 100))),
+                    }
+                }
+            }
         }
     }
-    result
+}
+
+fn is_field_key(s: &str) -> bool {
+    let s = s.trim();
+    if s.is_empty() || s.len() > 64 {
+        return false;
+    }
+    let mut chars = s.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !first.is_ascii_alphabetic() && first != '_' {
+        return false;
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
 /// True when a line looks like formatted/indented JSON or JSON token.
@@ -705,6 +801,172 @@ pub fn highlight_json_line(line: &str) -> Vec<Span<'static>> {
     }
 
     spans
+}
+
+/// Highlight human-readable structured tool outputs (like search_tool / mcp_status / schema listings).
+pub fn highlight_tool_output_line(line: &str) -> Option<Vec<Span<'static>>> {
+    let trimmed = line.trim_start();
+    let indent_len = line.len() - trimmed.len();
+    let indent = &line[..indent_len];
+
+    // 1. Server section header: `[server_name]`
+    if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains(' ') {
+        let name = &trimmed[1..trimmed.len() - 1];
+        return Some(vec![
+            Span::raw(indent.to_string()),
+            Span::styled("[", Theme::json_punct()),
+            Span::styled(name.to_string(), Theme::heading_sub()),
+            Span::styled("]", Theme::json_punct()),
+        ]);
+    }
+
+    // 2. Human-readable MCP result/status headers.
+    if (trimmed.starts_with("Found ") && trimmed.contains("MCP tool(s)"))
+        || (trimmed.starts_with("MCP Servers (") && trimmed.ends_with(':'))
+        || trimmed.starts_with("MCP result")
+    {
+        return Some(vec![
+            Span::raw(indent.to_string()),
+            Span::styled(trimmed.to_string(), Theme::tool_group_title()),
+        ]);
+    }
+
+    // 3. Tool signature line: `• tool_name(params...)` or `  • tool_name(params...)`.
+    // Plain outline bullets (`• key: value`) fall through to the next branch.
+    if let Some(rest) = trimmed.strip_prefix("• ") {
+        if let Some(paren_idx) = rest.find('(') {
+            let mut spans = vec![
+                Span::raw(indent.to_string()),
+                Span::styled("• ", Theme::json_punct()),
+            ];
+            let func_name = &rest[..paren_idx];
+            let after_paren = &rest[paren_idx..];
+            spans.push(Span::styled(func_name.to_string(), Theme::tool_kind("mcp")));
+            if let Some(close_idx) = after_paren.rfind(')') {
+                let inside = &after_paren[1..close_idx];
+                spans.push(Span::styled("(", Theme::json_punct()));
+                // Format parameter tokens inside parentheses
+                let mut first_p = true;
+                for part in inside.split(", ") {
+                    if part.is_empty() {
+                        continue;
+                    }
+                    if !first_p {
+                        spans.push(Span::styled(", ", Theme::json_punct()));
+                    }
+                    first_p = false;
+                    if let Some((p_name, p_type)) = part.split_once(": ") {
+                        spans.push(Span::styled(p_name.to_string(), Theme::tool_detail_done()));
+                        spans.push(Span::styled(": ", Theme::json_punct()));
+                        spans.push(Span::styled(p_type.to_string(), Theme::json_string()));
+                    } else {
+                        spans.push(Span::styled(part.to_string(), Theme::tool_detail_done()));
+                    }
+                }
+                spans.push(Span::styled(")", Theme::json_punct()));
+                if close_idx + 1 < after_paren.len() {
+                    spans.push(Span::styled(
+                        after_paren[close_idx + 1..].to_string(),
+                        Theme::tool_detail_done(),
+                    ));
+                }
+            } else {
+                spans.push(Span::styled(
+                    after_paren.to_string(),
+                    Theme::tool_detail_done(),
+                ));
+            }
+            return Some(spans);
+        }
+    }
+
+    // 4. Parameter/detail bullet line: `- param_name (type, req): desc` or `• key: value`.
+    if let Some(rest) = trimmed.strip_prefix("• ") {
+        if !rest.contains('(') {
+            let mut spans = vec![
+                Span::raw(indent.to_string()),
+                Span::styled("• ", Theme::json_punct()),
+            ];
+            if let Some((key, value)) = rest.split_once(": ") {
+                spans.push(Span::styled(key.to_string(), Theme::json_key()));
+                spans.push(Span::styled(": ", Theme::json_punct()));
+                spans.push(Span::styled(value.to_string(), Theme::tool_detail_done()));
+            } else {
+                spans.push(Span::styled(rest.to_string(), Theme::tool_detail_done()));
+            }
+            return Some(spans);
+        }
+    }
+
+    if let Some(rest) = trimmed.strip_prefix("- ") {
+        let mut spans = vec![
+            Span::raw(indent.to_string()),
+            Span::styled("- ", Theme::meta()),
+        ];
+        if let Some((field_part, desc_part)) = rest.split_once("): ") {
+            if let Some(paren_idx) = field_part.find(" (") {
+                let field_name = &field_part[..paren_idx];
+                let type_info = &field_part[paren_idx + 2..];
+                spans.push(Span::styled(field_name.to_string(), Theme::json_key()));
+                spans.push(Span::styled(" (", Theme::json_punct()));
+                spans.push(Span::styled(type_info.to_string(), Theme::meta()));
+                spans.push(Span::styled("): ", Theme::json_punct()));
+                spans.push(Span::styled(
+                    desc_part.to_string(),
+                    Theme::tool_detail_done(),
+                ));
+                return Some(spans);
+            }
+        } else if let Some((field_part, _)) = rest.split_once(')') {
+            if let Some(paren_idx) = field_part.find(" (") {
+                let field_name = &field_part[..paren_idx];
+                let type_info = &field_part[paren_idx + 2..];
+                spans.push(Span::styled(field_name.to_string(), Theme::json_key()));
+                spans.push(Span::styled(" (", Theme::json_punct()));
+                spans.push(Span::styled(type_info.to_string(), Theme::meta()));
+                spans.push(Span::styled(")", Theme::json_punct()));
+                return Some(spans);
+            }
+        }
+        if let Some(spans) = highlight_labeled_field(indent, "- ", rest) {
+            return Some(spans);
+        }
+        spans.push(Span::styled(rest.to_string(), Theme::tool_detail_done()));
+        return Some(spans);
+    }
+
+    // 5. Bare labeled fields from expanded use_tool args: `key: value`
+    if let Some(spans) = highlight_labeled_field(indent, "", trimmed) {
+        return Some(spans);
+    }
+
+    None
+}
+
+fn highlight_labeled_field(indent: &str, bullet: &str, rest: &str) -> Option<Vec<Span<'static>>> {
+    let rest = rest.trim_end();
+    if let Some(key) = rest.strip_suffix(':') {
+        if is_field_key(key) {
+            return Some(vec![
+                Span::raw(indent.to_string()),
+                Span::styled(bullet.to_string(), Theme::meta()),
+                Span::styled(key.to_string(), Theme::json_key()),
+                Span::styled(":", Theme::json_punct()),
+            ]);
+        }
+        return None;
+    }
+    let (key, value) = rest.split_once(": ")?;
+    if !is_field_key(key) {
+        return None;
+    }
+    Some(vec![
+        Span::raw(indent.to_string()),
+        Span::styled(bullet.to_string(), Theme::meta()),
+        Span::styled(key.to_string(), Theme::json_key()),
+        Span::styled(": ", Theme::json_punct()),
+        Span::styled(value.to_string(), Theme::tool_detail_done()),
+    ])
 }
 
 fn find_matching_quote(s: &str) -> Option<usize> {
@@ -1119,6 +1381,27 @@ pub fn parse_bash_exit(output: &str) -> (Option<i64>, &str) {
     (None, output)
 }
 
+/// Paint-time rewrite: if stored output is still raw JSON, format it for the TUI.
+///
+/// Already-rewritten bodies (search_tool signatures, MCP outlines) pass through.
+pub fn display_tool_output(name: &str, args: &str, output: &str, is_error: bool) -> String {
+    if !output_looks_like_json(output) {
+        return output.to_string();
+    }
+    match summarize_tool_special(name, args, output, is_error) {
+        Some((_, _, Some(better))) => better,
+        _ => output.to_string(),
+    }
+}
+
+fn output_looks_like_json(output: &str) -> bool {
+    let t = output.trim();
+    if t.contains("structuredContent:") {
+        return true;
+    }
+    (t.starts_with('{') && t.contains('}')) || (t.starts_with('[') && t.contains(']'))
+}
+
 /// Richer summary for edit/write/bash.
 ///
 /// Returns `(summary, auto_expand, optional_rewritten_output)`.
@@ -1364,53 +1647,7 @@ pub fn summarize_tool_special(
                 return Some(("error".into(), true, None));
             }
             if let Ok(val) = serde_json::from_str::<Value>(output.trim()) {
-                let status = val
-                    .get("status")
-                    .and_then(|s| s.as_str())
-                    .unwrap_or("ready");
-                let count = val
-                    .get("results")
-                    .and_then(|r| r.as_array())
-                    .map(|a| a.len())
-                    .unwrap_or(0);
-                let summary = if count == 0 {
-                    format!("{status} · no tools found")
-                } else if count == 1 {
-                    format!("{status} · 1 tool found")
-                } else {
-                    format!("{status} · {count} tools found")
-                };
-
-                let mut better = String::new();
-                if let Some(results) = val.get("results").and_then(|r| r.as_array()) {
-                    if !results.is_empty() {
-                        better.push_str(&format!("Found {} MCP tool(s):\n", results.len()));
-                        for r in results.iter().take(20) {
-                            let tool_name = r
-                                .get("tool_name")
-                                .and_then(|t| t.as_str())
-                                .unwrap_or("tool");
-                            let desc = r.get("description").and_then(|d| d.as_str()).unwrap_or("");
-                            let first_desc = desc.lines().next().unwrap_or("").trim();
-                            if first_desc.is_empty() {
-                                better.push_str(&format!("  • {tool_name}\n"));
-                            } else {
-                                better.push_str(&format!(
-                                    "  • {tool_name}: {}\n",
-                                    truncate(first_desc, 60)
-                                ));
-                            }
-                        }
-                        if results.len() > 20 {
-                            better.push_str(&format!("  … +{} more tools\n", results.len() - 20));
-                        }
-                    }
-                }
-                let better_opt = if better.is_empty() {
-                    None
-                } else {
-                    Some(better.trim_end().to_string())
-                };
+                let (summary, better_opt) = format_search_tool_view(&val);
                 Some((summary, false, better_opt))
             } else {
                 let lines = output.lines().filter(|l| !l.trim().is_empty()).count();
@@ -1422,103 +1659,61 @@ pub fn summarize_tool_special(
                 return Some(("error".into(), true, None));
             }
             if let Ok(val) = serde_json::from_str::<Value>(output.trim()) {
-                let connected = val
-                    .get("connected")
-                    .and_then(|c| c.as_array())
-                    .map(|a| a.len())
+                let ready = val
+                    .get("ready")
+                    .and_then(|r| r.as_u64())
+                    .or_else(|| {
+                        val.get("connected")
+                            .and_then(|c| c.as_array())
+                            .map(|a| a.len() as u64)
+                    })
                     .unwrap_or(0);
                 let failed = val
-                    .get("failed")
-                    .and_then(|f| f.as_array())
-                    .map(|a| a.len())
+                    .get("unavailable")
+                    .or_else(|| val.get("failed"))
+                    .and_then(|f| f.as_u64().or_else(|| f.as_array().map(|a| a.len() as u64)))
                     .unwrap_or(0);
+                let connecting = val.get("connecting").and_then(|c| c.as_u64()).unwrap_or(0);
+                let total_tools = val.get("total_tools").and_then(|t| t.as_u64()).unwrap_or(0);
+
                 let summary = if failed > 0 {
-                    format!("{connected} connected, {failed} failed")
+                    format!("{ready} ready, {failed} failed · {total_tools} tools")
+                } else if connecting > 0 {
+                    format!("{ready} ready, {connecting} connecting · {total_tools} tools")
+                } else if total_tools > 0 {
+                    format!("{ready} ready · {total_tools} tools")
                 } else {
-                    format!("{connected} connected")
+                    format!("{ready} ready")
                 };
-                Some((summary, false, None))
+                let better = format_mcp_status_view(&val);
+                Some((summary, false, better))
             } else {
                 Some(("status".into(), false, None))
             }
         }
         tool if tool == "use_tool" || tool.contains("__") => {
             if is_error {
-                let err_msg = if let Ok(val) = serde_json::from_str::<Value>(output.trim()) {
-                    val.get("error")
-                        .or_else(|| val.get("message"))
-                        .and_then(|m| m.as_str())
-                        .map(|s| truncate(s, 48))
-                } else {
-                    output
-                        .lines()
-                        .find(|l| !l.trim().is_empty())
-                        .map(|l| truncate(l.trim(), 48))
-                };
+                let err_msg = mcp_error_summary(output).map(|s| truncate(&s, 48));
                 let summary = match err_msg {
                     Some(msg) => format!("error · {msg}"),
                     None => "error".into(),
                 };
-                return Some((summary, true, None));
+                return Some((summary, true, format_mcp_tool_output_view(args, output)));
             }
 
             let trimmed = output.trim();
-            if trimmed.contains("structuredContent:") {
-                let lines = output.lines().filter(|l| !l.trim().is_empty()).count();
-                return Some((format!("{lines} lines · structured"), false, None));
+            if let Some((_, structured)) = parse_structured_content_block(trimmed) {
+                let summary = summarize_mcp_json_value(&structured);
+                return Some((summary, false, format_mcp_tool_output_view(args, output)));
             }
 
             if (trimmed.starts_with('{') && trimmed.ends_with('}'))
                 || (trimmed.starts_with('[') && trimmed.ends_with(']'))
             {
                 if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
-                    let summary = match &val {
-                        Value::Array(arr) => {
-                            if arr.is_empty() {
-                                "0 items".into()
-                            } else if arr.len() == 1 {
-                                "1 item".into()
-                            } else {
-                                format!("{} items", arr.len())
-                            }
-                        }
-                        Value::Object(obj) => {
-                            if let Some(items) = obj
-                                .get("items")
-                                .or_else(|| obj.get("results"))
-                                .and_then(|v| v.as_array())
-                            {
-                                format!("{} items", items.len())
-                            } else if let Some(count) = obj
-                                .get("count")
-                                .or_else(|| obj.get("total"))
-                                .and_then(|v| v.as_i64())
-                            {
-                                format!("{count} items")
-                            } else if let Some(status) = obj.get("status").and_then(|v| v.as_str())
-                            {
-                                format!("status={status}")
-                            } else if let Some(msg) = obj
-                                .get("message")
-                                .or_else(|| obj.get("title"))
-                                .and_then(|v| v.as_str())
-                            {
-                                truncate(msg, 40)
-                            } else if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
-                                format!("id={id}")
-                            } else {
-                                format!("{} fields", obj.len())
-                            }
-                        }
-                        _ => "ok".into(),
-                    };
-                    let better = if !trimmed.contains('\n')
-                        && (trimmed.len() > 20 || trimmed.contains(','))
-                    {
-                        serde_json::to_string_pretty(&val).ok()
-                    } else {
-                        None
-                    };
+                    let summary = summarize_mcp_json_value(&val);
+                    let better = format_mcp_tool_output_view(args, output)
+                        .or_else(|| serde_json::to_string_pretty(&val).ok());
                     return Some((summary, false, better));
                 }
             }
@@ -1567,6 +1762,547 @@ pub fn summarize_tool_special(
             None
         }
     }
+}
+
+fn summarize_mcp_json_value(val: &Value) -> String {
+    match val {
+        Value::Array(arr) => match arr.len() {
+            0 => "0 items".into(),
+            1 => "1 item".into(),
+            n => format!("{n} items"),
+        },
+        Value::Object(obj) => {
+            if let Some(items) = obj
+                .get("items")
+                .or_else(|| obj.get("results"))
+                .or_else(|| obj.get("data"))
+                .and_then(|v| v.as_array())
+            {
+                format!("{} items", items.len())
+            } else if let Some(count) = obj
+                .get("count")
+                .or_else(|| obj.get("total"))
+                .and_then(|v| v.as_i64())
+            {
+                format!("{count} items")
+            } else if let Some(status) = obj.get("status").and_then(|v| v.as_str()) {
+                format!("status={status}")
+            } else if let Some(msg) = obj
+                .get("message")
+                .or_else(|| obj.get("title"))
+                .and_then(|v| v.as_str())
+            {
+                truncate(msg, 40)
+            } else if let Some(result) = obj.get("result").and_then(|v| v.as_str()) {
+                truncate(result, 40)
+            } else if let Some(id) = obj.get("id").and_then(|v| v.as_str()) {
+                format!("id={id}")
+            } else {
+                format!("{} fields", obj.len())
+            }
+        }
+        _ => "ok".into(),
+    }
+}
+
+fn parse_structured_content_block(output: &str) -> Option<(&str, Value)> {
+    let marker = "structuredContent:";
+    let idx = output.find(marker)?;
+    let text_part = output[..idx].trim_end();
+    let json_part = output[idx + marker.len()..].trim();
+    let structured = serde_json::from_str::<Value>(json_part).ok()?;
+    Some((text_part, structured))
+}
+
+fn mcp_error_summary(output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    if let Ok(val) = serde_json::from_str::<Value>(trimmed) {
+        return val
+            .get("error")
+            .or_else(|| val.get("message"))
+            .or_else(|| val.get("result"))
+            .and_then(|m| m.as_str())
+            .map(str::to_string);
+    }
+    if let Some((text_part, structured)) = parse_structured_content_block(trimmed) {
+        if let Some(msg) = structured
+            .get("error")
+            .or_else(|| structured.get("message"))
+            .or_else(|| structured.get("result"))
+            .and_then(|m| m.as_str())
+        {
+            return Some(msg.to_string());
+        }
+        if let Some(first) = text_part
+            .lines()
+            .map(str::trim)
+            .find(|l| !l.is_empty() && *l != "structuredContent:")
+        {
+            return Some(first.to_string());
+        }
+    }
+    trimmed
+        .lines()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && *l != "structuredContent:")
+        .map(str::to_string)
+}
+
+fn format_mcp_tool_output_view(args: &str, output: &str) -> Option<String> {
+    let trimmed = output.trim();
+    let (plain_text, value) =
+        if let Some((text_part, structured)) = parse_structured_content_block(trimmed) {
+            (text_part.trim(), structured)
+        } else if (trimmed.starts_with('{') && trimmed.ends_with('}'))
+            || (trimmed.starts_with('[') && trimmed.ends_with(']'))
+        {
+            ("", serde_json::from_str::<Value>(trimmed).ok()?)
+        } else {
+            return None;
+        };
+
+    let mut out = String::new();
+    if let Some(target) = json_field(args, "tool_name").filter(|s| !s.trim().is_empty()) {
+        out.push_str(&format!("MCP result · {}\n", target.trim()));
+    } else {
+        out.push_str("MCP result\n");
+    }
+
+    if !plain_text.is_empty() {
+        out.push('\n');
+        for line in plain_text
+            .lines()
+            .map(str::trim_end)
+            .filter(|l| !l.trim().is_empty())
+        {
+            out.push_str("  ");
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+
+    let body = format_json_value_as_outline(&value, 0, 8);
+    if !body.is_empty() {
+        if !out.ends_with("\n\n") {
+            out.push('\n');
+        }
+        out.push_str(&body);
+    }
+
+    Some(out.trim_end().to_string())
+}
+
+fn format_json_value_as_outline(value: &Value, indent: usize, max_items: usize) -> String {
+    let mut out = String::new();
+    push_json_outline_value(&mut out, value, indent, max_items);
+    out.trim_end().to_string()
+}
+
+fn push_json_outline_value(out: &mut String, value: &Value, indent: usize, max_items: usize) {
+    let pad = "  ".repeat(indent);
+    match value {
+        Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str(&format!("{pad}∅ empty object\n"));
+                return;
+            }
+            for (idx, (key, val)) in map.iter().enumerate() {
+                if idx >= max_items {
+                    out.push_str(&format!("{pad}… +{} fields\n", map.len() - idx));
+                    break;
+                }
+                push_json_outline_entry(out, key, val, indent, max_items);
+            }
+        }
+        Value::Array(arr) => {
+            if arr.is_empty() {
+                out.push_str(&format!("{pad}∅ empty list\n"));
+                return;
+            }
+            for (idx, item) in arr.iter().enumerate() {
+                if idx >= max_items {
+                    out.push_str(&format!("{pad}… +{} items\n", arr.len() - idx));
+                    break;
+                }
+                match item {
+                    Value::Object(_) | Value::Array(_) => {
+                        out.push_str(&format!("{pad}• #{idx}\n"));
+                        push_json_outline_value(out, item, indent + 1, max_items.min(6));
+                    }
+                    _ => out.push_str(&format!("{pad}• {}\n", scalar_preview(item, 120))),
+                }
+            }
+        }
+        _ => out.push_str(&format!("{pad}{}\n", scalar_preview(value, 160))),
+    }
+}
+
+fn push_json_outline_entry(
+    out: &mut String,
+    key: &str,
+    value: &Value,
+    indent: usize,
+    max_items: usize,
+) {
+    let pad = "  ".repeat(indent);
+    match value {
+        Value::Object(map) => {
+            if map.is_empty() {
+                out.push_str(&format!("{pad}• {key}: {{}}\n"));
+            } else {
+                out.push_str(&format!("{pad}• {key}\n"));
+                push_json_outline_value(out, value, indent + 1, max_items.min(6));
+            }
+        }
+        Value::Array(arr) => {
+            out.push_str(&format!("{pad}• {key}: {} item(s)\n", arr.len()));
+            for (idx, item) in arr.iter().enumerate().take(max_items.min(5)) {
+                match item {
+                    Value::Object(_) | Value::Array(_) => {
+                        out.push_str(&format!("{pad}  • #{idx}\n"));
+                        push_json_outline_value(out, item, indent + 2, 5);
+                    }
+                    _ => out.push_str(&format!("{pad}  • {}\n", scalar_preview(item, 100))),
+                }
+            }
+            if arr.len() > max_items.min(5) {
+                out.push_str(&format!(
+                    "{pad}  … +{} items\n",
+                    arr.len().saturating_sub(max_items.min(5))
+                ));
+            }
+        }
+        _ => out.push_str(&format!("{pad}• {key}: {}\n", scalar_preview(value, 140))),
+    }
+}
+
+fn scalar_preview(value: &Value, max: usize) -> String {
+    match value {
+        Value::String(s) => truncate(&single_line_preview(s, max), max),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        Value::Null => "null".into(),
+        Value::Object(map) => format!("{} fields", map.len()),
+        Value::Array(arr) => format!("{} item(s)", arr.len()),
+    }
+}
+
+struct DiscoveredTool {
+    tool_name: String,
+    description: String,
+    input_schema: Option<Value>,
+}
+
+struct DiscoveredServerGroup {
+    server_name: String,
+    tools: Vec<DiscoveredTool>,
+}
+
+fn parse_discovered_tools(
+    val: &Value,
+) -> (
+    Vec<DiscoveredServerGroup>,
+    usize,
+    String,
+    Option<usize>,
+    Option<String>,
+) {
+    let status = val
+        .get("status")
+        .and_then(|s| s.as_str())
+        .unwrap_or("ready")
+        .to_string();
+    let total_tools = val
+        .get("total_tools")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as usize);
+    let note = val
+        .get("note")
+        .and_then(|s| s.as_str())
+        .map(|s| s.to_string());
+
+    let mut groups: Vec<DiscoveredServerGroup> = Vec::new();
+
+    if let Some(results) = val.get("results").and_then(|r| r.as_array()) {
+        for item in results {
+            if let Some(tools_arr) = item.get("tools").and_then(|t| t.as_array()) {
+                let server_name = item
+                    .get("server")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("tools")
+                    .to_string();
+                let mut tools = Vec::new();
+                for t in tools_arr {
+                    let tool_name = t
+                        .get("tool_name")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("tool")
+                        .to_string();
+                    let description = t
+                        .get("description")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    let input_schema = t.get("input_schema").cloned();
+                    tools.push(DiscoveredTool {
+                        tool_name,
+                        description,
+                        input_schema,
+                    });
+                }
+                if !tools.is_empty() {
+                    groups.push(DiscoveredServerGroup { server_name, tools });
+                }
+            } else if let Some(tool_name_str) = item.get("tool_name").and_then(|s| s.as_str()) {
+                let tool_name = tool_name_str.to_string();
+                let server_name = item
+                    .get("server_name")
+                    .or_else(|| item.get("server"))
+                    .and_then(|s| s.as_str())
+                    .or_else(|| tool_name.split("__").next())
+                    .unwrap_or("tools")
+                    .to_string();
+                let description = item
+                    .get("description")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let input_schema = item.get("input_schema").cloned();
+
+                if let Some(group) = groups.iter_mut().find(|g| g.server_name == server_name) {
+                    group.tools.push(DiscoveredTool {
+                        tool_name,
+                        description,
+                        input_schema,
+                    });
+                } else {
+                    groups.push(DiscoveredServerGroup {
+                        server_name,
+                        tools: vec![DiscoveredTool {
+                            tool_name,
+                            description,
+                            input_schema,
+                        }],
+                    });
+                }
+            }
+        }
+    }
+
+    let total_found: usize = groups.iter().map(|g| g.tools.len()).sum();
+    (groups, total_found, status, total_tools, note)
+}
+
+fn format_tool_signature_and_params(tool: &DiscoveredTool) -> (String, Vec<String>) {
+    let mut param_items: Vec<(bool, String, String, String)> = Vec::new();
+
+    if let Some(ref schema) = tool.input_schema {
+        let required_set: std::collections::HashSet<&str> = schema
+            .get("required")
+            .and_then(|r| r.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
+
+        if let Some(props) = schema.get("properties").and_then(|p| p.as_object()) {
+            for (name, prop) in props {
+                let is_req = required_set.contains(name.as_str());
+                let type_str = if let Some(enums) = prop.get("enum").and_then(|e| e.as_array()) {
+                    if enums.len() <= 3 && enums.iter().all(|v| v.is_string()) {
+                        enums
+                            .iter()
+                            .filter_map(|v| v.as_str())
+                            .map(|s| format!("\"{s}\""))
+                            .collect::<Vec<_>>()
+                            .join("|")
+                    } else {
+                        prop.get("type")
+                            .and_then(|t| t.as_str())
+                            .unwrap_or("string")
+                            .to_string()
+                    }
+                } else if let Some(t) = prop.get("type").and_then(|t| t.as_str()) {
+                    if t == "array" {
+                        if let Some(item_type) = prop
+                            .get("items")
+                            .and_then(|i| i.get("type"))
+                            .and_then(|t| t.as_str())
+                        {
+                            format!("{item_type}[]")
+                        } else {
+                            "array".to_string()
+                        }
+                    } else {
+                        t.to_string()
+                    }
+                } else {
+                    "any".to_string()
+                };
+
+                let req_label = if is_req { "required" } else { "optional" };
+                let default_str = if let Some(def) = prop.get("default") {
+                    format!(", default: {def}")
+                } else {
+                    String::new()
+                };
+
+                let desc_clean = prop
+                    .get("description")
+                    .and_then(|d| d.as_str())
+                    .map(|d| d.lines().next().unwrap_or("").trim())
+                    .filter(|s| !s.is_empty());
+
+                let detail_line = if let Some(desc) = desc_clean {
+                    format!("    - {name} ({type_str}, {req_label}{default_str}): {desc}")
+                } else {
+                    format!("    - {name} ({type_str}, {req_label}{default_str})")
+                };
+
+                param_items.push((is_req, name.clone(), type_str, detail_line));
+            }
+        }
+    }
+
+    // Required parameters first, then by name for stable ordering
+    param_items.sort_by(|a, b| match b.0.cmp(&a.0) {
+        std::cmp::Ordering::Equal => a.1.cmp(&b.1),
+        other => other,
+    });
+
+    let sig_params: Vec<String> = param_items
+        .iter()
+        .map(|(is_req, name, type_str, _)| {
+            if *is_req {
+                format!("{name}: {type_str}")
+            } else {
+                format!("{name}?: {type_str}")
+            }
+        })
+        .collect();
+
+    let param_lines: Vec<String> = param_items
+        .into_iter()
+        .map(|(_, _, _, line)| line)
+        .collect();
+
+    let sig = if sig_params.is_empty() {
+        format!("  • {}()", tool.tool_name)
+    } else {
+        format!("  • {}({})", tool.tool_name, sig_params.join(", "))
+    };
+
+    (sig, param_lines)
+}
+
+fn format_search_tool_view(val: &Value) -> (String, Option<String>) {
+    let (groups, total_found, status, total_tools, note) = parse_discovered_tools(val);
+
+    let summary = if total_found == 0 {
+        format!("{status} · no tools found")
+    } else if total_found == 1 {
+        let sname = groups
+            .first()
+            .map(|g| g.server_name.as_str())
+            .unwrap_or("tool");
+        format!("{status} · 1 tool ({sname})")
+    } else if groups.len() == 1 {
+        let sname = &groups[0].server_name;
+        format!("{status} · {total_found} tools ({sname})")
+    } else {
+        format!("{status} · {total_found} tools ({} servers)", groups.len())
+    };
+
+    if total_found == 0 {
+        let mut text = "No MCP tools found.".to_string();
+        if let Some(n) = note {
+            text.push_str(&format!("\n\nNote: {n}"));
+        }
+        return (summary, Some(text));
+    }
+
+    let mut out = String::new();
+    let total_in_catalog = total_tools.unwrap_or(total_found);
+    let more_note = if total_in_catalog > total_found {
+        format!(" ({} total in catalog)", total_in_catalog)
+    } else {
+        String::new()
+    };
+
+    if groups.len() == 1 {
+        let sname = &groups[0].server_name;
+        out.push_str(&format!(
+            "Found {total_found} MCP tool(s) from {sname}{more_note}:\n"
+        ));
+    } else {
+        out.push_str(&format!(
+            "Found {total_found} MCP tool(s) across {} servers{more_note}:\n",
+            groups.len()
+        ));
+    }
+
+    for (gi, group) in groups.iter().enumerate() {
+        if groups.len() > 1 || !out.contains(&format!("from {}", group.server_name)) {
+            if gi > 0 {
+                out.push('\n');
+            }
+            out.push_str(&format!("\n[{}]\n", group.server_name));
+        }
+
+        for (ti, tool) in group.tools.iter().enumerate() {
+            if ti > 0 {
+                out.push('\n');
+            }
+            let (sig, params) = format_tool_signature_and_params(tool);
+            out.push_str(&sig);
+            out.push('\n');
+
+            let desc_first = tool.description.lines().next().unwrap_or("").trim();
+            if !desc_first.is_empty() {
+                out.push_str(&format!("    {}\n", truncate(desc_first, 90)));
+            }
+
+            for p in params {
+                out.push_str(&p);
+                out.push('\n');
+            }
+        }
+    }
+
+    if let Some(n) = note {
+        out.push_str(&format!("\nNote: {n}\n"));
+    }
+
+    (summary, Some(out.trim_end().to_string()))
+}
+
+fn format_mcp_status_view(val: &Value) -> Option<String> {
+    let servers = val.get("servers").and_then(|s| s.as_array())?;
+    if servers.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    let total_tools = val.get("total_tools").and_then(|t| t.as_u64()).unwrap_or(0);
+    let ready = val.get("ready").and_then(|r| r.as_u64()).unwrap_or(0);
+    out.push_str(&format!(
+        "MCP Servers ({ready} ready · {total_tools} tools):\n\n"
+    ));
+    for s in servers {
+        let name = s.get("server").and_then(|v| v.as_str()).unwrap_or("server");
+        let status = s
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let count = s.get("tool_count").and_then(|v| v.as_u64()).unwrap_or(0);
+        let desc = s
+            .get("description")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        out.push_str(&format!("  • {name}: {status} ({count} tools)\n"));
+        if !desc.is_empty() {
+            out.push_str(&format!("    {}\n", truncate(desc, 80)));
+        }
+    }
+    Some(out.trim_end().to_string())
 }
 
 fn count_diff_stats(text: &str) -> (usize, usize) {
@@ -1955,36 +2691,258 @@ Updated src/a.rs
 
         let full = pretty_tool_detail_full(args, None);
         assert!(
-            full.contains("\"question\": \"How does One work?\"")
-                || full.contains("How does One work?"),
+            full.contains("- question: How does One work?"),
             "full={full}"
         );
+        assert!(full.contains("- repoName: facebook/react"), "full={full}");
+        assert!(
+            !full.contains('{') && !full.contains('"'),
+            "expanded use_tool args must not dump JSON: {full}"
+        );
+    }
+
+    #[test]
+    fn use_tool_args_format_nested_fields_without_json() {
+        let args = r#"{"tool_name":"linear__create_issue","tool_input":{"title":"Bug","nested":{"a":1,"b":"two"},"tags":["ui","tui"],"note":"line1\nline2"}}"#;
+        let text = format_use_tool_args_view(args).unwrap();
+        assert!(text.contains("- title: Bug"), "text={text}");
+        assert!(text.contains("- nested:"), "text={text}");
+        assert!(text.contains("- a: 1"), "text={text}");
+        assert!(text.contains("- b: two"), "text={text}");
+        assert!(text.contains("- tags: ui, tui"), "text={text}");
+        assert!(text.contains("- note:"), "text={text}");
+        assert!(text.contains("    line1"), "text={text}");
+        assert!(!text.contains('{'), "text={text}");
+        assert!(!text.contains("\"title\""), "text={text}");
     }
 
     #[test]
     fn search_tool_summarizes_and_formats_better_output() {
         let args = r#"{"query":"linear"}"#;
-        let out = r#"{"status":"ready","results":[{"tool_name":"linear__create_issue","description":"Create a new issue in Linear\nSupports labels and team."}]}"#;
+        let out = r#"{"status":"ready","results":[{"server":"linear","tools":[{"tool_name":"linear__create_issue","description":"Create a new issue in Linear\nSupports labels and team.","input_schema":{"type":"object","properties":{"title":{"type":"string","description":"Issue title"},"priority":{"type":"integer","description":"1-5"}},"required":["title"]}}]}],"total_tools":5}"#;
         let (s, expand, better) = summarize_tool_special("search_tool", args, out, false).unwrap();
-        assert_eq!(s, "ready · 1 tool found");
+        assert_eq!(s, "ready · 1 tool (linear)");
         assert!(!expand);
         let better_text = better.unwrap();
         assert!(
-            better_text.contains("Found 1 MCP tool(s):"),
+            better_text.contains("Found 1 MCP tool(s) from linear (5 total in catalog):"),
             "better={better_text}"
         );
         assert!(
-            better_text.contains("• linear__create_issue: Create a new issue in Linear"),
+            better_text.contains("• linear__create_issue(title: string, priority?: integer)"),
+            "better={better_text}"
+        );
+        assert!(
+            better_text.contains("Create a new issue in Linear"),
+            "better={better_text}"
+        );
+        assert!(
+            better_text.contains("- title (string, required): Issue title"),
+            "better={better_text}"
+        );
+        assert!(
+            better_text.contains("- priority (integer, optional): 1-5"),
             "better={better_text}"
         );
     }
 
     #[test]
-    fn mcp_status_summarizes_correctly() {
-        let out = r#"{"connected":["deepwiki","linear"],"failed":["broken_server"]}"#;
-        let (s, expand, _) = summarize_tool_special("mcp_status", "{}", out, false).unwrap();
-        assert_eq!(s, "2 connected, 1 failed");
+    fn search_tool_screenshot_payload_formats_grok_style() {
+        let args = r#"{"query":"search"}"#;
+        let out = r#"{
+  "note": null,
+  "results": [
+    {
+      "server": "agy",
+      "tools": [
+        {
+          "description": "[MCP:agy] Search the live web using the Antigravity/agy Google session (Cloud Code googleSearch). Use for news,\ncurrent events, and facts that need citations.",
+          "input_schema": {
+            "properties": {
+              "query": {
+                "description": "Search query, including dates or locale when relevant.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "query"
+            ],
+            "type": "object"
+          },
+          "score": 2.817005157470703,
+          "tool_name": "agy__search_web"
+        }
+      ]
+    },
+    {
+      "server": "context-mode",
+      "tools": [
+        {
+          "description": "[MCP:context-mode] Search a unified knowledge base with a multi-strategy ranking pipeline.",
+          "tool_name": "context-mode__search"
+        }
+      ]
+    }
+  ]
+}"#;
+        let (s, expand, better) = summarize_tool_special("search_tool", args, out, false).unwrap();
+        assert_eq!(s, "ready · 2 tools (2 servers)");
         assert!(!expand);
+        let text = better.unwrap();
+        assert!(
+            text.contains("Found 2 MCP tool(s) across 2 servers:"),
+            "text={text}"
+        );
+        assert!(text.contains("[agy]"), "text={text}");
+        assert!(
+            text.contains("• agy__search_web(query: string)"),
+            "text={text}"
+        );
+        assert!(text.contains("- query (string, required): Search query, including dates or locale when relevant."), "text={text}");
+        assert!(text.contains("[context-mode]"), "text={text}");
+        assert!(text.contains("• context-mode__search()"), "text={text}");
+    }
+
+    #[test]
+    fn search_tool_large_pretty_json_formats_from_full_payload() {
+        let huge = "knowledge ".repeat(400);
+        let out = format!(
+            r#"{{
+  "note": null,
+  "results": [
+    {{
+      "server": "agy",
+      "tools": [
+        {{
+          "description": "[MCP:agy] Search the live web. {huge}",
+          "input_schema": {{
+            "properties": {{
+              "query": {{"description": "Search query", "type": "string"}}
+            }},
+            "required": ["query"],
+            "type": "object"
+          }},
+          "tool_name": "agy__search_web"
+        }}
+      ]
+    }}
+  ],
+  "status": "ready",
+  "total_tools": 16
+}}"#
+        );
+        assert!(
+            out.len() > 4_000,
+            "fixture must exceed the TUI store cap, got {}",
+            out.len()
+        );
+
+        let truncated = crate::message::truncate_tool_output_for_ui(&out, 4_000);
+        let old = summarize_tool_special("search_tool", r#"{"query":"search"}"#, &truncated, false);
+        // Truncated pretty JSON does not parse, so the old finish path stored a dump.
+        if let Some((_, _, better)) = old {
+            assert!(
+                better.is_none()
+                    || !better
+                        .as_deref()
+                        .unwrap_or("")
+                        .contains("agy__search_web(query: string)"),
+                "truncated JSON must not be a reliable formatter input"
+            );
+        }
+
+        let (s, _, better) =
+            summarize_tool_special("search_tool", r#"{"query":"search"}"#, &out, false).unwrap();
+        let text = better.expect("full payload should format");
+        assert!(s.contains("1 tool"), "s={s}");
+        assert!(
+            text.contains("• agy__search_web(query: string)"),
+            "text={text}"
+        );
+        assert!(!text.contains("\"input_schema\""), "text={text}");
+        assert!(!text.contains("\"tool_name\""), "text={text}");
+
+        let painted = display_tool_output("search_tool", r#"{"query":"search"}"#, &out, false);
+        assert!(painted.contains("• agy__search_web(query: string)"));
+        assert!(!painted.contains("\"input_schema\""));
+    }
+
+    #[test]
+    fn search_tool_flat_results_formatted_properly() {
+        let args = r#"{"query":"deepwiki"}"#;
+        let out = r#"{"status":"ready","results":[{"tool_name":"deepwiki__ask_question","description":"Ask any question","input_schema":{"type":"object","properties":{"repo":{"type":"string","description":"Repo"},"q":{"type":"string"}},"required":["repo","q"]}}]}"#;
+        let (s, _, better) = summarize_tool_special("search_tool", args, out, false).unwrap();
+        assert_eq!(s, "ready · 1 tool (deepwiki)");
+        let text = better.unwrap();
+        assert!(text.contains("• deepwiki__ask_question(q: string, repo: string)"));
+        assert!(text.contains("- repo (string, required): Repo"));
+        assert!(text.contains("- q (string, required)"));
+    }
+
+    #[test]
+    fn mcp_status_summarizes_correctly() {
+        let out = r#"{"ready":2,"connecting":0,"unavailable":1,"total_tools":13,"servers":[{"server":"deepwiki","status":"ready","tool_count":3,"description":"GitHub docs"},{"server":"broken","status":"failed","tool_count":0,"description":""}]}"#;
+        let (s, expand, better) = summarize_tool_special("mcp_status", "{}", out, false).unwrap();
+        assert_eq!(s, "2 ready, 1 failed · 13 tools");
+        assert!(!expand);
+        let b = better.unwrap();
+        assert!(b.contains("deepwiki: ready (3 tools)"));
+        assert!(b.contains("broken: failed (0 tools)"));
+    }
+
+    #[test]
+    fn use_tool_result_formats_structured_content_as_outline() {
+        let args = r#"{"tool_name":"deepwiki__ask_question","tool_input":{"repoName":"xai/grok","question":"what is grok?"}}"#;
+        let out = r#"Error processing question: Repository not found.
+
+structuredContent:
+{
+  "result": "Error processing question: Repository not found.",
+  "meta": { "retryable": false },
+  "sources": ["a", "b"]
+}"#;
+
+        let (summary, expand, better) =
+            summarize_tool_special("use_tool", args, out, true).unwrap();
+        assert!(
+            summary.contains("Repository not found"),
+            "summary={summary}"
+        );
+        assert!(expand);
+        let text = better.unwrap();
+        assert!(
+            text.contains("MCP result · deepwiki__ask_question"),
+            "text={text}"
+        );
+        assert!(
+            text.contains("• result: Error processing question"),
+            "text={text}"
+        );
+        assert!(text.contains("• meta"), "text={text}");
+        assert!(text.contains("• retryable: false"), "text={text}");
+        assert!(text.contains("• sources: 2 item(s)"), "text={text}");
+        assert!(!text.contains("structuredContent:"), "text={text}");
+        assert!(!text.contains("\"result\""), "text={text}");
+    }
+
+    #[test]
+    fn use_tool_result_formats_plain_json_as_outline() {
+        let args = r#"{"tool_name":"linear__list_issues","tool_input":{"team":"eng"}}"#;
+        let out = r#"{"items":[{"id":"A","title":"First"},{"id":"B","title":"Second"}],"nextCursor":null}"#;
+        let (summary, expand, better) =
+            summarize_tool_special("use_tool", args, out, false).unwrap();
+        assert_eq!(summary, "2 items");
+        assert!(!expand);
+        let text = better.unwrap();
+        assert!(
+            text.contains("MCP result · linear__list_issues"),
+            "text={text}"
+        );
+        assert!(text.contains("• items: 2 item(s)"), "text={text}");
+        assert!(text.contains("• id: A"), "text={text}");
+        assert!(text.contains("• title: First"), "text={text}");
+        assert!(text.contains("• nextCursor: null"), "text={text}");
+        assert!(!text.contains("\"items\""), "text={text}");
     }
 
     #[test]
@@ -2094,6 +3052,17 @@ Updated parser/parser_test.go
         assert_eq!(spans_num[1].content, "\"timeout\"");
         assert_eq!(spans_num[2].content, ": ");
         assert_eq!(spans_num[3].content, "30");
+
+        let field = highlight_tool_output_line("- repoName: facebook/react").unwrap();
+        assert_eq!(field[1].content, "- ");
+        assert_eq!(field[2].content, "repoName");
+        assert_eq!(field[3].content, ": ");
+        assert_eq!(field[4].content, "facebook/react");
+
+        let outline = highlight_tool_output_line("  • result: not found").unwrap();
+        assert_eq!(outline[1].content, "• ");
+        assert_eq!(outline[2].content, "result");
+        assert_eq!(outline[4].content, "not found");
 
         let spans_bool = highlight_json_line("    \"active\": true,");
         assert_eq!(spans_bool[1].content, "\"active\"");

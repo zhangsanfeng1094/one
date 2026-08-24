@@ -728,9 +728,7 @@ mod tests {
             "/proj/.git/objects/ab/cdef1234"
         )));
         assert!(!is_opaque_git_path(Path::new("/proj/.git/HEAD")));
-        assert!(!is_opaque_git_path(Path::new(
-            "/proj/.git/refs/heads/main"
-        )));
+        assert!(!is_opaque_git_path(Path::new("/proj/.git/refs/heads/main")));
         assert!(!is_opaque_git_path(Path::new("/proj/.git/COMMIT_EDITMSG")));
         assert!(!is_opaque_git_path(Path::new("/proj/src/main.rs")));
     }

@@ -127,17 +127,10 @@ impl super::App {
                 msg.tool_ungroup = true;
             }
             if let Some(raw) = output.clone() {
-                let mut stored = truncate_tool_output_for_ui(&raw, 4_000);
-                let (summary, expand) = if let Some((s, e, better)) =
-                    tool_view::summarize_tool_special(&tool_name, &args, &stored, error)
-                {
-                    if let Some(b) = better {
-                        stored = truncate_tool_output_for_ui(&b, 4_000);
-                    }
-                    (s, e)
-                } else {
-                    summarize_tool_output(&stored, error)
-                };
+                // Format (search_tool / mcp JSON → outline) from the *full* payload,
+                // then cap the display string. Truncating first cuts pretty JSON in
+                // the middle and the formatter never runs.
+                let (summary, expand, stored) = store_tool_result(&tool_name, &args, &raw, error);
                 msg.tool_output = Some(stored);
                 msg.tool_summary = Some(summary);
                 // Expand policy lives in summarize_tool_special (single source).
@@ -239,8 +232,7 @@ impl super::App {
                 call_id.map(|s| s.to_string()),
             );
             if let Some(raw) = output {
-                let stored = truncate_tool_output_for_ui(&raw, 4_000);
-                let (summary, expand) = summarize_tool_output(&stored, true);
+                let (summary, expand, stored) = store_tool_result(name, "", &raw, true);
                 msg.tool_output = Some(stored);
                 msg.tool_summary = Some(summary);
                 msg.tool_expanded = expand;
@@ -325,17 +317,7 @@ impl super::App {
         msg.seal_duration();
         msg.tool_ungroup = true;
         let args = msg.content.clone();
-        let mut stored = truncate_tool_output_for_ui(&output, 4_000);
-        let (summary, expand) = if let Some((s, e, better)) =
-            tool_view::summarize_tool_special("task", &args, &stored, error)
-        {
-            if let Some(b) = better {
-                stored = truncate_tool_output_for_ui(&b, 4_000);
-            }
-            (s, e)
-        } else {
-            summarize_tool_output(&stored, error)
-        };
+        let (summary, expand, stored) = store_tool_result("task", &args, &output, error);
         msg.tool_output = Some(stored);
         msg.tool_summary = Some(summary);
         msg.tool_expanded = expand;
@@ -828,5 +810,29 @@ impl super::App {
 
     pub fn force_quit_pending(&self) -> bool {
         self.force_quit_pending
+    }
+}
+
+/// Summarize + pretty-format from the full tool payload, then cap what the TUI stores.
+///
+/// Pretty-printed MCP JSON (search_tool schemas, structuredContent) routinely
+/// exceeds the UI cap. Truncating first produces invalid JSON and the formatter
+/// never runs, so expand still shows a raw dump.
+fn store_tool_result(
+    tool_name: &str,
+    args: &str,
+    raw: &str,
+    error: bool,
+) -> (String, bool, String) {
+    const UI_CAP: usize = 4_000;
+    if let Some((summary, expand, better)) =
+        tool_view::summarize_tool_special(tool_name, args, raw, error)
+    {
+        let body = better.as_deref().unwrap_or(raw);
+        (summary, expand, truncate_tool_output_for_ui(body, UI_CAP))
+    } else {
+        let stored = truncate_tool_output_for_ui(raw, UI_CAP);
+        let (summary, expand) = summarize_tool_output(&stored, error);
+        (summary, expand, stored)
     }
 }

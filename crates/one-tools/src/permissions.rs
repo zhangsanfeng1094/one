@@ -40,7 +40,14 @@ pub enum PermissionMode {
     #[serde(alias = "dontAsk", alias = "dont_ask", alias = "DontAsk")]
     DontAsk,
     /// Always-approve (YOLO): tools proceed automatically without interactive prompts. Deny rules still block.
-    #[serde(alias = "bypassPermissions", alias = "bypass_permissions", alias = "always-approve", alias = "always_approve", alias = "yolo", alias = "BypassPermissions")]
+    #[serde(
+        alias = "bypassPermissions",
+        alias = "bypass_permissions",
+        alias = "always-approve",
+        alias = "always_approve",
+        alias = "yolo",
+        alias = "BypassPermissions"
+    )]
     BypassPermissions,
 }
 
@@ -71,9 +78,8 @@ impl PermissionMode {
             "acceptedits" | "accept-edits" => Some(Self::AcceptEdits),
             "auto" => Some(Self::Auto),
             "dontask" | "dont-ask" => Some(Self::DontAsk),
-            "bypasspermissions" | "bypass-permissions" | "always-approve" | "alwaysapprove" | "yolo" => {
-                Some(Self::BypassPermissions)
-            }
+            "bypasspermissions" | "bypass-permissions" | "always-approve" | "alwaysapprove"
+            | "yolo" => Some(Self::BypassPermissions),
             _ => None,
         }
     }
@@ -479,7 +485,13 @@ pub fn is_auto_mode_safe_command(command: &str) -> bool {
     if cmd.is_empty() {
         return true;
     }
-    if cmd.contains(';') || cmd.contains("&&") || cmd.contains("||") || cmd.contains('|') || cmd.contains('`') || cmd.contains("$(") {
+    if cmd.contains(';')
+        || cmd.contains("&&")
+        || cmd.contains("||")
+        || cmd.contains('|')
+        || cmd.contains('`')
+        || cmd.contains("$(")
+    {
         return false;
     }
     let tokens: Vec<&str> = cmd.split_whitespace().collect();
@@ -490,11 +502,29 @@ pub fn is_auto_mode_safe_command(command: &str) -> bool {
     let second = tokens.get(1).copied().unwrap_or("");
 
     match head {
-        "git" => matches!(second, "status" | "diff" | "log" | "show" | "branch" | "rev-parse" | "describe" | "tag" | "grep" | "remote"),
-        "cargo" => matches!(second, "check" | "test" | "build" | "clippy" | "bench" | "fmt" | "doc" | "tree"),
-        "npm" | "pnpm" | "yarn" | "bun" => matches!(second, "test" | "run" | "build" | "lint" | "check" | "list"),
+        "git" => matches!(
+            second,
+            "status"
+                | "diff"
+                | "log"
+                | "show"
+                | "branch"
+                | "rev-parse"
+                | "describe"
+                | "tag"
+                | "grep"
+                | "remote"
+        ),
+        "cargo" => matches!(
+            second,
+            "check" | "test" | "build" | "clippy" | "bench" | "fmt" | "doc" | "tree"
+        ),
+        "npm" | "pnpm" | "yarn" | "bun" => {
+            matches!(second, "test" | "run" | "build" | "lint" | "check" | "list")
+        }
         "go" => matches!(second, "test" | "build" | "vet" | "fmt" | "list"),
-        "pytest" | "tree" | "ls" | "pwd" | "which" | "whereis" | "echo" | "cat" | "head" | "tail" | "wc" | "uname" | "stat" | "file" | "date" => true,
+        "pytest" | "tree" | "ls" | "pwd" | "which" | "whereis" | "echo" | "cat" | "head"
+        | "tail" | "wc" | "uname" | "stat" | "file" | "date" => true,
         "python" | "python3" => second == "-m" || second == "--version" || second == "-V",
         _ => false,
     }
@@ -749,20 +779,36 @@ mod tests {
 
         // 1. BypassPermissions (Always-Approve)
         assert_eq!(
-            evaluate_with_mode(&bash("cargo check"), &rules, PermissionMode::BypassPermissions),
+            evaluate_with_mode(
+                &bash("cargo check"),
+                &rules,
+                PermissionMode::BypassPermissions
+            ),
             PermissionVerdict::Allow
         );
         assert_eq!(
-            evaluate_with_mode(&bash("sudo apt update"), &rules, PermissionMode::BypassPermissions),
+            evaluate_with_mode(
+                &bash("sudo apt update"),
+                &rules,
+                PermissionMode::BypassPermissions
+            ),
             PermissionVerdict::Allow
         );
         assert_eq!(
-            evaluate_with_mode(&write("app/.secret.json"), &rules, PermissionMode::BypassPermissions),
+            evaluate_with_mode(
+                &write("app/.secret.json"),
+                &rules,
+                PermissionMode::BypassPermissions
+            ),
             PermissionVerdict::Allow
         );
         // Deny still denies in BypassPermissions
         assert!(matches!(
-            evaluate_with_mode(&bash("rm -rf /critical"), &rules, PermissionMode::BypassPermissions),
+            evaluate_with_mode(
+                &bash("rm -rf /critical"),
+                &rules,
+                PermissionMode::BypassPermissions
+            ),
             PermissionVerdict::Deny { .. }
         ));
 
@@ -772,7 +818,11 @@ mod tests {
             PermissionVerdict::Allow
         );
         assert!(matches!(
-            evaluate_with_mode(&bash("sudo apt update"), &rules, PermissionMode::AcceptEdits),
+            evaluate_with_mode(
+                &bash("sudo apt update"),
+                &rules,
+                PermissionMode::AcceptEdits
+            ),
             PermissionVerdict::Ask { .. }
         ));
 

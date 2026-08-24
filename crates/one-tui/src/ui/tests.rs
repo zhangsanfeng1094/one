@@ -971,6 +971,133 @@ fn expanded_bash_recovers_full_command_history() {
 }
 
 #[test]
+fn expanded_use_tool_shows_labeled_fields_not_json() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    let args = serde_json::json!({
+        "tool_name": "deepwiki__ask_question",
+        "tool_input": {
+            "repoName": "facebook/react",
+            "question": "How does One work?"
+        }
+    })
+    .to_string();
+    app.push_tool_call("use_tool", &args);
+    app.finish_tool_with_output(
+        "use_tool",
+        false,
+        Some(r#"{"items":[{"id":"A","title":"First"}],"nextCursor":null}"#.into()),
+    );
+    if let Some(msg) = app.messages.last_mut() {
+        msg.tool_expanded = true;
+    }
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    assert!(
+        flat.contains("repoName") && flat.contains("facebook/react"),
+        "expanded use_tool must show labeled input fields:\n{flat}"
+    );
+    assert!(
+        flat.contains("question") && flat.contains("How does One work?"),
+        "expanded use_tool must show the question field:\n{flat}"
+    );
+    assert!(
+        !flat.contains("\"tool_input\"") && !flat.contains("\"repoName\""),
+        "expanded use_tool must not dump wrapper/input JSON:\n{flat}"
+    );
+    assert!(
+        flat.contains("items") && !flat.contains("\"items\""),
+        "expanded use_tool result should be an outline, not quoted JSON keys:\n{flat}"
+    );
+}
+
+#[test]
+fn expanded_search_tool_formats_large_json_instead_of_dumping_it() {
+    let backend = TestBackend::new(100, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    let huge = "knowledge ".repeat(400);
+    let out = format!(
+        r#"{{
+  "note": null,
+  "results": [
+    {{
+      "server": "agy",
+      "tools": [
+        {{
+          "description": "[MCP:agy] Search the live web using the Antigravity/agy Google session. {huge}",
+          "input_schema": {{
+            "properties": {{
+              "query": {{
+                "description": "Search query, including dates or locale when relevant.",
+                "type": "string"
+              }}
+            }},
+            "required": ["query"],
+            "type": "object"
+          }},
+          "score": 7.94,
+          "tool_name": "agy__search_web"
+        }}
+      ]
+    }},
+    {{
+      "server": "context-mode",
+      "tools": [
+        {{
+          "description": "[MCP:context-mode] Search a unified knowledge base.",
+          "tool_name": "context-mode__search"
+        }}
+      ]
+    }}
+  ],
+  "status": "ready",
+  "total_tools": 16
+}}"#
+    );
+    assert!(
+        out.len() > 4_000,
+        "fixture must exceed UI cap: {}",
+        out.len()
+    );
+    app.push_tool_call(
+        "search_tool",
+        r#"{"query":"search web query find grep wiki question"}"#,
+    );
+    app.finish_tool_with_output("search_tool", false, Some(out));
+    if let Some(msg) = app.messages.last_mut() {
+        msg.tool_expanded = true;
+    }
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    assert!(
+        flat.contains("agy__search_web") && flat.contains("query: string"),
+        "expanded search_tool must show signatures, not a JSON dump:\n{flat}"
+    );
+    assert!(
+        flat.contains("context-mode") && flat.contains("context-mode__search"),
+        "expanded search_tool must group by server:\n{flat}"
+    );
+    assert!(
+        !flat.contains("\"input_schema\"") && !flat.contains("\"tool_name\""),
+        "expanded search_tool must not dump raw JSON keys:\n{flat}"
+    );
+}
+
+#[test]
 fn prompt_meta_separates_mode_model_provider() {
     let backend = TestBackend::new(80, 10);
     let mut terminal = Terminal::new(backend).unwrap();

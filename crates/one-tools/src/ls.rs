@@ -115,9 +115,7 @@ impl Tool for LsTool {
             ));
         }
         if truncated {
-            lines.push(format!(
-                "... (truncated at {limit} entries, {total} total)"
-            ));
+            lines.push(format!("... (truncated at {limit} entries, {total} total)"));
         }
 
         Ok(ToolOutput::text_with_details(
@@ -254,10 +252,7 @@ mod tests {
             })
             .await
             .unwrap_err();
-        assert!(
-            err.to_string().contains("Not a directory"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("Not a directory"), "got: {err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -266,10 +261,7 @@ mod tests {
         let dir = temp_workspace();
         let out = run_ls(&dir, json!({ "limit": 2 })).await;
         let text = out.as_text();
-        let listed = text
-            .lines()
-            .filter(|l| !l.starts_with("..."))
-            .count();
+        let listed = text.lines().filter(|l| !l.starts_with("...")).count();
         assert_eq!(listed, 2, "got:\n{text}");
         assert!(text.contains("truncated at 2 entries, 5 total"), "{text}");
         assert_eq!(out.details.as_ref().unwrap()["truncated"], true);
