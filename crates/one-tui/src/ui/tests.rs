@@ -1301,3 +1301,157 @@ fn top_header_renders_grok_style_path_and_context() {
         "top header must render status indicator: {flat}"
     );
 }
+
+#[test]
+fn user_message_renders_with_clean_rail() {
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages
+        .push(Message::user("Refactor the whole renderer module"));
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+
+    assert!(
+        flat.contains("Refactor the whole renderer module"),
+        "user message text must be rendered: {flat}"
+    );
+    assert!(
+        flat.contains("You"),
+        "user message must have You badge: {flat}"
+    );
+}
+
+#[test]
+fn sticky_user_query_activates_when_scrolled_off_top() {
+    let backend = ratatui::backend::TestBackend::new(80, 14);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    // 1. User message
+    app.messages
+        .push(Message::user("Fix memory leak in background worker"));
+
+    // 2. Many assistant/tool lines pushing user query up off-screen
+    for i in 0..30 {
+        app.messages.push(Message::assistant(format!(
+            "Long output log row {i} with lots of details"
+        )));
+    }
+
+    // Scroll to bottom (user query is scrolled out of top)
+    app.follow_bottom = true;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+
+    assert!(
+        flat.contains("Prompt") && flat.contains("Fix memory leak in background worker"),
+        "sticky query header must be active at the top of transcript: {flat}"
+    );
+}
+
+#[test]
+fn strip_system_reminders_removes_injected_blocks() {
+    use super::chat::strip_system_reminders;
+
+    let pure = "<system-reminder>\nReminder details\n</system-reminder>";
+    assert_eq!(strip_system_reminders(pure), "");
+
+    let mixed =
+        "Implement user authentication\n\n<system-reminder>\nContext hints\n</system-reminder>";
+    assert_eq!(
+        strip_system_reminders(mixed),
+        "Implement user authentication"
+    );
+
+    let generic = "Fix CSS styles <reminder>internal rule</reminder>";
+    assert_eq!(strip_system_reminders(generic), "Fix CSS styles");
+}
+
+#[test]
+fn sticky_query_ignores_pure_system_reminders() {
+    let backend = ratatui::backend::TestBackend::new(80, 14);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    // Real user message
+    app.messages.push(Message::user("Real user question"));
+
+    // Followed by a system-reminder message
+    app.messages.push(Message::user(
+        "<system-reminder>\n### Injected intent\n</system-reminder>",
+    ));
+
+    // Many lines to scroll off-screen
+    for i in 0..30 {
+        app.messages
+            .push(Message::assistant(format!("Log line {i}")));
+    }
+
+    app.follow_bottom = true;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+
+    assert!(
+        flat.contains("Real user question"),
+        "sticky must show real user query: {flat}"
+    );
+    assert!(
+        !flat.contains("system-reminder") && !flat.contains("Injected intent"),
+        "sticky must NEVER show injected reminder: {flat}"
+    );
+}
+
+#[test]
+fn reminder_renders_as_styled_card_in_transcript() {
+    let backend = ratatui::backend::TestBackend::new(80, 24);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    app.messages.push(Message::user(
+        "Check this out\n<system-reminder>\n### Active Intent\n- **[tool-search]** Search `docs/` first\n</system-reminder>",
+    ));
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+
+    assert!(
+        flat.contains("Check this out"),
+        "user message text must be rendered: {flat}"
+    );
+    assert!(
+        flat.contains("Reminder") && flat.contains("Active Intent") && flat.contains("tool-search"),
+        "reminder must be rendered as a card with markdown content: {flat}"
+    );
+    assert!(
+        flat.contains("╭─") && flat.contains("╰"),
+        "card borders must be present: {flat}"
+    );
+}

@@ -35,7 +35,7 @@ pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     // Flatten every message into display lines, then window by **line** offset.
     // Full history stays in `app.messages`; we only paint a viewport slice.
-    let (all_lines, owners) = build_chat_lines(app, wrap_width);
+    let (all_lines, owners, last_user_query) = build_chat_lines(app, wrap_width);
     let total = all_lines.len();
     let max_from_bottom = total.saturating_sub(view_h);
 
@@ -80,6 +80,55 @@ pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // Content origin for mouse → caret mapping (matches horizontal pad above).
     app.chat_content_x = content.x;
     let sel = app.selection_span();
+
+    // Sticky header: if the active user query has scrolled off the top of the viewport.
+    let need_sticky = if let Some((_, end_line)) = &last_user_query {
+        start > *end_line && view_h >= 6
+    } else {
+        false
+    };
+
+    let (sticky_area, chat_area) = if need_sticky {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(1), Constraint::Min(1)])
+            .split(content);
+        (Some(chunks[0]), chunks[1])
+    } else {
+        (None, content)
+    };
+
+    if let (Some(s_area), Some((query, _))) = (sticky_area, last_user_query) {
+        let single_line = query.replace('\n', " ");
+        let has_hint = s_area.width >= 50;
+        let hint_w = if has_hint { 12 } else { 0 };
+        let budget = (s_area.width as usize).saturating_sub(14 + hint_w).max(8);
+        let preview = truncate_display(&single_line, budget);
+
+        let mut spans = vec![
+            Span::styled("▌", Theme::sticky_query_accent()),
+            Span::styled(" ❯ ", Theme::sticky_query_pin()),
+            Span::styled("Prompt ", Theme::sticky_query_pin()),
+            Span::styled("· ", Theme::sticky_query_sep()),
+            Span::styled(preview, Theme::sticky_query_body()),
+        ];
+
+        if has_hint {
+            let current_w: usize = spans
+                .iter()
+                .map(|s| display_width(s.content.as_ref()))
+                .sum();
+            let pad_cols = (s_area.width as usize).saturating_sub(current_w + 10);
+            spans.push(Span::styled(" ".repeat(pad_cols), Theme::sticky_query_bg()));
+            spans.push(Span::styled("⇡ Pinned ", Theme::sticky_query_hint()));
+        }
+
+        frame.render_widget(
+            Paragraph::new(Line::from(spans)).style(Theme::sticky_query_bg()),
+            s_area,
+        );
+    }
+
     let window: Vec<Line<'static>> = if start < end {
         all_lines[start..end]
             .iter()
@@ -107,7 +156,7 @@ pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         Vec::new()
     };
 
-    frame.render_widget(Paragraph::new(window).style(Theme::bg()), content);
+    frame.render_widget(Paragraph::new(window).style(Theme::bg()), chat_area);
 
     // Right-edge progress scrollbar when the transcript is taller than the viewport.
     if total > view_h && view_h > 0 && sb_col.width > 0 && sb_col.height > 0 {
@@ -223,13 +272,19 @@ fn highlight_line_full(line: &Line<'static>) -> Line<'static> {
 }
 
 /// Build the full chat transcript as terminal lines (wrap-aware).
-/// Also returns per-line click targets (`Message` vs multi-tool `ToolGroup`).
+/// Also returns per-line click targets (`Message` vs multi-tool `ToolGroup`)
+/// and the last user message text along with its final line index.
 fn build_chat_lines(
     app: &App,
     wrap_width: usize,
-) -> (Vec<Line<'static>>, Vec<Option<ChatLineTarget>>) {
+) -> (
+    Vec<Line<'static>>,
+    Vec<Option<ChatLineTarget>>,
+    Option<(String, usize)>,
+) {
     let mut lines: Vec<Line<'static>> = Vec::new();
     let mut owners: Vec<Option<ChatLineTarget>> = Vec::new();
+    let mut last_user_query: Option<(String, usize)> = None;
 
     let push_owned = |lines: &mut Vec<Line<'static>>,
                       owners: &mut Vec<Option<ChatLineTarget>>,
@@ -249,7 +304,7 @@ fn build_chat_lines(
             empty_state_lines(app, wrap_width),
             None,
         );
-        return (lines, owners);
+        return (lines, owners, None);
     }
 
     let mut i = 0;
@@ -319,11 +374,16 @@ fn build_chat_lines(
             continue;
         }
 
+        let chunk = message_lines(msg, app, wrap_width, i, None);
+        if chunk.is_empty() {
+            i += 1;
+            continue;
+        }
+
         if !lines.is_empty() {
             lines.push(Line::from(Span::styled("", Theme::bg())));
             owners.push(None);
         }
-        let chunk = message_lines(msg, app, wrap_width, i, None);
         let owner = if matches!(
             msg.role,
             MessageRole::Alert | MessageRole::Thinking | MessageRole::Tool
@@ -332,6 +392,13 @@ fn build_chat_lines(
         } else {
             None
         };
+        if msg.role == MessageRole::User {
+            let clean = strip_system_reminders(&msg.content);
+            if !clean.is_empty() {
+                let end_line = lines.len() + chunk.len().saturating_sub(1);
+                last_user_query = Some((clean, end_line));
+            }
+        }
         push_owned(&mut lines, &mut owners, chunk, owner);
         i += 1;
     }
@@ -377,7 +444,7 @@ fn build_chat_lines(
     }
 
     debug_assert_eq!(lines.len(), owners.len());
-    (lines, owners)
+    (lines, owners, last_user_query)
 }
 
 /// Empty-session welcome: brand, advanced tips, try samples — no chrome
@@ -551,7 +618,20 @@ fn message_lines(
 ) -> Vec<Line<'static>> {
     let focused = app.chat_focus == Some(msg_index);
     let mut lines = match message.role {
-        MessageRole::User => render_user(&message.content, wrap_width),
+        MessageRole::User => {
+            let extracted = extract_user_and_reminders(&message.content);
+            let mut res = Vec::new();
+            if !extracted.user_text.is_empty() {
+                res.extend(render_user(&extracted.user_text, wrap_width));
+            }
+            for reminder in &extracted.reminders {
+                if !res.is_empty() {
+                    res.push(Line::from(Span::raw("")));
+                }
+                res.extend(render_reminder_card(reminder, wrap_width));
+            }
+            res
+        }
         MessageRole::Alert => render_alert(message, wrap_width),
         MessageRole::Thinking => render_thinking(message, app, wrap_width),
         MessageRole::Assistant => {
@@ -734,30 +814,194 @@ fn duration_label(message: &Message) -> Option<String> {
     })
 }
 
-/// User: peach left rail + warm elevated bubble, bold body (tight, no empty pad rows).
-/// Visually louder than tools and distinct from the blue j/k focus rail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExtractedUserContent {
+    pub user_text: String,
+    pub reminders: Vec<String>,
+}
+
+/// Extract user visible text and `<system-reminder>...</system-reminder>` blocks.
+pub(super) fn extract_user_and_reminders(text: &str) -> ExtractedUserContent {
+    let mut reminders = Vec::new();
+    let mut user_parts = Vec::new();
+    let mut rest = text;
+
+    while let Some(start_idx) = rest.find("<system-reminder>") {
+        let before = &rest[..start_idx];
+        if !before.trim().is_empty() {
+            user_parts.push(before.trim());
+        }
+        let after_start = &rest[start_idx + "<system-reminder>".len()..];
+        if let Some(end_idx) = after_start.find("</system-reminder>") {
+            let body = after_start[..end_idx].trim();
+            if !body.is_empty() {
+                reminders.push(body.to_string());
+            }
+            rest = &after_start[end_idx + "</system-reminder>".len()..];
+        } else {
+            let body = after_start.trim();
+            if !body.is_empty() {
+                reminders.push(body.to_string());
+            }
+            rest = "";
+            break;
+        }
+    }
+
+    if !rest.trim().is_empty() {
+        let mut rem_rest = rest;
+        while let Some(start_idx) = rem_rest.find("<reminder>") {
+            let before = &rem_rest[..start_idx];
+            if !before.trim().is_empty() {
+                user_parts.push(before.trim());
+            }
+            let after_start = &rem_rest[start_idx + "<reminder>".len()..];
+            if let Some(end_idx) = after_start.find("</reminder>") {
+                let body = after_start[..end_idx].trim();
+                if !body.is_empty() {
+                    reminders.push(body.to_string());
+                }
+                rem_rest = &after_start[end_idx + "</reminder>".len()..];
+            } else {
+                let body = after_start.trim();
+                if !body.is_empty() {
+                    reminders.push(body.to_string());
+                }
+                rem_rest = "";
+                break;
+            }
+        }
+        if !rem_rest.trim().is_empty() {
+            user_parts.push(rem_rest.trim());
+        }
+    }
+
+    ExtractedUserContent {
+        user_text: user_parts.join("\n\n"),
+        reminders,
+    }
+}
+
+/// Strip `<system-reminder>...</system-reminder>` blocks (and `<reminder>...</reminder>`) from text.
+pub(super) fn strip_system_reminders(text: &str) -> String {
+    extract_user_and_reminders(text).user_text
+}
+
+/// Render an injected `<system-reminder>` block as an elegant rounded-corner TUI card
+/// with full Markdown support (headings, bold, lists, inline/fenced code, tables).
+pub(super) fn render_reminder_card(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
+    let card_width = wrap_width.saturating_sub(4).max(24);
+    let inner_width = card_width.saturating_sub(4).max(8);
+    let mut md_lines = markdown::render(content, inner_width);
+
+    // Drop trailing blank lines inside the card for tighter geometry.
+    while md_lines
+        .last()
+        .is_some_and(|l| l.spans.is_empty() || l.spans.iter().all(|s| s.content.trim().is_empty()))
+    {
+        md_lines.pop();
+    }
+
+    let mut out = Vec::with_capacity(md_lines.len().saturating_add(2));
+
+    // Top border: "  ╭─ ✦ Reminder ──────╮"
+    let title = "✦ Reminder ";
+    let title_len = display_width(title);
+    let prefix = "╭─ ";
+    let prefix_len = display_width(prefix);
+    let suffix = "╮";
+    let suffix_len = display_width(suffix);
+
+    let used_w = prefix_len + title_len + suffix_len;
+    let fill_len = card_width.saturating_sub(used_w);
+
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled(prefix, Theme::reminder_border()),
+        Span::styled(title, Theme::reminder_badge()),
+        Span::styled("─".repeat(fill_len), Theme::reminder_border()),
+        Span::styled(suffix, Theme::reminder_border()),
+    ]));
+
+    // Card body lines with full markdown spans and padding to right border
+    if md_lines.is_empty() {
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled("│ ", Theme::reminder_border()),
+            Span::raw(" ".repeat(inner_width)),
+            Span::styled(" │", Theme::reminder_border()),
+        ]));
+    } else {
+        for line in md_lines {
+            let line_w: usize = line
+                .spans
+                .iter()
+                .map(|s| display_width(s.content.as_ref()))
+                .sum();
+            let pad_len = inner_width.saturating_sub(line_w);
+
+            let mut row_spans = Vec::with_capacity(line.spans.len().saturating_add(4));
+            row_spans.push(Span::raw("  "));
+            row_spans.push(Span::styled("│ ", Theme::reminder_border()));
+            row_spans.extend(line.spans);
+            if pad_len > 0 {
+                row_spans.push(Span::raw(" ".repeat(pad_len)));
+            }
+            row_spans.push(Span::styled(" │", Theme::reminder_border()));
+            out.push(Line::from(row_spans));
+        }
+    }
+
+    // Bottom border: "  ╰───────────────────╯"
+    let bot_fill = card_width.saturating_sub(2);
+    out.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("╰", Theme::reminder_border()),
+        Span::styled("─".repeat(bot_fill), Theme::reminder_border()),
+        Span::styled("╯", Theme::reminder_border()),
+    ]));
+
+    out
+}
+
+/// User: elegant peach role badge ("❯ You") with clean indented paragraphs.
+/// High contrast, breathable spacing, and crisp modern typography.
 fn render_user(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
-    let budget = wrap_width.saturating_sub(3).max(8);
+    let budget = wrap_width.saturating_sub(4).max(8);
     let wrapped = wrap_paragraphs(content, budget);
-    let mut out = Vec::with_capacity(wrapped.len().max(1));
+    let mut out = Vec::with_capacity(wrapped.len().saturating_add(2));
 
     if wrapped.is_empty() {
         out.push(Line::from(vec![
-            Span::styled("▌", Theme::user_bar()),
-            Span::styled(" ", Theme::user_pad()),
-            Span::styled(" ".repeat(budget), Theme::user_pad()),
+            Span::styled("  ❯ ", Theme::user_badge()),
+            Span::styled("You", Theme::user_badge()),
         ]));
         return out;
     }
 
-    for line in &wrapped {
-        let pad_len = budget.saturating_sub(display_width(line));
+    if wrapped.len() == 1 {
+        // Single-line compact prompt: "  ❯ You  <text>"
         out.push(Line::from(vec![
-            Span::styled("▌", Theme::user_bar()),
-            Span::styled(" ", Theme::user_pad()),
-            Span::styled(line.clone(), Theme::user_body()),
-            Span::styled(" ".repeat(pad_len), Theme::user_pad()),
+            Span::styled("  ❯ ", Theme::user_badge()),
+            Span::styled("You  ", Theme::user_badge()),
+            Span::styled(wrapped[0].clone(), Theme::user_body()),
         ]));
+    } else {
+        // Multi-line prompt: header row + indented body rows
+        out.push(Line::from(vec![
+            Span::styled("  ❯ ", Theme::user_badge()),
+            Span::styled("You", Theme::user_badge()),
+        ]));
+        for line in wrapped {
+            if line.is_empty() {
+                out.push(Line::from(Span::raw("")));
+            } else {
+                out.push(Line::from(vec![
+                    Span::raw("    "),
+                    Span::styled(line, Theme::user_body()),
+                ]));
+            }
+        }
     }
 
     out

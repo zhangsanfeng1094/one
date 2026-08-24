@@ -406,21 +406,75 @@ impl Theme {
         Style::default().fg(Self::ELEMENT).bg(Self::ELEMENT)
     }
 
-    /// User bubble left rail — peach identity. Not shared with chat focus.
+    /// User bubble left rail / role indicator — peach identity.
     pub fn user_bar() -> Style {
-        Style::default().fg(Self::PRIMARY).bg(Self::USER_BG)
-    }
-
-    pub fn user_body() -> Style {
-        // Warm elevated card + bold so user turns read louder than tools/focus.
         Style::default()
-            .fg(Self::FG)
-            .bg(Self::USER_BG)
+            .fg(Self::PRIMARY)
             .add_modifier(Modifier::BOLD)
     }
 
+    /// User role badge ("❯ You").
+    pub fn user_badge() -> Style {
+        Style::default()
+            .fg(Self::PRIMARY)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn user_body() -> Style {
+        // High-clarity bold text for user prompts so they stand out cleanly.
+        Style::default().fg(Self::FG).add_modifier(Modifier::BOLD)
+    }
+
     pub fn user_pad() -> Style {
-        Style::default().bg(Self::USER_BG)
+        Style::default().bg(Self::BG)
+    }
+
+    /// Sticky query bar at the top of transcript when user message scrolled off-screen.
+    pub fn sticky_query_bg() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::FG)
+    }
+
+    pub fn sticky_query_accent() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::PRIMARY)
+    }
+
+    pub fn sticky_query_pin() -> Style {
+        Style::default()
+            .bg(Self::PANEL)
+            .fg(Self::PRIMARY)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn sticky_query_sep() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::BORDER_ACTIVE)
+    }
+
+    pub fn sticky_query_body() -> Style {
+        Style::default()
+            .bg(Self::PANEL)
+            .fg(Self::FG)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn sticky_query_hint() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::MUTED)
+    }
+
+    /// System reminder card border — subtle purple/accent outline.
+    pub fn reminder_border() -> Style {
+        Style::default().fg(Self::ACCENT)
+    }
+
+    /// System reminder badge header ("✦ Reminder").
+    pub fn reminder_badge() -> Style {
+        Style::default()
+            .fg(Self::ACCENT)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// System reminder text body.
+    pub fn reminder_body() -> Style {
+        Style::default().fg(Self::FG)
     }
 
     /// j/k transcript focus rail — blue, deliberately *not* user peach.
