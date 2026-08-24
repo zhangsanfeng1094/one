@@ -37,18 +37,32 @@ impl App {
         self.settings_saved_sandbox = sandbox.into();
     }
 
-    /// Rebuild the root panel without losing the user's place after a toggle.
+    /// Rebuild the root panel without losing the user's place after a toggle or back nav.
     pub fn reopen_settings_float(&mut self) {
-        let previous = self
+        let previous_item_id = self.selected_float_item_id_or_parent(
+            FloatKind::Settings,
+            &[
+                (FloatKind::SettingsToolOutput, "tool_output"),
+                (FloatKind::SettingsCompaction, "compaction"),
+                (FloatKind::SettingsProviders, "providers"),
+                (FloatKind::Features, "features"),
+                (FloatKind::Skills, "skills"),
+                (FloatKind::Agents, "agents"),
+            ],
+        );
+        let previous_index = self
             .float
             .as_ref()
             .filter(|f| f.kind == FloatKind::Settings)
-            .map(|f| f.selected)
-            .unwrap_or(0);
+            .map(|f| f.selected);
         self.open_settings_float();
-        if let Some(f) = self.float.as_mut() {
-            let max = f.filtered_entries().len().saturating_sub(1);
-            f.selected = previous.min(max);
+        if let Some(id) = previous_item_id {
+            self.restore_float_selection_by_id(Some(id));
+        } else if let Some(prev) = previous_index {
+            if let Some(f) = self.float.as_mut() {
+                let max = f.filtered_entries().len().saturating_sub(1);
+                f.selected = prev.min(max);
+            }
         }
     }
 
@@ -127,6 +141,13 @@ impl App {
         self.clear_notice();
     }
 
+    /// Rebuild Tool output without losing the selected setting row.
+    pub fn reopen_settings_tool_output(&mut self) {
+        let previous_item_id = self.selected_float_item_id(FloatKind::SettingsToolOutput);
+        self.open_settings_tool_output();
+        self.restore_float_selection_by_id(previous_item_id);
+    }
+
     /// Nested Settings → Compaction strategy panel.
     pub fn open_settings_compaction(&mut self) {
         let ratio_pct = (self.compaction_ratio * 100.0).round() as u32;
@@ -140,6 +161,13 @@ impl App {
             self.compaction_prune_max_chars,
         ));
         self.clear_notice();
+    }
+
+    /// Rebuild Compaction without losing the selected setting row.
+    pub fn reopen_settings_compaction(&mut self) {
+        let previous_item_id = self.selected_float_item_id(FloatKind::SettingsCompaction);
+        self.open_settings_compaction();
+        self.restore_float_selection_by_id(previous_item_id);
     }
 
     /// Populate skills manager rows (path, label, detail, enabled).
@@ -258,6 +286,42 @@ impl App {
         self.clear_notice();
     }
 
+    fn selected_float_item_id(&self, expected_kind: FloatKind) -> Option<String> {
+        self.float
+            .as_ref()
+            .filter(|f| f.kind == expected_kind)
+            .and_then(|f| f.selected_entry())
+            .map(|entry| entry.item.id)
+    }
+
+    fn selected_float_item_id_or_parent(
+        &self,
+        expected_kind: FloatKind,
+        parent_rows: &[(FloatKind, &str)],
+    ) -> Option<String> {
+        self.selected_float_item_id(expected_kind).or_else(|| {
+            let kind = self.float.as_ref().map(|f| f.kind)?;
+            parent_rows.iter().find_map(|(parent_kind, item_id)| {
+                (kind == *parent_kind).then(|| (*item_id).to_string())
+            })
+        })
+    }
+
+    fn restore_float_selection_by_id(&mut self, item_id: Option<String>) {
+        let Some(item_id) = item_id else {
+            return;
+        };
+        if let Some(f) = self.float.as_mut() {
+            if let Some(index) = f
+                .filtered_entries()
+                .iter()
+                .position(|entry| entry.item.id == item_id)
+            {
+                f.selected = index;
+            }
+        }
+    }
+
     /// Open `/tasks` subagent list. `rows`: `(job_id, label, detail, hint)`.
     pub fn open_subagent_float(&mut self, rows: &[(String, String, String, String)]) {
         self.task_list = rows.to_vec();
@@ -347,12 +411,9 @@ impl App {
 
     /// Re-open skills panel after a toggle (keeps rows already updated by CLI).
     pub fn reopen_skills_float(&mut self) {
-        let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
+        let previous_item_id = self.selected_float_item_id(FloatKind::Skills);
         self.float = Some(FloatMenu::skills_manager(&self.skills_rows));
-        if let Some(f) = self.float.as_mut() {
-            let max = f.filtered_entries().len().saturating_sub(1);
-            f.selected = prev_selected.min(max);
-        }
+        self.restore_float_selection_by_id(previous_item_id);
         self.clear_notice();
     }
 
@@ -366,12 +427,9 @@ impl App {
 
     /// Re-open features panel after a toggle.
     pub fn reopen_features_float(&mut self) {
-        let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
+        let previous_item_id = self.selected_float_item_id(FloatKind::Features);
         self.float = Some(FloatMenu::features_manager(&self.features_rows));
-        if let Some(f) = self.float.as_mut() {
-            let max = f.filtered_entries().len().saturating_sub(1);
-            f.selected = prev_selected.min(max);
-        }
+        self.restore_float_selection_by_id(previous_item_id);
         self.clear_notice();
     }
 
@@ -385,12 +443,9 @@ impl App {
 
     /// Re-open MCP panel after a toggle.
     pub fn reopen_mcp_float(&mut self) {
-        let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
+        let previous_item_id = self.selected_float_item_id(FloatKind::Mcp);
         self.float = Some(FloatMenu::mcp_manager(&self.mcp_rows));
-        if let Some(f) = self.float.as_mut() {
-            let max = f.filtered_entries().len().saturating_sub(1);
-            f.selected = prev_selected.min(max);
-        }
+        self.restore_float_selection_by_id(previous_item_id);
         self.clear_notice();
     }
 
@@ -407,12 +462,9 @@ impl App {
     }
 
     pub fn reopen_mcp_import_float(&mut self) {
-        let prev_selected = self.float.as_ref().map(|f| f.selected).unwrap_or(0);
+        let previous_item_id = self.selected_float_item_id(FloatKind::McpImport);
         self.float = Some(FloatMenu::mcp_import(&self.mcp_import_rows));
-        if let Some(f) = self.float.as_mut() {
-            let max = f.filtered_entries().len().saturating_sub(1);
-            f.selected = prev_selected.min(max);
-        }
+        self.restore_float_selection_by_id(previous_item_id);
         self.clear_notice();
     }
 
@@ -446,6 +498,24 @@ impl App {
         self.clear_notice();
     }
 
+    /// Re-open the provider list and keep focus on the provider that opened the detail page.
+    pub fn open_settings_providers_focused(&mut self) {
+        let focus = self.settings_provider_focus.clone();
+        self.open_settings_providers(&self.settings_provider_rows.clone());
+        if focus.is_empty() {
+            return;
+        }
+        if let Some(f) = self.float.as_mut() {
+            if let Some(index) = f
+                .filtered_entries()
+                .iter()
+                .position(|entry| entry.item.id == format!("p:{focus}"))
+            {
+                f.selected = index;
+            }
+        }
+    }
+
     /// Models for the focused provider (second level under provider detail).
     ///
     /// Each model shows `[x]`/`[ ]` for whether it appears in **Ctrl+L**.
@@ -464,17 +534,23 @@ impl App {
             self.open_settings_providers(&self.settings_provider_rows.clone());
             return;
         }
-        let previous = self
-            .float
-            .as_ref()
-            .filter(|f| f.kind == FloatKind::SettingsModels)
-            .map(|f| f.selected)
-            .unwrap_or(0);
+        let previous_item_id = self
+            .selected_float_item_id(FloatKind::SettingsModels)
+            .or_else(|| {
+                if self
+                    .float
+                    .as_ref()
+                    .is_some_and(|f| f.kind == FloatKind::SettingsModelAdd)
+                {
+                    Some("add_model".to_string())
+                } else if !self.settings_model_focus.is_empty() {
+                    Some(format!("m:{}", self.settings_model_focus))
+                } else {
+                    None
+                }
+            });
         self.open_settings_models_for_provider(&provider);
-        if let Some(f) = self.float.as_mut() {
-            let max = f.filtered_entries().len().saturating_sub(1);
-            f.selected = previous.min(max);
-        }
+        self.restore_float_selection_by_id(previous_item_id);
     }
 
     /// `(spec, detail, in_ctrl_l)` for one provider's models.
@@ -569,6 +645,24 @@ impl App {
         self.clear_notice();
     }
 
+    /// Re-open provider compatibility panel (after flag cycle/reset) without losing selection.
+    pub fn reopen_settings_provider_compat(&mut self) {
+        let id = self.settings_provider_focus.clone();
+        let previous_item_id = self.selected_float_item_id_or_parent(
+            FloatKind::SettingsProviderCompat,
+            &[
+                (FloatKind::SettingsThinkingFormat, "set_thinking_format"),
+                (FloatKind::SettingsMaxTokensField, "set_max_tokens_field"),
+            ],
+        );
+        if id.is_empty() {
+            self.open_settings_providers(&self.settings_provider_rows.clone());
+            return;
+        }
+        self.open_settings_provider_compat(&id);
+        self.restore_float_selection_by_id(previous_item_id);
+    }
+
     fn open_settings_delete_confirm(&mut self, target: SettingsDeleteTarget) {
         self.settings_delete_target = Some(target.clone());
         self.settings_inline_op = None;
@@ -585,12 +679,22 @@ impl App {
 
     pub fn open_settings_thinking_format(&mut self, scope: &str, on_model: bool) {
         self.settings_compat_on_model = on_model;
+        if on_model {
+            self.settings_model_focus = scope.to_string();
+        } else {
+            self.settings_provider_focus = scope.to_string();
+        }
         self.float = Some(FloatMenu::settings_thinking_format(scope));
         self.clear_notice();
     }
 
     pub fn open_settings_max_tokens_field(&mut self, scope: &str, on_model: bool) {
         self.settings_compat_on_model = on_model;
+        if on_model {
+            self.settings_model_focus = scope.to_string();
+        } else {
+            self.settings_provider_focus = scope.to_string();
+        }
         self.float = Some(FloatMenu::settings_max_tokens_field(scope));
         self.clear_notice();
     }
@@ -610,9 +714,46 @@ impl App {
         self.clear_notice();
     }
 
+    /// Re-open model detail for the focused model without losing the selected setting row.
+    pub fn reopen_settings_model_detail(&mut self) {
+        let spec = self.settings_model_focus.clone();
+        let previous_item_id = self.selected_float_item_id_or_parent(
+            FloatKind::SettingsModelDetail,
+            &[
+                (FloatKind::SettingsThinkingFormat, "set_thinking_format"),
+                (FloatKind::SettingsMaxTokensField, "set_max_tokens_field"),
+            ],
+        );
+        if spec.is_empty() {
+            let provider = self.settings_provider_focus.clone();
+            if provider.is_empty() {
+                self.open_settings_providers(&self.settings_provider_rows.clone());
+            } else {
+                self.open_settings_models_for_provider(&provider);
+            }
+            return;
+        }
+        let detail = self
+            .settings_model_rows
+            .iter()
+            .find(|(k, _)| k == &spec)
+            .map(|(_, d)| d.clone())
+            .unwrap_or_default();
+        self.open_settings_model_detail(&spec, &detail);
+        self.restore_float_selection_by_id(previous_item_id);
+    }
+
     /// Re-open provider detail for the focused provider (after edits).
     pub fn reopen_settings_provider_detail(&mut self) {
         let id = self.settings_provider_focus.clone();
+        let previous_item_id = self.selected_float_item_id_or_parent(
+            FloatKind::SettingsProviderDetail,
+            &[
+                (FloatKind::SettingsProviderApi, "set_provider_type"),
+                (FloatKind::SettingsProviderCompat, "compat"),
+                (FloatKind::SettingsModels, "models"),
+            ],
+        );
         if id.is_empty() {
             self.open_settings_providers(&self.settings_provider_rows.clone());
             return;
@@ -624,6 +765,7 @@ impl App {
             .map(|(_, d)| d.clone())
             .unwrap_or_default();
         self.open_settings_provider_detail(&id, &detail);
+        self.restore_float_selection_by_id(previous_item_id);
     }
 
     /// Open in-float Add model form for the focused provider.
@@ -643,6 +785,7 @@ impl App {
         let Some(draft) = self.model_draft.clone() else {
             return;
         };
+        let prev_selected = self.selected_float_item_id(FloatKind::SettingsModelAdd);
         let editing = self.settings_form_edit.clone();
         let mut menu = FloatMenu::settings_model_add(&draft.provider, &draft, editing.as_deref());
         // When editing a field, put current value into search for typing.
@@ -650,6 +793,9 @@ impl App {
             menu.begin_edit(key.clone(), draft.field(key));
         }
         self.float = Some(menu);
+        if let Some(id) = prev_selected {
+            self.restore_float_selection_by_id(Some(id));
+        }
     }
 
     /// Navigate one level up in the Settings hierarchy. Returns true if handled.
@@ -672,41 +818,32 @@ impl App {
                 self.close_float();
                 true
             }
-            FloatKind::SettingsToolOutput => {
-                self.open_settings_float();
-                true
-            }
-            FloatKind::SettingsCompaction => {
-                self.open_settings_float();
-                true
-            }
-            FloatKind::SettingsProviders => {
-                self.open_settings_float();
+            FloatKind::SettingsToolOutput
+            | FloatKind::SettingsCompaction
+            | FloatKind::SettingsProviders
+            | FloatKind::Features
+            | FloatKind::Skills
+            | FloatKind::Agents => {
+                self.reopen_settings_float();
                 true
             }
             FloatKind::SettingsProviderDetail => {
-                self.open_settings_providers(&self.settings_provider_rows.clone());
+                self.open_settings_providers_focused();
                 true
             }
             FloatKind::SettingsProviderCompat => {
                 self.reopen_settings_provider_detail();
                 true
             }
-            FloatKind::SettingsProviderApi
-            | FloatKind::SettingsRemoteModels
-            | FloatKind::SettingsThinkingFormat
-            | FloatKind::SettingsMaxTokensField => {
+            FloatKind::SettingsProviderApi | FloatKind::SettingsRemoteModels => {
+                self.reopen_settings_provider_detail();
+                true
+            }
+            FloatKind::SettingsThinkingFormat | FloatKind::SettingsMaxTokensField => {
                 if self.settings_compat_on_model && !self.settings_model_focus.is_empty() {
-                    let spec = self.settings_model_focus.clone();
-                    let detail = self
-                        .settings_model_rows
-                        .iter()
-                        .find(|(k, _)| k == &spec)
-                        .map(|(_, d)| d.clone())
-                        .unwrap_or_default();
-                    self.open_settings_model_detail(&spec, &detail);
+                    self.reopen_settings_model_detail();
                 } else {
-                    self.reopen_settings_provider_detail();
+                    self.reopen_settings_provider_compat();
                 }
                 true
             }
@@ -715,19 +852,13 @@ impl App {
                 true
             }
             FloatKind::SettingsModelDetail => {
-                let p = self.settings_provider_focus.clone();
-                if p.is_empty() {
-                    self.open_settings_providers(&self.settings_provider_rows.clone());
-                } else {
-                    self.open_settings_models_for_provider(&p);
-                }
+                self.reopen_settings_models_for_provider();
                 true
             }
             FloatKind::SettingsModelAdd => {
                 self.model_draft = None;
                 self.settings_form_edit = None;
-                let p = self.settings_provider_focus.clone();
-                self.open_settings_models_for_provider(&p);
+                self.reopen_settings_models_for_provider();
                 true
             }
             FloatKind::SettingsDeleteConfirm => {
@@ -748,27 +879,13 @@ impl App {
                 }
                 true
             }
-            FloatKind::Skills => {
-                // Same as Thinking: Esc returns to Settings root.
-                self.open_settings_float();
-                true
-            }
-            FloatKind::Agents => {
-                // From Settings → Agents, Esc goes back to Settings; from /agents just close.
-                self.open_settings_float();
-                true
-            }
-            FloatKind::Features => {
-                self.open_settings_float();
-                true
-            }
             FloatKind::Mcp => {
-                self.open_settings_float();
+                self.reopen_settings_float();
                 true
             }
             FloatKind::McpImport => {
                 // Back to MCP manager (caller may refresh rows).
-                self.open_mcp_float();
+                self.reopen_mcp_float();
                 true
             }
             FloatKind::BackgroundDetail | FloatKind::SubagentDetail => {
@@ -1012,20 +1129,14 @@ impl App {
                 self.open_thinking_float();
                 RunOutcome::Noop
             }
-            "auto_approve" => {
-                self.close_float();
-                RunOutcome::ConfigOp(ConfigOp::SettingSet {
-                    key: "auto_approve".into(),
-                    value: "toggle".into(),
-                })
-            }
-            "sandbox" => {
-                self.close_float();
-                RunOutcome::ConfigOp(ConfigOp::SettingSet {
-                    key: "sandbox".into(),
-                    value: "cycle".into(),
-                })
-            }
+            "auto_approve" => RunOutcome::ConfigOp(ConfigOp::SettingSet {
+                key: "auto_approve".into(),
+                value: "toggle".into(),
+            }),
+            "sandbox" => RunOutcome::ConfigOp(ConfigOp::SettingSet {
+                key: "sandbox".into(),
+                value: "cycle".into(),
+            }),
             "tool_output" => {
                 self.open_settings_tool_output();
                 RunOutcome::Noop
@@ -1092,13 +1203,10 @@ impl App {
 
     pub(crate) fn confirm_settings_compaction(&mut self, id: &str) -> RunOutcome {
         match id {
-            "auto" => {
-                self.close_float();
-                RunOutcome::ConfigOp(ConfigOp::SettingSet {
-                    key: "compaction.auto".into(),
-                    value: "toggle".into(),
-                })
-            }
+            "auto" => RunOutcome::ConfigOp(ConfigOp::SettingSet {
+                key: "compaction.auto".into(),
+                value: "toggle".into(),
+            }),
             "ratio" => {
                 let pct = (self.compaction_ratio * 100.0).round() as u32;
                 self.start_settings_inline_edit(
@@ -1128,13 +1236,10 @@ impl App {
                 );
                 RunOutcome::Noop
             }
-            "prune" => {
-                self.close_float();
-                RunOutcome::ConfigOp(ConfigOp::SettingSet {
-                    key: "compaction.prune".into(),
-                    value: "toggle".into(),
-                })
-            }
+            "prune" => RunOutcome::ConfigOp(ConfigOp::SettingSet {
+                key: "compaction.prune".into(),
+                value: "toggle".into(),
+            }),
             "prune_protect" => {
                 self.start_settings_inline_edit(
                     "setting:compaction.prune_protect_tokens",

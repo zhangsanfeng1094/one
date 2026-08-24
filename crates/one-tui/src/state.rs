@@ -315,7 +315,12 @@ impl ModelDraft {
 
     /// Build ConfigOp if id is non-empty.
     pub fn to_config_op(&self) -> Result<ConfigOp, String> {
-        let id = self.id.trim();
+        let raw_id = self.id.trim();
+        if raw_id.is_empty() {
+            return Err("model id is required".into());
+        }
+        let prefix = format!("{}:", self.provider);
+        let id = raw_id.strip_prefix(&prefix).unwrap_or(raw_id).trim();
         if id.is_empty() {
             return Err("model id is required".into());
         }

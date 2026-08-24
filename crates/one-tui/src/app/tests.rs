@@ -186,6 +186,191 @@ fn settings_models_enter_on_fetch_row() {
 }
 
 #[test]
+fn settings_tool_output_reopen_restores_selected_row() {
+    let mut app = App::new("test");
+    app.set_tool_output_limits(100, 4096);
+    app.open_settings_tool_output();
+    let f = app.float.as_mut().expect("tool output");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|entry| entry.item.id == "max_bytes")
+        .expect("max bytes row");
+
+    app.set_tool_output_limits(100, 8192);
+    app.reopen_settings_tool_output();
+
+    let f = app.float.as_ref().expect("tool output");
+    assert_eq!(f.kind, FloatKind::SettingsToolOutput);
+    assert_eq!(f.selected_entry().unwrap().item.id, "max_bytes");
+}
+
+#[test]
+fn settings_compaction_reopen_restores_selected_row() {
+    let mut app = App::new("test");
+    app.set_compaction_settings(true, 0.8, None, 10, true, 20_000, 1000);
+    app.open_settings_compaction();
+    let f = app.float.as_mut().expect("compaction");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|entry| entry.item.id == "prune_max_chars")
+        .expect("prune max chars row");
+
+    app.set_compaction_settings(true, 0.8, None, 10, true, 20_000, 2000);
+    app.reopen_settings_compaction();
+
+    let f = app.float.as_ref().expect("compaction");
+    assert_eq!(f.kind, FloatKind::SettingsCompaction);
+    assert_eq!(f.selected_entry().unwrap().item.id, "prune_max_chars");
+}
+
+#[test]
+fn settings_model_detail_reopen_restores_selected_field() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![("openai".into(), "2 models".into())],
+        vec![("openai:o3".into(), "o3 ctx=128000 reasoning=true".into())],
+        vec![],
+    );
+    app.open_settings_model_detail("openai:o3", "o3 ctx=128000 reasoning=true");
+    let f = app.float.as_mut().expect("model detail");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|entry| entry.item.id == "set_ctx")
+        .expect("context row");
+
+    app.set_settings_catalog(
+        vec![("openai".into(), "2 models".into())],
+        vec![("openai:o3".into(), "o3 ctx=256000 reasoning=true".into())],
+        vec![],
+    );
+    app.reopen_settings_model_detail();
+
+    let f = app.float.as_ref().expect("model detail");
+    assert_eq!(f.kind, FloatKind::SettingsModelDetail);
+    assert_eq!(f.selected_entry().unwrap().item.id, "set_ctx");
+}
+
+#[test]
+fn settings_models_reopen_restores_selected_model_by_id() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![("openai".into(), "2 models".into())],
+        vec![
+            ("openai:o3".into(), "o3 ctx=128000".into()),
+            ("openai:gpt-4o".into(), "gpt-4o ctx=128000".into()),
+        ],
+        vec![],
+    );
+    app.open_settings_models_for_provider("openai");
+    let f = app.float.as_mut().expect("models list");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|entry| entry.item.id == "m:openai:gpt-4o")
+        .expect("gpt-4o row");
+
+    app.set_settings_catalog(
+        vec![("openai".into(), "3 models".into())],
+        vec![
+            ("openai:new".into(), "new ctx=128000".into()),
+            ("openai:o3".into(), "o3 ctx=128000".into()),
+            ("openai:gpt-4o".into(), "gpt-4o ctx=128000".into()),
+        ],
+        vec![],
+    );
+    app.reopen_settings_models_for_provider();
+
+    let f = app.float.as_ref().expect("models list");
+    assert_eq!(f.kind, FloatKind::SettingsModels);
+    assert_eq!(f.selected_entry().unwrap().item.id, "m:openai:gpt-4o");
+}
+
+#[test]
+fn settings_models_reopen_prefers_current_list_selection_over_stale_detail_focus() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![("openai".into(), "2 models".into())],
+        vec![
+            ("openai:o3".into(), "o3 ctx=128000".into()),
+            ("openai:gpt-4o".into(), "gpt-4o ctx=128000".into()),
+        ],
+        vec![],
+    );
+    app.open_settings_model_detail("openai:o3", "o3 ctx=128000");
+    app.reopen_settings_models_for_provider();
+    let f = app.float.as_mut().expect("models list");
+    assert_eq!(f.kind, FloatKind::SettingsModels);
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|entry| entry.item.id == "m:openai:gpt-4o")
+        .expect("gpt-4o row");
+
+    app.set_settings_catalog(
+        vec![("openai".into(), "2 models".into())],
+        vec![
+            ("openai:o3".into(), "o3 ctx=128000".into()),
+            ("openai:gpt-4o".into(), "gpt-4o ctx=256000".into()),
+        ],
+        vec![],
+    );
+    app.reopen_settings_models_for_provider();
+
+    let f = app.float.as_ref().expect("models list after reopen");
+    assert_eq!(f.kind, FloatKind::SettingsModels);
+    assert_eq!(f.selected_entry().unwrap().item.id, "m:openai:gpt-4o");
+}
+
+#[test]
+fn settings_provider_detail_back_restores_provider_list_selection() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![
+            ("anthropic".into(), "2 models".into()),
+            ("cpa".into(), "23 models".into()),
+            ("openai".into(), "4 models".into()),
+        ],
+        vec![],
+        vec![],
+    );
+
+    app.open_settings_provider_detail("cpa", "23 models");
+    assert!(app.settings_go_back());
+
+    let f = app.float.as_ref().expect("provider list");
+    assert_eq!(f.kind, FloatKind::SettingsProviders);
+    let selected = f.selected_entry().expect("selected provider");
+    assert_eq!(selected.item.id, "p:cpa");
+}
+
+#[test]
+fn settings_provider_detail_reopen_restores_selected_field() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![("cpa".into(), "23 models".into())],
+        vec![],
+        vec![("cpa:default_model".into(), "gpt-5.5".into())],
+    );
+    app.open_settings_provider_detail("cpa", "23 models");
+    let f = app.float.as_mut().expect("provider detail");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|entry| entry.item.id == "set_default_model")
+        .expect("default model row");
+
+    app.reopen_settings_provider_detail();
+
+    let f = app.float.as_ref().expect("provider detail");
+    assert_eq!(f.kind, FloatKind::SettingsProviderDetail);
+    let selected = f.selected_entry().expect("selected field");
+    assert_eq!(selected.item.id, "set_default_model");
+}
+
+#[test]
 fn provider_detail_rows_show_configured_values() {
     let mut app = App::new("test");
     app.set_settings_catalog(
@@ -301,6 +486,327 @@ fn provider_api_picker_saves_fixed_values_and_unset() {
         RunOutcome::ConfigOp(ConfigOp::ProviderSet { id, key, value })
             if id == "proxy" && key == "api" && value.is_empty()
     ));
+}
+
+#[test]
+fn settings_providers_filter_and_select() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![
+            ("anthropic".into(), "2 models".into()),
+            ("deepseek".into(), "4 models".into()),
+            ("openai".into(), "5 models".into()),
+        ],
+        vec![],
+        vec![],
+    );
+    app.settings_provider_focus = "openai".into();
+    app.open_settings_providers_focused();
+    let f = app.float.as_mut().expect("providers list");
+    assert_eq!(f.kind, FloatKind::SettingsProviders);
+    f.search = "deep".into();
+    f.selected = 0;
+    let entries = f.filtered_entries();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].item.id, "p:deepseek");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(out, RunOutcome::Noop));
+    let f = app.float.as_ref().expect("provider detail");
+    assert_eq!(f.kind, FloatKind::SettingsProviderDetail);
+    assert_eq!(app.settings_provider_focus, "deepseek");
+}
+
+#[test]
+fn settings_provider_delete_active_provider_shows_notice() {
+    let mut app = App::new("test");
+    app.current_provider = "openai".into();
+    app.set_settings_catalog(vec![("openai".into(), "2 models".into())], vec![], vec![]);
+    app.open_settings_provider_detail("openai", "2 models");
+    let f = app.float.as_mut().expect("provider detail");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "rm_provider")
+        .expect("rm_provider row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(out, RunOutcome::Noop));
+    assert!(app
+        .toast
+        .as_ref()
+        .unwrap()
+        .text
+        .contains("cannot delete active provider"));
+    // Delete confirm modal should NOT be opened
+    assert_eq!(
+        app.float.as_ref().unwrap().kind,
+        FloatKind::SettingsProviderDetail
+    );
+}
+
+#[test]
+fn settings_provider_compat_back_restores_provider_detail_selection() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(vec![("cpa".into(), "23 models".into())], vec![], vec![]);
+    app.open_settings_provider_detail("cpa", "23 models");
+    app.open_settings_provider_compat("cpa");
+    assert_eq!(
+        app.float.as_ref().unwrap().kind,
+        FloatKind::SettingsProviderCompat
+    );
+
+    assert!(app.settings_go_back());
+    let f = app.float.as_ref().expect("provider detail");
+    assert_eq!(f.kind, FloatKind::SettingsProviderDetail);
+    let selected = f.selected_entry().expect("selected row");
+    assert_eq!(
+        selected.item.id, "compat",
+        "Esc from compat must restore focus on compat row"
+    );
+}
+
+#[test]
+fn settings_model_detail_back_restores_models_list_selection() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![("cpa".into(), "2 models".into())],
+        vec![
+            ("cpa:gpt-5.5".into(), "gpt-5.5 ctx=128000".into()),
+            ("cpa:gpt-5.6".into(), "gpt-5.6 ctx=128000".into()),
+        ],
+        vec![],
+    );
+    app.open_settings_models_for_provider("cpa");
+    app.open_settings_model_detail("cpa:gpt-5.6", "gpt-5.6 ctx=128000");
+    assert_eq!(
+        app.float.as_ref().unwrap().kind,
+        FloatKind::SettingsModelDetail
+    );
+
+    assert!(app.settings_go_back());
+    let f = app.float.as_ref().expect("models list");
+    assert_eq!(f.kind, FloatKind::SettingsModels);
+    let selected = f.selected_entry().expect("selected row");
+    assert_eq!(
+        selected.item.id, "m:cpa:gpt-5.6",
+        "Esc from model detail must restore focus on that model"
+    );
+}
+
+#[test]
+fn settings_provider_compat_reopen_restores_selected_flag() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(vec![("cpa".into(), "23 models".into())], vec![], vec![]);
+    app.open_settings_provider_compat("cpa");
+    let f = app.float.as_mut().expect("compat float");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "cycle_compat:supports_strict_mode")
+        .expect("strict mode row");
+
+    app.reopen_settings_provider_compat();
+    let f = app.float.as_ref().expect("compat float after reopen");
+    assert_eq!(f.kind, FloatKind::SettingsProviderCompat);
+    let selected = f.selected_entry().expect("selected row");
+    assert_eq!(selected.item.id, "cycle_compat:supports_strict_mode");
+}
+
+#[test]
+fn settings_provider_compat_cycles_flags_and_clears() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![("cpa".into(), "23 models".into())],
+        vec![],
+        vec![("cpa:compat.supportsDeveloperRole".into(), "auto".into())],
+    );
+    app.open_settings_provider_compat("cpa");
+    let f = app.float.as_mut().expect("compat float");
+    assert_eq!(f.kind, FloatKind::SettingsProviderCompat);
+
+    // Find cycle flag
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "cycle_compat:supports_developer_role")
+        .expect("cycle row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        out,
+        RunOutcome::ConfigOp(ConfigOp::ProviderSet { id, key, value })
+            if id == "cpa" && key == "supports_developer_role" && value == "true"
+    ));
+
+    // Clear overrides row
+    let f = app.float.as_mut().expect("compat float");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "clear_compat")
+        .expect("clear row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        out,
+        RunOutcome::ConfigOp(ConfigOp::ProviderSet { id, key, value })
+            if id == "cpa" && key == "compat" && value == "clear"
+    ));
+}
+
+#[test]
+fn settings_thinking_format_picker_selects_format() {
+    let mut app = App::new("test");
+    app.open_settings_thinking_format("cpa", false);
+    let f = app.float.as_mut().expect("thinking format float");
+    assert_eq!(f.kind, FloatKind::SettingsThinkingFormat);
+
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "tf:openai")
+        .expect("openai format row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        out,
+        RunOutcome::ConfigOp(ConfigOp::ProviderSet { id, key, value })
+            if id == "cpa" && key == "thinking_format" && value == "openai"
+    ));
+}
+
+#[test]
+fn settings_max_tokens_field_picker_provider_and_model_scopes() {
+    let mut app = App::new("test");
+    // 1. Provider scope
+    app.open_settings_max_tokens_field("cpa", false);
+    let f = app.float.as_mut().expect("max tokens float");
+    assert_eq!(f.kind, FloatKind::SettingsMaxTokensField);
+
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "mt:max_completion_tokens")
+        .expect("max_completion_tokens row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        out,
+        RunOutcome::ConfigOp(ConfigOp::ProviderSet { id, key, value })
+            if id == "cpa" && key == "max_tokens_field" && value == "max_completion_tokens"
+    ));
+
+    // 2. Model scope
+    app.open_settings_max_tokens_field("cpa:gpt-5.5", true);
+    let f = app.float.as_mut().expect("max tokens float model scope");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "mt:max_tokens")
+        .expect("max_tokens row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        out,
+        RunOutcome::ConfigOp(ConfigOp::ModelSet { spec, key, value })
+            if spec == "cpa:gpt-5.5" && key == "max_tokens_field" && value == "max_tokens"
+    ));
+}
+
+#[test]
+fn settings_model_detail_advanced_compat_overrides() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![("cpa".into(), "1 model".into())],
+        vec![(
+            "cpa:gpt-5.5".into(),
+            "gpt-5.5 ctx=128000 devRole=auto effort=auto format=auto".into(),
+        )],
+        vec![],
+    );
+    app.open_settings_model_detail(
+        "cpa:gpt-5.5",
+        "gpt-5.5 ctx=128000 devRole=auto effort=auto format=auto",
+    );
+
+    // Cycle model-level devRole
+    let f = app.float.as_mut().expect("model detail float");
+    assert_eq!(f.kind, FloatKind::SettingsModelDetail);
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "cycle_compat:supports_developer_role")
+        .expect("model devRole cycle row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        out,
+        RunOutcome::ConfigOp(ConfigOp::ModelSet { spec, key, value })
+            if spec == "cpa:gpt-5.5" && key == "supports_developer_role" && value == "true"
+    ));
+
+    // Clear model-level compat
+    let f = app.float.as_mut().expect("model detail float");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "clear_compat")
+        .expect("clear model compat row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        out,
+        RunOutcome::ConfigOp(ConfigOp::ModelSet { spec, key, value })
+            if spec == "cpa:gpt-5.5" && key == "compat" && value == "clear"
+    ));
+}
+
+#[test]
+fn settings_model_detail_reasoning_cycle_and_thinking_map() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![("cpa".into(), "1 model".into())],
+        vec![(
+            "cpa:gpt-5.5".into(),
+            "gpt-5.5 ctx=128000 reasoning=unset map=(none)".into(),
+        )],
+        vec![],
+    );
+    app.open_settings_model_detail(
+        "cpa:gpt-5.5",
+        "gpt-5.5 ctx=128000 reasoning=unset map=(none)",
+    );
+
+    // 1. Cycle reasoning: unset -> true
+    let f = app.float.as_mut().expect("model detail");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "set_reasoning")
+        .expect("reasoning row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(
+        out,
+        RunOutcome::ConfigOp(ConfigOp::ModelSet { spec, key, value })
+            if spec == "cpa:gpt-5.5" && key == "reasoning" && value == "true"
+    ));
+
+    // 2. Edit thinkingLevelMap starts inline edit
+    let f = app.float.as_mut().expect("model detail");
+    f.selected = f
+        .filtered_entries()
+        .iter()
+        .position(|e| e.item.id == "set_thinking_level_map")
+        .expect("thinkingLevelMap row");
+
+    let out = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(out, RunOutcome::Noop));
+    assert_eq!(
+        app.settings_inline_op.as_deref(),
+        Some("model_set:cpa:gpt-5.5:thinking_level_map")
+    );
 }
 
 #[test]
@@ -2098,4 +2604,99 @@ fn enter_on_focused_task_opens_frame() {
         RunOutcome::OpenSubagentDetail { id } => assert_eq!(id, "job_tv4"),
         other => panic!("expected OpenSubagentDetail, got {other:?}"),
     }
+}
+
+#[test]
+fn settings_root_toggle_preserves_selection() {
+    let mut app = App::new("test");
+    app.open_settings_float();
+    // Navigate to auto_approve
+    if let Some(f) = app.float.as_mut() {
+        let idx = f
+            .filtered_entries()
+            .iter()
+            .position(|e| e.item.id == "auto_approve")
+            .unwrap();
+        f.selected = idx;
+    }
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)) {
+        RunOutcome::ConfigOp(ConfigOp::SettingSet { key, value }) => {
+            assert_eq!(key, "auto_approve");
+            assert_eq!(value, "toggle");
+        }
+        other => panic!("expected SettingSet, got {other:?}"),
+    }
+    // Reopen float (as interactive loop does)
+    app.reopen_settings_float();
+    assert_eq!(
+        app.float
+            .as_ref()
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .item
+            .id,
+        "auto_approve"
+    );
+}
+
+#[test]
+fn settings_subviews_back_restores_root_settings_selection() {
+    let mut app = App::new("test");
+    app.open_settings_float();
+    // Open providers
+    if let Some(f) = app.float.as_mut() {
+        let idx = f
+            .filtered_entries()
+            .iter()
+            .position(|e| e.item.id == "providers")
+            .unwrap();
+        f.selected = idx;
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.float.as_ref().unwrap().kind,
+        FloatKind::SettingsProviders
+    );
+    // Press Esc to go back
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.float.as_ref().unwrap().kind, FloatKind::Settings);
+    assert_eq!(
+        app.float
+            .as_ref()
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .item
+            .id,
+        "providers"
+    );
+
+    // Open compaction
+    if let Some(f) = app.float.as_mut() {
+        let idx = f
+            .filtered_entries()
+            .iter()
+            .position(|e| e.item.id == "compaction")
+            .unwrap();
+        f.selected = idx;
+    }
+    app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert_eq!(
+        app.float.as_ref().unwrap().kind,
+        FloatKind::SettingsCompaction
+    );
+    // Press Esc to go back
+    app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE));
+    assert_eq!(app.float.as_ref().unwrap().kind, FloatKind::Settings);
+    assert_eq!(
+        app.float
+            .as_ref()
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .item
+            .id,
+        "compaction"
+    );
 }

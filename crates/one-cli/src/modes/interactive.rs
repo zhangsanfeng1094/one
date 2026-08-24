@@ -1034,7 +1034,15 @@ async fn apply_config_op(
                     refresh_model_catalog(app, providers);
                     app.set_notice(msg);
                     app.settings_provider_focus = id;
-                    app.reopen_settings_provider_detail();
+                    if app.float.as_ref().is_some_and(|f| {
+                        f.kind == FloatKind::SettingsProviderCompat
+                            || f.kind == FloatKind::SettingsThinkingFormat
+                            || f.kind == FloatKind::SettingsMaxTokensField
+                    }) {
+                        app.reopen_settings_provider_compat();
+                    } else {
+                        app.reopen_settings_provider_detail();
+                    }
                 }
                 Err(err) => app.set_notice(format!("provider: {err}")),
             }
@@ -1103,7 +1111,9 @@ async fn apply_config_op(
                         .split_once(':')
                         .map(|(p, _)| p.to_string())
                         .unwrap_or_else(|| app.settings_provider_focus.clone());
-                    app.open_settings_models_for_provider(&provider);
+                    app.settings_model_focus = spec;
+                    app.settings_provider_focus = provider;
+                    app.reopen_settings_models_for_provider();
                 }
                 Err(err) => app.set_notice(format!("model: {err}")),
             }
@@ -1116,7 +1126,17 @@ async fn apply_config_op(
                     .split_once(':')
                     .map(|(p, _)| p.to_string())
                     .unwrap_or_else(|| app.settings_provider_focus.clone());
-                app.open_settings_models_for_provider(&provider);
+                app.settings_model_focus = spec;
+                app.settings_provider_focus = provider.clone();
+                if app.float.as_ref().is_some_and(|f| {
+                    f.kind == FloatKind::SettingsModelDetail
+                        || f.kind == FloatKind::SettingsThinkingFormat
+                        || f.kind == FloatKind::SettingsMaxTokensField
+                }) {
+                    app.reopen_settings_model_detail();
+                } else {
+                    app.open_settings_models_for_provider(&provider);
+                }
             }
             Err(err) => app.set_notice(format!("model: {err}")),
         },
@@ -1165,7 +1185,7 @@ async fn apply_config_op(
                                 if on { "on" } else { "off" }
                             ));
                         }
-                        app.open_features_float();
+                        app.reopen_features_float();
                     }
                     Err(err) => app.set_notice(format!("feature: {err}")),
                 }
@@ -1222,9 +1242,9 @@ async fn apply_config_op(
                         format!("settings.{key} = {apply_value}")
                     };
                     if key.contains("tool_output") {
-                        app.open_settings_tool_output();
+                        app.reopen_settings_tool_output();
                     } else if key.contains("compaction") {
-                        app.open_settings_compaction();
+                        app.reopen_settings_compaction();
                     } else if is_enabled_models {
                         // Stay on Provider → Models after toggling Ctrl+L visibility.
                         app.reopen_settings_models_for_provider();
