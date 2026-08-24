@@ -1,0 +1,225 @@
+{
+  "version": 1,
+  "command": "./target/debug/one",
+  "cwd": "..",
+  "start": "home",
+  "states": [
+    {
+      "name": "float.settings.tool_output",
+      "include": ["╭ Tool output", "Max lines", "Max bytes"]
+    },
+    {
+      "name": "float.settings.compaction",
+      "include": ["╭ Compaction", "Auto-compact", "Threshold ratio"]
+    },
+    {
+      "name": "float.settings.provider_compat",
+      "include": ["╭ Compatibility ·", "Reasoning protocol", "Protocol flags"]
+    },
+    {
+      "name": "float.settings.model_detail",
+      "include": ["╭ Model ·", "context_window", "thinkingLevelMap"]
+    },
+    {
+      "name": "float.settings.provider_models",
+      "include": ["╭ Models ·", "Space toggle", "Ctrl+L"]
+    },
+    {
+      "name": "float.settings.provider_detail",
+      "include": ["╭ Provider ·", "Connection", "protocol", "base_url"]
+    },
+    {
+      "name": "float.settings.providers",
+      "include": ["╭ Providers", "Esc/← back", "+ Add provider"]
+    },
+    {
+      "name": "float.settings",
+      "include": ["╭ Settings", "General", "Providers"]
+    },
+    {
+      "name": "float.help",
+      "include": ["╭ Help", "Session", "Model & Context"]
+    },
+    {
+      "name": "float.model.picker",
+      "include": ["╭ Model", "Current model:", "navigate · Enter switch"]
+    },
+    {
+      "name": "float.model",
+      "include": ["╭ Model", "Choose a provider"],
+      "exclude": ["Current model:"]
+    },
+    {
+      "name": "popup.slash",
+      "include": ["/help", "/settings", "/model"],
+      "exclude": ["╭ Settings", "╭ Help", "╭ Model"]
+    },
+    {
+      "name": "mode.plan",
+      "include": ["Plan mode", "Plan ·"]
+    },
+    {
+      "name": "home",
+      "include": ["coding agent", "Ctrl+G settings"],
+      "exclude": ["╭ Settings", "╭ Help", "╭ Model", "Plan mode"]
+    }
+  ],
+  "transitions": [
+    {
+      "from": "home",
+      "to": "float.settings",
+      "keys": ["C-g"],
+      "markers": ["Ctrl+G settings"]
+    },
+    {
+      "from": "float.settings",
+      "to": "home",
+      "keys": ["Escape"],
+      "markers": ["Settings"]
+    },
+    {
+      "from": "float.settings",
+      "to": "float.settings.tool_output",
+      "keys": ["Down", "Down", "Down", "Enter"],
+      "markers": ["Tool output"]
+    },
+    {
+      "from": "float.settings.tool_output",
+      "to": "float.settings",
+      "keys": ["Escape"],
+      "markers": ["Tool output"]
+    },
+    {
+      "from": "float.settings",
+      "to": "float.settings.compaction",
+      "keys": ["Down", "Down", "Down", "Down", "Enter"],
+      "markers": ["Compaction"]
+    },
+    {
+      "from": "float.settings.compaction",
+      "to": "float.settings",
+      "keys": ["Escape"],
+      "markers": ["Compaction"]
+    },
+    {
+      "from": "float.settings",
+      "to": "float.settings.providers",
+      "keys": ["providers", "Enter"],
+      "markers": ["Providers"]
+    },
+    {
+      "from": "float.settings.providers",
+      "to": "float.settings",
+      "keys": ["Escape"],
+      "markers": ["Providers"]
+    },
+    {
+      "from": "float.settings.providers",
+      "to": "float.settings.provider_detail",
+      "keys": ["cpa", "Enter"],
+      "markers": ["cpa"]
+    },
+    {
+      "from": "float.settings.provider_detail",
+      "to": "float.settings.providers",
+      "keys": ["Escape"],
+      "markers": ["Provider ·"]
+    },
+    {
+      "from": "float.settings.provider_detail",
+      "to": "float.settings.provider_models",
+      "keys": ["Enter"],
+      "markers": ["Models"]
+    },
+    {
+      "from": "float.settings.provider_models",
+      "to": "float.settings.provider_detail",
+      "keys": ["Escape"],
+      "markers": ["Models ·"]
+    },
+    {
+      "from": "float.settings.provider_models",
+      "to": "float.settings.model_detail",
+      "keys": ["Down", "Enter"],
+      "markers": ["gpt-5.5"]
+    },
+    {
+      "from": "float.settings.model_detail",
+      "to": "float.settings.provider_models",
+      "keys": ["Escape"],
+      "markers": ["Model ·"]
+    },
+    {
+      "from": "float.settings.provider_detail",
+      "to": "float.settings.provider_compat",
+      "keys": ["compat", "Enter"],
+      "markers": ["Compatibility"]
+    },
+    {
+      "from": "float.settings.provider_compat",
+      "to": "float.settings.provider_detail",
+      "keys": ["Escape"],
+      "markers": ["Compatibility ·"]
+    },
+    {
+      "from": "home",
+      "to": "float.help",
+      "keys": ["M-h"],
+      "markers": ["Alt+H help"]
+    },
+    {
+      "from": "float.help",
+      "to": "home",
+      "keys": ["Escape"],
+      "markers": ["Help"]
+    },
+    {
+      "from": "home",
+      "to": "float.model",
+      "keys": ["C-l"],
+      "markers": ["Ctrl+L model"]
+    },
+    {
+      "from": "float.model",
+      "to": "home",
+      "keys": ["Escape"],
+      "markers": ["Model"]
+    },
+    {
+      "from": "float.model",
+      "to": "float.model.picker",
+      "keys": ["Enter"],
+      "markers": ["Choose a provider"]
+    },
+    {
+      "from": "float.model.picker",
+      "to": "float.model",
+      "keys": ["Escape"],
+      "markers": ["Current model:"]
+    },
+    {
+      "from": "home",
+      "to": "popup.slash",
+      "keys": ["/"],
+      "markers": ["Message…"]
+    },
+    {
+      "from": "popup.slash",
+      "to": "home",
+      "keys": ["BSpace"],
+      "markers": ["/help"]
+    },
+    {
+      "from": "home",
+      "to": "mode.plan",
+      "keys": ["BTab"],
+      "markers": ["coding agent"]
+    },
+    {
+      "from": "mode.plan",
+      "to": "home",
+      "keys": ["BTab"],
+      "markers": ["Plan mode"]
+    }
+  ]
+}
