@@ -995,10 +995,14 @@ impl Agent {
                 if let Some(hooks) = self.hooks.clone() {
                     let decision = hooks.on_stop(turn, Some(&final_text)).await;
                     match decision {
-                        StopDecision::Block { reason } if stop_continuations < MAX_STOP_CONTINUATIONS => {
+                        StopDecision::Block { reason }
+                            if stop_continuations < MAX_STOP_CONTINUATIONS =>
+                        {
                             stop_continuations += 1;
                             self.messages.push(AgentMessage::User(UserMessage {
-                                content: UserContent::Text(format!("[Stop Hook Feedback] {reason}")),
+                                content: UserContent::Text(format!(
+                                    "[Stop Hook Feedback] {reason}"
+                                )),
                                 timestamp: crate::message::now_ms(),
                             }));
                             self.emit(AgentEvent::TurnEnd {
@@ -1009,7 +1013,9 @@ impl Agent {
                             hooks.on_turn_end(turn).await;
                             continue;
                         }
-                        StopDecision::ForceStop { .. } | StopDecision::Allow | StopDecision::Block { .. } => {}
+                        StopDecision::ForceStop { .. }
+                        | StopDecision::Allow
+                        | StopDecision::Block { .. } => {}
                     }
                 }
                 self.emit(AgentEvent::TurnEnd {
@@ -1549,10 +1555,13 @@ impl Agent {
         }
 
         // Map slot index → job metadata for after_tool / Done construction.
-        let mut by_index: std::collections::HashMap<usize, (ToolCall, ToolCall, Option<TraceGateDecision>)> =
-            jobs.into_iter()
-                .map(|(i, original, effective, gate, _)| (i, (original, effective, gate)))
-                .collect();
+        let mut by_index: std::collections::HashMap<
+            usize,
+            (ToolCall, ToolCall, Option<TraceGateDecision>),
+        > = jobs
+            .into_iter()
+            .map(|(i, original, effective, gate, _)| (i, (original, effective, gate)))
+            .collect();
 
         while let Some((i, res, duration_ms)) = futs.next().await {
             let Some((original, effective, gate)) = by_index.remove(&i) else {
@@ -2309,12 +2318,7 @@ mod tests {
             async fn check(&self, _call: &ToolCall) -> ToolGateDecision {
                 ToolGateDecision::Allow
             }
-            async fn after_tool(
-                &self,
-                _call: &ToolCall,
-                _output: &ToolOutput,
-                _is_error: bool,
-            ) {
+            async fn after_tool(&self, _call: &ToolCall, _output: &ToolOutput, _is_error: bool) {
                 // If ToolExecutionEnd already fired, the flag is set by the listener.
                 if self.end_seen_before_after.load(Ordering::SeqCst) {
                     // good path recorded below
@@ -3092,7 +3096,9 @@ mod tests {
                         AgentMessage::User(u) => match &u.content {
                             UserContent::Text(t) => t.contains("tests failed, please fix"),
                             UserContent::Blocks(blocks) => blocks.iter().any(|b| match b {
-                                TextOrImage::Text { text } => text.contains("tests failed, please fix"),
+                                TextOrImage::Text { text } => {
+                                    text.contains("tests failed, please fix")
+                                }
                                 _ => false,
                             }),
                         },
@@ -3110,7 +3116,11 @@ mod tests {
 
         #[async_trait::async_trait]
         impl AgentHooks for TestStopHooks {
-            async fn on_stop(&self, _turn: usize, _last_assistant_message: Option<&str>) -> StopDecision {
+            async fn on_stop(
+                &self,
+                _turn: usize,
+                _last_assistant_message: Option<&str>,
+            ) -> StopDecision {
                 let count = self.stop_calls.fetch_add(1, Ordering::SeqCst);
                 if count == 0 {
                     StopDecision::Block {
@@ -3131,7 +3141,10 @@ mod tests {
         });
         agent.set_hooks(Some(stop_hooks.clone()));
 
-        let result = agent.prompt(&provider, "do task").await.expect("agent should succeed");
+        let result = agent
+            .prompt(&provider, "do task")
+            .await
+            .expect("agent should succeed");
         assert_eq!(result, "fixed and completed");
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         assert_eq!(stop_hooks.stop_calls.load(Ordering::SeqCst), 2);

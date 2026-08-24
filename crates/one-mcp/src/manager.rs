@@ -506,11 +506,28 @@ mod reminder_tests {
     #[test]
     fn full_reminder_formats_failed_and_auth_servers() {
         let snap = snapshot(vec![
-            server("figma", "auth_required", 0, &[], None, Some("auth required")),
-            server("bad_server", "unavailable", 0, &[], None, Some("connection refused")),
+            server(
+                "figma",
+                "auth_required",
+                0,
+                &[],
+                None,
+                Some("auth required"),
+            ),
+            server(
+                "bad_server",
+                "unavailable",
+                0,
+                &[],
+                None,
+                Some("connection refused"),
+            ),
         ]);
         let text = render_full_mcp_reminder(&snap);
-        assert!(text.contains("MCP servers that failed to connect:"), "{text}");
+        assert!(
+            text.contains("MCP servers that failed to connect:"),
+            "{text}"
+        );
         assert!(text.contains("- figma (auth required)"), "{text}");
         assert!(text.contains("- bad_server (connection refused)"), "{text}");
     }

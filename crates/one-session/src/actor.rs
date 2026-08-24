@@ -4,8 +4,8 @@
 //! this decouples disk operations (JSONL appending, Sidecar atomic writes, Summary updates)
 //! from the interactive TUI / agent event loop.
 
-use std::path::{Path, PathBuf};
 use serde_json::Value;
+use std::path::{Path, PathBuf};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
@@ -26,10 +26,7 @@ pub enum PersistenceMsg {
     /// Update or refresh the session summary sidecar.
     UpdateSummary(SessionSummary),
     /// Write a structured sidecar file (Todo, Plan, Hunks, etc.).
-    SaveSidecar {
-        kind: SidecarKind,
-        content: Value,
-    },
+    SaveSidecar { kind: SidecarKind, content: Value },
     /// Update active session presence/activity in lockfile.
     UpdateActivity(Activity),
     /// Request an immediate sync/flush to disk and wait for completion.
@@ -98,10 +95,9 @@ impl SessionActorHandle {
     /// Flush all pending writes and wait for completion.
     pub async fn flush(&self) -> Result<()> {
         let (tx, rx) = oneshot::channel();
-        self.tx
-            .send(PersistenceMsg::Flush(tx))
-            .await
-            .map_err(|e| SessionError::Io(std::io::Error::other(format!("actor send failed: {e}"))))?;
+        self.tx.send(PersistenceMsg::Flush(tx)).await.map_err(|e| {
+            SessionError::Io(std::io::Error::other(format!("actor send failed: {e}")))
+        })?;
         rx.await
             .map_err(|e| SessionError::Io(std::io::Error::other(format!("flush rx failed: {e}"))))?
     }
@@ -154,9 +150,8 @@ impl SessionActor {
                 }
                 PersistenceMsg::UpdateSummary(summary) => {
                     let fp = self.file_path.clone();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        write_summary_file(&fp, &summary)
-                    }).await;
+                    let _ = tokio::task::spawn_blocking(move || write_summary_file(&fp, &summary))
+                        .await;
                 }
                 PersistenceMsg::SaveSidecar { kind, content } => {
                     let _ = write_sidecar_json_async(&self.file_path, kind, content).await;

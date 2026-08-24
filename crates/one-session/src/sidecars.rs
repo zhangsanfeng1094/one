@@ -41,7 +41,11 @@ pub fn sidecar_path_for(session_jsonl: &Path, kind: &SidecarKind) -> PathBuf {
 }
 
 /// Generic atomic write for any serializable sidecar payload.
-pub fn write_sidecar_json<T: Serialize>(session_jsonl: &Path, kind: &SidecarKind, data: &T) -> std::io::Result<PathBuf> {
+pub fn write_sidecar_json<T: Serialize>(
+    session_jsonl: &Path,
+    kind: &SidecarKind,
+    data: &T,
+) -> std::io::Result<PathBuf> {
     let path = sidecar_path_for(session_jsonl, kind);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -51,13 +55,19 @@ pub fn write_sidecar_json<T: Serialize>(session_jsonl: &Path, kind: &SidecarKind
     let tmp = path.with_extension(format!("{}.tmp", kind.extension_suffix()));
     std::fs::write(&tmp, json)?;
     if std::fs::rename(&tmp, &path).is_err() {
-        std::fs::write(&path, serde_json::to_string_pretty(data).unwrap_or_default())?;
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(data).unwrap_or_default(),
+        )?;
     }
     Ok(path)
 }
 
 /// Generic read for any deserializable sidecar payload.
-pub fn read_sidecar_json<T: for<'de> Deserialize<'de>>(session_jsonl: &Path, kind: &SidecarKind) -> Option<T> {
+pub fn read_sidecar_json<T: for<'de> Deserialize<'de>>(
+    session_jsonl: &Path,
+    kind: &SidecarKind,
+) -> Option<T> {
     let path = sidecar_path_for(session_jsonl, kind);
     let raw = std::fs::read_to_string(path).ok()?;
     serde_json::from_str(&raw).ok()
@@ -137,7 +147,11 @@ pub struct PlanSidecar {
 }
 
 impl PlanSidecar {
-    pub fn new(session_id: impl Into<String>, plan_text: impl Into<String>, approved: bool) -> Self {
+    pub fn new(
+        session_id: impl Into<String>,
+        plan_text: impl Into<String>,
+        approved: bool,
+    ) -> Self {
         Self {
             session_id: session_id.into(),
             updated_at: Utc::now(),
@@ -185,7 +199,11 @@ impl HunkSnapshotsSidecar {
 
     pub fn add_snapshot(&mut self, snapshot: PromptHunkSnapshot) {
         // Replace existing prompt_index if already present, or append
-        if let Some(pos) = self.snapshots.iter().position(|s| s.prompt_index == snapshot.prompt_index) {
+        if let Some(pos) = self
+            .snapshots
+            .iter()
+            .position(|s| s.prompt_index == snapshot.prompt_index)
+        {
             self.snapshots[pos] = snapshot;
         } else {
             self.snapshots.push(snapshot);
@@ -194,7 +212,10 @@ impl HunkSnapshotsSidecar {
     }
 
     pub fn truncate_after_prompt(&mut self, max_prompt_index: usize) -> Vec<PromptHunkSnapshot> {
-        let (kept, removed) = self.snapshots.drain(..).partition(|s| s.prompt_index <= max_prompt_index);
+        let (kept, removed) = self
+            .snapshots
+            .drain(..)
+            .partition(|s| s.prompt_index <= max_prompt_index);
         self.snapshots = kept;
         self.updated_at = Utc::now();
         removed

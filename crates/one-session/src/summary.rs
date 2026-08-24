@@ -106,7 +106,10 @@ pub fn write_summary_file(session_jsonl: &Path, summary: &SessionSummary) -> std
     std::fs::write(&tmp, json)?;
     std::fs::rename(&tmp, &path).or_else(|_| {
         // Cross-device rename failure: fall back to direct write.
-        std::fs::write(&path, serde_json::to_string_pretty(summary).unwrap_or_default())
+        std::fs::write(
+            &path,
+            serde_json::to_string_pretty(summary).unwrap_or_default(),
+        )
     })?;
     Ok(())
 }
@@ -155,10 +158,8 @@ mod tests {
 
     #[test]
     fn write_and_load_roundtrip() {
-        let dir = std::env::temp_dir().join(format!(
-            "one-summary-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("one-summary-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let jsonl = dir.join("s.jsonl");
         std::fs::write(&jsonl, "{}\n").unwrap();

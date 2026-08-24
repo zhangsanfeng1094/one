@@ -1,13 +1,15 @@
 use one_core::message::AgentMessage;
 use one_session::{
-    Activity, FileHunkRecord, GlobalSessionDiscovery, HunkSnapshotsSidecar,
-    PlanSidecar, PromptHunkSnapshot, RewindMode, SessionActor, SessionLock,
+    read_sidecar_json, write_sidecar_json, Activity, FileHunkRecord, GlobalSessionDiscovery,
+    HunkSnapshotsSidecar, PlanSidecar, PromptHunkSnapshot, RewindMode, SessionActor, SessionLock,
     SessionManager, SessionPresence, SessionSource, SidecarKind, TodoItemRecord, TodoSidecar,
-    read_sidecar_json, write_sidecar_json,
 };
 
 fn unique_temp_dir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!("one_session_test_{}", uuid::Uuid::new_v4().simple()));
+    let dir = std::env::temp_dir().join(format!(
+        "one_session_test_{}",
+        uuid::Uuid::new_v4().simple()
+    ));
     let _ = std::fs::create_dir_all(&dir);
     dir
 }
@@ -17,9 +19,18 @@ async fn test_rewind_marker_and_points() {
     let tmp = unique_temp_dir();
     let mut sm = SessionManager::create(&tmp).await.unwrap();
 
-    let id1 = sm.append_message(AgentMessage::user_text("Prompt 1")).await.unwrap();
-    let id2 = sm.append_message(AgentMessage::user_text("Prompt 2")).await.unwrap();
-    let _id3 = sm.append_message(AgentMessage::user_text("Prompt 3")).await.unwrap();
+    let id1 = sm
+        .append_message(AgentMessage::user_text("Prompt 1"))
+        .await
+        .unwrap();
+    let id2 = sm
+        .append_message(AgentMessage::user_text("Prompt 2"))
+        .await
+        .unwrap();
+    let _id3 = sm
+        .append_message(AgentMessage::user_text("Prompt 3"))
+        .await
+        .unwrap();
 
     let points = sm.get_rewind_points();
     assert_eq!(points.len(), 3);
@@ -29,7 +40,12 @@ async fn test_rewind_marker_and_points() {
 
     // Rewind to Prompt 2 with RewindMode::All
     let marker_id = sm
-        .rewind_with_mode(&id2, RewindMode::All, Some(2), Some(vec!["src/main.rs".into()]))
+        .rewind_with_mode(
+            &id2,
+            RewindMode::All,
+            Some(2),
+            Some(vec!["src/main.rs".into()]),
+        )
         .await
         .unwrap();
     assert!(!marker_id.is_empty());
@@ -49,9 +65,18 @@ async fn test_session_fork() {
     let tmp = unique_temp_dir();
     let mut sm = SessionManager::create(&tmp).await.unwrap();
 
-    let _id1 = sm.append_message(AgentMessage::user_text("Step 1")).await.unwrap();
-    let _id2 = sm.append_message(AgentMessage::user_text("Step 2")).await.unwrap();
-    let _id3 = sm.append_message(AgentMessage::user_text("Step 3")).await.unwrap();
+    let _id1 = sm
+        .append_message(AgentMessage::user_text("Step 1"))
+        .await
+        .unwrap();
+    let _id2 = sm
+        .append_message(AgentMessage::user_text("Step 2"))
+        .await
+        .unwrap();
+    let _id3 = sm
+        .append_message(AgentMessage::user_text("Step 3"))
+        .await
+        .unwrap();
 
     // Fork up to prompt index 2
     let forked = sm.fork_session(Some(2), None).await.unwrap();
@@ -94,7 +119,11 @@ async fn test_sidecars_todo_and_plan() {
     assert_eq!(loaded_todo.items[0].content, "Implement feature");
 
     // Write Plan Sidecar
-    let plan = PlanSidecar::new("session_123", "# Implementation Plan\n1. Do A\n2. Do B", true);
+    let plan = PlanSidecar::new(
+        "session_123",
+        "# Implementation Plan\n1. Do A\n2. Do B",
+        true,
+    );
     write_sidecar_json(&session_file, &SidecarKind::Plan, &plan).unwrap();
 
     let loaded_plan: PlanSidecar = read_sidecar_json(&session_file, &SidecarKind::Plan).unwrap();
@@ -116,7 +145,8 @@ async fn test_sidecars_todo_and_plan() {
     });
     write_sidecar_json(&session_file, &SidecarKind::Hunks, &hunks).unwrap();
 
-    let loaded_hunks: HunkSnapshotsSidecar = read_sidecar_json(&session_file, &SidecarKind::Hunks).unwrap();
+    let loaded_hunks: HunkSnapshotsSidecar =
+        read_sidecar_json(&session_file, &SidecarKind::Hunks).unwrap();
     assert_eq!(loaded_hunks.snapshots.len(), 1);
     assert_eq!(loaded_hunks.snapshots[0].hunks[0].file_path, "src/lib.rs");
 

@@ -448,9 +448,7 @@ mod inner {
                 return Err(OneError::Provider(format!("openai-codex: {msg}")));
             }
             if status.as_deref() == Some("failed") {
-                return Err(OneError::Provider(
-                    "openai-codex: response failed".into(),
-                ));
+                return Err(OneError::Provider("openai-codex: response failed".into()));
             }
 
             let finish = match status.as_deref() {

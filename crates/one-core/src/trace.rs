@@ -403,9 +403,7 @@ pub fn llm_output_preview(
             })
             .sum::<usize>();
     let body_budget = max_chars.saturating_sub(overhead).max(64);
-    let thinking_trimmed = thinking
-        .map(str::trim)
-        .filter(|s| !s.is_empty());
+    let thinking_trimmed = thinking.map(str::trim).filter(|s| !s.is_empty());
     let (thinking_budget, content_budget) = if thinking_trimmed.is_some() {
         // Cap thinking so a long chain-of-thought does not wipe the final answer.
         let t_budget = (body_budget / 2).clamp(64, 4_096);
@@ -507,11 +505,7 @@ fn text_or_image_join(blocks: &[crate::message::TextOrImage]) -> String {
 }
 
 /// Serialize one conversation message into an OpenAI-style role object for traces.
-fn message_to_trace_value(
-    m: &AgentMessage,
-    tool_result_max: usize,
-    arg_max: usize,
-) -> Value {
+fn message_to_trace_value(m: &AgentMessage, tool_result_max: usize, arg_max: usize) -> Value {
     match m {
         AgentMessage::User(u) => {
             serde_json::json!({
@@ -534,8 +528,7 @@ fn message_to_trace_value(
                         name,
                         arguments,
                     } => {
-                        let raw =
-                            serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into());
+                        let raw = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".into());
                         let args = if raw.chars().count() <= arg_max {
                             arguments.clone()
                         } else {
@@ -1046,8 +1039,13 @@ mod tests {
 
     #[test]
     fn llm_output_preview_includes_thinking() {
-        let p = llm_output_preview("final answer", &[], Some("let me reason step by step"), 1024)
-            .unwrap();
+        let p = llm_output_preview(
+            "final answer",
+            &[],
+            Some("let me reason step by step"),
+            1024,
+        )
+        .unwrap();
         let v: Value = serde_json::from_str(&p).unwrap();
         assert_eq!(v["content"], "final answer");
         assert_eq!(v["thinking"], "let me reason step by step");
@@ -1173,9 +1171,7 @@ mod tests {
 
     #[test]
     fn llm_input_preview_truncates_huge_tool_results() {
-        use crate::message::{
-            AgentMessage, ToolResultMessage, UserContent, UserMessage,
-        };
+        use crate::message::{AgentMessage, ToolResultMessage, UserContent, UserMessage};
         let huge = "x".repeat(20_000);
         let messages = vec![
             AgentMessage::User(UserMessage {

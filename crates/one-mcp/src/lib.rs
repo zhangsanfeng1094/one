@@ -17,20 +17,20 @@ mod paths;
 pub mod tool;
 
 pub use catalog::{
-    SearchSnapshot, ServerSummary, ToolExposure, ToolSearchResult, build_prompt_announcement,
-    is_mcp_meta_tool,
+    build_prompt_announcement, is_mcp_meta_tool, SearchSnapshot, ServerSummary, ToolExposure,
+    ToolSearchResult,
 };
 pub use config::{
-    ConfigSourceKind, ConfigSourceReport, DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_STARTUP_TIMEOUT_SEC,
-    DEFAULT_TOOL_TIMEOUT_SEC, ImportCandidate, ImportReport, LoadedMcpConfig, McpConfig,
-    McpServerConfig, expand_env, import_servers_to_user, load_effective, load_merged,
-    load_one_only, load_user_or_empty, parse_config_json, project_mcp_path, save_user_config,
-    scan_import_candidates, set_server_disabled_persistent, user_mcp_path,
+    expand_env, import_servers_to_user, load_effective, load_merged, load_one_only,
+    load_user_or_empty, parse_config_json, project_mcp_path, save_user_config,
+    scan_import_candidates, set_server_disabled_persistent, user_mcp_path, ConfigSourceKind,
+    ConfigSourceReport, ImportCandidate, ImportReport, LoadedMcpConfig, McpConfig, McpServerConfig,
+    DEFAULT_MAX_OUTPUT_BYTES, DEFAULT_STARTUP_TIMEOUT_SEC, DEFAULT_TOOL_TIMEOUT_SEC,
 };
 pub use error::{McpError, Result};
 pub use manager::{
-    McpCatalog, McpChip, McpChipKind, McpLoadStatus, McpManager, McpProgressHandle, McpReminder,
-    McpReminderKind, McpReminderState, McpServerRow, McpServerStatus, McpStatusSnapshot,
-    ServerHealth, probe_server,
+    probe_server, McpCatalog, McpChip, McpChipKind, McpLoadStatus, McpManager, McpProgressHandle,
+    McpReminder, McpReminderKind, McpReminderState, McpServerRow, McpServerStatus,
+    McpStatusSnapshot, ServerHealth,
 };
 pub use naming::public_tool_name;

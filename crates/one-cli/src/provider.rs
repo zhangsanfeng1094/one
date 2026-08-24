@@ -1857,7 +1857,11 @@ pub(crate) fn heuristic_context_window(model: &str) -> usize {
         64_000
     } else if lower.contains("qwen") {
         128_000
-    } else if lower.contains("gpt-4o") || lower.contains("gpt-4.5") || lower.contains("o1") || lower.contains("o3") {
+    } else if lower.contains("gpt-4o")
+        || lower.contains("gpt-4.5")
+        || lower.contains("o1")
+        || lower.contains("o3")
+    {
         128_000
     } else if lower.contains("gpt-5") {
         272_000

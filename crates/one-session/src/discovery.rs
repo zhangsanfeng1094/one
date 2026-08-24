@@ -4,9 +4,9 @@
 //! this module allows discovering, indexing, and filtering sessions across all
 //! workspaces, detecting crashed or active sessions, and querying metadata fast.
 
-use std::path::PathBuf;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 use crate::error::Result;
 use crate::manager::scan_session_list_info;
@@ -31,10 +31,20 @@ pub struct IndexableSession {
 
 impl IndexableSession {
     pub fn display_label(&self) -> String {
-        if let Some(name) = self.name.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(name) = self
+            .name
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             return name.to_string();
         }
-        if let Some(preview) = self.preview.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        if let Some(preview) = self
+            .preview
+            .as_ref()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+        {
             return preview.to_string();
         }
         self.session_id.chars().take(12).collect()
@@ -84,7 +94,10 @@ impl GlobalSessionDiscovery {
                     let path = entry.path();
                     if path.extension().and_then(|s| s.to_str()) == Some("jsonl") {
                         if let Some(meta) = entry.metadata().ok() {
-                            let modified: DateTime<Utc> = meta.modified().unwrap_or(std::time::SystemTime::now()).into();
+                            let modified: DateTime<Utc> = meta
+                                .modified()
+                                .unwrap_or(std::time::SystemTime::now())
+                                .into();
                             if let Some(info) = scan_session_list_info(&path, modified) {
                                 let presence = inspect_session_presence(&path);
                                 let is_crashed = presence.is_crashed();
@@ -114,7 +127,10 @@ impl GlobalSessionDiscovery {
 
     /// Find crashed sessions that can be recovered.
     pub fn discover_crashed() -> Vec<IndexableSession> {
-        Self::discover_all().into_iter().filter(|s| s.is_crashed).collect()
+        Self::discover_all()
+            .into_iter()
+            .filter(|s| s.is_crashed)
+            .collect()
     }
 }
 
@@ -134,8 +150,14 @@ impl SessionSource for GlobalSessionDiscovery {
             .filter(|s| {
                 s.session_id.to_ascii_lowercase().contains(&q)
                     || s.cwd.to_ascii_lowercase().contains(&q)
-                    || s.name.as_ref().map(|n| n.to_ascii_lowercase().contains(&q)).unwrap_or(false)
-                    || s.preview.as_ref().map(|p| p.to_ascii_lowercase().contains(&q)).unwrap_or(false)
+                    || s.name
+                        .as_ref()
+                        .map(|n| n.to_ascii_lowercase().contains(&q))
+                        .unwrap_or(false)
+                    || s.preview
+                        .as_ref()
+                        .map(|p| p.to_ascii_lowercase().contains(&q))
+                        .unwrap_or(false)
             })
             .collect();
 

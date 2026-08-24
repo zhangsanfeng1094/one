@@ -3,9 +3,9 @@
 //! Aligns with `grok-build`'s `SessionPresence` (`Resident`, `Attaching`, `Evicted`,
 //! `Closed`, `DeadFailed`, `Dormant`) and provides robust crash detection across processes.
 
-use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 /// Real-time activity of an active session actor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,7 +39,10 @@ impl SessionPresence {
     }
 
     pub fn is_active(&self) -> bool {
-        matches!(self, SessionPresence::Resident { .. } | SessionPresence::Attaching)
+        matches!(
+            self,
+            SessionPresence::Resident { .. } | SessionPresence::Attaching
+        )
     }
 
     pub fn is_crashed(&self) -> bool {
@@ -48,8 +51,12 @@ impl SessionPresence {
 
     pub fn display_label(&self) -> &'static str {
         match self {
-            SessionPresence::Resident { activity: Activity::Working } => "working",
-            SessionPresence::Resident { activity: Activity::Idle } => "resident",
+            SessionPresence::Resident {
+                activity: Activity::Working,
+            } => "working",
+            SessionPresence::Resident {
+                activity: Activity::Idle,
+            } => "resident",
             SessionPresence::Attaching => "attaching",
             SessionPresence::Evicted => "evicted",
             SessionPresence::Closed => "closed",

@@ -1037,7 +1037,10 @@ fn list_sessions_sync(cwd: &Path) -> Vec<SessionInfo> {
 ///
 /// Prefers a valid `*.summary.json` sidecar when present (fast path); falls back
 /// to the JSONL prefix scan so old sessions keep working.
-pub(crate) fn scan_session_list_info(path: &Path, fs_modified: chrono::DateTime<Utc>) -> Option<SessionInfo> {
+pub(crate) fn scan_session_list_info(
+    path: &Path,
+    fs_modified: chrono::DateTime<Utc>,
+) -> Option<SessionInfo> {
     if let Some(summary) = load_summary(path) {
         return Some(SessionInfo {
             path: path.to_path_buf(),
@@ -1346,7 +1349,9 @@ mod tests {
     #[tokio::test]
     async fn usage_custom_does_not_enter_llm_context() {
         let mut sm = SessionManager::in_memory("/tmp/meta");
-        sm.append_message(AgentMessage::user_text("hi")).await.unwrap();
+        sm.append_message(AgentMessage::user_text("hi"))
+            .await
+            .unwrap();
         let usage = UsageMeta::new(
             TokenUsage {
                 input_tokens: 11,
@@ -1390,7 +1395,11 @@ mod tests {
         .unwrap();
 
         let ctx = sm.build_session_context();
-        assert_eq!(ctx.messages.len(), 1, "meta customs must not enter LLM context");
+        assert_eq!(
+            ctx.messages.len(),
+            1,
+            "meta customs must not enter LLM context"
+        );
         assert_eq!(sm.latest_usage_total().unwrap().input_tokens, 11);
         let err = sm.latest_error_meta().expect("one.error");
         assert_eq!(err.kind, "empty_response");

@@ -10,10 +10,10 @@ pub mod migrate;
 pub mod paths;
 pub mod presence;
 pub mod prompt_history;
-pub mod sidecars;
-pub mod summary;
 #[cfg(feature = "network")]
 pub mod share;
+pub mod sidecars;
+pub mod summary;
 
 pub use actor::{PersistenceMsg, SessionActor, SessionActorHandle};
 pub use context::{
@@ -39,14 +39,14 @@ pub use presence::{
 pub use prompt_history::{
     append_prompt_history, load_or_seed_prompt_history, load_prompt_history, prompt_history_path,
 };
+#[cfg(feature = "network")]
+pub use share::share_to_gist;
 pub use sidecars::{
     read_sidecar_json, read_sidecar_json_async, sidecar_path_for, write_sidecar_json,
-    write_sidecar_json_async, FileHunkRecord, HunkSnapshotsSidecar, PlanSidecar, PromptHunkSnapshot,
-    SidecarKind, TodoItemRecord, TodoSidecar,
+    write_sidecar_json_async, FileHunkRecord, HunkSnapshotsSidecar, PlanSidecar,
+    PromptHunkSnapshot, SidecarKind, TodoItemRecord, TodoSidecar,
 };
 pub use summary::{
     load_summary, summary_path_for, system_prompt_path_for, write_summary_file, SessionSummary,
     SUMMARY_SCHEMA,
 };
-#[cfg(feature = "network")]
-pub use share::share_to_gist;

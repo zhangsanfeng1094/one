@@ -26,10 +26,9 @@ impl Tool for SearchTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
             name: "search_tool".into(),
-            description:
-                "Search for MCP tools by keyword and retrieve their input schemas.\n\n\
+            description: "Search for MCP tools by keyword and retrieve their input schemas.\n\n\
                 If status is \"partial\", some servers may still be connecting."
-                    .into(),
+                .into(),
             parameters: json!({
                 "type": "object",
                 "properties": {

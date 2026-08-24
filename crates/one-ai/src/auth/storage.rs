@@ -202,11 +202,7 @@ impl AuthStorage {
         // Inside Tokio (incl. LocalSet / ACP): never call block_in_place.
         // Snapshot state and resolve on a dedicated OS thread.
         let path = self.path.clone();
-        let runtime_overrides = self
-            .runtime
-            .lock()
-            .expect("auth runtime lock")
-            .clone();
+        let runtime_overrides = self.runtime.lock().expect("auth runtime lock").clone();
         let data_snapshot = self.data.lock().expect("auth data lock").clone();
         let provider = provider.to_string();
 
