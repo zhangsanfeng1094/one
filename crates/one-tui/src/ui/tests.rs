@@ -43,6 +43,29 @@ fn typed_input_is_visible_in_buffer() {
 }
 
 #[test]
+fn hardware_cursor_anchored_at_input_caret_even_when_streaming() {
+    let backend = TestBackend::new(40, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.busy = true;
+    app.push_assistant("streaming chunk of llm text");
+    app.input = "prompt text".into();
+    app.input_cursor = 6; // before " text"
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let pos = terminal.get_cursor_position().unwrap();
+    // Layout: chat (chunks[0]), dock 0, prompt (chunks[2]), status (chunks[3])
+    // prompt box height = 3 (1 line of input + 2 pad). prompt_h = 3 + 1 = 4.
+    // terminal height 12: status 1, prompt 4, chat 12 - 5 = 7.
+    // prompt starts at y = 7. box_area is y = 7.
+    // caret is on top_padding + 0 = y: 7 + 1 = 8.
+    // caret x = 0 (left border) + 3 (indent + border) + 6 (display width of "prompt") = 9.
+    assert_eq!(pos.x, 9);
+    assert_eq!(pos.y, 8);
+}
+
+#[test]
 fn tall_assistant_message_shows_bottom_when_following() {
     // Regression: Ratatui List drops items taller than the viewport → blank chat.
     let backend = TestBackend::new(40, 14);

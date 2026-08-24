@@ -56,12 +56,12 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     const INDENT: &str = "  ";
 
-    // Software caret (▌) so the typewriter is visible even when the hardware
+    // Software caret (█) so the typewriter is visible even when the hardware
     // I-beam is hidden by the emulator / tmux / mouse reporting.
     // Hidden while float / select / empty-prompt transcript browse owns focus
     // (Grok: inactive pane hides caret so focus is unambiguous).
     let caret = if prompt_focused && app.cursor_on {
-        Span::styled("▌", Theme::input_cursor_on())
+        Span::styled("█", Theme::input_cursor_on())
     } else if prompt_focused {
         Span::styled(" ", Theme::input_cursor_off())
     } else {
@@ -72,12 +72,16 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     // Multi-line input: one Line per input row; caret at `input_cursor`.
     // Image attachments appear as `[图片.img]` tokens inside the text (deletable).
     let mut content: Vec<Line> = vec![Line::from("")]; // top padding
+    let mut cursor_pos: Option<(u16, u16)> = None;
     if app.input.is_empty() {
         content.push(Line::from(vec![
             Span::raw(INDENT),
             caret.clone(),
             Span::styled(placeholder, Theme::input_placeholder()),
         ]));
+        if prompt_focused {
+            cursor_pos = Some((box_area.x + 3, box_area.y + 1));
+        }
     } else {
         // Place caret using char offset (matches App::input_cursor).
         let mut remaining = app.input_cursor.min(app.input.chars().count());
@@ -121,6 +125,10 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     caret.clone(),
                     Span::styled(after.to_string(), Theme::input_text()),
                 ]));
+                if prompt_focused {
+                    let before_w = display_width(before) as u16;
+                    cursor_pos = Some((box_area.x + 3 + before_w, box_area.y + 1 + i as u16));
+                }
             } else {
                 content.push(Line::from(vec![
                     Span::raw(INDENT),
@@ -139,7 +147,11 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     );
 
     frame.render_widget(paragraph, box_area);
-    // Hardware cursor stays hidden — software ▌ above is the typewriter caret.
+    if let Some((cx, cy)) = cursor_pos {
+        if cx < box_area.right() && cy < box_area.bottom() {
+            frame.set_cursor_position((cx, cy));
+        }
+    }
 
     // Prompt meta — identity left, live ops chips right. Stats live on status.
     draw_prompt_meta(frame, meta_area, app);

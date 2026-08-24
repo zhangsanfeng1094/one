@@ -141,6 +141,23 @@ pub(super) fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMen
             .style(Theme::slash_panel()),
             search_area,
         );
+
+        let (before, _) = menu.search_split_at_cursor();
+        let prefix_len = if menu.edit_mode {
+            if menu.edit_label.is_empty() {
+                6
+            } else {
+                UnicodeWidthStr::width(menu.edit_label.as_str()) + 2
+            }
+        } else {
+            8 // "Filter: "
+        };
+        let before_w = UnicodeWidthStr::width(before);
+        let cx = search_area.x + prefix_len as u16 + before_w as u16;
+        let cy = search_area.y;
+        if cx < search_area.right() {
+            frame.set_cursor_position((cx, cy));
+        }
     }
 
     // List with scroll around selected. Detail panels are read-only logs:
@@ -640,7 +657,7 @@ fn float_filter_line(menu: &FloatMenu) -> Line<'static> {
         return Line::from(vec![
             Span::styled(prefix, Theme::float_edit_label()),
             Span::styled(before, Theme::float_edit_text()),
-            Span::styled("▌", Theme::input_cursor_on()),
+            Span::styled("█", Theme::input_cursor_on()),
             Span::styled(after, Theme::float_edit_text()),
         ]);
     }
@@ -648,7 +665,7 @@ fn float_filter_line(menu: &FloatMenu) -> Line<'static> {
     Line::from(vec![
         Span::styled("Filter: ".to_string(), Theme::float_filter_label()),
         Span::styled(before, Theme::float_filter_active()),
-        Span::styled("▌", Theme::input_cursor_on()),
+        Span::styled("█", Theme::input_cursor_on()),
         Span::styled(after, Theme::float_filter_active()),
     ])
 }

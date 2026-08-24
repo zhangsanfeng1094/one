@@ -160,6 +160,7 @@ pub(super) fn draw_select_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
         lines.push(select_option_line(prompt, idx, max_w));
     }
 
+    let mut typing_cursor: Option<(u16, u16)> = None;
     if let SelectPhase::Typing { buffer } = &prompt.phase {
         lines.push(Line::from(Span::styled(
             truncate_mid(&prompt.other_label, max_w),
@@ -173,6 +174,11 @@ pub(super) fn draw_select_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 .bg(Theme::ELEMENT)
                 .add_modifier(Modifier::BOLD),
         )));
+        let typing_line_idx = lines.len().saturating_sub(1);
+        let cursor_x =
+            inner.x.saturating_add(1) + 2 + UnicodeWidthStr::width(buffer.as_str()) as u16;
+        let cursor_y = inner.y + typing_line_idx as u16;
+        typing_cursor = Some((cursor_x, cursor_y));
     }
 
     while lines.len() < inner.height as usize {
@@ -191,6 +197,12 @@ pub(super) fn draw_select_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
             height: inner.height,
         },
     );
+
+    if let Some((cx, cy)) = typing_cursor {
+        if cx < inner.right() && cy < inner.bottom() {
+            frame.set_cursor_position((cx, cy));
+        }
+    }
 }
 
 fn select_option_line(

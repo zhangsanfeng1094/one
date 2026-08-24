@@ -339,7 +339,7 @@ impl Theme {
         Style::default().bg(Self::ELEMENT).fg(Self::MUTED)
     }
 
-    /// Input caret on — software typewriter bar (▌).
+    /// Input caret on — software typewriter bar (█).
     pub fn input_cursor_on() -> Style {
         Style::default().fg(Self::PRIMARY).bg(Self::ELEMENT)
     }
