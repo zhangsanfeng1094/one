@@ -10,6 +10,7 @@
 //! - [`subscribe`] — agent event fans-out
 
 mod build;
+mod context;
 pub mod coordinator;
 pub mod env_context;
 pub mod explore_tools;

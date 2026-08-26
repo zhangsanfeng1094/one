@@ -9,7 +9,9 @@ use ratatui::Frame;
 use crate::app::App;
 use crate::theme::Theme;
 
-use super::text::display_width;
+use super::text::{display_width, tokenize_input_chips, InputChipKind};
+
+const INDENT: &str = "  ";
 
 /// Soft left bar + multi-line input + software typewriter caret.
 ///
@@ -22,14 +24,7 @@ use super::text::display_width;
 /// Caret sits on a **dedicated 1-column slot** after the text (or before the
 /// placeholder when empty). Hardware cursor stays hidden.
 pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    let input_lines_n = app.input_line_count() as u16;
-    let box_h = (input_lines_n + 2).clamp(3, 8); // top pad + lines + bottom pad
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(box_h), Constraint::Min(1)])
-        .split(area);
-    let box_area = rows[0];
-    let meta_area = rows[1];
+    let box_area = area;
 
     // Left rail + caret track real interaction focus (not just "no modal").
     // Busy always keeps the busy rail; otherwise dim when float/select/j/k browse
@@ -45,7 +40,9 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
     // Keep placeholder quiet — keybindings live on the sparse status strip / Alt+H help.
     // Busy: light steer hint only; Esc/Ctrl+C live on the status row (avoid wall-of-text).
-    let placeholder = if app.busy {
+    let placeholder = if app.busy && app.busy_activity == "compacting" {
+        "compacting context…"
+    } else if app.busy {
         "steer or follow-up…"
     } else if app.transcript_browse_focused() {
         // Short: keys live on the status strip; avoid a long dual-hint soup.
@@ -53,8 +50,6 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     } else {
         "Message…"
     };
-
-    const INDENT: &str = "  ";
 
     // Software caret (█) so the typewriter is visible even when the hardware
     // I-beam is hidden by the emulator / tmux / mouse reporting.
@@ -70,7 +65,8 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
 
     // Multi-line input: one Line per input row; caret at `input_cursor`.
-    // Image attachments appear as `[图片.img]` tokens inside the text (deletable).
+    // Long paste / images render as solid chips (`[文本 · 12 lines · 3KB]` /
+    // `[图片.img]`), not as the raw body fanned across the composer.
     let mut content: Vec<Line> = vec![Line::from("")]; // top padding
     let mut cursor_pos: Option<(u16, u16)> = None;
     if app.input.is_empty() {
@@ -108,8 +104,24 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 remaining -= 1;
             }
         }
-        for (i, line) in lines.iter().enumerate() {
-            if i == caret_line {
+        // Only paint the 6-line composer window around the caret.
+        const MAX_VISIBLE: usize = 6;
+        let start = if lines.len() <= MAX_VISIBLE {
+            0
+        } else {
+            let max_start = lines.len() - MAX_VISIBLE;
+            caret_line.saturating_sub(MAX_VISIBLE - 1).min(max_start)
+        };
+        let end = (start + MAX_VISIBLE).min(lines.len());
+        for (vis_i, line) in lines[start..end].iter().enumerate() {
+            let abs_i = start + vis_i;
+            let caret_here = abs_i == caret_line;
+            content.push(paint_prompt_line(
+                line,
+                caret_here.then_some(caret_col),
+                caret.clone(),
+            ));
+            if caret_here && prompt_focused {
                 let col = caret_col.min(line.chars().count());
                 let byte = line
                     .chars()
@@ -117,23 +129,8 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
                     .map(|c| c.len_utf8())
                     .sum::<usize>()
                     .min(line.len());
-                let before = &line[..byte];
-                let after = &line[byte..];
-                content.push(Line::from(vec![
-                    Span::raw(INDENT),
-                    Span::styled(before.to_string(), Theme::input_text()),
-                    caret.clone(),
-                    Span::styled(after.to_string(), Theme::input_text()),
-                ]));
-                if prompt_focused {
-                    let before_w = display_width(before) as u16;
-                    cursor_pos = Some((box_area.x + 3 + before_w, box_area.y + 1 + i as u16));
-                }
-            } else {
-                content.push(Line::from(vec![
-                    Span::raw(INDENT),
-                    Span::styled((*line).to_string(), Theme::input_text()),
-                ]));
+                let before_w = display_width(&line[..byte]) as u16;
+                cursor_pos = Some((box_area.x + 3 + before_w, box_area.y + 1 + vis_i as u16));
             }
         }
     }
@@ -152,16 +149,61 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
             frame.set_cursor_position((cx, cy));
         }
     }
-
-    // Prompt meta — identity left, live ops chips right. Stats live on status.
-    draw_prompt_meta(frame, meta_area, app);
 }
 
-/// Prompt meta strip under the input box.
-///
-/// Left:  `Build · grok-4.5 · ziyong`  (mode · model · provider, separated)
-/// Right: `MCP 3/3  bg:1 · top…  running`  (ops only — never think/tokens)
-fn draw_prompt_meta(frame: &mut Frame<'_>, area: Rect, app: &App) {
+fn paint_prompt_line(line: &str, caret_col: Option<usize>, caret: Span<'static>) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = vec![Span::raw(INDENT)];
+    let segs = tokenize_input_chips(line);
+    if segs.is_empty() {
+        if caret_col.is_some() {
+            spans.push(caret);
+        }
+        return Line::from(spans);
+    }
+    let mut char_i = 0usize;
+    let mut caret_placed = false;
+    for (text, kind) in segs {
+        let style = match kind {
+            Some(InputChipKind::Text) => Theme::input_text_chip(),
+            Some(InputChipKind::Image) => Theme::input_image_chip(),
+            None => Theme::input_text(),
+        };
+        let n = text.chars().count();
+        if let Some(col) = caret_col {
+            if !caret_placed && col >= char_i && col <= char_i + n {
+                let local = col - char_i;
+                let byte = text
+                    .chars()
+                    .take(local)
+                    .map(|c| c.len_utf8())
+                    .sum::<usize>()
+                    .min(text.len());
+                let before = &text[..byte];
+                let after = &text[byte..];
+                if !before.is_empty() {
+                    spans.push(Span::styled(before.to_string(), style));
+                }
+                spans.push(caret.clone());
+                if !after.is_empty() {
+                    spans.push(Span::styled(after.to_string(), style));
+                }
+                caret_placed = true;
+                char_i += n;
+                continue;
+            }
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, style));
+        }
+        char_i += n;
+    }
+    if caret_col.is_some() && !caret_placed {
+        spans.push(caret);
+    }
+    Line::from(spans)
+}
+
+pub(super) fn identity_spans(app: &App) -> Vec<Span<'static>> {
     let agent = if app.agent_label.is_empty() {
         "Build".to_string()
     } else {
@@ -176,62 +218,64 @@ fn draw_prompt_meta(frame: &mut Frame<'_>, area: Rect, app: &App) {
     };
     let provider = app.current_provider.clone();
 
-    // —— left: session identity with clear separators ——
-    let sep = || Span::styled(" · ", Theme::status_faint());
+    let sep = || Span::styled(" · ", Theme::status_faint().bg(Theme::PANEL));
     let mut left = vec![
-        Span::styled("  ", Theme::bg()),
-        // Copper identity tag — PRIMARY reserved for caret / list selection.
-        Span::styled(agent, Theme::mode_label()),
+        Span::styled("  ", Theme::footer_bg()),
+        Span::styled(agent, Theme::mode_label().bg(Theme::PANEL)),
     ];
     if !model.is_empty() {
         left.push(sep());
-        left.push(Span::styled(model, Theme::meta()));
+        left.push(Span::styled(model, Theme::meta().bg(Theme::PANEL)));
     }
     if !provider.is_empty() {
         left.push(sep());
-        left.push(Span::styled(provider, Theme::status_faint()));
+        left.push(Span::styled(
+            provider,
+            Theme::status_faint().bg(Theme::PANEL),
+        ));
     }
+    left
+}
 
-    // —— right: live ops chips only ——
+pub(super) fn ops_spans(app: &App) -> Vec<Span<'static>> {
     let mut right: Vec<Span<'static>> = Vec::new();
-    // MCP progress (e.g. MCP 3/3) — coarse, no connection noise. Status does NOT mirror.
     if !app.mcp_chip_text.is_empty() {
         right.push(Span::styled(
             app.mcp_chip_text.clone(),
-            mcp_chip_style(app.mcp_chip_kind),
+            mcp_chip_style(app.mcp_chip_kind).bg(Theme::PANEL),
         ));
     }
-    // Background bash only (e.g. bg:1 · cargo…) — open /ps.
     if !app.bg_chip_text.is_empty() {
         if !right.is_empty() {
-            right.push(Span::styled("  ", Theme::bg()));
+            right.push(Span::styled("  ", Theme::footer_bg()));
         }
         right.push(Span::styled(
             app.bg_chip_text.clone(),
-            bg_chip_style(app.bg_chip_kind),
+            bg_chip_style(app.bg_chip_kind).bg(Theme::PANEL),
         ));
     }
-    // Subagents (e.g. task:1 · explore…) — open /tasks, not /ps.
     if !app.task_chip_text.is_empty() {
         if !right.is_empty() {
-            right.push(Span::styled("  ", Theme::bg()));
+            right.push(Span::styled("  ", Theme::footer_bg()));
         }
         right.push(Span::styled(
             app.task_chip_text.clone(),
-            bg_chip_style(app.task_chip_kind),
+            bg_chip_style(app.task_chip_kind).bg(Theme::PANEL),
         ));
     }
     if app.busy {
         if !right.is_empty() {
-            right.push(Span::styled("  ", Theme::bg()));
+            right.push(Span::styled("  ", Theme::footer_bg()));
         }
-        right.push(Span::styled("running", Theme::status_faint()));
+        right.push(Span::styled(
+            "running",
+            Theme::status_faint().bg(Theme::PANEL),
+        ));
     }
     if !right.is_empty() {
-        right.push(Span::raw("  ")); // trailing pad so right edge breathes
+        right.push(Span::raw("  "));
     }
-
-    render_split_row(frame, area, left, right);
+    right
 }
 
 /// Paint a single-row strip with left content + right-aligned trailing content.
@@ -244,7 +288,10 @@ pub(super) fn render_split_row(
     right: Vec<Span<'static>>,
 ) {
     if right.is_empty() {
-        frame.render_widget(Paragraph::new(Line::from(left)).style(Theme::bg()), area);
+        frame.render_widget(
+            Paragraph::new(Line::from(left)).style(Theme::footer_bg()),
+            area,
+        );
         return;
     }
 
@@ -259,21 +306,26 @@ pub(super) fn render_split_row(
         .constraints([Constraint::Min(8), Constraint::Length(right_w)])
         .split(area);
 
-    frame.render_widget(Paragraph::new(Line::from(left)).style(Theme::bg()), row[0]);
+    frame.render_widget(
+        Paragraph::new(Line::from(left)).style(Theme::footer_bg()),
+        row[0],
+    );
     frame.render_widget(
         Paragraph::new(Line::from(right))
             .alignment(Alignment::Right)
-            .style(Theme::bg()),
+            .style(Theme::footer_bg()),
         row[1],
     );
 }
 
 fn mcp_chip_style(kind: u8) -> Style {
     match kind {
-        1 => Theme::status().fg(Theme::INFO),    // loading
-        2 => Theme::status_faint(),              // all ok — quiet
-        3 => Theme::status().fg(Theme::WARNING), // partial
-        4 => Theme::status().fg(Theme::ERROR),   // error
+        1 => Theme::status().fg(Theme::INFO),
+        2 => Style::default()
+            .fg(Theme::SUCCESS)
+            .add_modifier(ratatui::style::Modifier::DIM),
+        3 => Theme::status().fg(Theme::WARNING),
+        4 => Theme::status().fg(Theme::ERROR),
         _ => Theme::status_faint(),
     }
 }

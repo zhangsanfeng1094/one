@@ -103,7 +103,12 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
     SlashCommand {
         name: "/compact",
         usage: "/compact [instructions]",
-        description: "manually compact context",
+        description: "compact model context (live spinner, then a result divider)",
+    },
+    SlashCommand {
+        name: "/context",
+        usage: "/context",
+        description: "context window breakdown (system / messages / tools / skills / MCP)",
     },
     SlashCommand {
         name: "/learn",
@@ -582,6 +587,16 @@ mod tests {
             completion_for_row(&row).as_deref(),
             Some("/model opencode:deepseek-v4-flash")
         );
+    }
+
+    #[test]
+    fn context_completion_has_no_trailing_space() {
+        let cmd = SLASH_COMMANDS
+            .iter()
+            .find(|c| c.name == "/context")
+            .expect("context command");
+        let row = PopupRow::Command(cmd);
+        assert_eq!(completion_for_row(&row).as_deref(), Some("/context"));
     }
 
     #[test]

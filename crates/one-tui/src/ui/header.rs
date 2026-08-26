@@ -135,41 +135,43 @@ pub(super) fn header_right_spans(app: &App, term_width: u16) -> Vec<Span<'static
     let approx = if app.usage_tokens_estimated { "~" } else { "" };
     let tokens_str = format_tokens(app.usage_tokens);
 
-    // Pill start padding
     spans.push(Span::styled(" ", Theme::top_bar_pill()));
-    spans.push(Span::styled("⚡ ", Theme::top_bar_pill_muted()));
-    spans.push(Span::styled(
-        format!("{approx}{tokens_str}"),
-        Theme::top_bar_pill(),
-    ));
-
     if app.context_window > 0 {
         let pct = ((app.usage_tokens * 100) / app.context_window.max(1)).min(100);
         let win_str = format_tokens(app.context_window);
         let usage_style = Theme::context_usage_style(pct);
 
+        if term_width >= 70 {
+            spans.extend(mini_meter_spans(pct));
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(
+            format!("{approx}{tokens_str}"),
+            if pct < 8 {
+                Theme::top_bar_pill_muted()
+            } else {
+                Theme::top_bar_pill()
+            },
+        ));
         spans.push(Span::styled(" / ", Theme::top_bar_pill_muted()));
         spans.push(Span::styled(win_str, Theme::top_bar_pill_muted()));
-
-        // On wider terminals (width >= 70), add mini progress bar inside the pill
-        if term_width >= 70 {
-            spans.push(Span::raw(" "));
-            let meter = mini_meter_spans(pct);
-            spans.extend(meter);
-        }
-
-        spans.push(Span::styled(format!(" {pct}%"), usage_style));
+        spans.push(Span::styled(format!("  ({pct}%)"), usage_style));
+    } else {
+        spans.push(Span::styled(
+            format!("{approx}{tokens_str}"),
+            Theme::top_bar_pill(),
+        ));
     }
 
     spans.push(Span::styled(" ", Theme::top_bar_pill()));
-    spans.push(Span::raw(" ")); // trailing margin from screen edge
+    spans.push(Span::raw(" "));
 
     spans
 }
 
-/// Generate a 6-block discrete mini meter for context fill.
+/// Generate a 10-cell mini meter for context fill (`████░░░░░░`).
 fn mini_meter_spans(pct: usize) -> Vec<Span<'static>> {
-    const TOTAL_CELLS: usize = 6;
+    const TOTAL_CELLS: usize = 10;
     let filled = (pct * TOTAL_CELLS + 50) / 100;
     let filled = filled.min(TOTAL_CELLS);
     let empty = TOTAL_CELLS.saturating_sub(filled);
@@ -178,8 +180,8 @@ fn mini_meter_spans(pct: usize) -> Vec<Span<'static>> {
     let empty_style = Theme::top_bar_pill_muted();
 
     vec![
-        Span::styled("▪".repeat(filled), fill_style),
-        Span::styled("▫".repeat(empty), empty_style),
+        Span::styled("█".repeat(filled), fill_style),
+        Span::styled("░".repeat(empty), empty_style),
     ]
 }
 
@@ -204,10 +206,15 @@ mod tests {
         let right = header_right_spans(&app, 80);
         let right_text: String = right.iter().map(|s| s.content.as_ref()).collect();
         assert!(
-            right_text.contains("45k") && right_text.contains("200k") && right_text.contains("22%"),
+            right_text.contains("45k")
+                && right_text.contains("200k")
+                && (right_text.contains("22%") || right_text.contains("(22%)")),
             "right: {right_text}"
         );
-        assert!(right_text.contains("▪"), "meter: {right_text}");
+        assert!(
+            right_text.contains('█') || right_text.contains('░'),
+            "meter: {right_text}"
+        );
     }
 
     #[test]
@@ -226,10 +233,10 @@ mod tests {
     fn mini_meter_calculates_correctly() {
         let spans_low = mini_meter_spans(15);
         let text_low: String = spans_low.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text_low, "▪▫▫▫▫▫");
+        assert_eq!(text_low, "██░░░░░░░░");
 
         let spans_high = mini_meter_spans(85);
         let text_high: String = spans_high.iter().map(|s| s.content.as_ref()).collect();
-        assert_eq!(text_high, "▪▪▪▪▪▫");
+        assert_eq!(text_high, "█████████░");
     }
 }

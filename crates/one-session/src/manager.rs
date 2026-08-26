@@ -518,6 +518,15 @@ impl SessionManager {
         build_context_entries(&self.entries, leaf)
     }
 
+    /// Full branch path for TUI restore (compaction is a marker, history stays).
+    pub fn transcript_entries(&self) -> Vec<SessionEntry> {
+        let leaf = match &self.leaf_id {
+            Some(id) => id.as_str(),
+            None => return Vec::new(),
+        };
+        crate::context::build_transcript_entries(&self.entries, leaf)
+    }
+
     pub fn build_session_context(&self) -> SessionContext {
         let leaf = self.leaf_id.as_deref().unwrap_or("");
         if leaf.is_empty() {
@@ -559,6 +568,17 @@ impl SessionManager {
         first_kept_entry_id: impl Into<String>,
         tokens_before: u64,
     ) -> Result<String> {
+        self.append_compaction_with_details(summary, first_kept_entry_id, tokens_before, None)
+            .await
+    }
+
+    pub async fn append_compaction_with_details(
+        &mut self,
+        summary: impl Into<String>,
+        first_kept_entry_id: impl Into<String>,
+        tokens_before: u64,
+        details: Option<serde_json::Value>,
+    ) -> Result<String> {
         let base = new_entry_base(self.leaf_id.clone());
         let id = base.id.clone();
         let entry = SessionEntry::Compaction {
@@ -566,7 +586,7 @@ impl SessionManager {
             summary: summary.into(),
             first_kept_entry_id: first_kept_entry_id.into(),
             tokens_before,
-            details: None,
+            details,
         };
         self.entries.push(entry);
         self.leaf_id = Some(id.clone());

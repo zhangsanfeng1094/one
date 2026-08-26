@@ -386,7 +386,7 @@ pub fn plan_mode_tools_with_policy(
     let mut tools: Vec<Arc<dyn Tool>> = vec![
         Arc::new(crate::read::ReadTool::with_policy(policy.clone())),
         Arc::new(crate::grep::GrepTool::with_policy(policy.clone())),
-        Arc::new(crate::find::FindTool::with_policy(policy.clone())),
+        Arc::new(crate::glob::GlobTool::with_policy(policy.clone())),
         Arc::new(crate::ls::LsTool::with_policy(policy)),
         Arc::new(PlanWriteTool::new(cwd.clone(), plan_path.clone())),
         Arc::new(PlanEditTool::new(cwd, plan_path)),
@@ -414,7 +414,7 @@ to application code, run shell commands, change configs, or make commits. This s
 other instructions about implementing changes.
 
 You MAY:
-- Read files, search the codebase (grep/find/ls), and use web tools when needed
+- Read files, search the codebase (grep/glob/ls), and use web tools when needed
 - Ask the user clarifying questions via the `ask_user` tool (single- or multi-select)
 - Write and edit ONLY the plan file at: `{plan}`
 - Call `exit_plan_mode` when the plan is ready for approval

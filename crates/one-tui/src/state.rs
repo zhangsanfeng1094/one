@@ -91,7 +91,7 @@ impl PendingImage {
     }
 }
 
-/// Long pasted text bound to `[文本.txt]` / `[文本.N.txt]` (same atomic delete UX as images).
+/// Long pasted text bound to `[文本 · 12 lines · 3KB]` (same atomic delete UX as images).
 #[derive(Debug, Clone)]
 pub struct PendingText {
     pub id: u32,
@@ -100,7 +100,7 @@ pub struct PendingText {
 
 impl PendingText {
     pub fn token(&self) -> String {
-        one_core::image::text_token(self.id)
+        one_core::image::text_token_labeled(self.id, &self.body)
     }
 
     pub fn summary(&self) -> String {

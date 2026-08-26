@@ -994,7 +994,7 @@ fn tool_kind(name: &str) -> ToolKind {
     match name {
         "read" | "ls" => ToolKind::Read,
         "write" | "edit" => ToolKind::Edit,
-        "grep" | "find" | "memory_search" | "search_tool" => ToolKind::Search,
+        "grep" | "glob" | "find" | "memory_search" | "search_tool" => ToolKind::Search,
         "bash" | "bash_output" | "bash_kill" | "monitor" => ToolKind::Execute,
         "web_search" | "web_fetch" | "use_tool" => ToolKind::Fetch,
         "plan" | "exit_plan_mode" | "todo_write" => ToolKind::Think,

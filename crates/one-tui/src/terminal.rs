@@ -15,6 +15,7 @@
 //! selection — which we do (caret-based half-open range per display line).
 
 use std::fmt;
+use std::future::Future;
 use std::io::{self, Stdout, Write};
 use std::time::{Duration, Instant};
 
@@ -32,6 +33,7 @@ use ratatui::Terminal;
 use crate::app::App;
 use crate::clipboard;
 use crate::error::Result;
+use crate::paste_burst::{coalesce_events, looks_like_paste_burst, CoalescedEvent};
 use crate::state::RunOutcome;
 use crate::ui;
 
@@ -89,6 +91,10 @@ const POLL_BUSY: Duration = Duration::from_millis(40);
 const CURSOR_BLINK: Duration = Duration::from_millis(530);
 const WHEEL_LINES: usize = 3;
 const SELECT_RELEASE_REARM: Duration = Duration::from_millis(800);
+/// Max events pulled in one drain so a huge unbracketed paste cannot stall forever.
+const DRAIN_MAX: usize = 32_768;
+/// After a paste-like burst, wait this long for straggler chunks before painting.
+const PASTE_STRAGGLER: Duration = Duration::from_millis(8);
 
 fn mouse_capture_default() -> bool {
     match std::env::var("ONE_MOUSE")
@@ -254,10 +260,12 @@ impl TerminalSession {
             }
         }
 
-        // Chat pane height (rows above prompt/footer).
+        // Chat pane in absolute terminal rows (below the grok header / sticky).
         let chat_h = app.chat_view_height as u16;
-        let in_chat = chat_h > 0 && mouse.row < chat_h;
-        let row = mouse.row as usize;
+        let in_chat = app.mouse_to_chat_row(mouse.row).is_some();
+        // Relative to the painted transcript; saturating so a drag onto the
+        // header still hits row 0 (edge-scroll up).
+        let row = mouse.row.saturating_sub(app.chat_content_y);
         let col = mouse.column;
 
         match mouse.kind {
@@ -280,29 +288,30 @@ impl TerminalSession {
             }
             MouseEventKind::Down(MouseButton::Left) if in_chat => {
                 self.left_down = true;
-                app.select_begin(row, col);
+                app.select_begin(row as usize, col);
             }
             // Character / multi-line select: Drag + Moved while held (hosts vary).
             // Keep tracking even when the pointer leaves the chat pane so the
             // user can edge-scroll past one viewport of lines.
             MouseEventKind::Drag(MouseButton::Left) if self.left_down => {
-                app.select_drag(mouse.row, col, chat_h);
+                app.select_drag(row, col, chat_h);
             }
             MouseEventKind::Moved if self.left_down => {
-                app.select_drag(mouse.row, col, chat_h);
+                app.select_drag(row, col, chat_h);
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 if self.left_down {
                     self.left_down = false;
                     // select_finish applies release cell; non-empty drag → auto-copy.
-                    app.select_finish_at(mouse.row, col, chat_h);
+                    app.select_finish_at(row, col, chat_h);
                     self.flush_clipboard(app);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Click outside chat clears selection.
+                // Click outside chat clears selection. If clicked on sticky bar, jump to message start.
                 self.left_down = false;
                 app.clear_selection();
+                app.click_sticky(mouse.row);
             }
             _ => {}
         }
@@ -358,11 +367,21 @@ impl TerminalSession {
             on_poll(app);
             self.maybe_rearm_after_select();
             self.tick_blink(app);
-            self.draw(app)?;
 
-            if event::poll(POLL_IDLE)? {
-                match event::read()? {
-                    Event::Key(key) => {
+            // Skip the idle draw while a paste burst is already in the queue so
+            // we never paint thousands of intermediate frames.
+            let ready = event::poll(Duration::ZERO)?;
+            if !ready {
+                self.draw(app)?;
+                if !event::poll(POLL_IDLE)? {
+                    tokio::task::yield_now().await;
+                    continue;
+                }
+            }
+
+            for ev in coalesce_events(drain_events()?) {
+                match ev {
+                    CoalescedEvent::Key(key) => {
                         if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
                             if self.handle_key_global(app, key) {
                                 continue;
@@ -376,16 +395,10 @@ impl TerminalSession {
                             }
                         }
                     }
-                    Event::Mouse(mouse) => {
-                        self.apply_mouse(app, mouse);
-                    }
-                    Event::Paste(text) => {
-                        app.handle_paste(&text);
-                    }
-                    Event::Resize(_, _) => {
-                        self.reassert_modes();
-                    }
-                    _ => {}
+                    CoalescedEvent::Mouse(mouse) => self.apply_mouse(app, mouse),
+                    CoalescedEvent::Paste(text) => app.handle_paste(&text),
+                    CoalescedEvent::Resize(_, _) => self.reassert_modes(),
+                    CoalescedEvent::Other => {}
                 }
             }
 
@@ -404,7 +417,6 @@ impl TerminalSession {
             on_tick(app);
             app.sync_stream_message();
             self.tick_blink(app);
-            let _ = self.draw(app);
 
             if app.take_force_quit() {
                 done.abort();
@@ -422,9 +434,95 @@ impl TerminalSession {
                 return Ok(done.await.expect("agent task panicked"));
             }
 
-            if let Ok(true) = event::poll(POLL_BUSY) {
-                match event::read() {
-                    Ok(Event::Key(key)) => {
+            let ready = event::poll(Duration::ZERO).unwrap_or(false);
+            if !ready {
+                let _ = self.draw(app);
+                match event::poll(POLL_BUSY) {
+                    Ok(true) => {}
+                    _ => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                }
+            }
+
+            if let Ok(events) = drain_events() {
+                for ev in coalesce_events(events) {
+                    match ev {
+                        CoalescedEvent::Key(key) => {
+                            if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
+                                if self.handle_key_global(app, key) {
+                                    continue;
+                                }
+                                if self.select_release_at.is_some() {
+                                    self.arm_mouse_if_wanted();
+                                }
+                                app.handle_busy_key(key);
+                            }
+                        }
+                        CoalescedEvent::Mouse(mouse) => self.apply_mouse(app, mouse),
+                        CoalescedEvent::Paste(text) => app.handle_paste(&text),
+                        CoalescedEvent::Resize(_, _) => self.reassert_modes(),
+                        CoalescedEvent::Other => {}
+                    }
+                }
+            }
+
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// Keep painting the TUI while `work` runs on this task (no spawn).
+    ///
+    /// Used for `/compact`: the LLM summary holds `&mut AppRuntime`, so it
+    /// cannot be `tokio::spawn`'d next to the event loop.
+    pub async fn run_until<T>(
+        &mut self,
+        app: &mut App,
+        mut on_tick: impl FnMut(&mut App),
+        work: impl Future<Output = T>,
+    ) -> std::result::Result<T, ForceQuit> {
+        tokio::pin!(work);
+        loop {
+            self.maybe_rearm_after_select();
+            on_tick(app);
+            app.sync_stream_message();
+            self.tick_blink(app);
+
+            if app.take_force_quit() {
+                return Err(ForceQuit);
+            }
+
+            tokio::select! {
+                biased;
+                result = &mut work => {
+                    on_tick(app);
+                    app.sync_stream_message();
+                    let _ = self.draw(app);
+                    return Ok(result);
+                }
+                _ = self.pump_busy_events(app) => {}
+            }
+        }
+    }
+
+    async fn pump_busy_events(&mut self, app: &mut App) {
+        let ready = event::poll(Duration::ZERO).unwrap_or(false);
+        if !ready {
+            let _ = self.draw(app);
+            match event::poll(POLL_BUSY) {
+                Ok(true) => {}
+                _ => {
+                    tokio::task::yield_now().await;
+                    return;
+                }
+            }
+        }
+
+        if let Ok(events) = drain_events() {
+            for ev in coalesce_events(events) {
+                match ev {
+                    CoalescedEvent::Key(key) => {
                         if key.kind == KeyEventKind::Press || key.kind == KeyEventKind::Repeat {
                             if self.handle_key_global(app, key) {
                                 continue;
@@ -433,26 +531,17 @@ impl TerminalSession {
                                 self.arm_mouse_if_wanted();
                             }
                             app.handle_busy_key(key);
-                            if app.force_quit_pending() {
-                                continue;
-                            }
                         }
                     }
-                    Ok(Event::Mouse(mouse)) => {
-                        self.apply_mouse(app, mouse);
-                    }
-                    Ok(Event::Paste(text)) => {
-                        app.handle_paste(&text);
-                    }
-                    Ok(Event::Resize(_, _)) => {
-                        self.reassert_modes();
-                    }
-                    _ => {}
+                    CoalescedEvent::Mouse(mouse) => self.apply_mouse(app, mouse),
+                    CoalescedEvent::Paste(text) => app.handle_paste(&text),
+                    CoalescedEvent::Resize(_, _) => self.reassert_modes(),
+                    CoalescedEvent::Other => {}
                 }
             }
-
-            tokio::task::yield_now().await;
         }
+
+        tokio::task::yield_now().await;
     }
 
     pub fn leave(mut self) -> Result<()> {
@@ -521,6 +610,26 @@ impl TerminalSession {
         self.terminal.show_cursor()?;
         Ok(())
     }
+}
+
+/// Read every event already in the kernel buffer (plus a short wait if this
+/// looks like a clipboard dump) so paste is one block, not one key per frame.
+fn drain_events() -> io::Result<Vec<Event>> {
+    let mut events = Vec::new();
+    events.push(event::read()?);
+    loop {
+        while events.len() < DRAIN_MAX && event::poll(Duration::ZERO)? {
+            events.push(event::read()?);
+        }
+        if events.len() >= DRAIN_MAX {
+            break;
+        }
+        if looks_like_paste_burst(&events) && event::poll(PASTE_STRAGGLER)? {
+            continue;
+        }
+        break;
+    }
+    Ok(events)
 }
 
 fn apply_input_modes<W: Write>(w: &mut W, mouse_capture: bool) -> io::Result<()> {

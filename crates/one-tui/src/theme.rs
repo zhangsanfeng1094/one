@@ -24,10 +24,17 @@ impl Theme {
     pub const SUCCESS: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
     pub const ERROR: Color = Color::Rgb(0xe0, 0x6c, 0x75);
     pub const WARNING: Color = Color::Rgb(0xf5, 0xa7, 0x42);
+    /// Caution / mid-high usage — yellow, distinct from orange warning.
+    pub const CAUTION: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
     pub const INFO: Color = Color::Rgb(0x56, 0xb6, 0xc2);
-    pub const CODE: Color = Color::Rgb(0x7f, 0xd8, 0x8f);
-    /// Warm elevated fill for user bubbles — distinct from neutral ELEMENT focus wash.
-    pub const USER_BG: Color = Color::Rgb(0x2c, 0x26, 0x22);
+    /// Inline code / tool names — cyan, never a second hue on bold.
+    pub const CODE: Color = Color::Rgb(0x56, 0xb6, 0xc2);
+    /// Soft wash behind inline `code` and tool-name chips.
+    pub const CODE_BG: Color = Color::Rgb(0x22, 0x28, 0x2a);
+    /// Full-row user bubble — navy wash, heavier than info / assistant (no fill).
+    pub const USER_BG: Color = Color::Rgb(0x1c, 0x23, 0x33);
+    /// Fenced code inside a user bubble — ~10% darker than [`USER_BG`].
+    pub const USER_CODE_BG: Color = Color::Rgb(0x15, 0x1b, 0x28);
 
     pub fn bg() -> Style {
         Style::default().bg(Self::BG).fg(Self::FG)
@@ -120,6 +127,24 @@ impl Theme {
         Style::default().fg(Self::FG)
     }
 
+    /// Inverted key badge (` Shift+G `) on the footer.
+    pub fn key_badge() -> Style {
+        Style::default()
+            .fg(Self::BG)
+            .bg(Self::FG)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Dim caption beside a key badge.
+    pub fn key_badge_label() -> Style {
+        Style::default().fg(Self::MUTED).bg(Self::PANEL)
+    }
+
+    /// Footer strip — slightly elevated so it separates from the transcript.
+    pub fn footer_bg() -> Style {
+        Style::default().bg(Self::PANEL).fg(Self::MUTED)
+    }
+
     pub fn status_faint() -> Style {
         Style::default().fg(Self::BORDER_ACTIVE)
     }
@@ -166,19 +191,36 @@ impl Theme {
     }
 
     /// Context usage highlight depending on fill percentage.
+    ///
+    /// Very low fill stays dim; >60% yellow, >80% orange, >95% red.
     pub fn context_usage_style(pct: usize) -> Style {
-        let fg = if pct >= 90 {
+        let fg = if pct >= 95 {
             Self::ERROR
-        } else if pct >= 70 {
+        } else if pct >= 80 {
             Self::WARNING
+        } else if pct >= 60 {
+            Self::CAUTION
         } else {
-            Self::INFO
+            Self::MUTED
         };
         let mut st = Style::default().bg(Self::ELEMENT).fg(fg);
-        if pct >= 90 {
+        if pct < 8 {
+            st = st.add_modifier(Modifier::DIM);
+        } else if pct >= 95 {
             st = st.add_modifier(Modifier::BOLD);
         }
         st
+    }
+
+    /// Intent / info-panel confidence: `<0.6` orange, `≥0.8` green, else muted.
+    pub fn confidence(score: f64) -> Style {
+        if score >= 0.8 {
+            Style::default().fg(Self::SUCCESS)
+        } else if score < 0.6 {
+            Style::default().fg(Self::WARNING)
+        } else {
+            Style::default().fg(Self::MUTED)
+        }
     }
 
     /// Base style for the prompt panel (applied via Paragraph::style).
@@ -191,6 +233,37 @@ impl Theme {
         Style::default()
             .fg(Self::FG)
             .bg(Self::ELEMENT)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Long-paste chip in the composer (`[文本 · 12 lines · 3KB]`) — solid pill.
+    pub fn input_text_chip() -> Style {
+        Style::default()
+            .fg(Self::BG)
+            .bg(Self::INFO)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Image attachment chip in the composer (`[图片.img]`).
+    pub fn input_image_chip() -> Style {
+        Style::default()
+            .fg(Self::BG)
+            .bg(Self::PRIMARY)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Paste/image chips inside a submitted user turn.
+    pub fn user_text_chip() -> Style {
+        Style::default()
+            .fg(Self::BG)
+            .bg(Self::INFO)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn user_image_chip() -> Style {
+        Style::default()
+            .fg(Self::BG)
+            .bg(Self::PRIMARY)
             .add_modifier(Modifier::BOLD)
     }
 
@@ -406,58 +479,136 @@ impl Theme {
         Style::default().fg(Self::ELEMENT).bg(Self::ELEMENT)
     }
 
-    /// User bubble left rail / role indicator — peach identity.
+    pub const USER_ACCENT: Color = Color::Rgb(0xf5, 0xa7, 0x42); // sticky-query pin (orange)
+
+    /// User bubble left rail (`▐`) — kept for code rows inside an expanded paste.
     pub fn user_bar() -> Style {
-        Style::default()
-            .fg(Self::PRIMARY)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::BORDER_ACTIVE).bg(Self::USER_BG)
     }
 
-    /// User role badge ("❯ You").
+    /// User role badge ("YOU") — unused on the timeline; kept for chips.
     pub fn user_badge() -> Style {
         Style::default()
-            .fg(Self::PRIMARY)
+            .fg(Self::FG)
+            .bg(Self::USER_BG)
             .add_modifier(Modifier::BOLD)
     }
 
     pub fn user_body() -> Style {
-        // High-clarity bold text for user prompts so they stand out cleanly.
-        Style::default().fg(Self::FG).add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::FG)
+    }
+
+    pub fn user_bg() -> Style {
+        Style::default().fg(Self::FG).bg(Self::USER_BG)
+    }
+
+    pub fn user_meta() -> Style {
+        Style::default().fg(Self::MUTED).add_modifier(Modifier::DIM)
+    }
+
+    /// Clickable chevron on a foldable turn row.
+    pub fn user_fold_key() -> Style {
+        Style::default().fg(Self::MUTED).bg(Self::USER_BG)
+    }
+
+    /// Thick spine on the expanded / focused turn (`┃`).
+    pub fn turn_rail() -> Style {
+        Style::default().fg(Self::BORDER_ACTIVE)
+    }
+
+    /// Rail on user bubble row (with user background).
+    pub fn turn_rail_user() -> Style {
+        Style::default().fg(Self::BORDER_ACTIVE).bg(Self::USER_BG)
+    }
+
+    pub fn turn_time() -> Style {
+        Style::default()
+            .fg(Self::MUTED)
+            .bg(Self::USER_BG)
+            .add_modifier(Modifier::DIM)
+    }
+
+    pub fn turn_preview() -> Style {
+        Style::default().fg(Self::FG).bg(Self::USER_BG)
+    }
+
+    pub fn turn_preview_dim() -> Style {
+        Style::default()
+            .fg(Self::MUTED)
+            .bg(Self::USER_BG)
+            .add_modifier(Modifier::DIM)
+    }
+
+    pub fn user_code() -> Style {
+        Style::default().fg(Self::CODE).bg(Self::USER_CODE_BG)
     }
 
     pub fn user_pad() -> Style {
-        Style::default().bg(Self::BG)
+        Style::default().bg(Self::USER_BG)
     }
+
+    /// Context glyph ("◇") — muted accent.
+    pub fn context_glyph() -> Style {
+        Style::default().fg(Self::ACCENT)
+    }
+
+    /// Context header title ("Context") — muted header.
+    pub fn context_header() -> Style {
+        Style::default()
+            .fg(Self::MUTED)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Context body text — subtle, low contrast.
+    pub fn context_body() -> Style {
+        Style::default().fg(Self::MUTED)
+    }
+
+    /// Context highlight (e.g. server names, tool numbers) — foreground.
+    pub fn context_highlight() -> Style {
+        Style::default().fg(Self::FG)
+    }
+
+    /// Warm dark orange wash for the sticky query bar background.
+    pub const STICKY_BG: Color = Color::Rgb(0x28, 0x1c, 0x12);
+    /// Vivid orange accent for the sticky bar rail, pin icon (`⇡ Pinned`), and highlights.
+    pub const STICKY_ACCENT: Color = Color::Rgb(0xf5, 0xa7, 0x42);
+    /// Warm muted orange for the sticky query timestamp.
+    pub const STICKY_TIME: Color = Color::Rgb(0xb8, 0x88, 0x68);
 
     /// Sticky query bar at the top of transcript when user message scrolled off-screen.
     pub fn sticky_query_bg() -> Style {
-        Style::default().bg(Self::PANEL).fg(Self::FG)
+        Style::default().bg(Self::STICKY_BG).fg(Self::FG)
     }
 
     pub fn sticky_query_accent() -> Style {
-        Style::default().bg(Self::PANEL).fg(Self::PRIMARY)
+        Style::default().bg(Self::STICKY_BG).fg(Self::STICKY_ACCENT)
+    }
+
+    pub fn sticky_query_time() -> Style {
+        Style::default()
+            .bg(Self::STICKY_BG)
+            .fg(Self::STICKY_TIME)
+            .add_modifier(Modifier::DIM)
     }
 
     pub fn sticky_query_pin() -> Style {
-        Style::default()
-            .bg(Self::PANEL)
-            .fg(Self::PRIMARY)
-            .add_modifier(Modifier::BOLD)
+        Style::default().bg(Self::STICKY_BG).fg(Self::STICKY_ACCENT)
     }
 
     pub fn sticky_query_sep() -> Style {
-        Style::default().bg(Self::PANEL).fg(Self::BORDER_ACTIVE)
+        Style::default().bg(Self::STICKY_BG).fg(Self::STICKY_ACCENT)
     }
 
     pub fn sticky_query_body() -> Style {
-        Style::default()
-            .bg(Self::PANEL)
-            .fg(Self::FG)
-            .add_modifier(Modifier::BOLD)
+        Style::default().bg(Self::STICKY_BG).fg(Self::FG)
     }
 
     pub fn sticky_query_hint() -> Style {
-        Style::default().bg(Self::PANEL).fg(Self::MUTED)
+        Style::default()
+            .bg(Self::STICKY_BG)
+            .fg(Self::STICKY_ACCENT)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// System reminder card border — subtle purple/accent outline.
@@ -519,26 +670,33 @@ impl Theme {
             .add_modifier(Modifier::ITALIC)
     }
 
+    /// H1: bold + one accent. Never stack a second hue on the same run.
     pub fn heading() -> Style {
         Style::default()
             .fg(Self::ACCENT)
             .add_modifier(Modifier::BOLD)
     }
 
+    /// H2 / H3: weight only — no extra hue.
     pub fn heading_sub() -> Style {
-        Style::default()
-            .fg(Self::SECONDARY)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::FG).add_modifier(Modifier::BOLD)
     }
 
+    /// `**bold**`: weight only, default foreground.
     pub fn strong() -> Style {
-        Style::default()
-            .fg(Self::WARNING)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::FG).add_modifier(Modifier::BOLD)
     }
 
+    /// `*italic*`: italic + dim, no extra hue.
+    pub fn emphasis() -> Style {
+        Style::default()
+            .fg(Self::MUTED)
+            .add_modifier(Modifier::ITALIC)
+    }
+
+    /// Inline `code`: cyan on a shallow wash.
     pub fn code() -> Style {
-        Style::default().fg(Self::CODE)
+        Style::default().fg(Self::CODE).bg(Self::CODE_BG)
     }
 
     /// Fenced code block body (panel fill + green text).
@@ -560,7 +718,12 @@ impl Theme {
     }
 
     pub fn blockquote() -> Style {
-        Style::default().fg(Self::BORDER_ACTIVE)
+        Style::default().fg(Self::MUTED).add_modifier(Modifier::DIM)
+    }
+
+    /// Left rail on a blockquote (color bar; body stays dim, not a second hue).
+    pub fn blockquote_bar() -> Style {
+        Style::default().fg(Self::SECONDARY)
     }
 
     pub fn table_border() -> Style {
@@ -620,7 +783,7 @@ impl Theme {
     }
 
     pub fn tool_name_done() -> Style {
-        Style::default().fg(Self::FG).add_modifier(Modifier::BOLD)
+        Style::default().fg(Self::CODE).bg(Self::CODE_BG)
     }
 
     pub fn tool_name_error() -> Style {
@@ -657,17 +820,9 @@ impl Theme {
         Style::default().fg(Self::BORDER)
     }
 
-    /// Per-tool accent for the name chip (subtle variety without rainbow soup).
-    pub fn tool_kind(name: &str) -> Style {
-        let fg = match name {
-            "bash" | "shell" => Self::WARNING,
-            "read" | "ls" | "find" | "grep" => Self::SECONDARY,
-            "edit" => Self::ACCENT,
-            "write" => Self::SUCCESS,
-            "web_search" | "web_fetch" => Self::INFO,
-            _ => Self::FG,
-        };
-        Style::default().fg(fg).add_modifier(Modifier::BOLD)
+    /// Tool name chip — cyan + wash, same as inline code (no per-tool rainbow).
+    pub fn tool_kind(_name: &str) -> Style {
+        Style::default().fg(Self::CODE).bg(Self::CODE_BG)
     }
 
     pub fn turn_glyph() -> Style {

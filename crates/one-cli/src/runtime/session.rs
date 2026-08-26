@@ -21,6 +21,8 @@ impl AppRuntime {
         {
             let mut agent = self.agent.lock().await;
             agent.messages.clear();
+            agent.last_prompt_tokens = 0;
+            agent.token_usage = Default::default();
             if let Some(s) = &self.session {
                 agent.set_trace_session_id(Some(s.header().id.clone()));
             }

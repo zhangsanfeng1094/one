@@ -121,7 +121,11 @@ One 实现 JSONL session **v3 子集**，文件为 JSONL（每行一个 JSON 对
 `firstKeptEntryId` 必须是「保留窗口里最旧一条」的 entry id（不是当前 leaf）。  
 写入时用 `SessionManager::first_kept_entry_id_for_tail(kept.len())`。
 
-`build_session_context(leaf_id)` 将 entries 转为 `AgentMessage` 列表供 LLM 使用。
+压缩时 `compaction.keep_recent`（默认 2）按 **用户回合** 计：一轮 = 一条 User 及其后的 assistant/工具消息。`/compact` 与自动压缩都按这个配置保留最近 N 轮原文，更早的回合收进摘要。TUI 在压缩期间保持可滚动，并显示 compacting 标记；完成后换成结果（保留回合数、压缩前后 token）。`details` 可含 `kept_turns` 与 `tokens_after`。
+
+`build_session_context(leaf_id)` 将 entries 转为 `AgentMessage` 列表供 **LLM** 使用。
+
+`build_transcript_entries(leaf_id)` 返回 leaf→root **完整路径**（含 compaction 之前的消息）。TUI `/resume` 用这条路径重画对话：compaction 只显示一行标记，**不**用摘要替换屏幕上的历史。压缩改的是模型 context，不是用户看到的 session。
 
 **`SessionEntry::Custom` 永不进入 LLM 上下文**（含下方 `one.*` 元数据）。
 

@@ -55,6 +55,8 @@ pub enum FloatKind {
     Rewind,
     /// Read-only info panel (session summary, …). Enter closes.
     Info,
+    /// `/context` categorical usage overlay. Enter / Esc close.
+    Context,
     /// Confirmation before starting a fresh conversation from Ctrl+N.
     NewSessionConfirm,
     /// Settings root (Ctrl+G).
@@ -366,6 +368,11 @@ impl FloatMenu {
         }
     }
 
+    /// `/context` overlay — body is drawn from [`crate::context::ContextSnapshot`].
+    pub fn context_panel() -> Self {
+        Self::with_sections(FloatKind::Context, "Context", vec![])
+    }
+
     /// Read-only key/value style info (session summary).
     pub fn info_panel(title: impl Into<String>, rows: &[(String, String)]) -> Self {
         let items: Vec<FloatItem> = rows
@@ -600,14 +607,14 @@ impl FloatMenu {
             "workspace-write",
             "open /mcp",
             "2000 · 50KB",
-            "auto 85% · keep 12 · prune",
+            "auto 85% · keep 2 · prune",
         )
     }
 
     /// Settings root with live MCP status, tool_output, and compaction summaries.
     ///
     /// `tool_output_summary` is e.g. `"2000 lines · 50.0KB"`.
-    /// `compaction_summary` is e.g. `"auto 85% · keep 12 · prune"`.
+    /// `compaction_summary` is e.g. `"auto 85% · keep 2 · prune"`.
     pub fn settings_root_with_mcp(
         thinking: &str,
         provider: &str,
@@ -781,8 +788,8 @@ impl FloatMenu {
                         item("threshold", "Absolute threshold", &thresh_detail, "edit"),
                         item(
                             "keep_recent",
-                            "Keep recent messages",
-                            &format!("{keep_recent} messages kept verbatim after summary"),
+                            "Keep recent turns",
+                            &format!("{keep_recent} user turns kept verbatim after /compact"),
                             "edit",
                         ),
                     ],
@@ -1897,6 +1904,15 @@ impl FloatMenu {
     }
 
     pub fn move_selection(&mut self, delta: isize) {
+        // `/context` uses `selected` as a line scroll offset (no list items).
+        if self.kind == FloatKind::Context {
+            if delta < 0 {
+                self.selected = self.selected.saturating_sub((-delta) as usize);
+            } else {
+                self.selected = self.selected.saturating_add(delta as usize);
+            }
+            return;
+        }
         let n = self.filtered_entries().len();
         if n == 0 {
             return;
@@ -2085,6 +2101,12 @@ fn default_command_sections() -> Vec<FloatSection> {
                     "Compact Context",
                     "summarize older turns",
                     "/compact",
+                ),
+                item(
+                    "context",
+                    "Context Usage",
+                    "window breakdown · system / messages / free",
+                    "/context",
                 ),
                 item(
                     "skills",

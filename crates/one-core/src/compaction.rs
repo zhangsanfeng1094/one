@@ -61,6 +61,20 @@ pub struct CompactRequest {
     pub instructions: Option<String>,
 }
 
+/// A compact pass that rewrote the live agent buffer (LLM context only).
+///
+/// The TUI transcript is **not** replaced; hosts should insert a compact
+/// marker into the existing conversation instead of rebuilding it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompactApplied {
+    pub tokens_before: u64,
+    /// Estimated tokens in the rewritten LLM buffer (char/4 after compact).
+    pub tokens_after: u64,
+    pub trigger: CompactTrigger,
+    /// User turns kept verbatim (`compaction.keep_recent`).
+    pub kept_turns: usize,
+}
+
 impl CompactRequest {
     pub fn auto() -> Self {
         Self {
@@ -141,13 +155,16 @@ pub struct PrefireCandidate {
     pub candidate_summary: String,
 }
 
-/// Session-state snippet injected after a compact (Grok `CompactionStateContext` mini).
+/// Session-state snippet injected after a compact (aligns with Grok `CompactionStateContext`).
 #[derive(Debug, Clone, Default)]
 pub struct CompactionStateContext {
     pub cwd: String,
     pub plan_active: bool,
     pub plan_path: Option<String>,
     pub edited_paths: Vec<String>,
+    pub active_todos: Vec<String>,
+    pub running_background_tasks: Vec<String>,
+    pub connected_mcp_servers: Vec<String>,
 }
 
 /// Fraction of the model context window at which auto-compact fires (Grok default 85%).
@@ -168,6 +185,8 @@ pub const SOFT_TRIM_MARKER: &str = "\n…\n";
 pub const DEFAULT_PREFIRE_LEAD_RATIO: f64 = 0.10;
 /// Deprecated alias: old meaning was "fraction of threshold". Prefer lead ratio.
 pub const DEFAULT_PREFIRE_RATIO: f64 = 0.85;
+/// Recent user turns kept verbatim after compact (`compaction.keep_recent`).
+pub const DEFAULT_KEEP_RECENT_TURNS: usize = 2;
 /// Recent user turns whose tool results are never pruned (Grok `keep_last_n_turns`).
 pub const DEFAULT_PRUNE_KEEP_LAST_N_TURNS: usize = 3;
 /// Character threshold above which old tool results are soft-trimmed.
@@ -189,7 +208,8 @@ pub struct CompactionConfig {
     pub token_threshold: usize,
     /// Model context window used to compute prefire lead (0 = unknown).
     pub context_window: usize,
-    /// Messages kept verbatim after summary (tail of the transcript).
+    /// User turns kept verbatim after summary (`compaction.keep_recent`).
+    /// A turn is one `User` message plus the assistant/tool messages that follow.
     pub keep_recent_messages: usize,
     /// Max chars of the fallback extract summary (when LLM summary is unavailable).
     pub max_summary_chars: usize,
@@ -222,7 +242,7 @@ impl Default for CompactionConfig {
             suppression: CompactionSuppression::None,
             token_threshold: FALLBACK_COMPACT_THRESHOLD,
             context_window: 0,
-            keep_recent_messages: 12,
+            keep_recent_messages: DEFAULT_KEEP_RECENT_TURNS,
             max_summary_chars: 6_000,
             prune: true,
             prune_protect_tokens: DEFAULT_PRUNE_PROTECT_TOKENS,
@@ -285,10 +305,95 @@ pub fn threshold_for_context_window_ratio(context_window: usize, ratio: f64) -> 
     capped.max(MIN_COMPACT_THRESHOLD)
 }
 
+/// Bytes per token under the rough character-based heuristic.
+pub const BYTES_PER_TOKEN: usize = 4;
+
+/// Per-image token cost (GPT-4o high-detail 4×512px tiles: `85 + 4×170 = 765`).
+///
+/// Used when the provider does not report image tokens. `/context` may later
+/// rescale this weight against the last API `used` total.
+pub const IMAGE_TOKEN_ESTIMATE: usize = 765;
+
 pub fn estimate_tokens(messages: &[AgentMessage]) -> usize {
     let chars: usize = messages.iter().map(message_chars).sum();
-    // ~4 chars/token heuristic (same as common rough estimates).
-    chars / 4
+    chars / BYTES_PER_TOKEN
+}
+
+/// Char/4 estimate for a raw string (system prompt, tool schemas, catalogs).
+///
+/// Uses byte length, matching [`estimate_tokens`].
+pub fn estimate_tokens_str(text: &str) -> usize {
+    text.len() / BYTES_PER_TOKEN
+}
+
+/// Conversation vs reasoning split of [`estimate_tokens`].
+///
+/// `messages` excludes thinking (text, tool calls/results, images at
+/// [`IMAGE_TOKEN_ESTIMATE`]). `reasoning` is thinking body + signature/blob.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MessageTokenParts {
+    pub messages: u64,
+    pub reasoning: u64,
+}
+
+/// Split message estimate into conversation vs thinking (both chars/4).
+pub fn estimate_message_parts(messages: &[AgentMessage]) -> MessageTokenParts {
+    let mut msg_chars = 0usize;
+    let mut reason_chars = 0usize;
+    for message in messages {
+        let (m, r) = message_char_parts(message);
+        msg_chars += m;
+        reason_chars += r;
+    }
+    MessageTokenParts {
+        messages: (msg_chars / BYTES_PER_TOKEN) as u64,
+        reasoning: (reason_chars / BYTES_PER_TOKEN) as u64,
+    }
+}
+
+/// Allocate `actual` across `weights` by share of the weight sum.
+///
+/// `display_i = actual * (weight_i / Σ weights)`, using largest-remainder
+/// rounding so the result sums **exactly** to `actual`.
+///
+/// When `actual == 0` every slot is 0. When all weights are 0 the whole
+/// `actual` lands in the first slot so a known API total is not dropped.
+pub fn scale_token_weights(weights: &[u64], actual: u64) -> Vec<u64> {
+    if weights.is_empty() {
+        return Vec::new();
+    }
+    if actual == 0 {
+        return vec![0; weights.len()];
+    }
+    let sum: u64 = weights.iter().copied().sum();
+    if sum == 0 {
+        let mut out = vec![0; weights.len()];
+        out[0] = actual;
+        return out;
+    }
+    let actual_u = actual as u128;
+    let sum_u = sum as u128;
+    let mut out = vec![0u64; weights.len()];
+    let mut allocated = 0u64;
+    let mut remainders: Vec<(u64, usize)> = Vec::with_capacity(weights.len());
+    for (i, w) in weights.iter().enumerate() {
+        let prod = (*w as u128) * actual_u;
+        let q = (prod / sum_u) as u64;
+        let r = (prod % sum_u) as u64;
+        out[i] = q;
+        allocated += q;
+        remainders.push((r, i));
+    }
+    remainders.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+    let mut left = actual.saturating_sub(allocated);
+    for (_, i) in remainders {
+        if left == 0 {
+            break;
+        }
+        out[i] += 1;
+        left -= 1;
+    }
+    out
 }
 
 /// Prefer provider-reported last-prompt size when available; else char estimate.
@@ -300,37 +405,67 @@ pub fn tokens_for_compaction(messages: &[AgentMessage], last_prompt_tokens: Opti
 }
 
 fn message_chars(message: &AgentMessage) -> usize {
+    let (m, r) = message_char_parts(message);
+    m + r
+}
+
+/// `(conversation_chars, reasoning_chars)` before the /4 conversion.
+fn message_char_parts(message: &AgentMessage) -> (usize, usize) {
     match message {
-        AgentMessage::User(user) => match &user.content {
-            UserContent::Text(text) => text.len(),
-            UserContent::Blocks(blocks) => blocks
+        AgentMessage::User(user) => (user_content_chars(&user.content), 0),
+        AgentMessage::Assistant(assistant) => {
+            let mut msg = 0usize;
+            let mut reason = 0usize;
+            for block in &assistant.content {
+                match block {
+                    ContentBlock::Text { text } => msg += text.len(),
+                    ContentBlock::Thinking {
+                        thinking,
+                        signature,
+                        ..
+                    } => {
+                        reason += thinking.len();
+                        if let Some(sig) = signature {
+                            reason += sig.len();
+                        }
+                    }
+                    ContentBlock::ToolCall {
+                        name, arguments, ..
+                    } => msg += name.len() + arguments.to_string().len() + 32,
+                }
+            }
+            (msg, reason)
+        }
+        AgentMessage::ToolResult(result) => {
+            let chars = result
+                .content
                 .iter()
                 .map(|block| match block {
                     crate::message::TextOrImage::Text { text } => text.len(),
-                    crate::message::TextOrImage::Image { .. } => 256,
+                    crate::message::TextOrImage::Image { .. } => image_char_equiv(),
                 })
-                .sum(),
-        },
-        AgentMessage::Assistant(assistant) => assistant
-            .content
-            .iter()
-            .map(|block| match block {
-                ContentBlock::Text { text } => text.len(),
-                ContentBlock::Thinking { thinking, .. } => thinking.len(),
-                ContentBlock::ToolCall {
-                    name, arguments, ..
-                } => name.len() + arguments.to_string().len() + 32,
-            })
-            .sum(),
-        AgentMessage::ToolResult(result) => result
-            .content
+                .sum();
+            (chars, 0)
+        }
+    }
+}
+
+fn user_content_chars(content: &UserContent) -> usize {
+    match content {
+        UserContent::Text(text) => text.len(),
+        UserContent::Blocks(blocks) => blocks
             .iter()
             .map(|block| match block {
                 crate::message::TextOrImage::Text { text } => text.len(),
-                crate::message::TextOrImage::Image { .. } => 256,
+                crate::message::TextOrImage::Image { .. } => image_char_equiv(),
             })
             .sum(),
     }
+}
+
+/// Image blocks contribute [`IMAGE_TOKEN_ESTIMATE`] tokens after `/4`.
+fn image_char_equiv() -> usize {
+    IMAGE_TOKEN_ESTIMATE.saturating_mul(BYTES_PER_TOKEN)
 }
 
 pub fn should_compact(messages: &[AgentMessage], config: &CompactionConfig) -> bool {
@@ -480,29 +615,83 @@ pub fn prune_old_tool_outputs(messages: &mut [AgentMessage], config: &Compaction
     pruned
 }
 
+/// Start index of each user turn (the `User` message; assistant/tools follow).
+pub fn user_turn_starts(messages: &[AgentMessage]) -> Vec<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| matches!(m, AgentMessage::User(_)))
+        .map(|(i, _)| i)
+        .collect()
+}
+
+pub fn user_turn_count(messages: &[AgentMessage]) -> usize {
+    user_turn_starts(messages).len()
+}
+
+fn snap_split_off_tool_result(messages: &[AgentMessage], mut split: usize) -> usize {
+    while split > 0 && matches!(messages.get(split), Some(AgentMessage::ToolResult(_))) {
+        split -= 1;
+    }
+    split
+}
+
+/// Split messages into (older to summarize, recent to keep).
+///
+/// `keep_recent_messages` is **user turns**, from `compaction.keep_recent`.
+/// When `force` is true (`/compact`, overflow, or auto already over threshold),
+/// keep as many configured turns as fit, but always summarize at least the
+/// oldest turn so compact still shrinks context.
+pub fn split_for_compaction_forced<'a>(
+    messages: &'a [AgentMessage],
+    config: &CompactionConfig,
+    force: bool,
+) -> Option<(&'a [AgentMessage], &'a [AgentMessage])> {
+    if messages.len() < 2 {
+        return None;
+    }
+    let keep_turns = config.keep_recent_messages;
+    if keep_turns == 0 {
+        return Some(messages.split_at(messages.len()));
+    }
+
+    let starts = user_turn_starts(messages);
+    let split = if starts.len() > keep_turns {
+        starts[starts.len() - keep_turns]
+    } else if force && starts.len() >= 2 {
+        let keep = keep_turns.min(starts.len() - 1);
+        starts[starts.len() - keep]
+    } else if force && starts.is_empty() {
+        messages.len().saturating_sub(keep_turns).max(1)
+    } else {
+        return None;
+    };
+
+    let split = snap_split_off_tool_result(messages, split.min(messages.len()));
+    if split == 0 {
+        if force && messages.len() > 1 {
+            let mut fwd = 1;
+            while fwd < messages.len() {
+                if !matches!(messages.get(fwd), Some(AgentMessage::ToolResult(_))) {
+                    return Some(messages.split_at(fwd));
+                }
+                fwd += 1;
+            }
+        }
+        return None;
+    }
+    if split >= messages.len() {
+        return None;
+    }
+    Some(messages.split_at(split))
+}
+
 /// Split messages into (older to summarize, recent to keep).
 pub fn split_for_compaction<'a>(
     messages: &'a [AgentMessage],
     config: &CompactionConfig,
 ) -> Option<(&'a [AgentMessage], &'a [AgentMessage])> {
-    if messages.len() <= config.keep_recent_messages {
-        return None;
-    }
-    let split = messages.len() - config.keep_recent_messages;
-    // Never split in the middle of a tool-call / tool-result pair: walk back so
-    // the first kept message is not an orphan toolResult.
-    let mut split = split;
-    while split > 0 {
-        if matches!(messages.get(split), Some(AgentMessage::ToolResult(_))) {
-            split -= 1;
-            continue;
-        }
-        break;
-    }
-    if split == 0 {
-        return None;
-    }
-    Some(messages.split_at(split))
+    split_for_compaction_forced(messages, config, false)
 }
 
 /// Local extractive summary used when LLM summarization is unavailable.
@@ -715,6 +904,37 @@ pub fn format_compaction_reminder(ctx: &CompactionStateContext) -> String {
             _ => lines.push("Plan mode is active.".into()),
         }
     }
+    if !ctx.active_todos.is_empty() {
+        let shown: Vec<&str> = ctx
+            .active_todos
+            .iter()
+            .map(String::as_str)
+            .take(12)
+            .collect();
+        let extra = ctx.active_todos.len().saturating_sub(shown.len());
+        let todo_body = shown
+            .iter()
+            .map(|t| format!("• {t}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if extra > 0 {
+            lines.push(format!("Active todos:\n{todo_body}\n(+{extra} more)"));
+        } else {
+            lines.push(format!("Active todos:\n{todo_body}"));
+        }
+    }
+    if !ctx.running_background_tasks.is_empty() {
+        lines.push(format!(
+            "Running background tasks: {}",
+            ctx.running_background_tasks.join(", ")
+        ));
+    }
+    if !ctx.connected_mcp_servers.is_empty() {
+        lines.push(format!(
+            "Connected MCP servers: {}",
+            ctx.connected_mcp_servers.join(", ")
+        ));
+    }
     if !ctx.edited_paths.is_empty() {
         let shown: Vec<&str> = ctx
             .edited_paths
@@ -779,43 +999,49 @@ pub fn split_two_pass(older: &[AgentMessage]) -> Option<(&[AgentMessage], &[Agen
 
 /// Compact messages: returns (summary text, kept recent messages).
 /// Summary is extractive (no LLM). Prefer `summarize_messages` prompt + provider for quality.
-pub fn compact_messages(
+pub fn compact_messages_forced(
     messages: &[AgentMessage],
     config: &CompactionConfig,
+    force: bool,
 ) -> (String, Vec<AgentMessage>) {
-    let Some((older, recent)) = split_for_compaction(messages, config) else {
+    let Some((older, recent)) = split_for_compaction_forced(messages, config, force) else {
         return (String::new(), messages.to_vec());
     };
     let summary = extractive_summary(older, config.max_summary_chars);
     (summary, recent.to_vec())
 }
 
-const DEFAULT_SUMMARY_INSTRUCTIONS: &str =
-    "Preserve decisions, file paths, commands run, errors, and unfinished work. Be concise.";
+pub fn compact_messages(
+    messages: &[AgentMessage],
+    config: &CompactionConfig,
+) -> (String, Vec<AgentMessage>) {
+    compact_messages_forced(messages, config, false)
+}
 
 /// Build a one-shot user prompt asking the model to summarize older turns.
 ///
-/// Feeds a real transcript (not an extractive dump). `custom_instructions`
-/// come from `/compact [context]`.
+/// Feeds a sanitized transcript (dropping thinking blocks, flattening tool calls).
+/// `custom_instructions` come from `/compact [context]`.
 pub fn summarization_prompt(older: &[AgentMessage], custom_instructions: Option<&str>) -> String {
     let transcript = format_transcript(older, 24_000);
     let extra = custom_instructions
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or(DEFAULT_SUMMARY_INSTRUCTIONS);
-    let user_ctx = custom_instructions
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(|s| format!("\n\nUser-provided context for this compaction:\n{s}\n"))
+        .map(|s| format!("\n\nUser-provided focus / instructions for this compaction:\n{s}\n"))
         .unwrap_or_default();
     format!(
-        "You are summarizing an earlier portion of a coding-agent conversation for context compaction.\n\
-         Write a dense summary that a future assistant can use to continue the work.\n\
-         {extra}{user_ctx}\n\
-         --- conversation ---\n\
+        "You are writing a dense, structured context compaction summary for a coding-agent session.\n\
+         This summary replaces earlier conversation turns so future turns can continue without context loss.\n\n\
+         Cover the following essential areas in concise bullet points:\n\
+         1. **Goals & Key Technical Decisions**: Primary task objectives, chosen approaches, architecture rules, and conventions.\n\
+         2. **Modified Files & Key Symbols**: Exact paths edited or created, and notable functions/types/modules modified.\n\
+         3. **Commands Run, Errors & Discarded Approaches**: Commands executed, errors encountered, what failed and why it was rejected.\n\
+         4. **Pending Work & Next Steps**: Incomplete tasks, unresolved blockers, and immediate next steps.\n\
+         {extra}\n\
+         --- conversation transcript ---\n\
          {transcript}\n\
-         --- end ---\n\n\
-         Reply with ONLY the summary, no preamble."
+         --- end transcript ---\n\n\
+         Reply with ONLY the summary Markdown (dense, precise, no conversational preamble or pleasantries)."
     )
 }
 
@@ -823,12 +1049,16 @@ pub fn summarization_prompt(older: &[AgentMessage], custom_instructions: Option<
 pub fn two_pass_pass1_prompt(prefix: &[AgentMessage]) -> String {
     let transcript = format_transcript(prefix, 16_000);
     format!(
-        "You are condensing the OLDEST portion of a coding-agent conversation into NOTE₁.\n\
-         Capture decisions, file paths, commands, errors, and unfinished work. Be dense.\n\n\
+        "You are condensing the OLDEST portion of a coding-agent conversation into intermediate NOTE₁.\n\
+         Capture:\n\
+         - Primary goal and key technical decisions made\n\
+         - Files created, edited, or explored, with key symbols\n\
+         - Commands executed, errors encountered, and failed attempts\n\
+         - Work completed vs work left in progress\n\n\
          --- oldest conversation ---\n\
          {transcript}\n\
-         --- end ---\n\n\
-         Reply with ONLY NOTE₁, no preamble."
+         --- end oldest conversation ---\n\n\
+         Reply with ONLY NOTE₁ (dense, structured bullet points, no preamble)."
     )
 }
 
@@ -842,19 +1072,24 @@ pub fn two_pass_pass2_prompt(
     let extra = custom_instructions
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .map(|s| format!("\n\nUser-provided context for this compaction:\n{s}\n"))
+        .map(|s| format!("\n\nUser-provided focus / instructions for this compaction:\n{s}\n"))
         .unwrap_or_default();
     format!(
-        "You are writing the FINAL compaction summary for a coding-agent conversation.\n\
-         Combine NOTE₁ (oldest portion, already condensed) with the more recent intermediate turns.\n\
-         Preserve decisions, file paths, commands run, errors, and unfinished work. Be concise.{extra}\n\
-         --- NOTE₁ ---\n\
+        "You are writing the FINAL compaction summary for a coding-agent session.\n\
+         Combine NOTE₁ (oldest portion, already condensed) with the more recent intermediate turns.\n\n\
+         Structure the summary into concise bullet points:\n\
+         1. **Goals & Key Technical Decisions**: Task objectives, architectural decisions, and conventions.\n\
+         2. **Modified Files & Key Symbols**: Exact paths modified and key symbols.\n\
+         3. **Commands Run, Errors & Discarded Approaches**: What was executed, errors seen, and rejected approaches.\n\
+         4. **Pending Work & Next Steps**: Unfinished tasks and immediate next steps.\n\
+         {extra}\n\
+         --- NOTE₁ (Oldest summary) ---\n\
          {note1}\n\
          --- end NOTE₁ ---\n\n\
          --- intermediate conversation ---\n\
          {transcript}\n\
-         --- end ---\n\n\
-         Reply with ONLY the final summary, no preamble."
+         --- end intermediate conversation ---\n\n\
+         Reply with ONLY the final summary Markdown (dense, precise, no preamble)."
     )
 }
 
@@ -970,6 +1205,57 @@ mod tests {
     }
 
     #[test]
+    fn keep_recent_counts_user_turns_not_raw_messages() {
+        let messages = vec![
+            AgentMessage::user_text("u1"),
+            AgentMessage::assistant_text("p", "m", "a1"),
+            AgentMessage::user_text("u2"),
+            AgentMessage::assistant_text("p", "m", "a2"),
+            AgentMessage::user_text("u3"),
+            AgentMessage::assistant_text("p", "m", "a3"),
+        ];
+        assert_eq!(
+            CompactionConfig::default().keep_recent_messages,
+            DEFAULT_KEEP_RECENT_TURNS
+        );
+        assert_eq!(DEFAULT_KEEP_RECENT_TURNS, 2);
+        let config = CompactionConfig::default();
+        let (older, recent) = split_for_compaction(&messages, &config).unwrap();
+        assert_eq!(user_turn_count(older), 1);
+        assert_eq!(user_turn_count(recent), 2);
+        match &recent[0] {
+            AgentMessage::User(u) => assert_eq!(u.content.as_display_text(), "u2"),
+            other => panic!("expected last-2 turns to start at u2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn compact_force_honors_keep_recent_when_shorter() {
+        // 3 turns, keep_recent larger than history: /compact keeps 2 (as much of
+        // the config as possible, still summarizes the oldest turn).
+        let messages = vec![
+            AgentMessage::user_text("u1"),
+            AgentMessage::assistant_text("p", "m", "a1"),
+            AgentMessage::user_text("u2"),
+            AgentMessage::assistant_text("p", "m", "a2"),
+            AgentMessage::user_text("u3"),
+            AgentMessage::assistant_text("p", "m", "a3"),
+        ];
+        let config = CompactionConfig {
+            keep_recent_messages: 12,
+            ..Default::default()
+        };
+        assert!(split_for_compaction(&messages, &config).is_none());
+        let (older, recent) = split_for_compaction_forced(&messages, &config, true).unwrap();
+        assert_eq!(user_turn_count(older), 1);
+        assert_eq!(user_turn_count(recent), 2);
+        match &recent[0] {
+            AgentMessage::User(u) => assert_eq!(u.content.as_display_text(), "u2"),
+            other => panic!("expected keep last 2 turns, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn threshold_from_context_window() {
         assert_eq!(threshold_for_context_window(0), FALLBACK_COMPACT_THRESHOLD);
         let t = threshold_for_context_window(200_000);
@@ -982,6 +1268,77 @@ mod tests {
             100_000,
             &CompactionConfig::from_context_window(200_000)
         ));
+    }
+
+    #[test]
+    fn estimate_tokens_str_is_bytes_over_four() {
+        assert_eq!(estimate_tokens_str(""), 0);
+        assert_eq!(estimate_tokens_str("abcd"), 1);
+        assert_eq!(estimate_tokens_str("abcdefgh"), 2);
+        assert_eq!(estimate_tokens_str("abc"), 0);
+    }
+
+    #[test]
+    fn message_parts_sum_to_estimate_tokens() {
+        let messages = vec![
+            AgentMessage::user_text("hello world!!"), // 13 bytes
+            AgentMessage::assistant_text("p", "m", "hi there!!"), // 10 bytes
+        ];
+        let parts = estimate_message_parts(&messages);
+        assert_eq!(
+            parts.messages + parts.reasoning,
+            estimate_tokens(&messages) as u64
+        );
+    }
+
+    #[test]
+    fn image_block_counts_as_765_tokens() {
+        let msg =
+            AgentMessage::user_with_images("hi", vec![("image/png".into(), "/tmp/x.png".into())]);
+        let parts = estimate_message_parts(&[msg]);
+        assert_eq!(parts.messages, (2 / 4 + IMAGE_TOKEN_ESTIMATE) as u64);
+        assert_eq!(parts.reasoning, 0);
+    }
+
+    #[test]
+    fn thinking_and_signature_go_to_reasoning() {
+        let msg = AgentMessage::Assistant(crate::message::AssistantMessage {
+            content: vec![
+                crate::message::ContentBlock::text("okay"),
+                crate::message::ContentBlock::thinking_with_signature("think", "sig!!"),
+            ],
+            provider: "p".into(),
+            model: "m".into(),
+            stop_reason: crate::message::StopReason::Stop,
+            citations: Vec::new(),
+            timestamp: 0,
+        });
+        let parts = estimate_message_parts(&[msg]);
+        assert_eq!(parts.messages, 1); // "okay" = 4 bytes
+        assert_eq!(parts.reasoning, 2); // "think" + "sig!!" = 10 bytes
+    }
+
+    #[test]
+    fn scale_token_weights_sums_to_actual() {
+        let out = scale_token_weights(&[10_000, 40_000, 10_000, 20_000], 100_000);
+        assert_eq!(out.iter().sum::<u64>(), 100_000);
+        // 10/80, 40/80, 10/80, 20/80 of 100k → 12.5k, 50k, 12.5k, 25k
+        assert_eq!(out[1], 50_000);
+        assert_eq!(out[3], 25_000);
+        assert_eq!(out[0] + out[2], 25_000);
+    }
+
+    #[test]
+    fn scale_token_weights_identity_when_actual_equals_sum() {
+        let w = [12u64, 34, 56];
+        let out = scale_token_weights(&w, 102);
+        assert_eq!(out, w);
+    }
+
+    #[test]
+    fn scale_token_weights_zero_weights_keeps_actual() {
+        assert_eq!(scale_token_weights(&[0, 0], 50), vec![50, 0]);
+        assert_eq!(scale_token_weights(&[1, 2], 0), vec![0, 0]);
     }
 
     #[test]
@@ -1204,7 +1561,7 @@ mod tests {
         let p = summarization_prompt(&older, Some("keep the auth implementation details"));
         assert!(p.contains("implement auth"));
         assert!(p.contains("keep the auth implementation details"));
-        assert!(p.contains("User-provided context"));
+        assert!(p.contains("User-provided focus"));
         assert!(!p.contains("UserMessage"));
     }
 
@@ -1215,11 +1572,17 @@ mod tests {
             plan_active: true,
             plan_path: Some("/tmp/proj/plan.md".into()),
             edited_paths: vec!["src/lib.rs".into()],
+            active_todos: vec!["[in_progress] finish auth".into()],
+            running_background_tasks: vec!["bg_task_1".into()],
+            connected_mcp_servers: vec!["github".into()],
         };
         let body = format_compaction_reminder(&ctx);
         assert!(body.contains("cwd: /tmp/proj"));
         assert!(body.contains("Plan mode"));
         assert!(body.contains("src/lib.rs"));
+        assert!(body.contains("finish auth"));
+        assert!(body.contains("bg_task_1"));
+        assert!(body.contains("github"));
         let summary = attach_compaction_reminder("did auth", &ctx);
         assert!(summary.contains("did auth"));
         assert!(summary.contains("<system-reminder>"));

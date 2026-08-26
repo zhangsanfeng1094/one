@@ -28,6 +28,105 @@ impl super::App {
         self.messages.push(Message::system(text));
     }
 
+    /// Append a compact marker at the end of the live transcript.
+    ///
+    /// Compaction rewrites LLM context only; the TUI conversation stays.
+    pub fn push_compact_marker(
+        &mut self,
+        tokens_before: u64,
+        tokens_after: u64,
+        kept_turns: usize,
+    ) {
+        if self
+            .messages
+            .last()
+            .is_some_and(|m| Message::is_context_compacted(&m.content))
+        {
+            return;
+        }
+        self.messages.push(Message::context_compacted(
+            tokens_before,
+            tokens_after,
+            kept_turns,
+        ));
+        self.scroll_to_bottom();
+    }
+
+    /// Insert the compact marker just before the latest user turn.
+    ///
+    /// Auto-compact runs after the user bubble is already on screen, but it
+    /// summarizes the *prior* context — keep that user turn after the marker.
+    pub fn push_compact_marker_before_last_user(
+        &mut self,
+        tokens_before: u64,
+        tokens_after: u64,
+        kept_turns: usize,
+    ) {
+        if self
+            .messages
+            .iter()
+            .rev()
+            .take(2)
+            .any(|m| Message::is_context_compacted(&m.content))
+        {
+            return;
+        }
+        let idx = self
+            .messages
+            .iter()
+            .rposition(|m| m.role == MessageRole::User)
+            .unwrap_or(self.messages.len());
+        self.messages.insert(
+            idx,
+            Message::context_compacted(tokens_before, tokens_after, kept_turns),
+        );
+        self.scroll_to_bottom();
+    }
+
+    /// In-transcript spinner row while `/compact` is summarizing.
+    pub fn push_compacting_marker(&mut self) {
+        if self
+            .messages
+            .last()
+            .is_some_and(|m| Message::is_context_compacting(&m.content))
+        {
+            return;
+        }
+        self.messages.push(Message::context_compacting());
+        self.scroll_to_bottom();
+    }
+
+    /// Replace the in-progress compact row with the finished divider.
+    pub fn finish_compacting_marker(
+        &mut self,
+        tokens_before: u64,
+        tokens_after: u64,
+        kept_turns: usize,
+    ) {
+        if let Some(idx) = self
+            .messages
+            .iter()
+            .rposition(|m| Message::is_context_compacting(&m.content))
+        {
+            self.messages[idx] =
+                Message::context_compacted(tokens_before, tokens_after, kept_turns);
+            self.scroll_to_bottom();
+            return;
+        }
+        self.push_compact_marker(tokens_before, tokens_after, kept_turns);
+    }
+
+    /// Drop the in-progress compact row (cancelled / nothing to compact / failed).
+    pub fn cancel_compacting_marker(&mut self) {
+        if self
+            .messages
+            .last()
+            .is_some_and(|m| Message::is_context_compacting(&m.content))
+        {
+            self.messages.pop();
+        }
+    }
+
     pub fn push_tool(&mut self, text: impl Into<String>) {
         // Backward-compatible: `name(args)` or free text → running tool row.
         let text = text.into();
@@ -481,10 +580,16 @@ impl super::App {
         self.messages
             .iter()
             .enumerate()
-            .filter(|(_, m)| match m.role {
-                MessageRole::Tool => true,
-                MessageRole::Thinking if !m.streaming => true,
-                _ => false,
+            .filter(|(i, m)| {
+                if self.message_hidden_by_turn_fold(*i) {
+                    return false;
+                }
+                match m.role {
+                    MessageRole::Tool => true,
+                    MessageRole::Thinking if !m.streaming => true,
+                    MessageRole::User => crate::user_fold::is_real_user(m),
+                    _ => false,
+                }
             })
             .map(|(i, _)| i)
             .collect()
@@ -513,11 +618,16 @@ impl super::App {
         self.follow_bottom = false;
         // Nudge scroll so the focused row stays discoverable (best-effort).
         // Exact line mapping is recomputed on next draw from chat_line_owners.
-        if let Some(owner_line) = self
-            .chat_line_owners
-            .iter()
-            .position(|o| matches!(o, Some(ChatLineTarget::Message(i)) if *i == targets[next]))
-        {
+        if let Some(owner_line) = self.chat_line_owners.iter().position(|o| {
+            matches!(
+                o,
+                Some(
+                    ChatLineTarget::Message(i)
+                        | ChatLineTarget::User(i)
+                        | ChatLineTarget::UserContent(i)
+                ) if *i == targets[next]
+            )
+        }) {
             let view_h = self.chat_view_height.max(1);
             if owner_line < self.chat_view_start {
                 self.chat_scroll = owner_line;
@@ -545,10 +655,155 @@ impl super::App {
                     self.toggle_tool_at(idx);
                     return true;
                 }
+                Some(MessageRole::User) => {
+                    self.toggle_user_or_turn_fold_at(idx);
+                    return true;
+                }
                 _ => {}
             }
         }
         false
+    }
+
+    fn last_real_user_index(&self) -> Option<usize> {
+        self.messages
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, m)| crate::user_fold::is_real_user(m).then_some(i))
+    }
+
+    fn owning_user_index(&self, idx: usize) -> Option<usize> {
+        let end = (idx + 1).min(self.messages.len());
+        self.messages[..end]
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, m)| crate::user_fold::is_real_user(m).then_some(i))
+    }
+
+    fn message_hidden_by_turn_fold(&self, idx: usize) -> bool {
+        let Some(user_i) = self.owning_user_index(idx) else {
+            return false;
+        };
+        if user_i == idx {
+            return false;
+        }
+        let is_current = self.last_real_user_index() == Some(user_i);
+        let expanded = self.messages.get(user_i).and_then(|m| m.turn_expanded);
+        crate::user_fold::is_turn_folded(expanded, is_current, true)
+    }
+
+    /// Fold / expand the Q&A turn at this user, or the long-paste body if no turn.
+    pub fn toggle_user_or_turn_fold_at(&mut self, idx: usize) {
+        if self.toggle_turn_fold_at(idx) {
+            return;
+        }
+        self.toggle_user_content_fold_at(idx);
+    }
+
+    /// Fold / expand the user bubble at `idx` (no-op if it cannot fold).
+    pub fn toggle_user_fold_at(&mut self, idx: usize) {
+        self.toggle_user_or_turn_fold_at(idx);
+    }
+
+    pub fn toggle_turn_fold_at(&mut self, idx: usize) -> bool {
+        let Some(msg) = self.messages.get(idx) else {
+            return false;
+        };
+        if !crate::user_fold::is_real_user(msg) {
+            return false;
+        }
+        if !crate::user_fold::turn_has_followup(&self.messages, idx) {
+            return false;
+        }
+        let is_current = self.last_real_user_index() == Some(idx);
+        let folded = crate::user_fold::is_turn_folded(msg.turn_expanded, is_current, true);
+        if let Some(msg) = self.messages.get_mut(idx) {
+            msg.turn_expanded = Some(folded); // currently folded → expand
+        }
+        self.chat_focus = Some(idx);
+        true
+    }
+
+    pub fn toggle_user_content_fold_at(&mut self, idx: usize) {
+        let Some(msg) = self.messages.get(idx) else {
+            return;
+        };
+        if msg.role != MessageRole::User {
+            return;
+        }
+        let text = crate::user_fold::visible_user_text(&msg.content);
+        if text.is_empty() {
+            return;
+        }
+        let is_current = self.last_real_user_index() == Some(idx);
+        let folded = crate::user_fold::is_folded(msg.user_expanded, is_current, &text);
+        if !folded && !crate::user_fold::should_fold(&text) {
+            self.chat_focus = Some(idx);
+            return;
+        }
+        if let Some(msg) = self.messages.get_mut(idx) {
+            msg.user_expanded = Some(folded); // currently folded → expand
+        }
+        self.chat_focus = Some(idx);
+    }
+
+    /// Alt+Z: focused user turn, else the last user bubble.
+    pub fn toggle_focused_user_fold(&mut self) {
+        if let Some(idx) = self.chat_focus {
+            if let Some(user_i) = self.owning_user_index(idx) {
+                self.toggle_user_or_turn_fold_at(user_i);
+                return;
+            }
+        }
+        if let Some(idx) = self.last_real_user_index() {
+            self.toggle_user_or_turn_fold_at(idx);
+        }
+    }
+
+    /// Alt+Shift+Z: expand all historical turns, or collapse them if all are open.
+    pub fn toggle_all_user_folds(&mut self) {
+        let last = self.last_real_user_index();
+        let mut turn_targets: Vec<usize> = Vec::new();
+        let mut any_turn_folded = false;
+        let mut content_targets: Vec<usize> = Vec::new();
+        let mut any_content_folded = false;
+        for (i, msg) in self.messages.iter().enumerate() {
+            if last == Some(i) || !crate::user_fold::is_real_user(msg) {
+                continue;
+            }
+            if crate::user_fold::turn_has_followup(&self.messages, i) {
+                let folded = crate::user_fold::is_turn_folded(msg.turn_expanded, false, true);
+                if folded {
+                    any_turn_folded = true;
+                }
+                turn_targets.push(i);
+            }
+            let text = crate::user_fold::visible_user_text(&msg.content);
+            if crate::user_fold::should_fold(&text) {
+                let folded = crate::user_fold::is_folded(msg.user_expanded, false, &text);
+                if folded {
+                    any_content_folded = true;
+                }
+                content_targets.push(i);
+            }
+        }
+        if !turn_targets.is_empty() {
+            let expand = any_turn_folded;
+            for i in turn_targets {
+                if let Some(msg) = self.messages.get_mut(i) {
+                    msg.turn_expanded = Some(expand);
+                }
+            }
+            return;
+        }
+        let expand = any_content_folded;
+        for i in content_targets {
+            if let Some(msg) = self.messages.get_mut(i) {
+                msg.user_expanded = Some(expand);
+            }
+        }
     }
 
     pub fn append_stream(&mut self, delta: &str) {
@@ -730,6 +985,7 @@ impl super::App {
 
     pub fn begin_busy(&mut self) {
         self.busy = true;
+        self.busy_activity.clear();
         self.stream_buffer.clear();
         self.thinking_buffer.clear();
         self.remove_trailing_empty_stream();
@@ -743,6 +999,7 @@ impl super::App {
 
     pub fn end_busy(&mut self) {
         self.busy = false;
+        self.busy_activity.clear();
         self.status = STATUS_IDLE.into();
         self.clear_retry_wait();
     }

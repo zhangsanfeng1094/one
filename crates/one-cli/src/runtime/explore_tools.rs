@@ -11,7 +11,7 @@ use one_tools::{materialize_explore, PathPolicy, ToolBuildContext};
 pub const EXPLORE_TOOL_NAMES: &[&str] = &[
     "read",
     "grep",
-    "find",
+    "glob",
     "ls",
     #[cfg(feature = "network")]
     "web_search",
@@ -56,7 +56,7 @@ mod tests {
                 "explore must not include {forbidden}, got {names:?}"
             );
         }
-        for required in ["read", "grep", "find", "ls"] {
+        for required in ["read", "grep", "glob", "ls"] {
             assert!(
                 names.iter().any(|n| n == required),
                 "explore must include {required}, got {names:?}"

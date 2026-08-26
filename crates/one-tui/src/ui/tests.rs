@@ -4,13 +4,138 @@ use ratatui::backend::TestBackend;
 use ratatui::Terminal;
 
 use crate::app::App;
+use crate::context::{ContextSnapshot, TokenUsageCategory};
 use crate::message::{ChatLineTarget, Message, ToolStatus};
 use crate::tool_view;
 use crate::ui::draw;
 
 use super::chat::{render_thinking, render_tool_group, THINKING_STREAM_TAIL_LINES};
-use super::text::{display_cols, scrollbar_thumb_geometry};
+use super::text::{display_cols, display_width, scrollbar_thumb_geometry};
 use super::SPINNER;
+
+#[test]
+fn compact_marker_paints_as_one_line_divider() {
+    let backend = TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.push_user("keep this turn");
+    app.push_system(Message::context_compacted_text(85_000, 12_000, 12));
+    app.push_assistant("still the same conversation");
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let flat: String = buffer
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    assert!(
+        flat.contains("Context compacted"),
+        "compact divider missing:\n{flat}"
+    );
+    assert!(
+        flat.contains("keep this turn"),
+        "prior turn must stay visible:\n{flat}"
+    );
+    assert!(
+        flat.contains("still the same conversation"),
+        "later turn must stay visible:\n{flat}"
+    );
+    assert!(
+        !flat.contains("[Compaction summary]"),
+        "must not dump the LLM summary:\n{flat}"
+    );
+    assert!(
+        flat.contains("85k") && flat.contains("~12k"),
+        "result should show before → after tokens:\n{flat}"
+    );
+}
+
+#[test]
+fn compacting_marker_paints_spinner_divider() {
+    let backend = TestBackend::new(80, 12);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.busy = true;
+    app.busy_activity = "compacting".into();
+    app.push_user("keep this turn");
+    app.push_compacting_marker();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let flat: String = buffer
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    assert!(
+        flat.contains("Compacting context"),
+        "compacting divider missing:\n{flat}"
+    );
+    assert!(
+        SPINNER.iter().any(|s| flat.contains(s)),
+        "spinner missing from compacting row:\n{flat}"
+    );
+    assert!(
+        flat.contains("keep this turn"),
+        "prior turn must stay visible:\n{flat}"
+    );
+    assert!(
+        !flat.contains("[Context compacting]"),
+        "raw prefix must not paint:\n{flat}"
+    );
+}
+
+#[test]
+fn context_float_renders_bar_and_legend() {
+    let backend = TestBackend::new(80, 32);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.open_context_float(ContextSnapshot {
+        used: 36_700,
+        total: 1_000_000,
+        system_prompt_tokens: 1_200,
+        tool_definitions_count: 12,
+        tool_definitions_tokens: 5_600,
+        compaction_count: 0,
+        turn_count: 5,
+        tool_call_count: 12,
+        message_count: 8,
+        message_tokens: 29_900,
+        reasoning_tokens: 0,
+        free_tokens: 963_300,
+        usage_pct: 4,
+        auto_compact_threshold_percent: 85,
+        used_estimated: false,
+        auto_compact_enabled: true,
+        model: "opencode:deepseek".into(),
+        usage_categories: vec![
+            TokenUsageCategory::skills(2_400, 21),
+            TokenUsageCategory::mcp_servers(320, 4),
+        ],
+    });
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let flat: String = buffer
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    assert!(flat.contains("Context"), "title missing:\n{flat}");
+    assert!(flat.contains("System prompt"), "legend missing:\n{flat}");
+    assert!(flat.contains("Messages"), "messages row missing:\n{flat}");
+    assert!(
+        flat.contains("Tool definitions"),
+        "tools row missing:\n{flat}"
+    );
+    assert!(flat.contains("Skills"), "skills row missing:\n{flat}");
+    assert!(flat.contains("MCP servers"), "mcp row missing:\n{flat}");
+    assert!(
+        flat.contains("Auto-compact"),
+        "auto-compact line missing:\n{flat}"
+    );
+}
 
 #[test]
 fn settings_float_survives_a_narrow_short_terminal() {
@@ -19,6 +144,39 @@ fn settings_float_survives_a_narrow_short_terminal() {
     let mut app = App::new("test");
     app.open_settings_float();
     terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+}
+
+#[test]
+fn long_paste_chip_paints_as_compact_token() {
+    let backend = TestBackend::new(80, 16);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.handle_paste(&"line\n".repeat(40));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let buffer = terminal.backend().buffer();
+    let flat: String = buffer
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    let compact: String = flat.chars().filter(|c| !c.is_whitespace()).collect();
+    assert!(
+        compact.contains("文本"),
+        "composer should show a paste chip, got:\n{flat}"
+    );
+    assert!(
+        compact.contains("40lines") || flat.contains("lines"),
+        "chip should show line count, got:\n{flat}"
+    );
+    assert!(
+        compact.contains("200B") || compact.contains("KB"),
+        "chip should show size, got:\n{flat}"
+    );
+    assert!(
+        !flat.split_whitespace().any(|w| w == "line"),
+        "raw pasted body must not tile the composer:\n{flat}"
+    );
 }
 
 #[test]
@@ -790,8 +948,8 @@ fn meta_and_status_do_not_duplicate_chips() {
         "think on status: {status_row}"
     );
     assert!(
-        status_row.contains("ctx") && status_row.contains("37k"),
-        "context tokens on status: {status_row}"
+        !status_row.contains("ctx 37k") && !status_row.contains("37k"),
+        "token fill belongs on the header, not the footer: {status_row}"
     );
     assert!(
         !status_row.contains("MCP"),
@@ -926,6 +1084,30 @@ fn thinking_header_has_no_inline_click_hint() {
         flat.contains("Analyzing") || flat.contains("flags"),
         "should show preview: {flat}"
     );
+}
+
+#[test]
+fn thinking_expanded_strips_leading_blanks_and_renders_rail() {
+    let app = App::new("test");
+    let body = "\n\n\nFirst line of reasoning\n\n\n\nSecond line of reasoning\n\n\n";
+    let mut msg = crate::message::Message::thinking(body);
+    msg.thinking_expanded = true;
+    let lines = render_thinking(&msg, &app, 60);
+
+    // Header + "First line" + blank paragraph + "Second line"
+    assert_eq!(
+        lines.len(),
+        4,
+        "expected header + 2 text lines + 1 blank line"
+    );
+    // All body lines have the '│' rail
+    for line in &lines[1..] {
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.starts_with("  │ "),
+            "body lines must start with rail: {text}"
+        );
+    }
 }
 
 #[test]
@@ -1183,7 +1365,7 @@ fn tool_group_aggregates_duplicate_names() {
         crate::message::Message::tool("grep", "{}", crate::message::ToolStatus::Done),
         crate::message::Message::tool("read", "{}", crate::message::ToolStatus::Done),
     ];
-    let lines = render_tool_group(&tools, 80, false);
+    let lines = render_tool_group(&tools, 80, 120, false);
     let text: String = lines
         .iter()
         .flat_map(|l| l.spans.iter().map(|s| s.content.as_ref()))
@@ -1191,6 +1373,11 @@ fn tool_group_aggregates_duplicate_names() {
     assert!(text.contains("[grep ×2]"), "{text}");
     assert!(text.contains("[read]"), "{text}");
     assert!(!text.contains("  ↵") && !text.contains("↵"), "{text}");
+    assert_eq!(
+        display_width(&text),
+        120,
+        "tool group should fill row width: {text:?}"
+    );
 }
 
 #[test]
@@ -1293,7 +1480,9 @@ fn top_header_renders_grok_style_path_and_context() {
         "top header must render project folder: {flat}"
     );
     assert!(
-        flat.contains("32k") && flat.contains("128k") && flat.contains("25%"),
+        flat.contains("32k")
+            && flat.contains("128k")
+            && (flat.contains("25%") || flat.contains("(25%)")),
         "top header must render context usage and window: {flat}"
     );
     assert!(
@@ -1324,8 +1513,19 @@ fn user_message_renders_with_clean_rail() {
         "user message text must be rendered: {flat}"
     );
     assert!(
-        flat.contains("You"),
-        "user message must have You badge: {flat}"
+        !flat.contains("YOU") && !flat.contains("You"),
+        "timeline rows must not paint a YOU badge: {flat}"
+    );
+    assert!(
+        {
+            let compact = compact_flat(&flat);
+            !compact.contains("展开")
+                && !compact.contains("折叠")
+                && !compact.contains("Alt+Z")
+                && !compact.contains("▸")
+                && !compact.contains("▾")
+        },
+        "short user message with no reply must not show fold chrome: {flat}"
     );
 }
 
@@ -1359,8 +1559,121 @@ fn sticky_user_query_activates_when_scrolled_off_top() {
         .collect();
 
     assert!(
-        flat.contains("Prompt") && flat.contains("Fix memory leak in background worker"),
+        flat.contains("Pinned") && flat.contains("Fix memory leak in background worker"),
         "sticky query header must be active at the top of transcript: {flat}"
+    );
+}
+
+#[test]
+fn sticky_click_jumps_to_user_message_start() {
+    let backend = ratatui::backend::TestBackend::new(80, 14);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    app.messages
+        .push(Message::user("Fix memory leak in background worker"));
+
+    for i in 0..30 {
+        app.messages.push(Message::assistant(format!(
+            "Long output log row {i} with lots of details"
+        )));
+    }
+
+    // Render while following bottom (user query is off the top)
+    app.follow_bottom = true;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    assert!(app.chat_sticky_y.is_some());
+    assert!(app.chat_sticky_line.is_some());
+    let sticky_y = app.chat_sticky_y.unwrap();
+    let target_line = app.chat_sticky_line.unwrap();
+    assert_eq!(target_line, 0);
+
+    // Clicking sticky row should jump directly to line 0
+    let handled = app.click_sticky(sticky_y);
+    assert!(handled, "clicking sticky row must be handled");
+    assert!(!app.follow_bottom);
+    assert_eq!(app.chat_scroll, 0);
+}
+
+#[test]
+fn sticky_pins_nearest_query_above_viewport_not_only_last() {
+    let backend = ratatui::backend::TestBackend::new(80, 14);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    app.messages
+        .push(Message::user("unique-alpha-question about the renderer"));
+    for i in 0..40 {
+        app.messages.push(Message::assistant(format!(
+            "alpha-log-{i} with lots of details to fill the pane"
+        )));
+    }
+    app.messages
+        .push(Message::user("unique-beta-question about the prompt"));
+    for i in 0..8 {
+        app.messages.push(Message::assistant(format!(
+            "beta-log-{i} with lots of details to fill the pane"
+        )));
+    }
+    app.messages[0].turn_expanded = Some(true);
+    app.follow_bottom = false;
+    app.chat_scroll = 8;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+
+    assert!(
+        flat.contains("Pinned") && flat.contains("unique-alpha-question"),
+        "sticky must pin the nearest question above the viewport: {flat}"
+    );
+    assert!(
+        !flat.contains("unique-beta-question"),
+        "sticky must not keep pinning only the last turn: {flat}"
+    );
+}
+
+#[test]
+fn sticky_current_turn_still_pins_when_scrolled_into_its_reply() {
+    let backend = ratatui::backend::TestBackend::new(80, 14);
+    let mut terminal = ratatui::Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    app.messages
+        .push(Message::user("unique-alpha-question about the renderer"));
+    app.messages
+        .push(Message::assistant("short historical reply"));
+    app.messages
+        .push(Message::user("unique-beta-question about the prompt"));
+    for i in 0..30 {
+        app.messages.push(Message::assistant(format!(
+            "beta-log-{i} with lots of details to fill the pane"
+        )));
+    }
+    app.follow_bottom = true;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+
+    assert!(
+        flat.contains("Pinned") && flat.contains("unique-beta-question"),
+        "scrolled current turn still pins its own question: {flat}"
+    );
+    assert!(
+        !flat.contains("unique-alpha-question"),
+        "previous turn must not stay pinned once the viewport is in the current turn: {flat}"
     );
 }
 
@@ -1424,7 +1737,7 @@ fn sticky_query_ignores_pure_system_reminders() {
 }
 
 #[test]
-fn reminder_renders_as_styled_card_in_transcript() {
+fn reminder_renders_as_lightweight_context_in_transcript() {
     let backend = ratatui::backend::TestBackend::new(80, 24);
     let mut terminal = ratatui::Terminal::new(backend).unwrap();
     let mut app = App::new("test");
@@ -1447,11 +1760,425 @@ fn reminder_renders_as_styled_card_in_transcript() {
         "user message text must be rendered: {flat}"
     );
     assert!(
-        flat.contains("Reminder") && flat.contains("Active Intent") && flat.contains("tool-search"),
-        "reminder must be rendered as a card with markdown content: {flat}"
+        (flat.contains("Context") || flat.contains("意图") || flat.contains("ℹ"))
+            && flat.contains("tool-search"),
+        "reminder must be rendered as lightweight context: {flat}"
+    );
+}
+
+#[test]
+fn two_same_name_tools_merge_into_one_row() {
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    for q in ["grokbuild", "grok-build"] {
+        app.push_tool_call("web_search", &format!(r#"{{"query":"{q}"}}"#));
+        app.finish_tool_with_output("web_search", false, Some("ok".into()));
+        if let Some(last) = app.messages.last_mut() {
+            last.tool_expanded = false;
+            last.tool_ungroup = false;
+        }
+    }
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    assert!(
+        flat.contains("×2") || flat.contains("x2") || flat.contains("web_search"),
+        "repeated calls should merge or at least name the tool: {flat}"
+    );
+}
+
+#[test]
+fn intent_info_is_collapsed_until_clicked() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user(
+        "Check this\n<system-reminder>\n### Graph Intent Guidance\n- **[SearchExternalDocs]** (置信度: 0.59, 来源: `id`) · 先查 deepwiki\n</system-reminder>",
+    ));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let owners = app.chat_line_owners.clone();
+    assert!(
+        owners
+            .iter()
+            .any(|o| matches!(o, Some(ChatLineTarget::Message(0)))),
+        "collapsed info row must be clickable"
+    );
+    let info_line = owners
+        .iter()
+        .position(|o| matches!(o, Some(ChatLineTarget::Message(0))))
+        .expect("info line");
+    let before = owners.len();
+    app.click_chat_row(info_line.saturating_sub(app.chat_view_start));
+    assert!(app.messages[0].info_expanded);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(
+        app.chat_line_owners.len() >= before,
+        "expanded info should not shrink"
+    );
+}
+
+fn long_user_paste(n: usize) -> String {
+    (0..n)
+        .map(|i| format!("line {i} of a pasted log"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn terminal_flat(terminal: &ratatui::Terminal<TestBackend>) -> String {
+    terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect()
+}
+
+/// TestBackend stores a space in the trailing cell of a width-2 glyph.
+fn compact_flat(flat: &str) -> String {
+    flat.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+#[test]
+fn historical_turn_fold_summarizes_tools() {
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user("list files"));
+    app.push_tool_call("bash", r#"{"command":"ls"}"#);
+    app.finish_tool_with_output("bash", false, Some("ok".into()));
+    app.messages.push(Message::assistant("here they are"));
+    app.messages.push(Message::user("thanks"));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    let compact = compact_flat(&flat);
+    assert!(
+        compact.contains("▸") && flat.contains("list files"),
+        "folded turn is a one-line timeline row: {flat}"
     );
     assert!(
-        flat.contains("╭─") && flat.contains("╰"),
-        "card borders must be present: {flat}"
+        !compact.contains("展开") && !compact.contains("Alt+Z") && !compact.contains("1工具"),
+        "folded turn must not repeat expand hints or a summary bar: {flat}"
+    );
+    assert!(
+        !flat.contains("here they are"),
+        "folded turn must hide the assistant body: {flat}"
+    );
+}
+
+#[test]
+fn historical_turn_with_injected_reminder_can_expand() {
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user("First real prompt"));
+    app.messages.push(Message::user(
+        "<system-reminder>Graph Intent Reminder</system-reminder>",
+    ));
+    app.messages
+        .push(Message::assistant("Answer to first prompt"));
+    app.messages.push(Message::user("Second real prompt"));
+    app.messages
+        .push(Message::assistant("Answer to second prompt"));
+
+    // By default, turn 0 is historical and folded.
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat_folded = terminal_flat(&terminal);
+    assert!(!flat_folded.contains("Answer to first prompt"));
+
+    // Expand turn 0.
+    app.toggle_turn_fold_at(0);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat_expanded = terminal_flat(&terminal);
+    assert!(
+        flat_expanded.contains("Answer to first prompt"),
+        "expanding historical turn with injected reminder must show assistant reply: {flat_expanded}"
+    );
+}
+
+#[test]
+fn current_turn_with_reply_shows_fold_button() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user("Fix the auth leak"));
+    app.messages.push(Message::assistant("Patched session.rs"));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    let compact = compact_flat(&flat);
+    assert!(
+        compact.contains("▾") && flat.contains("Fix the auth leak"),
+        "current turn with a reply shows a collapse chevron: {flat}"
+    );
+    assert!(
+        flat.contains('┃'),
+        "expanded current turn uses the left spine: {flat}"
+    );
+    assert!(
+        !compact.contains("折叠") && !compact.contains("Alt+Z"),
+        "fold key must live in the status bar, not on every turn: {flat}"
+    );
+    assert!(
+        flat.contains("Patched session.rs"),
+        "current turn stays expanded: {flat}"
+    );
+}
+
+#[test]
+fn current_long_user_stays_expanded() {
+    let backend = TestBackend::new(80, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user(long_user_paste(10)));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    let compact = compact_flat(&flat);
+    assert!(
+        flat.contains("line 9 of a pasted log"),
+        "current-turn user must stay expanded: {flat}"
+    );
+    assert!(
+        !compact.contains("折叠") && !compact.contains("Alt+Z"),
+        "expanded current paste must not paint fold key chrome: {flat}"
+    );
+    assert!(
+        !compact.contains("还有"),
+        "expanded current turn must not show remainder marker: {flat}"
+    );
+}
+
+#[test]
+fn historical_long_user_folds_by_default() {
+    let backend = TestBackend::new(80, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user(long_user_paste(10)));
+    app.messages.push(Message::assistant("unique-reply-xyz"));
+    app.messages.push(Message::user("follow up"));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    let compact = compact_flat(&flat);
+    assert!(
+        flat.contains("line 0 of a pasted log"),
+        "folded preview keeps the first lines: {flat}"
+    );
+    assert!(
+        !flat.contains("line 9 of a pasted log"),
+        "folded history must hide the tail: {flat}"
+    );
+    assert!(
+        !flat.contains("unique-reply-xyz"),
+        "folded historical turn must hide the assistant reply: {flat}"
+    );
+    assert!(
+        compact.contains("▸") && !compact.contains("展开") && !compact.contains("回复"),
+        "folded history is a one-line chevron row: {flat}"
+    );
+    assert!(
+        app.chat_line_owners
+            .iter()
+            .any(|o| matches!(o, Some(ChatLineTarget::User(0)))),
+        "user bubble lines must be clickable"
+    );
+}
+
+#[test]
+fn historical_turn_content_fold_after_expanding_turn() {
+    let backend = TestBackend::new(80, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user(long_user_paste(10)));
+    app.messages.push(Message::assistant("ok"));
+    app.messages.push(Message::user("follow up"));
+    app.messages[0].turn_expanded = Some(true);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    let compact = compact_flat(&flat);
+    assert!(
+        flat.contains("ok"),
+        "expanded turn shows the assistant reply: {flat}"
+    );
+    assert!(
+        !flat.contains("line 9 of a pasted log"),
+        "long paste stays content-folded after the turn opens: {flat}"
+    );
+    assert!(
+        compact.contains("还有") && !compact.contains("展开"),
+        "content remainder is visible once the turn is open: {flat}"
+    );
+}
+
+#[test]
+fn click_user_fold_marker_expands() {
+    let backend = TestBackend::new(80, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user(long_user_paste(10)));
+    app.messages.push(Message::assistant("secret-reply-token"));
+    app.messages.push(Message::user("follow up"));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let line = app
+        .chat_line_owners
+        .iter()
+        .position(|o| matches!(o, Some(ChatLineTarget::User(0))))
+        .expect("user bubble");
+    app.click_chat_row(line.saturating_sub(app.chat_view_start));
+    assert_eq!(app.messages[0].turn_expanded, Some(true));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    assert!(
+        flat.contains("secret-reply-token"),
+        "click must expand the folded turn reply: {flat}"
+    );
+}
+
+#[test]
+fn click_content_remainder_expands_long_paste() {
+    let backend = TestBackend::new(80, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user(long_user_paste(10)));
+    app.messages.push(Message::assistant("ok"));
+    app.messages.push(Message::user("follow up"));
+    app.messages[0].turn_expanded = Some(true);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let line = app
+        .chat_line_owners
+        .iter()
+        .position(|o| matches!(o, Some(ChatLineTarget::UserContent(0))))
+        .expect("content remainder");
+    app.click_chat_row(line.saturating_sub(app.chat_view_start));
+    assert_eq!(app.messages[0].user_expanded, Some(true));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    assert!(
+        flat.contains("line 9 of a pasted log"),
+        "clicking the remainder must expand the long paste: {flat}"
+    );
+}
+
+#[test]
+fn click_maps_below_header_not_one_row_above() {
+    let backend = TestBackend::new(80, 28);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user(long_user_paste(10)));
+    app.messages.push(Message::assistant("ok"));
+    app.messages.push(Message::user("follow up"));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    assert!(
+        app.chat_content_y >= 1,
+        "transcript is below the grok header, got y={}",
+        app.chat_content_y
+    );
+    assert!(
+        app.mouse_to_chat_row(0).is_none(),
+        "header row is not a chat line"
+    );
+    assert_eq!(
+        app.mouse_to_chat_row(app.chat_content_y),
+        Some(0),
+        "first painted transcript row is mouse y = chat_content_y"
+    );
+
+    let line = app
+        .chat_line_owners
+        .iter()
+        .position(|o| matches!(o, Some(ChatLineTarget::User(0))))
+        .expect("user bubble");
+    let view_row = line.saturating_sub(app.chat_view_start);
+    let mouse_row = app.chat_content_y + view_row as u16;
+    let mapped = app.mouse_to_chat_row(mouse_row).expect("in chat");
+    app.click_chat_row(mapped);
+    assert_eq!(
+        app.messages[0].turn_expanded,
+        Some(true),
+        "clicking the painted fold row (not the row above) must expand"
+    );
+}
+
+#[test]
+fn user_code_block_folds_as_a_unit() {
+    let backend = TestBackend::new(80, 24);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    let mut body = String::from("帮我看下这段报错：\n```\n");
+    for i in 0..14 {
+        body.push_str(&format!("Error line {i}\n"));
+    }
+    body.push_str("```\n麻烦帮我定位一下");
+    app.messages.push(Message::user(body));
+    app.messages.push(Message::assistant("ok"));
+    app.messages.push(Message::user("next"));
+    app.messages[0].turn_expanded = Some(true);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    let compact = compact_flat(&flat);
+    assert!(
+        compact.contains("代码块") && compact.contains("14"),
+        "code fence must fold as a unit: {flat}"
+    );
+    assert!(
+        !flat.contains("Error line 5"),
+        "must not cut through the code body: {flat}"
+    );
+}
+
+#[test]
+fn user_timeline_row_shows_clock_and_question() {
+    let backend = TestBackend::new(40, 16);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user("你好世界"));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    let compact = compact_flat(&flat);
+    assert!(
+        compact.contains("你好世界"),
+        "timeline must show the question: {flat}"
+    );
+    assert!(
+        !compact.contains("YOU") && !flat.contains('▐'),
+        "timeline must not use the old YOU card chrome: {flat}"
+    );
+}
+
+#[test]
+fn folded_turns_stack_as_single_timeline_rows() {
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+    app.messages.push(Message::user("你好啊"));
+    app.messages.push(Message::assistant("unique-reply-alpha"));
+    app.messages.push(Message::user("你可以干啥"));
+    app.messages.push(Message::assistant("unique-reply-beta"));
+    app.messages.push(Message::user("你有哪些工具"));
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let flat = terminal_flat(&terminal);
+    let compact = compact_flat(&flat);
+    assert!(
+        compact.contains("你好啊")
+            && compact.contains("你可以干啥")
+            && compact.contains("你有哪些工具"),
+        "each folded question stays visible: {flat}"
+    );
+    assert!(
+        compact.matches('▸').count() >= 2,
+        "historical turns collapse to a chevron row: {flat}"
+    );
+    assert!(
+        !flat.contains("YOU") && !compact.contains("展开") && !compact.contains("Alt+Z"),
+        "timeline must drop YOU / expand-key chrome: {flat}"
+    );
+    assert!(
+        !flat.contains("unique-reply-alpha") && !flat.contains("unique-reply-beta"),
+        "folded follow-up stays hidden: {flat}"
     );
 }

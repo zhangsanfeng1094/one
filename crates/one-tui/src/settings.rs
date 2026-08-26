@@ -1249,7 +1249,7 @@ impl App {
             "keep_recent" => {
                 self.start_settings_inline_edit(
                     "setting:compaction.keep_recent",
-                    "keep recent messages",
+                    "keep recent user turns",
                     self.compaction_keep_recent.to_string(),
                 );
                 RunOutcome::Noop
@@ -1281,7 +1281,7 @@ impl App {
             }
             "hint" => {
                 self.set_notice(
-                    "Auto-compact at threshold. Prune trims old tool bodies by turn age. Two-pass (off): background NOTE₁ then final summary.",
+                    "Auto-compact at threshold. keep_recent is user turns kept verbatim after /compact. Prune trims old tool bodies by turn age.",
                 );
                 RunOutcome::Noop
             }

@@ -67,12 +67,7 @@ impl super::App {
             .collect();
 
         // Expand `[文本.txt]` bodies for the model; strip image tokens (sent as blocks).
-        let text_bodies: std::collections::HashMap<u32, String> = self
-            .pending_texts
-            .drain(..)
-            .map(|t| (t.id, t.body))
-            .collect();
-        let plain = one_core::image::materialize_prompt_text(&text, &text_bodies);
+        let plain = self.take_materialized_text(&text);
         let expanded = if plain.contains('@') {
             expand_at_files(&plain)
         } else {
@@ -87,24 +82,38 @@ impl super::App {
     }
 
     pub(crate) fn submit_followup(&mut self) -> RunOutcome {
+        self.sync_pending_chips();
         let text = self.input.trim().to_string();
-        self.input.clear();
         if text.is_empty() {
             return RunOutcome::Noop;
         }
+        let expanded = self.take_materialized_text(&text);
+        self.input.clear();
         self.push_user(&text);
-        self.followup_pending = Some(text.clone());
-        RunOutcome::FollowUp(text)
+        self.followup_pending = Some(expanded.clone());
+        RunOutcome::FollowUp(expanded)
     }
 
     pub(crate) fn submit_steer(&mut self) -> RunOutcome {
+        self.sync_pending_chips();
         let text = self.input.trim().to_string();
-        self.input.clear();
         if text.is_empty() {
             return RunOutcome::Noop;
         }
+        let expanded = self.take_materialized_text(&text);
+        self.input.clear();
         self.push_user(&text);
-        self.steer_pending = Some(text.clone());
-        RunOutcome::Steer(text)
+        self.steer_pending = Some(expanded.clone());
+        RunOutcome::Steer(expanded)
+    }
+
+    /// Expand `[文本.N.txt]` chips for the agent; transcript keeps the compact token.
+    fn take_materialized_text(&mut self, text: &str) -> String {
+        let text_bodies: std::collections::HashMap<u32, String> = self
+            .pending_texts
+            .drain(..)
+            .map(|t| (t.id, t.body))
+            .collect();
+        one_core::image::materialize_prompt_text(text, &text_bodies)
     }
 }

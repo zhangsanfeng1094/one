@@ -5,6 +5,7 @@ pub mod bash_output;
 pub mod edit;
 pub mod edit_diff;
 pub mod find;
+pub mod glob;
 pub(crate) mod glob_util;
 pub mod grep;
 pub mod ls;
@@ -39,6 +40,7 @@ pub use bash_kill::BashKillTool;
 pub use bash_output::BashOutputTool;
 pub use edit::EditTool;
 pub use find::FindTool;
+pub use glob::GlobTool;
 pub use grep::GrepTool;
 pub use ls::LsTool;
 pub use memory_io::{

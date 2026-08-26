@@ -1,20 +1,58 @@
-//! Bottom status / footer line.
+//! Bottom status / footer (2 lines: identity + key badges).
 
-use ratatui::layout::Rect;
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::text::Span;
+use ratatui::widgets::Block;
 use ratatui::Frame;
 
 use crate::app::App;
 use crate::theme::Theme;
 
-use super::prompt::render_split_row;
+use super::prompt::{identity_spans, ops_spans, render_split_row};
 use super::SPINNER;
 
 pub(super) fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    frame.render_widget(Block::default().style(Theme::footer_bg()), area);
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Length(1)])
+        .split(area);
+
+    let ident_right = {
+        let mut right = ops_spans(app);
+        if let Some(pos) = scroll_position_label(app) {
+            if !right.is_empty() {
+                right.insert(0, Span::styled("  ", Theme::footer_bg()));
+            }
+            right.insert(0, Span::styled(pos, Theme::status_faint().bg(Theme::PANEL)));
+        }
+        right
+    };
+    render_split_row(frame, rows[0], identity_spans(app), ident_right);
+
     let (left, right) = status_spans(app);
-    // Content-measured right width — fixed 28 was too tight for think+usage and
-    // too loose when empty, and collided with left keys on narrow terminals.
-    render_split_row(frame, area, left, right);
+    render_split_row(frame, rows[1], left, right);
+}
+
+fn scroll_position_label(app: &App) -> Option<String> {
+    if !app.can_scroll() {
+        return None;
+    }
+    let total = app.chat_total_lines.max(1);
+    let view = app.chat_view_height.max(1);
+    let start = if app.follow_bottom {
+        total.saturating_sub(view)
+    } else {
+        app.chat_view_start
+    };
+    let shown = (start + view).min(total);
+    let max = total.saturating_sub(view).max(1);
+    let pct = if app.follow_bottom {
+        100
+    } else {
+        ((start as f64 / max as f64) * 100.0).round() as u16
+    };
+    Some(format!("{pct}% · {shown}/{total}"))
 }
 
 /// Sparse, context-aware status strip.
@@ -26,8 +64,8 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     // Key + label pairs, joined with double-space (no middle-dot soup).
     fn pair(key: &'static str, label: &'static str) -> [Span<'static>; 2] {
         [
-            Span::styled(key, Theme::status_key()),
-            Span::styled(label, Theme::status()),
+            Span::styled(format!(" {key} "), Theme::key_badge()),
+            Span::styled(format!(" {label}  "), Theme::key_badge_label()),
         ]
     }
 
@@ -43,25 +81,23 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     }
 
     if !app.follow_bottom && app.can_scroll() {
-        // chat_scroll is top-relative: 0 = top (oldest), max = bottom edge.
-        let max = app.max_scroll().max(1);
-        let pct = ((app.chat_scroll as f64 / max as f64) * 100.0).round() as u16;
-        let mut left = vec![Span::raw("  ")];
-        left.extend(pair("Shift+G", " latest  "));
-        left.extend(pair("wheel", " scroll"));
-        let right = vec![
-            Span::styled(format!("↑{pct}%"), Theme::status_faint()),
-            Span::raw("  "),
-        ];
-        return (left, right);
+        let mut left = vec![Span::raw(" ")];
+        left.extend(pair("Shift+G", "latest"));
+        left.extend(pair("wheel", "scroll"));
+        return (left, Vec::new());
     }
 
     if app.busy {
+        let compacting = app.busy_activity == "compacting";
         let mut left = vec![Span::raw("  ")];
         // Soft cancel vs hard exit — single Ctrl+C never exits (double-tap quit).
-        left.extend(pair("esc", " stop  "));
+        if !compacting {
+            left.extend(pair("esc", " stop  "));
+        }
         left.extend(pair("Ctrl+C", "×2 quit  "));
-        left.extend(pair("Ctrl+S", " steer"));
+        if !compacting {
+            left.extend(pair("Ctrl+S", " steer"));
+        }
         // Ops chips (MCP/bg) stay on meta; status only shows activity + stats.
         let mut right = status_stats_spans(app);
         if let Some((retry, max_retries, seconds)) = app.retry_wait_status() {
@@ -73,6 +109,16 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
             };
             right.insert(0, Span::raw("  "));
             right.insert(0, Span::styled(label, Theme::status().fg(Theme::WARNING)));
+        } else if compacting {
+            let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
+            right.insert(0, Span::raw("  "));
+            right.insert(
+                0,
+                Span::styled(
+                    format!("{spinner} compacting…"),
+                    Theme::status().fg(Theme::WARNING),
+                ),
+            );
         }
         if right.is_empty() {
             right.push(Span::styled("working", Theme::status_faint()));
@@ -87,9 +133,7 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     if app.transcript_browse_focused() {
         left.extend(pair("j/k", " nav  "));
         left.extend(pair("↵", " expand  "));
-        left.extend(pair("click", " toggle  "));
-        left.push(Span::styled(" │  ", Theme::status_faint()));
-        left.extend(pair("Ctrl+O", " last tool"));
+        left.extend(pair("Alt+Z", " fold"));
     } else {
         left.extend(pair("Ctrl+G", " settings"));
         left.push(Span::styled("  │  ", Theme::status_faint()));
@@ -111,26 +155,19 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
 /// current prompt size (`ctx`).
 fn status_stats_spans(app: &App) -> Vec<Span<'static>> {
     let mut right = Vec::new();
-    let mut parts: Vec<String> = Vec::new();
-
     if app.thinking_level != "off" {
-        // Default is collapsed; only badge when the user opted into full bodies.
         let vis = if app.show_thinking { "·full" } else { "" };
-        parts.push(format!("think:{}{vis}", app.thinking_level));
-    }
-
-    if let Some(ctx) = format_context_usage(app) {
-        parts.push(ctx);
-    }
-
-    if !parts.is_empty() {
-        right.push(Span::styled(parts.join("  "), Theme::status_faint()));
-        right.push(Span::raw("  ")); // trailing pad
+        right.push(Span::styled(
+            format!("think:{}{vis}", app.thinking_level),
+            Theme::status_faint().bg(Theme::PANEL),
+        ));
+        right.push(Span::raw("  "));
     }
     right
 }
 
 /// Last prompt / estimated context size (not session-cumulative billing).
+/// Token fill itself is painted on the header bar, not the footer.
 pub(super) fn format_context_usage(app: &App) -> Option<String> {
     if app.usage_tokens == 0 {
         return None;
@@ -179,7 +216,10 @@ mod usage_format_tests {
 
         let spans = status_stats_spans(&app);
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
-        assert!(text.contains("ctx 44k"), "status: {text}");
+        assert!(
+            !text.contains("ctx") && !text.contains("44k"),
+            "token fill belongs on the header, not footer stats: {text}"
+        );
         assert!(
             !text.contains('↑')
                 && !text.contains('↓')

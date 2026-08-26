@@ -1,7 +1,7 @@
 //! OpenCode-faithful chat chrome (dark `opencode` theme).
 //!
-//! - User: peach rail + warm elevated bubble (bold) — strongest content signal
-//! - Chat focus (j/k): blue rail + neutral wash — separate from user peach
+//! - User turns: timeline rows (`HH:MM  question  ▸`); expanded/focused get a `┃` spine
+//! - Chat focus (j/k): the same turn spine, not a second bubble style
 //! - Assistant: markdown body (headings, lists, code, tables), turn footer
 //! - Tool: `⚙ name detail` inline row (running / muted / error)
 //! - Prompt: left-border only + agent/model meta strip
@@ -63,7 +63,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     // Dock above the prompt (priority: HITL select > `/` command menu).
     // Centered float remains for Settings (Ctrl+G) and sessions/tree/etc.
     let input_lines = app.input_line_count() as u16;
-    let prompt_h = (input_lines + 2).clamp(3, 8).saturating_add(1); // box + meta
+    let prompt_h = (input_lines + 2).clamp(3, 8); // input box only; identity lives on the footer
     let select_h = app.select_dock_height();
     let slash_h = if select_h == 0 {
         app.slash_dock_height()
@@ -77,8 +77,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
             Constraint::Length(1),        // grok-build top header (path + context)
             Constraint::Min(3),           // transcript
             Constraint::Length(dock_h),   // select or `/` menu (0 when closed)
-            Constraint::Length(prompt_h), // prompt box + agent meta
-            Constraint::Length(1),        // footer
+            Constraint::Length(prompt_h), // prompt box
+            Constraint::Length(2),        // footer (identity + keys)
         ])
         .split(frame.area());
 
@@ -96,7 +96,13 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     draw_toast(frame, frame.area(), app);
 
     // Floating modal on top (Settings, sessions, …) — not used for `/`.
-    if let Some(menu) = &app.float {
+    if app
+        .float
+        .as_ref()
+        .is_some_and(|m| m.kind == FloatKind::Context)
+    {
+        float_menu::draw_context_float(frame, frame.area(), app);
+    } else if let Some(menu) = &app.float {
         draw_float_menu(frame, frame.area(), menu);
     }
 }

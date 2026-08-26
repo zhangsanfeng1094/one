@@ -19,6 +19,14 @@ pub fn context_message_entries(entries: &[SessionEntry], leaf_id: &str) -> Vec<S
         .collect()
 }
 
+/// Full leaf→root path for the **UI transcript**.
+///
+/// Unlike [`build_context_entries`], a compaction does **not** drop earlier
+/// turns. Those stay visible; the compaction entry is a marker in place.
+pub fn build_transcript_entries(entries: &[SessionEntry], leaf_id: &str) -> Vec<SessionEntry> {
+    walk_to_root(entries, leaf_id)
+}
+
 fn entry_produces_message(entry: &SessionEntry) -> bool {
     match entry {
         SessionEntry::Message { .. }
@@ -328,5 +336,38 @@ mod tests {
         };
         assert!(t0.contains("second"));
         assert!(!t0.contains("first"));
+    }
+
+    #[test]
+    fn transcript_keeps_turns_before_compaction() {
+        let m0 = msg(None, "u0");
+        let m0_id = m0.id().to_string();
+        let m1 = msg(Some(m0_id.clone()), "u1");
+        let m1_id = m1.id().to_string();
+        let m2 = msg(Some(m1_id.clone()), "u2");
+        let m2_id = m2.id().to_string();
+        let mut compact_base = new_entry_base(Some(m2_id.clone()));
+        compact_base.id = "compact1".into();
+        let compact = SessionEntry::Compaction {
+            base: compact_base,
+            summary: "early".into(),
+            first_kept_entry_id: m2_id.clone(),
+            tokens_before: 9_000,
+            details: None,
+        };
+        let m3 = msg(Some("compact1".into()), "u3");
+        let m3_id = m3.id().to_string();
+        let entries = vec![m0, m1, m2, compact, m3];
+
+        let llm = build_context_entries(&entries, &m3_id);
+        assert_eq!(llm.len(), 3); // compact + m2 + m3
+        assert!(matches!(llm[0], SessionEntry::Compaction { .. }));
+
+        let ui = build_transcript_entries(&entries, &m3_id);
+        assert_eq!(ui.len(), 5, "UI keeps u0/u1 plus the compact marker");
+        assert_eq!(ui[0].id(), m0_id);
+        assert_eq!(ui[1].id(), m1_id);
+        assert!(matches!(ui[3], SessionEntry::Compaction { .. }));
+        assert_eq!(ui[4].id(), m3_id);
     }
 }

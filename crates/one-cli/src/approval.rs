@@ -411,7 +411,7 @@ impl PermissionGate {
 }
 
 fn is_path_read_tool(name: &str) -> bool {
-    matches!(name, "read" | "grep" | "find" | "ls")
+    matches!(name, "read" | "grep" | "glob" | "find" | "ls")
 }
 
 fn is_path_write_tool(name: &str) -> bool {
@@ -438,7 +438,9 @@ fn path_read_escalate_env_enabled() -> bool {
 fn path_from_call(call: &ToolCall) -> std::result::Result<Option<String>, String> {
     match path_arg(&call.arguments)? {
         Some(p) => Ok(Some(p.to_string())),
-        None if matches!(call.name.as_str(), "grep" | "find" | "ls") => Ok(Some(".".into())),
+        None if matches!(call.name.as_str(), "grep" | "glob" | "find" | "ls") => {
+            Ok(Some(".".into()))
+        }
         None => Ok(None),
     }
 }
@@ -1022,11 +1024,53 @@ mod tests {
         dir
     }
 
+    fn temp_outside() -> PathBuf {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let dir = home.join(format!(
+            ".one-gate-outside-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[tokio::test]
+    async fn path_tmp_read_allowed_without_prompt() {
+        let ws = temp_outside();
+        let tmp_file = std::env::temp_dir().join(format!("one-tmp-img-{}.png", std::process::id()));
+        std::fs::write(&tmp_file, b"png").unwrap();
+
+        let policy = PathPolicy::workspace(ws.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            true, // interactive
+            Some(policy),
+        );
+        let d = gate
+            .check(&ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: json!({ "path": tmp_file.to_str().unwrap() }),
+            })
+            .await;
+        assert_eq!(d, ToolGateDecision::Allow);
+        assert!(gate.poll_request().is_none());
+
+        let _ = std::fs::remove_file(&tmp_file);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
     #[tokio::test]
     async fn path_fail_closed_no_prompt() {
         let ws = temp_workspace();
-        let outside = std::env::temp_dir().join(format!("one-out-{}", std::process::id()));
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = temp_outside();
         let file = outside.join("x.txt");
         std::fs::write(&file, "hi").unwrap();
 
@@ -1058,8 +1102,7 @@ mod tests {
     #[tokio::test]
     async fn path_auto_mode_hard_deny() {
         let ws = temp_workspace();
-        let outside = std::env::temp_dir().join(format!("one-out-auto-{}", std::process::id()));
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = temp_outside();
         let file = outside.join("x.txt");
         std::fs::write(&file, "hi").unwrap();
 
@@ -1086,8 +1129,7 @@ mod tests {
     #[tokio::test]
     async fn path_once_grant_visible_to_cloned_policy() {
         let ws = temp_workspace();
-        let outside = std::env::temp_dir().join(format!("one-out-once-{}", std::process::id()));
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = temp_outside();
         let file = outside.join("x.txt");
         std::fs::write(&file, "hi").unwrap();
 
@@ -1143,8 +1185,7 @@ mod tests {
     #[tokio::test]
     async fn path_always_does_not_enable_session_auto() {
         let ws = temp_workspace();
-        let outside = std::env::temp_dir().join(format!("one-out-alw-{}", std::process::id()));
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = temp_outside();
         let file = outside.join("x.txt");
         std::fs::write(&file, "hi").unwrap();
 
@@ -1190,8 +1231,7 @@ mod tests {
     #[tokio::test]
     async fn path_write_outside_hard_deny() {
         let ws = temp_workspace();
-        let outside = std::env::temp_dir().join(format!("one-out-w-{}", std::process::id()));
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = temp_outside();
         let file = outside.join("x.txt");
 
         let policy = PathPolicy::workspace(ws.clone());
@@ -1254,8 +1294,7 @@ mod tests {
     #[tokio::test]
     async fn path_session_root_grant() {
         let ws = temp_workspace();
-        let outside = std::env::temp_dir().join(format!("one-out-sess-{}", std::process::id()));
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = temp_outside();
         let file = outside.join("a.txt");
         let other = outside.join("b.txt");
         std::fs::write(&file, "a").unwrap();

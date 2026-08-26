@@ -61,6 +61,15 @@ impl super::App {
             return;
         }
 
+        if Self::is_fold_key(key) {
+            self.toggle_focused_user_fold();
+            return;
+        }
+        if Self::is_fold_all_key(key) {
+            self.toggle_all_user_folds();
+            return;
+        }
+
         match key.code {
             KeyCode::Esc => {
                 if self.slash_menu_visible() {

@@ -239,6 +239,7 @@ pub(crate) fn is_ui_slash(text: &str) -> bool {
             | "/logout"
             | "/thinking"
             | "/compact"
+            | "/context"
             | "/settings"
             | "/skills"
             | "/agents"

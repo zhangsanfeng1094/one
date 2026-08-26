@@ -12,7 +12,7 @@
 //! | System | rare meta lines | only if agent also has it (usually no) |
 //! | Alert | turn / tool errors, UI cards | **never** — display only |
 
-use std::time::Instant;
+use std::time::{Instant, SystemTime};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MessageRole {
@@ -43,8 +43,12 @@ pub enum AlertLevel {
 /// Click target for a rendered chat display line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatLineTarget {
-    /// Message index (tool row body/header, thinking, alert).
+    /// Message index (tool row body/header, thinking, alert, info card).
     Message(usize),
+    /// User turn timeline row (and expanded body); click toggles the Q&A turn.
+    User(usize),
+    /// Long-paste remainder row inside a user bubble; click toggles content fold.
+    UserContent(usize),
     /// Multi-tool group chip / expanded group header; value is streak start index.
     ToolGroup(usize),
 }
@@ -73,6 +77,15 @@ pub struct Message {
     pub tool_ungroup: bool,
     /// Thinking block expanded (Thinking role); also reused as expand flag.
     pub thinking_expanded: bool,
+    /// Info / intent reminder card expanded (User role, default collapsed).
+    pub info_expanded: bool,
+    /// User-bubble fold override (`None` = auto: current expanded, history folds).
+    pub user_expanded: Option<bool>,
+    /// Turn fold override (`None` = auto: current expanded, history folds).
+    /// When folded, assistant / tools / thinking after this user stay hidden.
+    pub turn_expanded: Option<bool>,
+    /// Wall clock for the timeline `HH:MM` column (UI only).
+    pub created_at: SystemTime,
     /// Alert severity (Alert role only).
     pub alert_level: Option<AlertLevel>,
     /// Live subagent job id for `task` — click opens `/tasks` detail (not `/ps`).
@@ -97,6 +110,10 @@ fn blank_message(role: MessageRole, content: String) -> Message {
         tool_expanded: false,
         tool_ungroup: false,
         thinking_expanded: false,
+        info_expanded: false,
+        user_expanded: None,
+        turn_expanded: None,
+        created_at: SystemTime::now(),
         alert_level: None,
         tool_job_id: None,
         started_at: None,
@@ -127,6 +144,64 @@ impl Message {
 
     pub fn system(content: impl Into<String>) -> Self {
         blank_message(MessageRole::System, content.into())
+    }
+
+    /// One-line TUI marker after context compaction (not the LLM summary).
+    pub const CONTEXT_COMPACTED_PREFIX: &str = "[Context compacted]";
+    /// In-progress compact marker while the LLM summary is running.
+    pub const CONTEXT_COMPACTING_PREFIX: &str = "[Context compacting]";
+
+    pub fn format_token_count(n: u64) -> String {
+        if n >= 1_000 {
+            format!("{}k", n / 1_000)
+        } else {
+            n.to_string()
+        }
+    }
+
+    pub fn context_compacted_text(
+        tokens_before: u64,
+        tokens_after: u64,
+        kept_turns: usize,
+    ) -> String {
+        let mut parts = vec![Self::CONTEXT_COMPACTED_PREFIX.to_string()];
+        if kept_turns > 0 {
+            parts.push(format!("kept last {kept_turns} turns"));
+        }
+        if tokens_before > 0 && tokens_after > 0 {
+            parts.push(format!(
+                "{} → ~{}",
+                Self::format_token_count(tokens_before),
+                Self::format_token_count(tokens_after)
+            ));
+        } else if tokens_before >= 1_000 {
+            parts.push(format!("{}k tokens before", tokens_before / 1_000));
+        } else if tokens_before > 0 {
+            parts.push(format!("{tokens_before} tokens before"));
+        }
+        parts.join(" · ")
+    }
+
+    pub fn is_context_compacted(content: &str) -> bool {
+        content.starts_with(Self::CONTEXT_COMPACTED_PREFIX)
+    }
+
+    pub fn is_context_compacting(content: &str) -> bool {
+        content.starts_with(Self::CONTEXT_COMPACTING_PREFIX)
+    }
+
+    pub fn context_compacting() -> Self {
+        blank_message(
+            MessageRole::System,
+            Self::CONTEXT_COMPACTING_PREFIX.to_string(),
+        )
+    }
+
+    pub fn context_compacted(tokens_before: u64, tokens_after: u64, kept_turns: usize) -> Self {
+        blank_message(
+            MessageRole::System,
+            Self::context_compacted_text(tokens_before, tokens_after, kept_turns),
+        )
     }
 
     pub fn tool(name: impl Into<String>, detail: impl Into<String>, status: ToolStatus) -> Self {

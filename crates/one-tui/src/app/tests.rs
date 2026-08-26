@@ -74,6 +74,72 @@ fn settings_tool_output_panel_opens() {
 }
 
 #[test]
+fn compact_marker_stays_in_existing_transcript() {
+    let mut app = App::new("test");
+    app.push_user("old question");
+    app.push_assistant("old answer");
+    app.push_user("new question");
+    app.push_compact_marker_before_last_user(12_000, 2_000, 12);
+
+    let roles: Vec<_> = app.messages.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![
+            MessageRole::User,
+            MessageRole::Assistant,
+            MessageRole::System,
+            MessageRole::User,
+        ]
+    );
+    assert_eq!(app.messages[0].content, "old question");
+    assert_eq!(app.messages[1].content, "old answer");
+    assert!(Message::is_context_compacted(&app.messages[2].content));
+    assert!(app.messages[2].content.contains("12k"));
+    assert!(app.messages[2].content.contains("~2k"));
+    assert!(app.messages[2].content.contains("kept last 12 turns"));
+    assert_eq!(app.messages[3].content, "new question");
+
+    let before = app.messages.len();
+    app.push_compact_marker_before_last_user(12_000, 2_000, 12);
+    assert_eq!(
+        app.messages.len(),
+        before,
+        "duplicate compact markers skipped"
+    );
+}
+
+#[test]
+fn compacting_marker_becomes_result() {
+    let mut app = App::new("test");
+    app.push_user("old question");
+    app.push_assistant("old answer");
+    app.push_compacting_marker();
+    assert!(Message::is_context_compacting(
+        &app.messages.last().unwrap().content
+    ));
+    app.push_compacting_marker();
+    assert_eq!(
+        app.messages.len(),
+        3,
+        "duplicate compacting markers skipped"
+    );
+
+    app.finish_compacting_marker(80_000, 12_000, 2);
+    let last = app.messages.last().unwrap();
+    assert!(Message::is_context_compacted(&last.content));
+    assert!(!Message::is_context_compacting(&last.content));
+    assert!(last.content.contains("kept last 2 turns"));
+    assert!(last.content.contains("80k"));
+    assert!(last.content.contains("~12k"));
+
+    app.push_compacting_marker();
+    app.cancel_compacting_marker();
+    assert!(Message::is_context_compacted(
+        &app.messages.last().unwrap().content
+    ));
+}
+
+#[test]
 fn settings_compaction_panel_opens() {
     let mut app = App::new("test");
     app.set_compaction_settings(true, 0.8, None, 10, true, 3, false, 0.10);
@@ -900,6 +966,7 @@ fn ui_slash_commands_skip_prompt_history_and_chat() {
         "/agents",
         "/plan",
         "/compact",
+        "/context",
     ] {
         app.input = cmd.into();
         // Bare `/new` / `/plan` still open the slash menu; complete+submit
@@ -951,6 +1018,67 @@ fn ui_slash_commands_skip_prompt_history_and_chat() {
         vec!["real prompt".to_string(), "hello".to_string()]
     );
     assert_eq!(app.messages.last().unwrap().content, "hello");
+}
+
+#[test]
+fn context_float_enter_and_esc_close() {
+    let mut app = App::new("test");
+    app.open_context_float(crate::context::ContextSnapshot {
+        used: 100,
+        total: 1_000,
+        system_prompt_tokens: 40,
+        tool_definitions_count: 1,
+        tool_definitions_tokens: 10,
+        compaction_count: 0,
+        turn_count: 1,
+        tool_call_count: 0,
+        message_count: 1,
+        message_tokens: 60,
+        reasoning_tokens: 0,
+        free_tokens: 900,
+        usage_pct: 10,
+        auto_compact_threshold_percent: 85,
+        used_estimated: true,
+        auto_compact_enabled: true,
+        model: "test".into(),
+        usage_categories: vec![],
+    });
+    assert_eq!(app.float.as_ref().unwrap().kind, FloatKind::Context);
+    assert!(app.context_info.is_some());
+
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)),
+        RunOutcome::Noop
+    ));
+    assert!(app.float.is_none());
+    assert!(app.context_info.is_none());
+
+    app.open_context_float(crate::context::ContextSnapshot {
+        used: 100,
+        total: 1_000,
+        system_prompt_tokens: 40,
+        tool_definitions_count: 1,
+        tool_definitions_tokens: 10,
+        compaction_count: 0,
+        turn_count: 1,
+        tool_call_count: 0,
+        message_count: 1,
+        message_tokens: 60,
+        reasoning_tokens: 0,
+        free_tokens: 900,
+        usage_pct: 10,
+        auto_compact_threshold_percent: 85,
+        used_estimated: true,
+        auto_compact_enabled: true,
+        model: "test".into(),
+        usage_categories: vec![],
+    });
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+        RunOutcome::Noop
+    ));
+    assert!(app.float.is_none());
+    assert!(app.context_info.is_none());
 }
 
 #[test]
@@ -1353,6 +1481,108 @@ fn transcript_browse_unfocuses_prompt_caret_until_typing() {
 }
 
 #[test]
+fn typing_z_inserts_into_input() {
+    let mut app = App::new("test");
+    app.messages.push(Message::user("q"));
+    app.messages.push(Message::assistant("a"));
+    app.input.clear();
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::NONE));
+    assert_eq!(app.input, "z", "plain z must type, not fold");
+    assert_eq!(app.messages[0].turn_expanded, None);
+}
+
+#[test]
+fn alt_z_toggles_focused_user_fold() {
+    let mut app = App::new("test");
+    let long = (0..10)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.messages.push(Message::user(&long));
+    app.messages.push(Message::assistant("ok"));
+    app.messages.push(Message::user("short"));
+    app.input = "draft".into();
+    app.input_cursor = 5;
+    app.chat_focus = Some(0);
+    assert_eq!(app.messages[0].turn_expanded, None);
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::ALT));
+    assert_eq!(app.messages[0].turn_expanded, Some(true));
+    assert_eq!(app.input, "draft", "Alt+Z must not mutate the draft");
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::ALT));
+    assert_eq!(app.messages[0].turn_expanded, Some(false));
+}
+
+#[test]
+fn alt_z_falls_back_to_content_fold_when_turn_has_no_reply() {
+    let mut app = App::new("test");
+    let long = (0..10)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.messages.push(Message::user(&long));
+    app.input.clear();
+    app.chat_focus = Some(0);
+    assert_eq!(app.messages[0].user_expanded, None);
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::ALT));
+    assert_eq!(app.messages[0].user_expanded, Some(false));
+    app.handle_key(key(KeyCode::Char('z'), KeyModifiers::ALT));
+    assert_eq!(app.messages[0].user_expanded, Some(true));
+}
+
+#[test]
+fn alt_shift_z_toggles_all_historical_user_folds() {
+    let mut app = App::new("test");
+    let long = (0..10)
+        .map(|i| format!("line {i}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    app.messages.push(Message::user(&long));
+    app.messages.push(Message::assistant("a"));
+    app.messages.push(Message::user(&long));
+    app.messages.push(Message::assistant("b"));
+    app.messages.push(Message::user("now"));
+    app.input = "keep".into();
+    app.handle_key(key(
+        KeyCode::Char('Z'),
+        KeyModifiers::ALT | KeyModifiers::SHIFT,
+    ));
+    assert_eq!(app.messages[0].turn_expanded, Some(true));
+    assert_eq!(app.messages[2].turn_expanded, Some(true));
+    assert_eq!(app.messages[4].turn_expanded, None);
+    assert_eq!(app.input, "keep");
+    app.handle_key(key(KeyCode::Char('Z'), KeyModifiers::ALT));
+    assert_eq!(app.messages[0].turn_expanded, Some(false));
+    assert_eq!(app.messages[2].turn_expanded, Some(false));
+    assert_eq!(app.messages[4].turn_expanded, None);
+}
+
+#[test]
+fn folded_turn_hides_tools_from_jk_focus() {
+    let mut app = App::new("test");
+    app.messages.push(Message::user("q1"));
+    app.messages
+        .push(Message::tool("bash", "ls", ToolStatus::Done));
+    app.messages.push(Message::assistant("ok"));
+    app.messages.push(Message::user("q2"));
+    let focusable = app.focusable_message_indices();
+    assert!(
+        !focusable.contains(&1),
+        "tools inside a folded historical turn must not be j/k targets: {focusable:?}"
+    );
+    assert!(
+        focusable.contains(&0),
+        "folded user question stays focusable"
+    );
+    assert!(focusable.contains(&3), "current user stays focusable");
+    app.messages[0].turn_expanded = Some(true);
+    let focusable = app.focusable_message_indices();
+    assert!(
+        focusable.contains(&1),
+        "expanding the turn restores tool focus: {focusable:?}"
+    );
+}
+
+#[test]
 fn main_input_left_right_moves_cursor_and_inserts_mid() {
     let mut app = App::new("test");
     for ch in "hello".chars() {
@@ -1611,9 +1841,15 @@ fn long_paste_becomes_text_chip() {
     let mut app = App::new("test");
     let long = "line\n".repeat(30);
     app.handle_paste(&long);
+    assert!(app.input.contains("[文本"), "input={}", app.input);
     assert!(
-        app.input.contains(one_core::image::TEXT_TOKEN),
-        "input={}",
+        app.input.contains("lines"),
+        "chip should show line count, input={}",
+        app.input
+    );
+    assert!(
+        app.input.contains("B") || app.input.contains("KB"),
+        "chip should show size, input={}",
         app.input
     );
     assert!(!app.input.contains("line\nline"));
@@ -1624,6 +1860,62 @@ fn long_paste_becomes_text_chip() {
     app.pop_input();
     assert!(app.input.is_empty() || !app.input.contains("文本"));
     assert!(app.pending_texts.is_empty());
+}
+
+#[test]
+fn unbracketed_key_burst_collapses_like_bracketed_paste() {
+    use crate::paste_burst::{coalesce_events, CoalescedEvent};
+    let mut events = Vec::new();
+    for line in 0..20 {
+        for ch in format!("line{line}").chars() {
+            events.push(crossterm::event::Event::Key(key(
+                KeyCode::Char(ch),
+                KeyModifiers::NONE,
+            )));
+        }
+        events.push(crossterm::event::Event::Key(key(
+            KeyCode::Enter,
+            KeyModifiers::NONE,
+        )));
+    }
+    let coalesced = coalesce_events(events);
+    assert_eq!(coalesced.len(), 1, "{coalesced:?}");
+    let CoalescedEvent::Paste(text) = &coalesced[0] else {
+        panic!("expected one paste block, got {coalesced:?}");
+    };
+    let mut app = App::new("test");
+    app.handle_paste(text);
+    assert!(
+        app.input.contains("[文本") && app.input.contains("lines"),
+        "burst should collapse to sized chip, input={}",
+        app.input
+    );
+    assert!(!app.input.contains("line0"), "raw body must not tile input");
+}
+
+#[test]
+fn followup_expands_text_chip() {
+    let mut app = App::new("test");
+    app.attach_text_blob("FOLLOWUP_BODY_XYZ".into());
+    match app.submit_followup() {
+        RunOutcome::FollowUp(t) => {
+            assert!(t.contains("FOLLOWUP_BODY_XYZ"), "{t}");
+            assert!(!t.contains("文本"), "{t}");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let shown = &app.messages.last().unwrap().content;
+    assert!(
+        shown.contains("[文本") && (shown.contains("line") || shown.contains("lines")),
+        "{shown}"
+    );
+}
+
+#[test]
+fn paste_keeps_tabs() {
+    let mut app = App::new("test");
+    app.handle_paste("a\tb");
+    assert_eq!(app.input, "a\tb");
 }
 
 #[test]
@@ -1640,9 +1932,12 @@ fn submit_expands_text_chip_for_agent() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    // Transcript stays compact.
+    // Transcript stays compact but still shows lines / size.
     let shown = &app.messages.last().unwrap().content;
-    assert!(shown.contains(one_core::image::TEXT_TOKEN), "{shown}");
+    assert!(
+        shown.contains("[文本") && shown.contains("lines"),
+        "{shown}"
+    );
     assert!(!shown.contains("SECRET_BODY_XYZ"), "{shown}");
 }
 

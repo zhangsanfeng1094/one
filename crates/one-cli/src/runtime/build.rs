@@ -291,6 +291,7 @@ impl AppRuntime {
                 // Set properly after refresh_web_search_backend (capability + feature).
                 server_search: false,
                 empty_response_retries,
+                compaction_config: Some(user_settings.compaction_config(0)),
             },
             tools,
         );

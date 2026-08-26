@@ -209,21 +209,34 @@ pub fn strip_image_tokens(text: &str) -> String {
     strip_chips(text, ChipKind::Image)
 }
 
-// ── Long-text paste chips (`[文本.txt]` / `[文本.N.txt]`) ───────────────────
+// ── Long-text paste chips ───────────────────────────────────────────────────
+//
+// Stored + painted as `[文本 · 12 lines · 3.4KB]` / `[文本.2 · 12 lines · 3KB]`.
+// Legacy `[文本.txt]` / `[文本.N.txt]` still parse (history / tests).
 
-/// Prompt placeholder for long pasted text id 1.
+/// Legacy prompt placeholder for long pasted text id 1.
 pub const TEXT_TOKEN: &str = "[文本.txt]";
 
 /// Collapse paste into a chip when it exceeds this many chars **or** lines.
 pub const LONG_PASTE_CHAR_THRESHOLD: usize = 120;
 pub const LONG_PASTE_LINE_THRESHOLD: usize = 4;
 
-/// Placeholder for text paste `id` (1-based).
+/// Placeholder for text paste `id` (1-based), without size (legacy / tests).
 pub fn text_token(id: u32) -> String {
     if id <= 1 {
         TEXT_TOKEN.to_string()
     } else {
         format!("[文本.{id}.txt]")
+    }
+}
+
+/// Chip label with line count and size, e.g. `[文本 · 12 lines · 3.4KB]`.
+pub fn text_token_labeled(id: u32, body: &str) -> String {
+    let summary = text_blob_summary(body);
+    if id <= 1 {
+        format!("[文本 · {summary}]")
+    } else {
+        format!("[文本.{id} · {summary}]")
     }
 }
 
@@ -244,19 +257,29 @@ pub fn should_collapse_paste(text: &str) -> bool {
         || (lines >= 2 && chars >= 80)
 }
 
-/// Short label for notices / tooltips, e.g. `12 lines · 3.4KB`.
+/// Short label for chips / notices, e.g. `12 lines · 3.4KB`.
 pub fn text_blob_summary(body: &str) -> String {
     let lines = body
         .lines()
         .count()
         .max(if body.is_empty() { 0 } else { 1 });
-    let bytes = body.len();
-    let size = if bytes < 1024 {
+    let line_word = if lines == 1 { "line" } else { "lines" };
+    format!("{lines} {line_word} · {}", format_blob_size(body.len()))
+}
+
+/// Human size: `200B`, `3.4KB`, `12KB`, `1.2MB`.
+pub fn format_blob_size(bytes: usize) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    if bytes < 1024 {
         format!("{bytes}B")
+    } else if (bytes as f64) < 10.0 * KB {
+        format!("{:.1}KB", bytes as f64 / KB)
+    } else if (bytes as f64) < MB {
+        format!("{}KB", ((bytes as f64 / KB) + 0.5).floor() as usize)
     } else {
-        format!("{}KB", (bytes + 512) / 1024)
-    };
-    format!("{lines} lines · {size}")
+        format!("{:.1}MB", bytes as f64 / MB)
+    }
 }
 
 pub fn text_token_ids_in(text: &str) -> Vec<u32> {
@@ -306,21 +329,47 @@ pub fn text_token_backspace_len(s: &str) -> Option<usize> {
 }
 
 pub fn parse_text_token_at(s: &str) -> Option<(u32, usize)> {
-    let prefix = "[文本.";
-    let suffix = ".txt]";
-    if let Some(after) = s.strip_prefix(prefix) {
-        if let Some(end) = after.find(suffix) {
-            let num = &after[..end];
-            if !num.is_empty() && num.chars().all(|c| c.is_ascii_digit()) {
-                if let Ok(id) = num.parse::<u32>() {
-                    if id >= 1 {
-                        let len = prefix.len() + num.len() + suffix.len();
-                        return Some((id, len));
+    const NUM_PREFIX: &str = "[文本.";
+    const LEGACY_SUFFIX: &str = ".txt]";
+    const META_SEP: &str = " · ";
+    const LABEL_PREFIX: &str = "[文本 · ";
+
+    // `[文本.N.txt]` or `[文本.N · 12 lines · 3KB]`
+    if let Some(after) = s.strip_prefix(NUM_PREFIX) {
+        let digit_end = after
+            .bytes()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(after.len());
+        if digit_end > 0 {
+            if let Ok(id) = after[..digit_end].parse::<u32>() {
+                if id >= 1 {
+                    let rest = &after[digit_end..];
+                    if rest.starts_with(LEGACY_SUFFIX) {
+                        return Some((id, NUM_PREFIX.len() + digit_end + LEGACY_SUFFIX.len()));
+                    }
+                    if let Some(meta) = rest.strip_prefix(META_SEP) {
+                        if let Some(end) = meta.find(']') {
+                            if !meta[..end].contains('[') {
+                                return Some((
+                                    id,
+                                    NUM_PREFIX.len() + digit_end + META_SEP.len() + end + 1,
+                                ));
+                            }
+                        }
                     }
                 }
             }
         }
     }
+    // `[文本 · 12 lines · 3.4KB]`
+    if let Some(after) = s.strip_prefix(LABEL_PREFIX) {
+        if let Some(end) = after.find(']') {
+            if !after[..end].contains('[') {
+                return Some((1, LABEL_PREFIX.len() + end + 1));
+            }
+        }
+    }
+    // Legacy `[文本.txt]`
     if s.starts_with(TEXT_TOKEN) {
         return Some((1, TEXT_TOKEN.len()));
     }
@@ -669,6 +718,11 @@ mod tests {
         assert!(prompt.contains("please"));
         assert!(!prompt.contains("文本"));
         assert!(!prompt.contains("图片"));
+
+        let labeled = text_token_labeled(1, "LINE1\nLINE2");
+        let prompt2 = materialize_prompt_text(&format!("see {labeled} please"), &bodies);
+        assert!(prompt2.contains("LINE1"));
+        assert!(!prompt2.contains("文本"));
     }
 
     #[test]
@@ -677,5 +731,32 @@ mod tests {
         let n = text_token_backspace_len(s).unwrap();
         assert_eq!(&s[..s.len() - n], "hi");
         assert_eq!(paste_chip_backspace_len(s), Some(n));
+    }
+
+    #[test]
+    fn labeled_text_token_parses_and_backspaces() {
+        let tok = text_token_labeled(1, &"x\n".repeat(12));
+        assert!(tok.starts_with("[文本 · "));
+        assert!(tok.contains("lines"));
+        assert!(tok.ends_with(']'));
+        let (id, len) = parse_text_token_at(&tok).unwrap();
+        assert_eq!(id, 1);
+        assert_eq!(len, tok.len());
+
+        let tok2 = text_token_labeled(2, "hello world this is a blob");
+        let (id2, len2) = parse_text_token_at(&tok2).unwrap();
+        assert_eq!(id2, 2);
+        assert_eq!(len2, tok2.len());
+
+        let s = format!("hi {tok2} ");
+        let n = text_token_backspace_len(&s).unwrap();
+        assert_eq!(&s[..s.len() - n], "hi");
+    }
+
+    #[test]
+    fn blob_size_format() {
+        assert_eq!(format_blob_size(200), "200B");
+        assert_eq!(format_blob_size(1536), "1.5KB");
+        assert_eq!(format_blob_size(12 * 1024), "12KB");
     }
 }

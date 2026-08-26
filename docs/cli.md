@@ -97,7 +97,7 @@ one --max-turns 16           # 单 prompt 最大 tool 循环
 
 ## 权限与路径沙箱
 
-默认 **`workspace-write`**：`read` / `write` / `edit` / `grep` / `find` / `ls` 只能访问：
+默认 **`workspace-write`**：`read` / `write` / `edit` / `grep` / `glob` / `ls` 只能访问：
 
 | 范围 | 权限 |
 |------|------|
@@ -111,7 +111,7 @@ one --max-turns 16           # 单 prompt 最大 tool 循环
 
 ### 越界读审批（交互）
 
-Interactive 模式下，`read` / `grep` / `find` / `ls` 访问工作区外路径时弹出 **路径读审批**（与 bash 高危审批同一 Select 通道）：
+Interactive 模式下，`read` / `grep` / `glob` / `ls` 访问工作区外路径时弹出 **路径读审批**（与 bash 高危审批同一 Select 通道）：
 
 | 选项 | 语义 |
 |------|------|
@@ -544,7 +544,7 @@ tail -n 5 ~/.one/agent/cache-debug/log.jsonl
 
 ### 工具输出截断（OpenCode 统一策略）
 
-所有工具结果（`bash` / `grep` / `find` / MCP …）走同一条管道：
+所有工具结果（`bash` / `grep` / `glob` / MCP …）走同一条管道：
 
 | 规则 | 默认 |
 |------|------|
@@ -578,10 +578,10 @@ spill 目录在 `~/.one/agent/tool-outputs/` 下，默认对模型 **只读**，
 |------|------|
 | 自动压缩阈值 | **模型 `context_window` 的 85%**（未知窗口时回退 **80 000** tokens） |
 | Token 估算 | 优先用上次 API 返回的 prompt size；否则 messages 字符数 / 4 |
-| 保留最近消息 | 12 条（不拆断 tool_call / tool_result 对） |
+| 保留最近回合 | 最近 **2 轮用户 turn**（一轮 = User + 其后 assistant/工具；不拆断 tool_call / tool_result 对） |
 | Prune | 每轮按 user-turn 年龄 soft-trim / hard-clear（最近 3 turn 不裁） |
 | 两遍摘要 | 默认关；开启后阈值前 10% 窗口后台 Pass-1 |
-| 手动 | `/compact [instructions]`（指令进入摘要 prompt） |
+| 手动 | `/compact [instructions]`（指令进入摘要 prompt）。TUI 显示 compacting 标记并保持可滚动，完成后换成结果（保留回合、压缩前后 token） |
 | Overflow 恢复 | API 报 context 过长 → force compact 后重试一次；失败后抑制到下一轮成功采样 |
 
 **模型字段 `reasoning: true`**：声明支持 extended thinking；影响 `developer` role 与部分 reasoning 回放逻辑。交互里可用 `/model-add … reasoning=true`。
@@ -741,6 +741,8 @@ cargo run -p one-cli --features http-providers -- --provider openai -m gpt-4o
 - `Alt+H`：打开 Help 目录（同 `/help`；有草稿也能开；`Ctrl+K` / `F1` / `Ctrl+/` 仍兼容）
 - `Ctrl+L`：模型 select（输入框上方）
 - `Ctrl+G`：Settings 居中面板
+- `Alt+Z`：折叠 / 展开当前用户问题这一轮。历史回合默认收成一行时间线（`HH:MM  问题  ▸`），当前回合展开并用 `┃` 左边线串起回复和工具。点行或 `Enter`（浏览聚焦时）也可开关。没有可折叠回合时则折叠长粘贴。有草稿也能按，不会把 `z` 打进输入框
+- `Alt+Shift+Z`：一键展开或折叠全部历史用户问题
 - `PageUp` / `PageDown` / 鼠标滚轮：滚动对话记录；生成中向上滚动会进入稳定的历史浏览，不会被后续输出拉回底部
 - `Alt+G`（或 `End`）：跳到最新输出并恢复实时跟随；向下滚到最底部也会恢复跟随
 - `Esc`：中止生成（运行中）；关闭浮层
@@ -768,6 +770,7 @@ Slash 命令：
 | `/plan` | 进入 Plan 模式（只读探索 + 写 plan 文件） |
 | `/act` / `/build` | 批准计划并切到 Build 模式开始实现 |
 | `/compact [instructions]` | 手动压缩上下文（LLM 摘要优先） |
+| `/context` | 上下文窗口分析弹窗（系统提示 / 消息 / 开销 / 剩余；工具、Skills、MCP 估算） |
 | `/skills [enable\|disable <name>]` | 管理 skills：裸命令打开开关面板；`enable`/`disable` 按名称切换 |
 | `/skill:name [args]` | **可选**强制加载 skill（默认由模型 `read` 按需加载） |
 | `/mcp [import\|enable\|disable <name>]` | MCP 面板 / 导入 / 开关 |
@@ -786,7 +789,7 @@ Slash 命令：
 | `bash` | Act | shell；`run_in_background=true` → 立即返回 `task_id`（**session-owned**，见下） |
 | `bash_output` | Act | 轮询/等待后台 bash 输出（`task_id` 可省略则列 `/ps` 式快照） |
 | `bash_kill` | Act | 终止指定后台 bash 任务 |
-| `grep` / `find` / `ls` | Act / Plan / read-only | 搜索与列举 |
+| `grep` / `glob` / `ls` | Act / Plan / read-only | 搜索与列举 |
 | `task` | Act / Plan / read-only | 子 agent（默认 explore）→ 同一 `harness::run`；见 [protocol.md](./protocol.md)。观测面与 bash **分层**：chip `task:N`、`/tasks` TV4 画框；点击 / Enter / Ctrl+F 打开（**不**进 `/ps`） |
 | `ask_user` | 均有（仅 Interactive） | 结构化澄清问题 |
 | `web_search` / `web_fetch` | Act / Plan / read-only | 联网（需 `network` feature，CLI 默认开） |

@@ -57,6 +57,48 @@ pub fn tool_streak_len(messages: &[Message], start: usize) -> usize {
     n
 }
 
+/// Consecutive same-display-name tools starting at `start` (within `end`).
+///
+/// Stops at a running/expanded/ungrouped row so those stay visible as themselves.
+pub fn same_name_run(messages: &[Message], start: usize, end: usize) -> usize {
+    if start >= end || start >= messages.len() {
+        return 0;
+    }
+    let raw = messages[start].tool_name.as_deref().unwrap_or("tool");
+    let name = tool_display_name(raw, &messages[start].content);
+    let mut n = 1;
+    while start + n < end && start + n < messages.len() {
+        let m = &messages[start + n];
+        if m.role != MessageRole::Tool {
+            break;
+        }
+        if m.tool_expanded || m.tool_ungroup {
+            break;
+        }
+        if m.tool_status == Some(ToolStatus::Running) {
+            break;
+        }
+        let nraw = m.tool_name.as_deref().unwrap_or("tool");
+        if tool_display_name(nraw, &m.content) != name {
+            break;
+        }
+        n += 1;
+    }
+    n
+}
+
+/// Sum sealed wall times in a tool slice.
+pub fn tools_duration_ms(tools: &[Message]) -> u64 {
+    tools.iter().filter_map(|t| t.duration_ms).sum()
+}
+
+/// First running tool in a slice, if any.
+pub fn first_running(tools: &[Message]) -> Option<&Message> {
+    tools
+        .iter()
+        .find(|t| t.tool_status == Some(ToolStatus::Running))
+}
+
 /// True when the streak is long enough and every tool is base-groupable.
 pub fn streak_group_eligible(messages: &[Message], start: usize, len: usize) -> bool {
     if len < COLLAPSE_GROUP_MIN {
@@ -1631,7 +1673,7 @@ pub fn summarize_tool_special(
             let lines = output.lines().count();
             Some((format!("{lines} lines"), false, None))
         }
-        "grep" | "find" | "ls" => {
+        "grep" | "glob" | "find" | "ls" => {
             if is_error {
                 return None;
             }

@@ -18,7 +18,8 @@
 | **`/logout`** | 退出当前服务商登录态 | `/logout` |
 | **`/model`** | 查看或切换当前使用的模型 | `/model anthropic:claude-3-7-sonnet-20250219` |
 | **`/learn`** | 意图学习与规则管理（自动从会话学习或手动录入） | `/learn` / `/learn list` / `/learn status` |
-| **`/compact`** | 手动触发上下文压缩与历史摘要 | `/compact` · `/compact keep the auth details` |
+| **`/compact`** | 压缩发给模型的上下文。发送后对话继续可滚动，中间显示 compacting 标记；完成后换成结果（保留回合数、压缩前后 token） | `/compact` · `/compact keep the auth details` |
+| **`/context`** | 上下文窗口分析弹窗：系统提示 / 消息 / 推理开销 / 剩余空间，以及工具定义、Skills、MCP 公告的估算 token | `/context` |
 | **`/clear`** 或 **`/new`** | 清空当前对话并开始新会话（保持 MCP 连接池） | `/clear` |
 | **`/reload`** | 热重载磁盘配置（MCP、Skills、Prompt 模板、Plugins） | `/reload` |
 | **`/help`** | 显示帮助手册与命令列表 | `/help` |
@@ -34,3 +35,5 @@
 | **`Ctrl + D`** / **`Esc`** | 退出当前会话 / 关闭弹出菜单 |
 | **`Up / Down`** | 浏览历史输入命令 |
 | **`PageUp / PageDown`** | 上下滚动对话内容 |
+| **`Alt+Z`** | 折叠 / 展开当前用户问题这一轮。历史回合默认收成一行时间线，当前回合展开。点行或浏览聚焦后 `Enter` 也可开关 |
+| **`Alt+Shift+Z`** | 一键展开或折叠全部历史用户问题 |

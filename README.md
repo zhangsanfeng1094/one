@@ -1,6 +1,11 @@
-# One
+<div align="center">
+  <img src="assets/logo.png" alt="One Logo" width="180" style="border-radius: 16px;" />
+  <h1>One</h1>
+  <p><strong>Rust 原生 AI 编程 Agent</strong></p>
+  <p>灵感来自 <a href="https://pi.dev">Pi Agent</a>：极简核心、内置工具、可扩展、JSONL 树形会话格式。</p>
+</div>
 
-Rust 实现的编程 Agent，灵感来自 [Pi Agent](https://pi.dev)：极简核心、内置工具、可扩展、JSONL 树形会话格式。
+---
 
 ## 特性
 

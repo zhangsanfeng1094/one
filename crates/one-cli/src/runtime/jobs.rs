@@ -325,6 +325,7 @@ impl JobEventLog {
             AgentEvent::TurnEnd { turn, .. } => {
                 self.push_line(format!("◂ turn {} end", turn + 1));
             }
+            AgentEvent::UsageUpdate { .. } => {}
             AgentEvent::AgentEnd { .. } => {
                 self.set_activity("finishing");
                 self.push_line("▸ finishing");
@@ -351,8 +352,9 @@ fn tool_call_brief(call: &one_core::tool::ToolCall) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        "find" => args
-            .get("glob")
+        "glob" | "find" => args
+            .get("pattern")
+            .or_else(|| args.get("glob"))
             .or_else(|| args.get("path"))
             .and_then(|v| v.as_str())
             .unwrap_or("")

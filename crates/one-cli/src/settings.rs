@@ -39,7 +39,7 @@ pub struct ToolOutputSettings {
 
 /// Context compaction strategy (settings key `compaction`).
 ///
-/// Main path: auto threshold + keep_recent summary (Grok-style).
+/// Main path: auto threshold + keep_recent **user turns** verbatim after compact.
 /// `prune` (default **on**): every turn, trim old tool bodies by user-turn age.
 /// `two_pass` (default **off**): Pass-1 NOTE₁ + Pass-2 final; background prefire
 /// starts `prefire_lead_ratio` of the window below the auto-compact limit.
@@ -54,7 +54,7 @@ pub struct CompactionSettings {
     pub ratio: Option<f64>,
     /// Absolute token threshold override (takes precedence over ratio).
     pub threshold: Option<usize>,
-    /// Recent messages kept after LLM/extractive summary (default 12).
+    /// Recent user turns kept verbatim after compact (default 2).
     pub keep_recent: Option<usize>,
     /// Prune old tool bodies by user-turn age every compact check (default true).
     pub prune: Option<bool>,
@@ -133,7 +133,7 @@ impl CompactionSettings {
         cfg
     }
 
-    /// One-line summary for Settings UI, e.g. `auto 85% · keep 12 · prune · 2-pass`.
+    /// One-line summary for Settings UI, e.g. `auto 85% · keep 2 · prune · 2-pass`.
     pub fn summary_line(&self) -> String {
         let auto = if self.auto.unwrap_or(true) {
             "auto"
@@ -153,7 +153,9 @@ impl CompactionSettings {
                 .unwrap_or(one_core::DEFAULT_COMPACT_RATIO);
             format!("{}%", (r * 100.0).round() as u32)
         };
-        let keep = self.keep_recent.unwrap_or(12);
+        let keep = self
+            .keep_recent
+            .unwrap_or(one_core::DEFAULT_KEEP_RECENT_TURNS);
         let prune = if self.prune.unwrap_or(true) {
             "prune"
         } else {
@@ -627,10 +629,9 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             }
         }
         "compaction.keep_recent" | "compaction_keep_recent" | "compaction.keep-recent" => {
-            let n: usize = value
-                .trim()
-                .parse()
-                .map_err(|_| "compaction.keep_recent must be a positive number".to_string())?;
+            let n: usize = value.trim().parse().map_err(|_| {
+                "compaction.keep_recent must be a positive user-turn count".to_string()
+            })?;
             if n < 1 {
                 return Err("compaction.keep_recent must be >= 1".into());
             }

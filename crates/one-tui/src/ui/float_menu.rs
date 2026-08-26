@@ -7,6 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
+use crate::app::App;
 use crate::float::{FloatKind, FloatMenu, FloatRenderRow};
 use crate::theme::Theme;
 
@@ -312,6 +313,123 @@ fn draw_float_scrollbar(
     frame.render_widget(Paragraph::new(lines).style(Theme::slash_panel()), area);
 }
 
+/// `/context` overlay — categorical bar + legend, scrollable when tall.
+pub(super) fn draw_context_float(frame: &mut Frame<'_>, full: Rect, app: &mut App) {
+    let Some(snapshot) = app.context_info.as_ref() else {
+        return;
+    };
+    let scroll = app.float.as_ref().map(|f| f.selected).unwrap_or(0);
+
+    let max_w = full.width.saturating_sub(2);
+    let min_w = 48.min(max_w);
+    let width = (full.width.saturating_mul(3) / 4).clamp(min_w, max_w);
+
+    let inner_w = width.saturating_sub(6); // borders + 2-col pad each side
+    let lines = snapshot.lines(inner_w);
+    let total = lines.len();
+
+    let available = full.height.saturating_sub(6).max(1); // chrome + pad
+    let list_rows = (total as u16).clamp(1, available.min(32));
+    let inner_h = 1u16.saturating_add(list_rows).saturating_add(1);
+    let max_h = full.height.saturating_sub(2);
+    let min_h = 8.min(max_h);
+    let height = (inner_h.saturating_add(2)).clamp(min_h, max_h);
+
+    let x = full.x + (full.width.saturating_sub(width)) / 2;
+    let y = full.y + (full.height.saturating_sub(height)) / 2;
+    let area = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(Block::default().style(Theme::slash_panel()), area);
+
+    let title = " Context ";
+    let footer = " ↑/↓ Scroll  ·  Enter / Esc Close ";
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(Theme::border())
+        .style(Theme::slash_panel())
+        .title(Span::styled(title, Theme::title()))
+        .title_bottom(Span::styled(footer, Theme::float_footer()));
+    let border_inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let h_pad = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(1),
+            Constraint::Length(2),
+        ])
+        .split(border_inner);
+    let parts = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(h_pad[1]);
+    let list_area = parts[1];
+    let max_rows = list_area.height as usize;
+    let max_scroll = total.saturating_sub(max_rows.max(1));
+    let start = scroll.min(max_scroll);
+    let end = (start + max_rows).min(total);
+    let need_scrollbar = total > max_rows && max_rows > 0;
+    let sb_w: u16 = if need_scrollbar { 1 } else { 0 };
+    let content_area = Rect {
+        x: list_area.x,
+        y: list_area.y,
+        width: list_area.width.saturating_sub(sb_w),
+        height: list_area.height,
+    };
+
+    let visible: Vec<Line<'static>> = lines[start..end]
+        .iter()
+        .cloned()
+        .map(|line| {
+            // Ensure every span sits on PANEL so chat doesn't bleed through.
+            let spans: Vec<Span> = line
+                .spans
+                .into_iter()
+                .map(|s| {
+                    let style = s.style;
+                    Span::styled(
+                        s.content,
+                        Style {
+                            bg: Some(style.bg.unwrap_or(Theme::PANEL)),
+                            ..style
+                        },
+                    )
+                })
+                .collect();
+            Line::from(spans)
+        })
+        .collect();
+    frame.render_widget(
+        Paragraph::new(visible).style(Theme::slash_panel()),
+        content_area,
+    );
+
+    if need_scrollbar {
+        let sb_area = Rect {
+            x: list_area.x + content_area.width,
+            y: list_area.y,
+            width: 1,
+            height: list_area.height,
+        };
+        draw_float_scrollbar(frame, sb_area, total, max_rows, start, false);
+    }
+
+    app.context_line_count = total;
+    app.context_view_height = max_rows;
+}
+
 fn float_footer_text(menu: &FloatMenu) -> String {
     if menu.edit_mode {
         if menu.kind == FloatKind::SettingsDeleteConfirm {
@@ -320,7 +438,7 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         return " ←→ Cursor  ·  Enter Save  ·  Esc Cancel ".into();
     }
     let base = match menu.kind {
-        FloatKind::Info => " Enter / Esc Close ",
+        FloatKind::Info | FloatKind::Context => " ↑/↓ Scroll  ·  Enter / Esc Close ",
         FloatKind::NewSessionConfirm => " ↑/↓ Choose  ·  Enter Confirm  ·  Esc Cancel ",
         FloatKind::Sessions => " ↑/↓ Navigate  ·  Enter Resume  ·  Esc Back ",
         FloatKind::Tree => " ↑/↓ Navigate  ·  Enter Branch  ·  Esc Back ",

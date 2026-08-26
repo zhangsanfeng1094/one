@@ -239,7 +239,7 @@ async fn handle(
                 )
                 .await
             {
-                Ok(()) => {
+                Ok(_) => {
                     let (tokens, estimated) = runtime.context_tokens().await;
                     json!({
                         "id": id,

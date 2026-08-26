@@ -1588,6 +1588,7 @@ dependencies = [
 name = "one-tui"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "crossterm",
  "one-core",
  "pulldown-cmark",

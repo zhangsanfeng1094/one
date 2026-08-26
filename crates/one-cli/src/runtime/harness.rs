@@ -166,6 +166,7 @@ pub async fn run_with_control(
         thinking_level: thinking,
         server_search: false,
         empty_response_retries,
+        compaction_config: None,
     };
 
     let mut agent = Agent::new(config, tools);

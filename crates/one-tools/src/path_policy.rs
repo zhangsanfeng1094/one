@@ -395,14 +395,14 @@ fn dirs_home() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-/// Default read-only skill roots (Codex / agentskills convention).
+/// Default read-only skill roots (Codex / agentskills convention) + temporary directory roots.
 ///
 /// Keep in sync with `one_resources::skill_discovery_dirs` user roots.
 /// Runtime also merges discovered package dirs via [`PathPolicy::with_readable_roots`].
 fn default_skill_readable_roots() -> Vec<PathBuf> {
     let home = dirs_home();
     let agent = default_agent_dir();
-    vec![
+    let mut roots = vec![
         agent.clone(),
         agent.join("skills"),
         agent.join("builtin-skills"),
@@ -413,7 +413,24 @@ fn default_skill_readable_roots() -> Vec<PathBuf> {
         home.join(".claude").join("skills"),
         home.join(".codex").join("skills"),
         home.join(".grok").join("skills"),
-    ]
+    ];
+
+    // Temporary directory roots (/tmp, /var/tmp, $TMPDIR) are always readable
+    // (e.g. for user-uploaded images, diffs, temp files).
+    let tmp = PathBuf::from("/tmp");
+    if tmp.is_dir() || tmp.exists() {
+        roots.push(tmp);
+    }
+    let td = std::env::temp_dir();
+    if td.as_os_str() != "/tmp" && (td.is_dir() || td.parent().is_some()) {
+        roots.push(td);
+    }
+    let var_tmp = PathBuf::from("/var/tmp");
+    if var_tmp.is_dir() {
+        roots.push(var_tmp);
+    }
+
+    roots
 }
 
 fn normalize_existing_dir(path: PathBuf) -> PathBuf {
@@ -640,6 +657,22 @@ mod tests {
         dir
     }
 
+    fn isolated_outside_dir() -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let dir = dirs_home().join(format!(
+            ".one-test-isolated-{}-{}-{}",
+            std::process::id(),
+            n,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
     #[test]
     fn allows_relative_inside_workspace() {
         let dir = temp_dir();
@@ -809,9 +842,32 @@ mod tests {
     }
 
     #[test]
+    fn tmp_roots_readable_by_default() {
+        let ws = isolated_outside_dir();
+        let policy = PathPolicy::workspace(ws.clone());
+
+        // File in /tmp or temp_dir is readable without explicit grant.
+        let tmp_file =
+            std::env::temp_dir().join(format!("one-test-img-{}.png", std::process::id()));
+        std::fs::write(&tmp_file, b"png").unwrap();
+        policy
+            .check(&tmp_file, AccessKind::Read)
+            .expect("/tmp paths should be readable by default");
+
+        // But writing to /tmp is still denied outside workspace.
+        let write_err = policy
+            .check(&tmp_file, AccessKind::Write)
+            .expect_err("/tmp paths must not be writable without explicit grant");
+        assert!(write_err.contains("outside workspace"), "{write_err}");
+
+        let _ = std::fs::remove_file(&tmp_file);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[test]
     fn clone_shares_dynamic_grants() {
         let dir = temp_dir();
-        let outside = temp_dir();
+        let outside = isolated_outside_dir();
         let file = outside.join("secret.txt");
         std::fs::write(&file, "x").unwrap();
 
@@ -836,7 +892,7 @@ mod tests {
     #[test]
     fn grant_dir_allows_descendants_read_not_write() {
         let dir = temp_dir();
-        let outside = temp_dir();
+        let outside = isolated_outside_dir();
         let nested = outside.join("sub").join("a.rs");
         std::fs::create_dir_all(nested.parent().unwrap()).unwrap();
         std::fs::write(&nested, "fn main() {}").unwrap();
@@ -903,7 +959,7 @@ mod tests {
     #[test]
     fn export_apply_detached_read_only() {
         let dir = temp_dir();
-        let outside = temp_dir();
+        let outside = isolated_outside_dir();
         let file = outside.join("a.txt");
         std::fs::write(&file, "hi").unwrap();
 

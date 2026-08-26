@@ -8,6 +8,7 @@ authors.workspace = true
 
 [dependencies]
 one-core.workspace = true
+chrono.workspace = true
 crossterm.workspace = true
 pulldown-cmark = { version = "0.13", default-features = false }
 ratatui.workspace = true

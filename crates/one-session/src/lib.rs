@@ -17,8 +17,8 @@ pub mod summary;
 
 pub use actor::{PersistenceMsg, SessionActor, SessionActorHandle};
 pub use context::{
-    build_context_entries, build_session_context, context_message_entries, first_kept_entry_id,
-    SessionContext,
+    build_context_entries, build_session_context, build_transcript_entries,
+    context_message_entries, first_kept_entry_id, SessionContext,
 };
 pub use discovery::{GlobalSessionDiscovery, IndexableSession, SessionSource};
 pub use entries::*;

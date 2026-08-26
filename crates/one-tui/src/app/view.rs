@@ -5,6 +5,20 @@ use crate::state::{display_col_to_caret, SelectPos};
 use crate::tool_view;
 
 impl super::App {
+    /// Absolute terminal row → 0-based row in the painted transcript.
+    ///
+    /// `None` when the pointer is on the grok header, sticky prompt, or
+    /// prompt/footer — those are not chat lines.
+    pub fn mouse_to_chat_row(&self, mouse_row: u16) -> Option<usize> {
+        let y = self.chat_content_y;
+        let h = self.chat_view_height;
+        if h == 0 || mouse_row < y {
+            return None;
+        }
+        let rel = (mouse_row - y) as usize;
+        (rel < h).then_some(rel)
+    }
+
     pub fn view_row_to_line(&self, row_in_view: usize) -> Option<usize> {
         if row_in_view < self.chat_top_pad {
             return None;
@@ -77,9 +91,22 @@ impl super::App {
                     self.chat_focus = Some(start);
                     self.toggle_tool_group_at(start);
                 }
+                ChatLineTarget::User(msg_i) => {
+                    self.chat_focus = Some(msg_i);
+                    self.toggle_user_or_turn_fold_at(msg_i);
+                }
+                ChatLineTarget::UserContent(msg_i) => {
+                    self.chat_focus = Some(msg_i);
+                    self.toggle_user_content_fold_at(msg_i);
+                }
                 ChatLineTarget::Message(msg_i) => match self.messages.get(msg_i).map(|m| m.role) {
                     Some(MessageRole::Thinking) => self.toggle_thinking_at(msg_i),
                     Some(MessageRole::Tool) => self.toggle_tool_at(msg_i),
+                    Some(MessageRole::User) => {
+                        if let Some(msg) = self.messages.get_mut(msg_i) {
+                            msg.info_expanded = !msg.info_expanded;
+                        }
+                    }
                     Some(MessageRole::Alert) => {
                         // dismiss alerts if clickable — leave existing behaviour via tool path no-op
                     }
@@ -407,6 +434,50 @@ impl super::App {
         }
     }
 
+    /// Scroll directly to the given transcript line (e.g. user message start).
+    pub fn scroll_to_line(&mut self, line: usize) {
+        self.follow_bottom = false;
+        self.chat_scroll = line.min(self.max_scroll());
+    }
+
+    /// Jump to the start of the user query pinned in the sticky bar.
+    pub fn scroll_to_sticky(&mut self) -> bool {
+        if let Some(line) = self.chat_sticky_line {
+            self.scroll_to_line(line);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Click handler for the sticky bar. If `mouse_row` matches the rendered
+    /// sticky bar row, jump directly to that user message start.
+    pub fn click_sticky(&mut self, mouse_row: u16) -> bool {
+        if self.chat_sticky_y == Some(mouse_row) {
+            self.scroll_to_sticky()
+        } else {
+            false
+        }
+    }
+
+    /// Jump to the first tool row of the current turn.
+    pub fn scroll_to_turn_tools(&mut self) {
+        let Some(line) = self.chat_turn_tools_line else {
+            return;
+        };
+        self.follow_bottom = false;
+        self.chat_scroll = line.min(self.max_scroll());
+    }
+
+    /// Jump to the assistant answer of the current turn.
+    pub fn scroll_to_turn_answer(&mut self) {
+        let Some(line) = self.chat_turn_answer_line else {
+            return;
+        };
+        self.follow_bottom = false;
+        self.chat_scroll = line.min(self.max_scroll());
+    }
+
     /// How many lines above the bottom can still be revealed.
     pub fn max_scroll(&self) -> usize {
         self.chat_total_lines
@@ -466,18 +537,60 @@ impl super::App {
     ///
     /// `up = true` → older / previous rows (selection decreases).
     pub fn scroll_float_wheel(&mut self, up: bool, lines: usize) {
-        let Some(f) = self.float.as_mut() else {
-            return;
-        };
         if lines == 0 {
             return;
         }
+        if self
+            .float
+            .as_ref()
+            .is_some_and(|f| f.kind == crate::float::FloatKind::Context)
+        {
+            let delta = if up {
+                -(lines as isize)
+            } else {
+                lines as isize
+            };
+            self.scroll_context(delta);
+            return;
+        }
+        let Some(f) = self.float.as_mut() else {
+            return;
+        };
         let delta = if up {
             -(lines as isize)
         } else {
             lines as isize
         };
         f.move_selection(delta);
+    }
+
+    /// Clamp `/context` overlay scroll to the last-drawn body.
+    pub(crate) fn scroll_context(&mut self, delta: isize) {
+        let max = self
+            .context_line_count
+            .saturating_sub(self.context_view_height.max(1));
+        let Some(f) = self.float.as_mut() else {
+            return;
+        };
+        if f.kind != crate::float::FloatKind::Context {
+            return;
+        }
+        if delta < 0 {
+            f.selected = f.selected.saturating_sub((-delta) as usize);
+        } else {
+            f.selected = (f.selected + delta as usize).min(max);
+        }
+    }
+
+    pub(crate) fn scroll_context_end(&mut self) {
+        let max = self
+            .context_line_count
+            .saturating_sub(self.context_view_height.max(1));
+        if let Some(f) = self.float.as_mut() {
+            if f.kind == crate::float::FloatKind::Context {
+                f.selected = max;
+            }
+        }
     }
 
     /// Page-scroll the open float (PgUp/PgDn).

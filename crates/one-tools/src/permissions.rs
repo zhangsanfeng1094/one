@@ -204,7 +204,7 @@ impl ParsedRule {
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
-            "read" | "write" | "edit" | "grep" | "find" | "ls" => call
+            "read" | "write" | "edit" | "grep" | "glob" | "find" | "ls" => call
                 .arguments
                 .get("path")
                 .and_then(|v| v.as_str())
@@ -446,7 +446,7 @@ pub fn call_summary(call: &ToolCall) -> String {
                 core.to_string()
             }
         }
-        "write" | "edit" | "read" | "ls" | "grep" | "find" => {
+        "write" | "edit" | "read" | "ls" | "grep" | "glob" | "find" => {
             let path = call
                 .arguments
                 .get("path")
@@ -628,7 +628,7 @@ pub fn evaluate_with_mode(
 fn default_verdict_with_mode(call: &ToolCall, mode: PermissionMode) -> PermissionVerdict {
     let auto_approve = mode.is_always_approve();
     match call.name.as_str() {
-        "read" | "grep" | "find" | "ls" | "bash_output" | "bash_kill" | "web_search"
+        "read" | "grep" | "glob" | "find" | "ls" | "bash_output" | "bash_kill" | "web_search"
         | "web_fetch" | "exit_plan_mode" | "memory_search" | "todo_write" => {
             PermissionVerdict::Allow
         }

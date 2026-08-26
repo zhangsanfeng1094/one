@@ -82,6 +82,8 @@ pub struct App {
     /// Live streaming always shows a short rolling tail regardless of this flag.
     pub show_thinking: bool,
     pub busy: bool,
+    /// Short activity while `busy` (e.g. `"compacting"`). Empty = generic turn.
+    pub busy_activity: String,
     /// Absolute first visible display row while browsing transcript history.
     ///
     /// Must be line-based, not message-based: a single long assistant reply can be
@@ -102,12 +104,23 @@ pub struct App {
     pub chat_focus: Option<usize>,
     /// Top of chat viewport in the full line list (updated each draw).
     pub chat_view_start: usize,
+    /// First display line of this turn's tool streak (after the last user).
+    pub chat_turn_tools_line: Option<usize>,
+    /// First display line of this turn's assistant answer (after the last user).
+    pub chat_turn_answer_line: Option<usize>,
     /// Blank rows painted above short transcripts (bottom-pin). Clicks skip these.
     pub chat_top_pad: usize,
     /// Terminal mouse capture is armed (wheel → chat).
     pub mouse_capture: bool,
     /// Left column of chat text content (terminal x). Mouse col − this → display col.
     pub chat_content_x: u16,
+    /// Top row of the painted transcript (terminal y). Mouse row − this → view row.
+    /// Below the grok header, and below the sticky prompt bar when it is shown.
+    pub chat_content_y: u16,
+    /// First display line of the message currently pinned by sticky bar.
+    pub chat_sticky_line: Option<usize>,
+    /// Terminal row where the sticky bar is rendered (`None` when not visible).
+    pub chat_sticky_y: Option<u16>,
     /// In-app transcript selection (character carets on absolute display lines).
     /// App-owned select + OSC 52 copy — does not need native terminal drag-select.
     pub select_anchor: Option<SelectPos>,
@@ -196,6 +209,12 @@ pub struct App {
     pub toast: Option<Toast>,
     /// Centered floating secondary menu (Settings, commands, sessions, …).
     pub float: Option<FloatMenu>,
+    /// `/context` snapshot while the context overlay is open.
+    pub context_info: Option<crate::context::ContextSnapshot>,
+    /// Last-drawn `/context` body line count (for scroll clamp).
+    pub(crate) context_line_count: usize,
+    /// Last-drawn `/context` viewport height (for scroll clamp).
+    pub(crate) context_view_height: usize,
     /// Current provider id (for model picker "current" marker).
     pub current_provider: String,
     /// Current model id.
@@ -312,6 +331,7 @@ impl App {
             // Prefer collapsed headers so long reasoning doesn't flood the transcript.
             show_thinking: false,
             busy: false,
+            busy_activity: String::new(),
             chat_scroll: 0,
             follow_bottom: true,
             chat_view_height: 0,
@@ -319,9 +339,14 @@ impl App {
             chat_line_owners: Vec::new(),
             chat_focus: None,
             chat_view_start: 0,
+            chat_turn_tools_line: None,
+            chat_turn_answer_line: None,
             chat_top_pad: 0,
             mouse_capture: true,
             chat_content_x: 0,
+            chat_content_y: 0,
+            chat_sticky_line: None,
+            chat_sticky_y: None,
             select_anchor: None,
             select_end: None,
             select_dragging: false,
@@ -351,7 +376,7 @@ impl App {
             compaction_auto: true,
             compaction_ratio: 0.85,
             compaction_threshold: None,
-            compaction_keep_recent: 12,
+            compaction_keep_recent: one_core::DEFAULT_KEEP_RECENT_TURNS,
             compaction_prune: true,
             compaction_prune_keep_last_n_turns: 3,
             compaction_two_pass: false,
@@ -371,6 +396,9 @@ impl App {
             task_detail_id: None,
             toast: None,
             float: None,
+            context_info: None,
+            context_line_count: 0,
+            context_view_height: 0,
             current_provider: String::new(),
             current_model: String::new(),
             settings_provider_focus: String::new(),

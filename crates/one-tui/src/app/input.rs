@@ -101,11 +101,11 @@ impl super::App {
         self.cursor_on = true;
     }
 
-    /// Insert a string at the caret (control chars other than `\n` dropped).
+    /// Insert a string at the caret (control chars other than `\n` / `\t` dropped).
     pub(crate) fn insert_input_str(&mut self, text: &str) {
         let cleaned: String = text
             .chars()
-            .filter(|c| *c == '\n' || !c.is_control())
+            .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
             .collect();
         if cleaned.is_empty() {
             return;
@@ -322,15 +322,15 @@ impl super::App {
         one_core::image::try_load_image_path_paste(s)
     }
 
-    /// Collapse a long paste into `[文本.txt]` (body kept until submit / delete).
+    /// Collapse a long paste into `[文本 · 12 lines · 3KB]` (body kept until submit / delete).
     pub fn attach_text_blob(&mut self, body: String) {
         let id = self.next_text_id;
         self.next_text_id = self.next_text_id.saturating_add(1).max(2);
-        let token = one_core::image::text_token(id);
-        let summary = one_core::image::text_blob_summary(&body);
-        self.pending_texts.push(PendingText { id, body });
+        let pending = PendingText { id, body };
+        let token = pending.token();
         self.insert_chip_token(&token);
-        self.set_notice(format!("pasted  {token}  {summary}"));
+        self.set_notice(format!("pasted  {token}"));
+        self.pending_texts.push(pending);
     }
 
     /// Backspace: delete one character (or an entire paste chip) before the caret.
@@ -458,14 +458,16 @@ impl super::App {
             return;
         }
 
+        self.leave_history_browse();
+
         // Preserve newlines for multi-line paste (normalize \r\n / \r → \n).
         let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
         // Long paste → `[文本.txt]` chip (same UX as images: compact + atomic delete).
         if one_core::image::should_collapse_paste(&normalized) {
-            // Drop other control chars from the stored body.
+            // Drop other control chars from the stored body (keep tabs).
             let body: String = normalized
                 .chars()
-                .filter(|c| *c == '\n' || !c.is_control())
+                .filter(|c| *c == '\n' || *c == '\t' || !c.is_control())
                 .collect();
             self.attach_text_blob(body);
             self.cursor_on = true;
@@ -473,6 +475,9 @@ impl super::App {
         }
 
         self.insert_input_str(&normalized);
+        if self.input.starts_with('/') {
+            self.clamp_slash_selection();
+        }
         self.clear_notice();
     }
 

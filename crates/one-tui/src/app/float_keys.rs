@@ -105,13 +105,25 @@ impl super::App {
                 RunOutcome::Noop
             }
             KeyCode::Up if !editing => {
-                if let Some(f) = self.float.as_mut() {
+                if self
+                    .float
+                    .as_ref()
+                    .is_some_and(|f| f.kind == FloatKind::Context)
+                {
+                    self.scroll_context(-1);
+                } else if let Some(f) = self.float.as_mut() {
                     f.move_selection(-1);
                 }
                 RunOutcome::Noop
             }
             KeyCode::Down if !editing => {
-                if let Some(f) = self.float.as_mut() {
+                if self
+                    .float
+                    .as_ref()
+                    .is_some_and(|f| f.kind == FloatKind::Context)
+                {
+                    self.scroll_context(1);
+                } else if let Some(f) = self.float.as_mut() {
                     f.move_selection(1);
                 }
                 RunOutcome::Noop
@@ -131,7 +143,13 @@ impl super::App {
                 RunOutcome::Noop
             }
             KeyCode::End if !editing && !text_focus => {
-                if let Some(f) = self.float.as_mut() {
+                if self
+                    .float
+                    .as_ref()
+                    .is_some_and(|f| f.kind == FloatKind::Context)
+                {
+                    self.scroll_context_end();
+                } else if let Some(f) = self.float.as_mut() {
                     let n = f.filtered_entries().len();
                     if n > 0 {
                         f.selected = n - 1;
@@ -219,7 +237,9 @@ impl super::App {
                     && !self.float.as_ref().is_some_and(|f| {
                         matches!(
                             f.kind,
-                            FloatKind::BackgroundDetail | FloatKind::SubagentDetail
+                            FloatKind::BackgroundDetail
+                                | FloatKind::SubagentDetail
+                                | FloatKind::Context
                         )
                     }) =>
             {
@@ -305,6 +325,10 @@ impl super::App {
             };
             (f.kind, f.selected_entry())
         };
+        if kind == FloatKind::Context {
+            self.close_float();
+            return RunOutcome::Noop;
+        }
         let Some(entry) = entry else {
             return RunOutcome::Noop;
         };
@@ -361,7 +385,7 @@ impl super::App {
                 self.input.clear();
                 RunOutcome::Prompt(format!("/rewind {}", entry.item.id))
             }
-            FloatKind::Info => {
+            FloatKind::Info | FloatKind::Context => {
                 self.close_float();
                 RunOutcome::Noop
             }
@@ -509,7 +533,7 @@ impl super::App {
             }
             // These need runtime data → emit slash so CLI opens the right float.
             "resume" | "session" | "tree" | "rewind" | "new" | "name" | "export" | "compact"
-            | "reload" | "skill" | "plan" | "act" | "build" => {
+            | "context" | "reload" | "skill" | "plan" | "act" | "build" => {
                 self.close_float();
                 self.input.clear();
                 let cmd = if hint.starts_with('/') {

@@ -565,8 +565,8 @@ impl IntentGraph {
             description: "DeepWiki GitHub 仓库与开源库文档检索".into(),
         });
         g.add_node(GraphNode::Tool {
-            id: "tool-find".into(),
-            name: "find".into(),
+            id: "tool-glob".into(),
+            name: "glob".into(),
             description: "文件与符号检索工具".into(),
         });
         g.add_edge(
@@ -576,7 +576,7 @@ impl IntentGraph {
         );
         g.add_edge(
             "SearchExternalDocs",
-            "tool-find",
+            "tool-glob",
             GraphEdge::SuggestsTool { priority: 70 },
         );
 
@@ -1603,6 +1603,7 @@ impl IntentGraph {
         // Extract known tools mentioned anywhere in the rule
         let known_tool_names = [
             "deepwiki",
+            "glob",
             "find",
             "grep",
             "read_file",
@@ -2449,11 +2450,11 @@ mod tests {
         let res = graph.infer_with(
             "帮我查一下 tokio 的用法",
             &InferOptions {
-                available_tools: vec!["find".into()],
+                available_tools: vec!["glob".into()],
                 ..InferOptions::default()
             },
         );
-        assert!(res.suggested_tools.iter().any(|t| t.tool_name == "find"));
+        assert!(res.suggested_tools.iter().any(|t| t.tool_name == "glob"));
         assert!(!res
             .suggested_tools
             .iter()

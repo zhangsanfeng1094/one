@@ -1790,6 +1790,7 @@ mod tests {
                 thinking_level: one_core::agent::ThinkingLevel::Off,
                 server_search: false,
                 empty_response_retries: one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES,
+                compaction_config: None,
             },
             vec![task],
         );

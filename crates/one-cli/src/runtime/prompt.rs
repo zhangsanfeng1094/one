@@ -4,12 +4,12 @@ use std::sync::Arc;
 
 use one_core::agent::{CompletionRequest, LlmProvider, ThinkingLevel};
 use one_core::compaction::{
-    attach_compaction_reminder, compact_messages, compacted_live_messages,
+    attach_compaction_reminder, compact_messages_forced, compacted_live_messages,
     edited_paths_from_messages, estimate_tokens, prefix_fingerprint, prune_old_tool_outputs,
-    should_compact_tokens, should_prefire_two_pass, split_for_compaction, split_two_pass,
-    summarization_prompt, tokens_for_compaction, two_pass_pass1_prompt, two_pass_pass2_prompt,
-    CompactRequest, CompactionConfig, CompactionStateContext, CompactionSuppression,
-    PrefireCandidate,
+    should_compact_tokens, should_prefire_two_pass, split_for_compaction,
+    split_for_compaction_forced, split_two_pass, summarization_prompt, tokens_for_compaction,
+    two_pass_pass1_prompt, two_pass_pass2_prompt, user_turn_count, CompactApplied, CompactRequest,
+    CompactionConfig, CompactionStateContext, CompactionSuppression, PrefireCandidate,
 };
 use one_core::error::OneError;
 use one_core::message::AgentMessage;
@@ -43,7 +43,7 @@ impl AppRuntime {
 
         let text = self.resources.resolve_prompt(text);
         self.inject_graph_intent_reminder(&text).await;
-        self.maybe_compact(provider, CompactRequest::auto()).await?;
+        let _ = self.maybe_compact(provider, CompactRequest::auto()).await?;
 
         // M3: memory read/grep budget is per user turn.
         self.memory_lookups.reset_turn();
@@ -71,7 +71,8 @@ impl AppRuntime {
                 Ok(out) => Ok(out),
                 Err(err) if is_overflow_err(&err) => {
                     drop(err);
-                    self.maybe_compact(provider, CompactRequest::overflow())
+                    let _ = self
+                        .maybe_compact(provider, CompactRequest::overflow())
                         .await?;
                     // Buffer shrank. Re-base so we (1) don't panic on `[before..]` and
                     // (2) still persist the in-flight user turn (never written yet) without
@@ -160,7 +161,7 @@ impl AppRuntime {
         &mut self,
         provider: Arc<dyn LlmProvider>,
         request: CompactRequest,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Option<CompactApplied>, Box<dyn std::error::Error>> {
         let prefire = Arc::clone(&provider);
         self.maybe_compact_inner(provider.as_ref(), request, Some(prefire))
             .await
@@ -168,17 +169,17 @@ impl AppRuntime {
 
     /// Compact when over threshold, or when `request` forces (`/compact`, overflow).
     ///
-    /// Flow (Grok-aligned):
+    /// Flow:
     /// 1. **Prune** every check when enabled (turn-age soft-trim / hard-clear).
     /// 2. **Prefire Pass-1** when `two_pass` and tokens are within the lead band.
     /// 3. **Full compact** at threshold (or force): LLM summary (two-pass if
-    ///    enabled / cached NOTE₁), keep_recent tail, session compaction entry,
-    ///    live buffer rebuilt the same way resume does.
+    ///    enabled / cached NOTE₁), keep_recent tail, session compaction entry.
+    ///    The TUI transcript is **not** replaced — callers insert a marker.
     pub async fn maybe_compact(
         &mut self,
         provider: &dyn LlmProvider,
         request: CompactRequest,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Option<CompactApplied>, Box<dyn std::error::Error>> {
         self.maybe_compact_inner(provider, request, None).await
     }
 
@@ -187,7 +188,7 @@ impl AppRuntime {
         provider: &dyn LlmProvider,
         request: CompactRequest,
         prefire_provider: Option<Arc<dyn LlmProvider>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<Option<CompactApplied>, Box<dyn std::error::Error>> {
         let settings = crate::settings::load();
         let mut config = settings.compaction_config(self.context_window);
         if request.trigger.ignore_suppression() {
@@ -221,7 +222,7 @@ impl AppRuntime {
 
         // Manual / overflow always proceed; auto respects `enabled`.
         if !force && !config.enabled {
-            return Ok(());
+            return Ok(None);
         }
 
         self.collect_prefire_if_ready().await;
@@ -235,10 +236,12 @@ impl AppRuntime {
             && config.suppression != CompactionSuppression::None;
         let over_full = force || (!suppressed && should_compact_tokens(tokens, &config));
         if !over_full {
-            return Ok(());
+            return Ok(None);
         }
-        if split_for_compaction(&messages, &config).is_none() {
-            return Ok(());
+        // Once we've decided to compact, split with force so keep_recent
+        // (user turns) is honored even when the transcript is shorter than N.
+        if split_for_compaction_forced(&messages, &config, true).is_none() {
+            return Ok(None);
         }
 
         let matcher = request.trigger.hook_matcher();
@@ -251,13 +254,42 @@ impl AppRuntime {
                 &messages,
                 &config,
                 request.instructions.as_deref(),
+                true,
             )
             .await;
-        let (fallback, kept) = compact_messages(&messages, &config);
+        let (fallback, kept) = compact_messages_forced(&messages, &config, true);
+        let kept_turns = user_turn_count(&kept);
+        let kept_len = kept.len();
         let mut summary = summary.unwrap_or(fallback);
         if summary.is_empty() {
             self.compact_suppression = CompactionSuppression::StickyUntilSuccess;
-            return Ok(());
+            return Ok(None);
+        }
+
+        let active_todos: Vec<String> = self
+            .todo_state
+            .snapshot()
+            .into_iter()
+            .filter(|t| {
+                t.status != one_tools::TodoStatus::Completed
+                    && t.status != one_tools::TodoStatus::Cancelled
+            })
+            .map(|t| format!("[{}] {}", t.status.as_str(), t.content))
+            .collect();
+
+        let mut running_tasks = Vec::new();
+        for snap in self.bg_registry.list() {
+            if snap.state == one_tools::TaskState::Running {
+                running_tasks.push(format!("{} (`{}`)", snap.id, snap.command));
+            }
+        }
+        if let Some(host) = &self.task_host {
+            for job in host.jobs().list() {
+                if job.state.is_live() {
+                    let desc = job.description.as_deref().unwrap_or(&job.agent);
+                    running_tasks.push(format!("{} (subagent: {})", job.id, desc));
+                }
+            }
         }
 
         let reminder_ctx = CompactionStateContext {
@@ -265,18 +297,32 @@ impl AppRuntime {
             plan_active: self.mode == super::AgentMode::Plan,
             plan_path: self.plan_path.as_ref().map(|p| p.display().to_string()),
             edited_paths: edited_paths_from_messages(&messages),
+            active_todos,
+            running_background_tasks: running_tasks,
+            connected_mcp_servers: self.mcp.server_names(),
         };
         summary = attach_compaction_reminder(&summary, &reminder_ctx);
+
+        let live = compacted_live_messages(&summary, kept);
+        let tokens_after = tokens_for_compaction(&live, None) as u64;
 
         let first_kept = self
             .session
             .as_ref()
-            .map(|s| s.first_kept_entry_id_for_tail(kept.len()))
+            .map(|s| s.first_kept_entry_id_for_tail(kept_len))
             .unwrap_or_else(|| "root".into());
 
         if let Some(session) = &mut self.session {
             session
-                .append_compaction(&summary, first_kept, tokens_before)
+                .append_compaction_with_details(
+                    &summary,
+                    first_kept,
+                    tokens_before,
+                    Some(serde_json::json!({
+                        "kept_turns": kept_turns,
+                        "tokens_after": tokens_after,
+                    })),
+                )
                 .await?;
         }
 
@@ -307,7 +353,7 @@ impl AppRuntime {
             agent.messages = if let Some(session) = &self.session {
                 session.build_session_context().messages
             } else {
-                compacted_live_messages(&summary, kept)
+                live
             };
             agent.last_prompt_tokens = 0;
         }
@@ -318,7 +364,12 @@ impl AppRuntime {
         }
         self.compact_suppression = CompactionSuppression::StickyUntilSuccess;
         self.extensions.notify_post_compact(matcher).await;
-        Ok(())
+        Ok(Some(CompactApplied {
+            tokens_before,
+            tokens_after,
+            trigger: request.trigger,
+            kept_turns,
+        }))
     }
 
     async fn collect_prefire_if_ready(&mut self) {
@@ -391,8 +442,9 @@ impl AppRuntime {
         messages: &[AgentMessage],
         config: &CompactionConfig,
         instructions: Option<&str>,
+        force: bool,
     ) -> Option<String> {
-        let (older, _) = split_for_compaction(messages, config)?;
+        let (older, _) = split_for_compaction_forced(messages, config, force)?;
         if older.is_empty() {
             return None;
         }
@@ -461,13 +513,18 @@ async fn sample_summary(provider: &dyn LlmProvider, prompt: String) -> Option<St
                 .trim()
                 .to_string();
             if text.is_empty() {
+                tracing::warn!("compaction summarizer returned empty text");
                 None
             } else {
+                tracing::info!(
+                    length = text.len(),
+                    "compaction summarizer generated summary"
+                );
                 Some(text)
             }
         }
         Err(e) => {
-            tracing::debug!(error = %e, "compaction summarizer failed");
+            tracing::warn!(error = %e, "compaction summarizer LLM call failed");
             None
         }
     }

@@ -186,6 +186,15 @@ impl super::App {
         self.clear_notice();
     }
 
+    /// `/context` categorical usage overlay.
+    pub fn open_context_float(&mut self, snapshot: crate::context::ContextSnapshot) {
+        self.context_info = Some(snapshot);
+        self.context_line_count = 0;
+        self.context_view_height = 0;
+        self.float = Some(FloatMenu::context_panel());
+        self.clear_notice();
+    }
+
     /// Ctrl+N asks before switching to a fresh session so the current draft
     /// and conversation are never replaced by accident.
     pub fn open_new_session_confirm(&mut self) {
@@ -250,6 +259,9 @@ impl super::App {
 
     pub fn close_float(&mut self) {
         self.float = None;
+        self.context_info = None;
+        self.context_line_count = 0;
+        self.context_view_height = 0;
         self.settings_delete_target = None;
     }
 

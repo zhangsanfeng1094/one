@@ -1,6 +1,51 @@
 //! Shared display-width helpers for TUI paint (truncate / wrap / pad).
 
+use ratatui::style::Style;
+use ratatui::text::Span;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+/// Kind of in-buffer attachment chip (`[文本.txt]` / `[图片.img]`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum InputChipKind {
+    Text,
+    Image,
+}
+
+/// If `s` starts with a paste/image chip token, return `(kind, byte_len)`.
+pub(super) fn next_input_chip(s: &str) -> Option<(InputChipKind, usize)> {
+    if let Some((_, len)) = one_core::image::parse_text_token_at(s) {
+        return Some((InputChipKind::Text, len));
+    }
+    if let Some((_, len)) = one_core::image::parse_image_token_at(s) {
+        return Some((InputChipKind::Image, len));
+    }
+    None
+}
+
+/// Split `s` into `(text, chip)` runs so paint can style chips as pills.
+pub(super) fn tokenize_input_chips(s: &str) -> Vec<(String, Option<InputChipKind>)> {
+    let mut out = Vec::new();
+    let mut buf = String::new();
+    let mut i = 0usize;
+    while i < s.len() {
+        let rest = &s[i..];
+        if let Some((kind, len)) = next_input_chip(rest) {
+            if !buf.is_empty() {
+                out.push((std::mem::take(&mut buf), None));
+            }
+            out.push((rest[..len].to_string(), Some(kind)));
+            i += len;
+            continue;
+        }
+        let ch = rest.chars().next().unwrap();
+        buf.push(ch);
+        i += ch.len_utf8();
+    }
+    if !buf.is_empty() {
+        out.push((buf, None));
+    }
+    out
+}
 
 pub(super) fn truncate_mid(s: &str, max: usize) -> String {
     if max == 0 {
@@ -358,8 +403,42 @@ pub(crate) fn expand_tabs(s: &str, tab_size: usize) -> String {
     out
 }
 
-pub(super) fn display_width(s: &str) -> usize {
+pub(crate) fn display_width(s: &str) -> usize {
     UnicodeWidthStr::width(s)
+}
+
+/// Pad `spans` with `pad_style` spaces so the row occupies `width` display columns.
+///
+/// Uses display width (CJK = 2), never `len()`. Remaining cells must be real
+/// spaces so a background color actually reaches the pane edge.
+pub(crate) fn fill_spans_to(spans: &mut Vec<Span<'static>>, width: usize, pad_style: Style) {
+    let used: usize = spans
+        .iter()
+        .map(|s| display_width(s.content.as_ref()))
+        .sum();
+    if used < width {
+        spans.push(Span::styled(" ".repeat(width - used), pad_style));
+    }
+}
+
+/// Pad `s` to `width` display columns (CJK = 2) on the right.
+pub(crate) fn pad_end(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(width - w))
+    }
+}
+
+/// Pad `s` to `width` display columns on the left (right-align).
+pub(crate) fn pad_start(s: &str, width: usize) -> String {
+    let w = display_width(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{}{s}", " ".repeat(width - w))
+    }
 }
 
 pub(super) fn char_width(ch: char) -> usize {

@@ -11,6 +11,8 @@ export const ThoughtBlock: React.FC<ThoughtBlockProps> = ({ thought, isStreaming
 
   if (!thought) return null;
 
+  const cleanThought = isStreaming ? thought.trimStart() : thought.trim();
+
   return (
     <div className="thought-container">
       <div className="thought-header" onClick={() => setIsOpen(!isOpen)}>
@@ -34,7 +36,7 @@ export const ThoughtBlock: React.FC<ThoughtBlockProps> = ({ thought, isStreaming
         </div>
         {isOpen ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
       </div>
-      {isOpen && <div className="thought-body">{thought}</div>}
+      {isOpen && <div className="thought-body">{cleanThought}</div>}
     </div>
   );
 };

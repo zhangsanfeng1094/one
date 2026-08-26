@@ -49,6 +49,10 @@ pub enum AgentEvent {
         output: ToolOutput,
         is_error: bool,
     },
+    UsageUpdate {
+        usage: crate::agent::TokenUsage,
+        context_tokens: u64,
+    },
 }
 
 pub type EventListener = Box<dyn Fn(&AgentEvent) + Send + Sync>;

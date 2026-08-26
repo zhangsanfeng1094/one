@@ -1,7 +1,7 @@
 //! Interactive terminal UI for One, built on [Ratatui](https://ratatui.rs/).
 //!
 //! Visual language follows OpenCode-style soft chrome:
-//! user turns get a peach left rail + warm elevated bubble (no `you>` tags),
+//! user turns get a full-row navy wash + blue left bar (no `you>` tags),
 //! j/k focus uses a separate blue rail, assistant is plain body text,
 //! tools render as compact `◇ name · args` rows.
 //!
@@ -19,11 +19,13 @@
 
 pub mod app;
 pub mod clipboard;
+pub mod context;
 pub mod error;
 pub mod float;
 pub mod markdown;
 pub mod message;
 pub mod notification;
+pub(crate) mod paste_burst;
 pub mod select;
 pub mod settings;
 pub mod slash;
@@ -32,12 +34,14 @@ pub mod terminal;
 pub mod theme;
 pub mod tool_view;
 pub mod ui;
+pub(crate) mod user_fold;
 
 pub use crate::state::{
     ApprovalAnswer, ApprovalPrompt, ConfigOp, ModelDraft, PendingImage, PendingText, RunOutcome,
     SelectKind, SelectPos, Toast,
 };
 pub use app::{expand_at_files, App, InteractiveApp};
+pub use context::{count_detail, ContextSnapshot, TokenUsageCategory};
 pub use error::Result;
 pub use float::{FloatItem, FloatKind, FloatMenu, FloatSection};
 pub use message::{AlertLevel, ChatLineTarget, Message, MessageRole, ToolStatus};

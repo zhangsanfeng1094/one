@@ -19,12 +19,13 @@ use crate::ui::text::expand_tabs;
 /// Leading indent (`  `) is applied by the caller for assistant messages.
 pub fn render(content: &str, width: usize) -> Vec<Line<'static>> {
     let width = width.max(8);
+    let content = rewrite_ascii_tables(content);
     let mut opts = Options::empty();
     opts.insert(Options::ENABLE_TABLES);
     opts.insert(Options::ENABLE_STRIKETHROUGH);
     opts.insert(Options::ENABLE_TASKLISTS);
 
-    let parser = Parser::new_ext(content, opts);
+    let parser = Parser::new_ext(&content, opts);
     let mut w = Writer::new(width);
     w.run(parser);
     w.finish()
@@ -127,7 +128,11 @@ impl Writer {
         match tag {
             Tag::Paragraph => {
                 self.runs.clear();
-                self.style = Theme::assistant_body();
+                self.style = if self.blockquote_depth > 0 {
+                    Theme::blockquote()
+                } else {
+                    Theme::assistant_body()
+                };
             }
             Tag::Heading { level, .. } => {
                 self.runs.clear();
@@ -145,6 +150,12 @@ impl Writer {
                 };
             }
             Tag::List(start) => {
+                // Nested lists arrive before the parent Item ends; flush the
+                // parent marker + text so the child's `runs.clear()` cannot
+                // drop it.
+                if self.item_prefix.is_some() {
+                    self.flush_list_item();
+                }
                 let ordered = start.is_some();
                 self.list_stack.push(ListState {
                     ordered,
@@ -160,7 +171,8 @@ impl Writer {
                         list.next_index += 1;
                         format!("{indent}{n}. ")
                     } else {
-                        format!("{indent}• ")
+                        let bullet = if depth == 0 { "• " } else { "◦ " };
+                        format!("{indent}{bullet}")
                     }
                 } else {
                     format!("{indent}• ")
@@ -170,7 +182,7 @@ impl Writer {
                 self.style = Theme::assistant_body();
             }
             Tag::Emphasis => {
-                self.style = self.style.add_modifier(Modifier::ITALIC);
+                self.style = Theme::emphasis();
             }
             Tag::Strong => {
                 self.style = Theme::strong();
@@ -239,7 +251,11 @@ impl Writer {
                 self.flush_list_item();
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
-                self.style = Theme::assistant_body();
+                self.style = if self.blockquote_depth > 0 {
+                    Theme::blockquote()
+                } else {
+                    Theme::assistant_body()
+                };
             }
             TagEnd::Table => {
                 self.flush_table();
@@ -428,7 +444,7 @@ impl Writer {
     }
 
     fn rule(&mut self) {
-        let w = self.width.min(48).max(8);
+        let w = self.width.max(8);
         self.lines
             .push(Line::from(Span::styled("─".repeat(w), Theme::meta())));
         self.lines.push(Line::from(""));
@@ -464,7 +480,7 @@ impl Writer {
         if self.blockquote_depth == 0 {
             String::new()
         } else {
-            "│ ".repeat(self.blockquote_depth)
+            "▎ ".repeat(self.blockquote_depth)
         }
     }
 
@@ -492,6 +508,9 @@ impl Writer {
     }
 
     fn flush_list_item(&mut self) {
+        if self.item_prefix.is_none() && self.runs.is_empty() {
+            return;
+        }
         let marker = self.item_prefix.take().unwrap_or_else(|| "• ".into());
         let bq = self.blockquote_prefix();
         let full_prefix = format!("{bq}{marker}");
@@ -617,34 +636,89 @@ fn render_table(table: &TableBuild, avail: usize) -> Vec<Line<'static>> {
         })
         .collect();
 
-    // Natural width per column (content + 2 padding).
-    let mut natural: Vec<usize> = vec![3; cols]; // min
+    let aligns = effective_alignments(&table.alignments, &header, &body, cols);
+
+    // Natural width per column (content + 2 padding), capped so long CJK
+    // cells wrap instead of stretching the box past `avail`.
+    let mut natural: Vec<usize> = vec![3; cols];
     for (i, cell) in header.iter().enumerate() {
-        natural[i] = natural[i].max(display_width(cell) + 2);
+        natural[i] = natural[i].max(display_width(cell.trim()) + 2);
     }
     for row in &body {
         for (i, cell) in row.iter().enumerate() {
-            natural[i] = natural[i].max(display_width(cell) + 2);
+            natural[i] = natural[i].max(display_width(cell.trim()) + 2);
         }
     }
-
-    // Box borders take 1 + cols (verticals) + (cols separators already in cell? )
-    // Layout: │ cell │ cell │  → 1 + sum(widths) + (cols+1) wait:
-    //   ┌──┬──┐  outer uses cols*inner + (cols+1) border chars
     // borders: left + between* + right = cols + 1
     let border_cost = cols + 1;
+    let max_col = avail.saturating_sub(border_cost).max(12);
+    for w in natural.iter_mut() {
+        *w = (*w).min(max_col);
+    }
     let max_inner = avail.saturating_sub(border_cost).max(cols * 3);
     let widths = fit_columns(&natural, max_inner, cols);
 
     let mut out = Vec::new();
     out.push(box_line(&widths, BoxRow::Top));
-    out.push(table_data_row(&header, &widths, &table.alignments, true));
+    out.extend(table_data_rows(&header, &widths, &aligns, true));
     out.push(box_line(&widths, BoxRow::Mid));
     for row in &body {
-        out.push(table_data_row(row, &widths, &table.alignments, false));
+        out.extend(table_data_rows(row, &widths, &aligns, false));
     }
     out.push(box_line(&widths, BoxRow::Bot));
     out
+}
+
+/// GFM alignment, with a numeric-column fallback (right) when unspecified.
+fn effective_alignments(
+    declared: &[Alignment],
+    header: &[String],
+    body: &[Vec<String>],
+    cols: usize,
+) -> Vec<Alignment> {
+    (0..cols)
+        .map(|i| {
+            let given = declared.get(i).copied().unwrap_or(Alignment::None);
+            if !matches!(given, Alignment::None) {
+                return given;
+            }
+            let cells = body.iter().filter_map(|r| r.get(i).map(|s| s.trim()));
+            let mut saw = false;
+            for cell in cells {
+                if cell.is_empty() {
+                    continue;
+                }
+                saw = true;
+                if !looks_numeric(cell) {
+                    return Alignment::Left;
+                }
+            }
+            if saw {
+                Alignment::Right
+            } else if header
+                .get(i)
+                .is_some_and(|h| looks_numeric(h.trim()) && !h.trim().is_empty())
+            {
+                Alignment::Right
+            } else {
+                Alignment::Left
+            }
+        })
+        .collect()
+}
+
+fn looks_numeric(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() {
+        return false;
+    }
+    let t = t.trim_end_matches('%').trim();
+    if t.parse::<f64>().is_ok() {
+        return true;
+    }
+    t.chars()
+        .all(|c| c.is_ascii_digit() || matches!(c, '.' | ',' | '-' | '+' | ':' | '/'))
+        && t.chars().any(|c| c.is_ascii_digit())
 }
 
 enum BoxRow {
@@ -668,37 +742,100 @@ fn box_line(widths: &[usize], kind: BoxRow) -> Line<'static> {
     Line::from(Span::styled(s, Theme::table_border()))
 }
 
-fn table_data_row(
+fn table_data_rows(
     cells: &[String],
     widths: &[usize],
     aligns: &[Alignment],
     header: bool,
-) -> Line<'static> {
-    let mut spans = vec![Span::styled("│", Theme::table_border())];
-    for (i, &w) in widths.iter().enumerate() {
-        let raw = cells.get(i).map(|s| s.as_str()).unwrap_or("");
-        // cell content width = w - 2 (padding spaces)
-        let content_w = w.saturating_sub(2).max(1);
-        let text = truncate_display(raw.trim(), content_w);
-        let pad = content_w.saturating_sub(display_width(&text));
-        let align = aligns.get(i).copied().unwrap_or(Alignment::None);
-        let (left, right) = match align {
-            Alignment::Center => (pad / 2, pad - pad / 2),
-            Alignment::Right => (pad, 0),
-            Alignment::Left | Alignment::None => (0, pad),
-        };
-        let style = if header {
-            Theme::table_header()
-        } else {
-            Theme::table_cell()
-        };
-        spans.push(Span::styled(
-            format!(" {}{}{} ", " ".repeat(left), text, " ".repeat(right)),
-            style,
-        ));
-        spans.push(Span::styled("│", Theme::table_border()));
+) -> Vec<Line<'static>> {
+    let wrapped: Vec<Vec<String>> = widths
+        .iter()
+        .enumerate()
+        .map(|(i, &w)| {
+            let raw = cells.get(i).map(|s| s.trim()).unwrap_or("");
+            let content_w = w.saturating_sub(2).max(1);
+            wrap_plain(raw, content_w)
+        })
+        .collect();
+    let height = wrapped.iter().map(|c| c.len().max(1)).max().unwrap_or(1);
+    let style = if header {
+        Theme::table_header()
+    } else {
+        Theme::table_cell()
+    };
+
+    (0..height)
+        .map(|row_i| {
+            let mut spans = vec![Span::styled("│", Theme::table_border())];
+            for (i, &w) in widths.iter().enumerate() {
+                let content_w = w.saturating_sub(2).max(1);
+                let text = wrapped
+                    .get(i)
+                    .and_then(|c| c.get(row_i))
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                let pad = content_w.saturating_sub(display_width(text));
+                let align = aligns.get(i).copied().unwrap_or(Alignment::None);
+                let (left, right) = match align {
+                    Alignment::Center => (pad / 2, pad - pad / 2),
+                    Alignment::Right => (pad, 0),
+                    Alignment::Left | Alignment::None => (0, pad),
+                };
+                spans.push(Span::styled(
+                    format!(" {}{}{} ", " ".repeat(left), text, " ".repeat(right)),
+                    style,
+                ));
+                spans.push(Span::styled("│", Theme::table_border()));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Wrap plain text to `width` display columns (CJK = 2). Never splits a grapheme.
+fn wrap_plain(text: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return vec![text.to_string()];
     }
-    Line::from(spans)
+    let t = text.trim();
+    if t.is_empty() {
+        return vec![String::new()];
+    }
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut cur_w = 0usize;
+    let mut last_space: Option<usize> = None;
+    for ch in t.chars() {
+        let cw = char_width(ch);
+        if cur_w + cw > width && !cur.is_empty() {
+            if let Some(sp) = last_space {
+                let rest = cur.split_off(sp);
+                let rest = rest.trim_start().to_string();
+                if !cur.is_empty() {
+                    out.push(std::mem::take(&mut cur));
+                }
+                cur = rest;
+                cur_w = display_width(&cur);
+                last_space = None;
+            } else {
+                out.push(std::mem::take(&mut cur));
+                cur_w = 0;
+                last_space = None;
+            }
+        }
+        if ch == ' ' {
+            last_space = Some(cur.len());
+        }
+        cur.push(ch);
+        cur_w += cw;
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    if out.is_empty() {
+        out.push(String::new());
+    }
+    out
 }
 
 /// Shrink column widths so sum(widths) ≤ budget, preserving min 3 per col.
@@ -734,7 +871,7 @@ fn fit_columns(natural: &[usize], budget: usize, cols: usize) -> Vec<usize> {
 
 fn heading_style(level: HeadingLevel) -> Style {
     match level {
-        HeadingLevel::H1 | HeadingLevel::H2 => Theme::heading(),
+        HeadingLevel::H1 => Theme::heading(),
         _ => Theme::heading_sub(),
     }
 }
@@ -742,7 +879,7 @@ fn heading_style(level: HeadingLevel) -> Style {
 fn prefix_line(prefix: &str, row: Vec<(String, Style)>) -> Line<'static> {
     let mut spans = Vec::new();
     if !prefix.is_empty() {
-        spans.push(Span::styled(prefix.to_string(), Theme::blockquote()));
+        spans.push(Span::styled(prefix.to_string(), Theme::blockquote_bar()));
     }
     if row.is_empty() {
         return Line::from(spans);
@@ -841,6 +978,170 @@ fn display_width(s: &str) -> usize {
 
 fn char_width(ch: char) -> usize {
     UnicodeWidthStr::width(ch.encode_utf8(&mut [0; 4])).max(1)
+}
+
+/// Rewrite model-drawn box-diagram "tables" into GFM pipe tables so the
+/// renderer can re-flow them with display-width columns. Fenced code is left
+/// untouched. Non-tabular ASCII art is kept as-is.
+fn rewrite_ascii_tables(src: &str) -> String {
+    if !src.contains('┌') && !src.contains('│') && !src.contains('├') {
+        return src.to_string();
+    }
+    let mut out = String::with_capacity(src.len());
+    let mut in_fence = false;
+    let mut buf: Vec<&str> = Vec::new();
+    let flush = |buf: &mut Vec<&str>, out: &mut String| {
+        if buf.is_empty() {
+            return;
+        }
+        if let Some(gfm) = box_block_to_gfm(buf) {
+            out.push_str(&gfm);
+            if !gfm.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            for (i, line) in buf.iter().enumerate() {
+                if i > 0 {
+                    out.push('\n');
+                }
+                out.push_str(line);
+            }
+            out.push('\n');
+        }
+        buf.clear();
+    };
+    for line in src.lines() {
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("```") {
+            flush(&mut buf, &mut out);
+            in_fence = !in_fence;
+            out.push_str(line);
+            out.push('\n');
+            continue;
+        }
+        if !in_fence && is_box_table_line(line) {
+            buf.push(line);
+        } else {
+            flush(&mut buf, &mut out);
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    flush(&mut buf, &mut out);
+    if src.ends_with('\n') {
+        out
+    } else {
+        out.trim_end_matches('\n').to_string()
+    }
+}
+
+fn is_box_table_line(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() {
+        return false;
+    }
+    t.contains('│')
+        || t.contains('┌')
+        || t.contains('└')
+        || t.contains('├')
+        || t.contains('┤')
+        || t.contains('┬')
+        || t.contains('┴')
+        || t.contains('┼')
+}
+
+fn is_box_separator(line: &str) -> bool {
+    let t = line.trim();
+    !t.is_empty()
+        && t.chars().all(|c| {
+            matches!(
+                c,
+                '─' | '━'
+                    | '┌'
+                    | '┐'
+                    | '└'
+                    | '┘'
+                    | '├'
+                    | '┤'
+                    | '┬'
+                    | '┴'
+                    | '┼'
+                    | '│'
+                    | '+'
+                    | '-'
+                    | '|'
+                    | ' '
+            )
+        })
+        && t.chars()
+            .any(|c| matches!(c, '─' | '━' | '-' | '┼' | '┬' | '┴'))
+}
+
+fn box_block_to_gfm(lines: &[&str]) -> Option<String> {
+    if lines.len() < 3 {
+        return None;
+    }
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    for line in lines {
+        if is_box_separator(line) {
+            continue;
+        }
+        let cells = split_box_cells(line);
+        if cells.len() < 2 {
+            return None;
+        }
+        rows.push(cells);
+    }
+    if rows.len() < 2 {
+        return None;
+    }
+    let cols = rows.iter().map(|r| r.len()).max()?;
+    for row in rows.iter_mut() {
+        row.resize(cols, String::new());
+        for cell in row.iter_mut() {
+            *cell = cell.replace('|', "\\|");
+        }
+    }
+    let mut gfm = String::new();
+    gfm.push('|');
+    for cell in &rows[0] {
+        gfm.push(' ');
+        gfm.push_str(cell);
+        gfm.push_str(" |");
+    }
+    gfm.push('\n');
+    gfm.push('|');
+    for _ in 0..cols {
+        gfm.push_str(" --- |");
+    }
+    gfm.push('\n');
+    for row in rows.iter().skip(1) {
+        gfm.push('|');
+        for cell in row {
+            gfm.push(' ');
+            gfm.push_str(cell);
+            gfm.push_str(" |");
+        }
+        gfm.push('\n');
+    }
+    Some(gfm)
+}
+
+fn split_box_cells(line: &str) -> Vec<String> {
+    let t = line.trim();
+    let parts: Vec<&str> = if t.contains('│') {
+        t.split('│').collect()
+    } else {
+        t.split('|').collect()
+    };
+    let mut cells: Vec<String> = parts.iter().map(|s| s.trim().to_string()).collect();
+    if cells.first().is_some_and(|s| s.is_empty()) {
+        cells.remove(0);
+    }
+    if cells.last().is_some_and(|s| s.is_empty()) {
+        cells.pop();
+    }
+    cells
 }
 
 fn truncate_display(s: &str, max_cols: usize) -> String {
@@ -993,7 +1294,107 @@ mod tests {
         let lines = render(md, 40);
         let s = flat(&lines);
         assert!(s.contains("quoted text"), "{s}");
-        assert!(s.contains('│'), "{s}");
+        assert!(s.contains('▎') || s.contains('│'), "{s}");
+    }
+
+    #[test]
+    fn nested_list_uses_hollow_bullet() {
+        let md = "- alpha\n    - nested";
+        let lines = render(md, 40);
+        let s = flat(&lines);
+        assert!(s.contains("• alpha"), "{s}");
+        assert!(s.contains("◦ nested"), "{s}");
+    }
+
+    #[test]
+    fn cjk_table_columns_share_display_width() {
+        let md = "\
+| 层 | 职责 |
+|----|------|
+| 表现层 | UI |
+| API | 网关 |
+";
+        let lines = render(md, 48);
+        let widths: Vec<usize> = lines
+            .iter()
+            .filter(|l| {
+                let t: String = l.spans.iter().map(|s| s.content.as_ref()).collect();
+                t.contains('│') || t.contains('┌') || t.contains('├') || t.contains('└')
+            })
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| display_width(s.content.as_ref()))
+                    .sum()
+            })
+            .collect();
+        assert!(widths.len() >= 3, "expected a boxed table");
+        let first = widths[0];
+        assert!(
+            widths.iter().all(|&w| w == first),
+            "CJK table rows must share display width, got {widths:?}\n{}",
+            flat(&lines)
+        );
+    }
+
+    #[test]
+    fn ascii_box_table_is_reparsed() {
+        let md = "\
+┌──────┬──────┐
+│ 项目 │ 值   │
+├──────┼──────┤
+│ 中文 │ 12   │
+│ ASCII│ 3    │
+└──────┴──────┘
+";
+        let lines = render(md, 40);
+        let s = flat(&lines);
+        assert!(s.contains("项目") && s.contains("中文"), "{s}");
+        let widths: Vec<usize> = lines
+            .iter()
+            .filter(|l| {
+                let t: String = l.spans.iter().map(|sp| sp.content.as_ref()).collect();
+                t.contains('│') || t.contains('┌')
+            })
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|sp| display_width(sp.content.as_ref()))
+                    .sum()
+            })
+            .collect();
+        if let Some(&first) = widths.first() {
+            assert!(
+                widths.iter().all(|&w| w == first),
+                "reparsed box must align, got {widths:?}\n{s}"
+            );
+        }
+    }
+
+    #[test]
+    fn numeric_column_right_aligns() {
+        let md = "\
+| Name | Age |
+|------|-----|
+| Ada  | 36  |
+| Lin  | 4   |
+";
+        let lines = render(md, 40);
+        let body = lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .find(|s| s.contains("Lin"))
+            .unwrap_or_default();
+        // Right-aligned 4 sits closer to the right pipe than a left-aligned digit.
+        assert!(
+            body.contains("  4 ") || body.contains(" 4 │") || body.contains("  4│"),
+            "expected numeric right-align, got {body:?}"
+        );
     }
 
     #[test]

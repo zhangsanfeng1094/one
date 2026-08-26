@@ -43,8 +43,9 @@ If you find unexpected state — unfamiliar files, branches, or configuration �
 </action_safety>
 
 <tool_calling>
-- Use specialized tools instead of bash commands when possible. Prefer `read` over cat/head/tail, `edit`/`write` over sed/awk/heredoc, `grep`/`find` over shell rg/find, and `ls` over `bash ls` or `wc -l`. `ls` already reports line counts for text files and size for binaries — do not follow it with `wc` or `stat` just to learn how big a file is.
-- Never guess file paths. Derive paths directly from context (e.g. `use`/`import` statements) or verify with `ls`/`find` before calling `read`. If a file is not found, stop guessing and search.
+- Use specialized tools instead of bash commands when possible. Prefer `read` over cat/head/tail, `edit`/`write` over sed/awk/heredoc, `glob` over find/locate, `grep` over grep/ripgrep, and `ls` over `bash ls` or `wc -l`. `ls` already reports line counts for text files and size for binaries — do not follow it with `wc` or `stat` just to learn how big a file is.
+- Never guess file paths. Derive paths directly from context (e.g. `use`/`import` statements) or verify with `ls`/`glob` before calling `read`. If a file is not found, stop guessing and search with `glob` or `grep`.
+- Use `glob` for finding files by pattern/name, and `grep` for searching file contents.
 - Reserve bash for actual system commands and terminal operations. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.
 </tool_calling>
 
@@ -62,6 +63,9 @@ Use the `monitor` tool — it streams each stdout line back as a chat notificati
 
 <formatting>
 Your text output is rendered as GitHub-flavored markdown (CommonMark). Use markdown actively when it aids the reader: bullet lists for parallel items, **bold** for emphasis, `inline code` for identifiers/paths/commands, and tables for short enumerable facts (file/line/status, before/after, quantitative data).
+- Structured comparisons belong in markdown tables — do not draw ASCII box diagrams (`┌─┐│`). The renderer re-flows tables by display width.
+- Give the English form of a proper noun only on first mention, in inline code or italics. Never stack bold and a second color.
+- Keep paragraphs to at most 4 lines.
 </formatting>
 
 <user_guide>
@@ -162,6 +166,8 @@ pub struct AgentConfig {
     /// How many times to retry a blank model turn or temporary provider error.
     /// Reasoning-only turns count as empty (same as Grok Build).
     pub empty_response_retries: usize,
+    /// Optional compaction/pruning configuration applied during intra-turn tool loops.
+    pub compaction_config: Option<crate::compaction::CompactionConfig>,
 }
 
 impl Default for AgentConfig {
@@ -172,6 +178,7 @@ impl Default for AgentConfig {
             thinking_level: ThinkingLevel::Off,
             server_search: false,
             empty_response_retries: DEFAULT_EMPTY_RESPONSE_RETRIES,
+            compaction_config: None,
         }
     }
 }
@@ -449,6 +456,11 @@ impl Agent {
 
     pub fn trace_meta(&self) -> &TraceRunMeta {
         &self.trace_meta
+    }
+
+    /// Update compaction / pruning configuration for intra-run execution.
+    pub fn set_compaction_config(&mut self, cfg: Option<crate::compaction::CompactionConfig>) {
+        self.config.compaction_config = cfg;
     }
 
     /// Update session id for the next run (e.g. after `/new` or `/resume`).
@@ -953,6 +965,10 @@ impl Agent {
                 if ctx > 0 {
                     self.last_prompt_tokens = ctx;
                 }
+                self.emit(AgentEvent::UsageUpdate {
+                    usage: self.token_usage,
+                    context_tokens: self.last_prompt_tokens,
+                });
             }
 
             turns_done = turn + 1;
@@ -1082,6 +1098,12 @@ impl Agent {
                         .await;
                 }
                 ToolBatchOutcome::Continue => {}
+            }
+
+            if let Some(compaction_cfg) = &self.config.compaction_config {
+                if compaction_cfg.prune {
+                    crate::compaction::prune_old_tool_outputs(&mut self.messages, compaction_cfg);
+                }
             }
 
             self.emit(AgentEvent::TurnEnd {
@@ -1659,11 +1681,10 @@ impl Agent {
             }
         }
 
-        match self
-            .tools
-            .iter()
-            .find(|tool| tool.definition().name == effective.name)
-        {
+        match self.tools.iter().find(|tool| {
+            let def_name = tool.definition().name;
+            def_name == effective.name || resolve_tool_name(&def_name) == effective.name
+        }) {
             Some(tool) => GateOutcome::Allow {
                 effective,
                 gate: gate_decision,
@@ -1867,7 +1888,15 @@ pub fn is_parallel_safe_tool(name: &str) -> bool {
         // `task` is explore-only (read-only research) in MVP → concurrent-safe.
         // When general/write subagents land, keep them serial via a different
         // name or gate classification on mode.
-        "read" | "grep" | "find" | "ls" | "bash_output" | "web_search" | "web_fetch" | "task"
+        "read"
+            | "grep"
+            | "glob"
+            | "find"
+            | "ls"
+            | "bash_output"
+            | "web_search"
+            | "web_fetch"
+            | "task"
     )
 }
 
@@ -2118,6 +2147,10 @@ mod tests {
             "tool policy should mention ls line counts"
         );
         assert!(
+            DEFAULT_SYSTEM_PROMPT.contains("markdown tables"),
+            "formatting should steer structured output toward GFM tables"
+        );
+        assert!(
             !DEFAULT_SYSTEM_PROMPT.contains("`read_file`"),
             "Grok tool names must not leak into One's system prompt"
         );
@@ -2131,6 +2164,7 @@ mod tests {
     fn parallel_safe_tools_are_read_only() {
         assert!(is_parallel_safe_tool("read"));
         assert!(is_parallel_safe_tool("grep"));
+        assert!(is_parallel_safe_tool("glob"));
         assert!(is_parallel_safe_tool("find"));
         assert!(is_parallel_safe_tool("ls"));
         assert!(is_parallel_safe_tool("web_search"));

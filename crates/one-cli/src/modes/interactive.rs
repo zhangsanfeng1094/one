@@ -118,12 +118,15 @@ async fn apply_switch_model(
                 tracing::warn!(error = %e, "hosted search refresh after model switch failed");
             }
             if ctx < previous_context_window {
-                runtime
+                if let Some(applied) = runtime
                     .maybe_compact_with(
                         providers.as_arc(),
                         one_core::compaction::CompactRequest::model_switch(),
                     )
-                    .await?;
+                    .await?
+                {
+                    note_compacted(app, applied);
+                }
             }
             app.set_notice(format!(
                 "model → {} / {}",
@@ -1364,6 +1367,8 @@ enum SlashAction {
     Consumed,
     /// Run a full agent turn with this text as the user prompt.
     Prompt(String),
+    /// Manual `/compact` — needs TerminalSession so the TUI can keep painting.
+    Compact { instructions: Option<String> },
     /// OAuth login/logout — needs TerminalSession suspend (see main loop).
     LoginLogout { is_login: bool, args: Vec<String> },
 }
@@ -1435,13 +1440,19 @@ pub async fn run_interactive(
         ));
     }
 
-    // `--continue` / boot-time resume already loaded agent messages — paint them
-    // into the transcript (including tool results) so history is not a blank UI.
+    // `--continue` / boot-time resume: paint the **UI transcript** (full
+    // history + compact markers). Agent messages stay the compacted LLM context.
     {
-        let msgs = runtime.agent.lock().await.messages.clone();
-        if !msgs.is_empty() {
-            let durations = session_tool_durations(runtime);
-            rebuild_tui_from_agent(&mut app, &msgs, &durations);
+        let durations = session_tool_durations(runtime);
+        if let Some(session) = runtime.session.as_ref() {
+            if !session.transcript_entries().is_empty() {
+                rebuild_tui_from_session(&mut app, session, &durations);
+            }
+        } else {
+            let msgs = runtime.agent.lock().await.messages.clone();
+            if !msgs.is_empty() {
+                rebuild_tui_from_agent(&mut app, &msgs, &durations);
+            }
         }
     }
 
@@ -1546,6 +1557,26 @@ pub async fn run_interactive(
                         terminal
                             .draw(&mut app)
                             .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                    }
+                    SlashAction::Compact { instructions } => {
+                        match compact_with_live_ui(
+                            runtime,
+                            providers.as_arc(),
+                            &mut terminal,
+                            &mut app,
+                            one_core::compaction::CompactRequest::manual(instructions),
+                            true,
+                        )
+                        .await?
+                        {
+                            TurnEnd::Continue => {
+                                refresh_usage(&mut app, runtime).await;
+                                terminal
+                                    .draw(&mut app)
+                                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+                            }
+                            TurnEnd::ForceQuit => break,
+                        }
                     }
                     SlashAction::LoginLogout { is_login, args } => {
                         if is_login {
@@ -1822,7 +1853,7 @@ fn sync_compaction_settings(app: &mut App, s: &crate::settings::Settings) {
         c.auto.unwrap_or(true),
         c.ratio.unwrap_or(one_core::DEFAULT_COMPACT_RATIO),
         c.threshold,
-        c.keep_recent.unwrap_or(12),
+        c.keep_recent.unwrap_or(one_core::DEFAULT_KEEP_RECENT_TURNS),
         c.prune.unwrap_or(true),
         c.prune_keep_last_n_turns
             .unwrap_or(one_core::DEFAULT_PRUNE_KEEP_LAST_N_TURNS),
@@ -1961,12 +1992,23 @@ async fn run_turn_streaming(
             app.set_notice(format!("🧠 提醒: {}", top_rem.title));
         }
     }
-    runtime
-        .maybe_compact_with(
-            provider.clone(),
-            one_core::compaction::CompactRequest::auto(),
-        )
-        .await?;
+    match compact_with_live_ui(
+        runtime,
+        provider.clone(),
+        terminal,
+        app,
+        one_core::compaction::CompactRequest::auto(),
+        false,
+    )
+    .await?
+    {
+        TurnEnd::Continue => {}
+        TurnEnd::ForceQuit => {
+            app.end_busy();
+            app.finish_stream_with_interrupted(true);
+            return Ok(TurnEnd::ForceQuit);
+        }
+    }
     let _ = runtime
         .extensions
         .emit(&one_ext::ExtensionEvent::UserPromptSubmit { text: text.clone() })
@@ -1977,6 +2019,12 @@ async fn run_turn_streaming(
     let usage_before = agent.lock().await.token_usage;
     let steering = runtime.steering_queue();
     let followup = runtime.followup_queue();
+
+    let input_tokens = one_core::estimate_tokens_str(&text);
+    if input_tokens > 0 {
+        app.set_usage_tokens(app.usage_tokens.saturating_add(input_tokens));
+        app.set_usage_tokens_estimated(true);
+    }
 
     let prompt_handle = {
         let agent = agent.clone();
@@ -2043,13 +2091,23 @@ async fn run_turn_streaming(
     let prompt_result = match prompt_result {
         Err(err) if is_overflow(&err) => {
             app.set_notice("context overflow · compacting…");
-            let _ = terminal.draw(app);
-            runtime
-                .maybe_compact_with(
-                    provider.clone(),
-                    one_core::compaction::CompactRequest::overflow(),
-                )
-                .await?;
+            match compact_with_live_ui(
+                runtime,
+                provider.clone(),
+                terminal,
+                app,
+                one_core::compaction::CompactRequest::overflow(),
+                false,
+            )
+            .await?
+            {
+                TurnEnd::Continue => {}
+                TurnEnd::ForceQuit => {
+                    app.end_busy();
+                    app.finish_stream_with_interrupted(true);
+                    return Ok(TurnEnd::ForceQuit);
+                }
+            }
             // Buffer shrank: avoid `[before..]` panic; keep the in-flight user turn
             // for session append without re-writing already-persisted kept history.
             before = {
@@ -2301,6 +2359,24 @@ fn drain_events(
                 if let Some(rt) = runtime.as_deref_mut() {
                     rt.note_tool_end(&tool_call.id, &tool_call.name, is_error);
                 }
+                let added = one_core::estimate_tokens_str(&output.as_text());
+                if added > 0 {
+                    app.set_usage_tokens(app.usage_tokens.saturating_add(added));
+                    app.set_usage_tokens_estimated(true);
+                }
+            }
+            AgentEvent::UsageUpdate {
+                usage,
+                context_tokens,
+            } => {
+                if context_tokens > 0 {
+                    app.set_usage_tokens(context_tokens as usize);
+                    app.set_usage_tokens_estimated(false);
+                }
+                app.set_usage_io(usage.input_tokens, usage.output_tokens);
+                app.set_usage_cache(usage.cache_read_tokens, usage.cache_write_tokens);
+                let cost = estimate_cost_usd(&app.current_provider, &app.current_model, &usage);
+                app.set_usage_cost_usd(cost);
             }
             _ => {}
         }
@@ -2479,6 +2555,18 @@ async fn handle_slash(
                     }
                 }
             }
+            Ok(SlashAction::Consumed)
+        }
+        Some("/context") => {
+            let model = if app.current_provider.is_empty() {
+                app.current_model.clone()
+            } else if app.current_model.is_empty() {
+                app.current_provider.clone()
+            } else {
+                format!("{}:{}", app.current_provider, app.current_model)
+            };
+            let snapshot = runtime.context_snapshot(model).await;
+            app.open_context_float(snapshot);
             Ok(SlashAction::Consumed)
         }
         Some("/session") => {
@@ -2824,25 +2912,7 @@ async fn handle_slash(
         Some("/compact") => {
             let custom = parts.get(1..).map(|p| p.join(" "));
             let instructions = custom.filter(|s| !s.is_empty());
-            if let Some(instr) = instructions.as_deref() {
-                app.set_notice(format!("compacting… ({instr})"));
-            } else {
-                app.set_notice("compacting…");
-            }
-            runtime
-                .maybe_compact_with(
-                    providers.as_arc(),
-                    one_core::compaction::CompactRequest::manual(instructions),
-                )
-                .await?;
-            refresh_usage(app, runtime).await;
-            let (toks, estimated) = runtime.context_tokens().await;
-            app.set_notice(format!(
-                "compacted · {}{} tokens",
-                if estimated { "~" } else { "" },
-                toks
-            ));
-            Ok(SlashAction::Consumed)
+            Ok(SlashAction::Compact { instructions })
         }
         Some("/reload") => {
             match runtime.reload_extensions().await {
@@ -3080,7 +3150,7 @@ async fn handle_slash(
                         agent.messages.clear();
                         session.load_messages_into(&mut agent.messages);
                         let durations = session.tool_duration_by_call_id();
-                        rebuild_tui_from_agent(app, &agent.messages, &durations);
+                        rebuild_tui_from_session(app, session, &durations);
                         app.set_notice(format!("branched to {id}"));
                         refresh_usage(app, runtime).await;
                     }
@@ -3467,16 +3537,20 @@ async fn load_session_into_app(
         tracing::warn!(error = %err, "hosted search refresh after session resume failed");
     }
     if ctx < previous_context_window {
-        runtime
+        let _ = runtime
             .maybe_compact_with(
                 providers.as_arc(),
                 one_core::compaction::CompactRequest::model_switch(),
             )
             .await?;
     }
-    let msgs = runtime.agent.lock().await.messages.clone();
     let durations = session_tool_durations(runtime);
-    rebuild_tui_from_agent(app, &msgs, &durations);
+    if let Some(session) = runtime.session.as_ref() {
+        rebuild_tui_from_session(app, session, &durations);
+    } else {
+        let msgs = runtime.agent.lock().await.messages.clone();
+        rebuild_tui_from_agent(app, &msgs, &durations);
+    }
     // ↑ history is project-scoped (loaded at startup); do not re-append on resume.
     app.set_thinking_level(runtime.thinking_level().await.as_str());
     app.set_agent_label(runtime.mode().label());
@@ -3525,7 +3599,7 @@ async fn apply_rewind(
         agent.messages.clear();
         session.load_messages_into(&mut agent.messages);
         let durations = session.tool_duration_by_call_id();
-        rebuild_tui_from_agent(app, &agent.messages, &durations);
+        rebuild_tui_from_session(app, session, &durations);
     }
 
     app.set_input_for_edit_with_images(prompt_text, images);
@@ -3541,6 +3615,138 @@ async fn apply_rewind(
     Ok(())
 }
 
+fn compact_result_notice(applied: &one_core::compaction::CompactApplied) -> String {
+    use one_tui::message::Message;
+    let tokens = if applied.tokens_after > 0 {
+        format!(
+            "{} → ~{}",
+            Message::format_token_count(applied.tokens_before),
+            Message::format_token_count(applied.tokens_after)
+        )
+    } else {
+        format!(
+            "{} tokens",
+            Message::format_token_count(applied.tokens_before)
+        )
+    };
+    let mut parts = vec![format!("compacted · {tokens}")];
+    if applied.kept_turns > 0 {
+        parts.push(format!("kept {} turns", applied.kept_turns));
+    }
+    parts.join(" · ")
+}
+
+/// Run compaction while the TUI keeps painting.
+///
+/// `loading_marker` is for manual `/compact`: in-transcript spinner, then the
+/// result divider. Auto/overflow already have a busy turn, so they only pump
+/// frames and insert the finished marker.
+async fn compact_with_live_ui(
+    runtime: &mut AppRuntime,
+    provider: std::sync::Arc<dyn LlmProvider>,
+    terminal: &mut TerminalSession,
+    app: &mut App,
+    request: one_core::compaction::CompactRequest,
+    loading_marker: bool,
+) -> Result<TurnEnd, Box<dyn std::error::Error>> {
+    let was_busy = app.busy;
+    if !was_busy {
+        app.begin_busy();
+    }
+    if loading_marker {
+        app.busy_activity = "compacting".into();
+        app.push_compacting_marker();
+        if let Some(instr) = request.instructions.as_deref() {
+            app.set_notice(format!("compacting… ({instr})"));
+        } else {
+            app.set_notice("compacting…");
+        }
+        let _ = terminal.draw(app);
+    }
+
+    let result = terminal
+        .run_until(
+            app,
+            |app| {
+                app.spinner_frame = app.spinner_frame.wrapping_add(1);
+            },
+            runtime.maybe_compact_with(provider, request),
+        )
+        .await;
+
+    app.busy_activity.clear();
+
+    match result {
+        Ok(Ok(Some(applied))) => {
+            if loading_marker {
+                app.finish_compacting_marker(
+                    applied.tokens_before,
+                    applied.tokens_after,
+                    applied.kept_turns,
+                );
+            } else {
+                note_compacted(app, applied);
+            }
+            app.set_notice(compact_result_notice(&applied));
+            if !was_busy {
+                app.end_busy();
+            }
+            Ok(TurnEnd::Continue)
+        }
+        Ok(Ok(None)) => {
+            if loading_marker {
+                app.cancel_compacting_marker();
+                app.set_notice("nothing to compact");
+            }
+            if !was_busy {
+                app.end_busy();
+            }
+            Ok(TurnEnd::Continue)
+        }
+        Ok(Err(err)) => {
+            if loading_marker {
+                app.cancel_compacting_marker();
+                app.set_notice(format!("compact failed: {err}"));
+                if !was_busy {
+                    app.end_busy();
+                }
+                Ok(TurnEnd::Continue)
+            } else {
+                if !was_busy {
+                    app.end_busy();
+                }
+                Err(err)
+            }
+        }
+        Err(ForceQuit) => {
+            if loading_marker {
+                app.cancel_compacting_marker();
+            }
+            if !was_busy {
+                app.end_busy();
+            }
+            Ok(TurnEnd::ForceQuit)
+        }
+    }
+}
+
+fn note_compacted(app: &mut App, applied: one_core::compaction::CompactApplied) {
+    match applied.trigger {
+        one_core::compaction::CompactTrigger::Auto => {
+            app.push_compact_marker_before_last_user(
+                applied.tokens_before,
+                applied.tokens_after,
+                applied.kept_turns,
+            );
+        }
+        _ => app.push_compact_marker(
+            applied.tokens_before,
+            applied.tokens_after,
+            applied.kept_turns,
+        ),
+    }
+}
+
 /// Rebuild on-screen transcript from agent messages (user / thinking / assistant / tools).
 ///
 /// Tool rows rehydrate from matching [`AgentMessage::ToolResult`] by
@@ -3550,6 +3756,69 @@ async fn apply_rewind(
 ///
 /// `tool_durations` is optional `tool_call_id → duration_ms` from
 /// `one.tool_audit` (via [`one_session::SessionManager::tool_duration_by_call_id`]).
+fn rebuild_tui_from_session(
+    app: &mut App,
+    session: &one_session::SessionManager,
+    tool_durations: &std::collections::HashMap<String, u64>,
+) {
+    rebuild_tui_from_entries(app, &session.transcript_entries(), tool_durations);
+}
+
+fn rebuild_tui_from_entries(
+    app: &mut App,
+    entries: &[one_session::SessionEntry],
+    tool_durations: &std::collections::HashMap<String, u64>,
+) {
+    app.messages.clear();
+    app.chat_scroll = 0;
+    app.stream_buffer.clear();
+    app.thinking_buffer.clear();
+
+    let mut batch: Vec<AgentMessage> = Vec::new();
+    for entry in entries {
+        match entry {
+            one_session::SessionEntry::Message { message, .. } => batch.push(message.clone()),
+            one_session::SessionEntry::Compaction {
+                tokens_before,
+                details,
+                ..
+            } => {
+                paint_agent_messages(app, &batch, tool_durations);
+                batch.clear();
+                let kept_turns = details
+                    .as_ref()
+                    .and_then(|d| d.get("kept_turns"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0) as usize;
+                let tokens_after = details
+                    .as_ref()
+                    .and_then(|d| d.get("tokens_after"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                app.push_compact_marker(*tokens_before, tokens_after, kept_turns);
+            }
+            one_session::SessionEntry::BranchSummary { summary, .. } => {
+                paint_agent_messages(app, &batch, tool_durations);
+                batch.clear();
+                app.push_system(format!("[Branch summary] {summary}"));
+            }
+            one_session::SessionEntry::CustomMessage {
+                content, display, ..
+            } if *display => {
+                if let Some(text) = content.as_str() {
+                    if !text.is_empty() {
+                        paint_agent_messages(app, &batch, tool_durations);
+                        batch.clear();
+                        app.push_user(text);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    paint_agent_messages(app, &batch, tool_durations);
+}
+
 fn rebuild_tui_from_agent(
     app: &mut App,
     messages: &[AgentMessage],
@@ -3559,7 +3828,14 @@ fn rebuild_tui_from_agent(
     app.chat_scroll = 0;
     app.stream_buffer.clear();
     app.thinking_buffer.clear();
+    paint_agent_messages(app, messages, tool_durations);
+}
 
+fn paint_agent_messages(
+    app: &mut App,
+    messages: &[AgentMessage],
+    tool_durations: &std::collections::HashMap<String, u64>,
+) {
     // Index results first so multi-tool rounds with the same name stay paired
     // correctly (finish-by-name alone would match the newest Running row).
     let mut results: std::collections::HashMap<&str, &one_core::ToolResultMessage> =
@@ -3576,6 +3852,7 @@ fn rebuild_tui_from_agent(
                 app.push_user(u.content.as_display_text());
             }
             AgentMessage::Assistant(a) => {
+                let is_compaction = a.provider == "system" && a.model == "compaction";
                 for block in &a.content {
                     match block {
                         one_core::message::ContentBlock::Thinking {
@@ -3589,7 +3866,13 @@ fn rebuild_tui_from_agent(
                         }
                         one_core::message::ContentBlock::Text { text } => {
                             if !text.is_empty() {
-                                app.push_assistant(text);
+                                if is_compaction {
+                                    // LLM context still carries the summary; TUI
+                                    // shows a one-line marker, not the dump.
+                                    app.push_compact_marker(0, 0, 0);
+                                } else {
+                                    app.push_assistant(text);
+                                }
                             }
                         }
                         one_core::message::ContentBlock::ToolCall {
@@ -3874,7 +4157,7 @@ async fn handle_logout_slash(
 mod server_search_tests {
     use std::sync::{Arc, Mutex};
 
-    use super::{drain_events, format_sources, rebuild_tui_from_agent};
+    use super::{drain_events, format_sources, rebuild_tui_from_agent, rebuild_tui_from_entries};
     use one_core::{AgentEvent, AgentMessage, ServerTool, ServerToolStatus};
     use one_tui::{App, MessageRole, ToolStatus};
 
@@ -4097,6 +4380,75 @@ mod server_search_tests {
                 .as_deref()
                 .is_some_and(|o| o.contains("interrupted")),
             "dangling call should surface interruption notice"
+        );
+    }
+
+    #[test]
+    fn transcript_restore_keeps_turns_before_compaction() {
+        use one_session::entries::{new_entry_base, SessionEntry};
+        use one_tui::message::Message;
+
+        let m0 = SessionEntry::Message {
+            base: new_entry_base(None),
+            message: AgentMessage::user_text("first question"),
+        };
+        let m0_id = m0.id().to_string();
+        let m1 = SessionEntry::Message {
+            base: new_entry_base(Some(m0_id.clone())),
+            message: AgentMessage::assistant_text("mock", "m", "first answer"),
+        };
+        let m1_id = m1.id().to_string();
+        let m2 = SessionEntry::Message {
+            base: new_entry_base(Some(m1_id.clone())),
+            message: AgentMessage::user_text("keep this"),
+        };
+        let m2_id = m2.id().to_string();
+        let mut cbase = new_entry_base(Some(m2_id.clone()));
+        cbase.id = "compact1".into();
+        let compact = SessionEntry::Compaction {
+            base: cbase,
+            summary: "should not dump into the TUI".into(),
+            first_kept_entry_id: m2_id,
+            tokens_before: 12_000,
+            details: Some(serde_json::json!({ "kept_turns": 1 })),
+        };
+        let m3 = SessionEntry::Message {
+            base: new_entry_base(Some("compact1".into())),
+            message: AgentMessage::user_text("after compact"),
+        };
+        let entries = vec![m0, m1, m2, compact, m3];
+        let empty = std::collections::HashMap::new();
+        let mut app = App::new("test");
+        rebuild_tui_from_entries(&mut app, &entries, &empty);
+
+        let users: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .map(|m| m.content.as_str())
+            .collect();
+        assert_eq!(
+            users,
+            vec!["first question", "keep this", "after compact"],
+            "UI transcript must keep pre-compaction turns"
+        );
+        assert!(app
+            .messages
+            .iter()
+            .any(|m| m.role == MessageRole::Assistant && m.content.contains("first answer")));
+        let markers: Vec<_> = app
+            .messages
+            .iter()
+            .filter(|m| Message::is_context_compacted(&m.content))
+            .collect();
+        assert_eq!(markers.len(), 1);
+        assert!(markers[0].content.contains("12k"));
+        assert!(markers[0].content.contains("kept last 1 turns"));
+        assert!(
+            !app.messages
+                .iter()
+                .any(|m| m.content.contains("should not dump into the TUI")),
+            "LLM summary must not replace the conversation"
         );
     }
 

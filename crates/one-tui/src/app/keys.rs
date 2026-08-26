@@ -74,6 +74,16 @@ impl super::App {
             return self.handle_float_key(key);
         }
 
+        // Alt+Z / Alt+Shift+Z — fold never steals a typed `z`.
+        if Self::is_fold_key(key) {
+            self.toggle_focused_user_fold();
+            return RunOutcome::Noop;
+        }
+        if Self::is_fold_all_key(key) {
+            self.toggle_all_user_folds();
+            return RunOutcome::Noop;
+        }
+
         match key.code {
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) && self.busy => {
                 self.submit_steer()
@@ -311,6 +321,33 @@ impl super::App {
                 self.scroll_to_bottom();
                 RunOutcome::Noop
             }
+            KeyCode::Char('g')
+                if self.transcript_browse_focused()
+                    && !self.busy
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.scroll_to_top();
+                RunOutcome::Noop
+            }
+            KeyCode::Char('t')
+                if self.transcript_browse_focused()
+                    && !self.busy
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.scroll_to_turn_tools();
+                RunOutcome::Noop
+            }
+            KeyCode::Char('a')
+                if self.transcript_browse_focused()
+                    && !self.busy
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.scroll_to_turn_answer();
+                RunOutcome::Noop
+            }
             KeyCode::Char(ch)
                 if !key.modifiers.contains(KeyModifiers::CONTROL)
                     && !key.modifiers.contains(KeyModifiers::ALT)
@@ -384,6 +421,25 @@ impl super::App {
         matches!(key.code, KeyCode::Char('G') | KeyCode::Char('g'))
             && key.modifiers.contains(KeyModifiers::ALT)
             && !key.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
+    /// Alt+Z — fold / expand the focused (or current) user turn.
+    /// Alt keeps a typed `z` in the prompt.
+    pub(crate) fn is_fold_key(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char('z'))
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::SHIFT)
+    }
+
+    /// Alt+Shift+Z — expand or collapse every historical user turn.
+    /// Some terminals report this as `Z`+Alt without a SHIFT flag.
+    pub(crate) fn is_fold_all_key(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char('z') | KeyCode::Char('Z'))
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && (key.modifiers.contains(KeyModifiers::SHIFT)
+                || matches!(key.code, KeyCode::Char('Z')))
     }
 
     /// Ctrl+F — fetch remote models. Also accept legacy ASCII ACK (0x06).
