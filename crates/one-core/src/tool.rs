@@ -155,11 +155,10 @@ pub fn resolve_tool_name(name: &str) -> &str {
         // bash
         "shell" | "Bash" | "Shell" | "run_terminal_cmd" | "run_command" | "execute"
         | "terminal" => "bash",
-        // glob / find
-        "find" | "Find" | "Glob" | "glob" | "GlobTool" | "glob_file_search" | "find_files"
-        | "list_files_glob" | "file_search" | "find_by_name" => "glob",
         // grep
-        "Grep" | "rg" | "search_codebase" | "codebase_search" => "grep",
+        "Grep" | "rg" | "search_codebase" | "codebase_search" | "find" | "Find" | "Glob"
+        | "glob" | "GlobTool" | "glob_file_search" | "find_files" | "list_files_glob"
+        | "file_search" | "find_by_name" => "grep",
         // ls
         "LS" | "list_dir" | "list_files" | "list_directory" => "ls",
         // web
@@ -181,10 +180,10 @@ mod tool_name_tests {
         assert_eq!(resolve_tool_name("search_replace"), "edit");
         assert_eq!(resolve_tool_name("str_replace"), "edit");
         assert_eq!(resolve_tool_name("shell"), "bash");
-        assert_eq!(resolve_tool_name("Glob"), "glob");
-        assert_eq!(resolve_tool_name("find"), "glob");
-        assert_eq!(resolve_tool_name("GlobTool"), "glob");
-        assert_eq!(resolve_tool_name("file_search"), "glob");
+        assert_eq!(resolve_tool_name("Glob"), "grep");
+        assert_eq!(resolve_tool_name("find"), "grep");
+        assert_eq!(resolve_tool_name("GlobTool"), "grep");
+        assert_eq!(resolve_tool_name("file_search"), "grep");
         assert_eq!(resolve_tool_name("read"), "read");
         assert_eq!(resolve_tool_name("mcp__x"), "mcp__x");
     }

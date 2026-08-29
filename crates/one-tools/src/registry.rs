@@ -15,7 +15,6 @@ use crate::bash::BashTool;
 use crate::bash_kill::BashKillTool;
 use crate::bash_output::BashOutputTool;
 use crate::edit::EditTool;
-use crate::glob::GlobTool;
 use crate::grep::GrepTool;
 use crate::ls::LsTool;
 use crate::memory_io::MemoryLookupBudget;
@@ -153,7 +152,7 @@ impl BuiltinToolProfile {
             Self::None => vec![],
             Self::Explore => {
                 #[allow(unused_mut)]
-                let mut v = vec!["read".into(), "grep".into(), "glob".into(), "ls".into()];
+                let mut v = vec!["read".into(), "grep".into(), "ls".into()];
                 #[cfg(feature = "network")]
                 {
                     v.push("web_search".into());
@@ -163,13 +162,7 @@ impl BuiltinToolProfile {
             }
             Self::ReadOnly => {
                 #[allow(unused_mut)]
-                let mut v = vec![
-                    "read".into(),
-                    "grep".into(),
-                    "glob".into(),
-                    "ls".into(),
-                    "ask_user".into(),
-                ];
+                let mut v = vec!["read".into(), "grep".into(), "ls".into(), "ask_user".into()];
                 #[cfg(feature = "network")]
                 {
                     v.push("web_search".into());
@@ -194,7 +187,6 @@ impl BuiltinToolProfile {
                     "bash_output".into(),
                     "bash_kill".into(),
                     "grep".into(),
-                    "glob".into(),
                     "ls".into(),
                     "ask_user".into(),
                     "todo_write".into(),
@@ -380,12 +372,6 @@ impl ToolRegistry {
                 GrepTool::with_policy(ctx.policy.clone())
                     .with_memory_lookups(ctx.memory_lookups.clone()),
             ) as Arc<dyn Tool>
-        });
-        self.register_factory("glob", |ctx| {
-            Arc::new(GlobTool::with_policy(ctx.policy.clone())) as Arc<dyn Tool>
-        });
-        self.register_factory("find", |ctx| {
-            Arc::new(GlobTool::with_policy(ctx.policy.clone())) as Arc<dyn Tool>
         });
         self.register_factory("ls", |ctx| {
             Arc::new(LsTool::with_policy(ctx.policy.clone())) as Arc<dyn Tool>

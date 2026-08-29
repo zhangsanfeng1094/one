@@ -411,7 +411,7 @@ impl PermissionGate {
 }
 
 fn is_path_read_tool(name: &str) -> bool {
-    matches!(name, "read" | "grep" | "glob" | "find" | "ls")
+    matches!(name, "read" | "grep" | "ls")
 }
 
 fn is_path_write_tool(name: &str) -> bool {
@@ -438,9 +438,7 @@ fn path_read_escalate_env_enabled() -> bool {
 fn path_from_call(call: &ToolCall) -> std::result::Result<Option<String>, String> {
     match path_arg(&call.arguments)? {
         Some(p) => Ok(Some(p.to_string())),
-        None if matches!(call.name.as_str(), "grep" | "glob" | "find" | "ls") => {
-            Ok(Some(".".into()))
-        }
+        None if matches!(call.name.as_str(), "grep" | "ls") => Ok(Some(".".into())),
         None => Ok(None),
     }
 }

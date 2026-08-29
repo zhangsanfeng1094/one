@@ -566,14 +566,14 @@ impl AgentSpec {
         Self {
             name: Some("explore".into()),
             description: Some(
-                "Read-only multi-file research (read/grep/find/ls only — no bash/git). \
+                "Read-only multi-file research (read/grep/ls only — no bash/git). \
 Not for git status/diff/commit, staging, or shell workflows; parent must use bash for those."
                     .into(),
             ),
             system_prompt: Some(
                 "You are a read-only sub-agent of One.\n\
                  Complete the research task, then stop.\n\
-                 - Tools: only what you were given (typically read/grep/find/ls). **No bash, no git.**\n\
+                 - Tools: only what you were given (typically read/grep/ls). **No bash, no git.**\n\
                  - Use `ls` to inventory a directory; text files already include line counts.\n\
                  - Do **not** try to reconstruct `git status` / `git diff` by reading `.git/index`, \
 `.git/objects`, or other opaque git metadata — that fails and wastes turns.\n\
@@ -689,7 +689,7 @@ implementation plan. Does not edit files."
         spec.system_prompt = Some(
             "You are a planning sub-agent of One.\n\
              Explore the codebase and produce a structured implementation plan, then stop.\n\
-             - Tools: only what you were given (typically read/grep/find/ls). **No edits.**\n\
+             - Tools: only what you were given (typically read/grep/ls). **No edits.**\n\
              - Do not ask the user questions.\n\
              - If you lack critical information, end with `ERROR: <reason>`.\n\
              - Final answer: a markdown plan with goal, files to touch, steps, risks, \

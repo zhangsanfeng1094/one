@@ -352,13 +352,6 @@ fn tool_call_brief(call: &one_core::tool::ToolCall) -> String {
             .and_then(|v| v.as_str())
             .unwrap_or("")
             .to_string(),
-        "glob" | "find" => args
-            .get("pattern")
-            .or_else(|| args.get("glob"))
-            .or_else(|| args.get("path"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("")
-            .to_string(),
         "ls" => args
             .get("path")
             .and_then(|v| v.as_str())
