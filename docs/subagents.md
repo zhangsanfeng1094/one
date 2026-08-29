@@ -535,15 +535,19 @@ parent run
 当前台已 `task(background=true)` 派完所有子任务、自己无其他 tool 可做时：
 
 ```text
-wait_tasks()                    # 默认 mode=all，等全部 running
+wait_tasks()                    # 默认 mode=all，等全部 running（omit wait_ms = 等到完）
 wait_tasks(mode="any")          # 等下一个完成就返回（可循环收）
 wait_tasks(job_ids=["job_a","job_b"], wait_ms=120000)
+wait_tasks(wait_ms=0)           # 对齐 Grok：0 = 默认等 30s，不是 snapshot
 ```
 
-- **阻塞** tool 直到条件满足或 `wait_ms` 超时  
-- 返回 **completion stream**（按完成顺序带摘要）  
-- 会 **吸收** 对应的 `[job completed]` 通知，避免下一 turn drain 重复  
+- **阻塞** tool 直到条件满足或 `wait_ms` 超时
+- `wait_ms=0` **不是** snapshot（那是 `job_output`）；按 Grok Build 默认等 30s
+- 超时且仍 running → **成功**（`ok=true`）+ 「会有 [job completed] 通知，不要再 poll」；不要标成 tool error
+- 返回 **completion stream**（按完成顺序带摘要）
+- 会 **吸收** 对应的 `[job completed]` 通知，避免下一 turn drain 重复
 - 模型在 **单次 tool_result** 里看到全部过程摘要（「每完成一个」体现在 stream 段落里）
+- `mode` 接受 Grok 别名 `wait_all` / `wait_any`；也接受 `timeout_ms` 作为 `wait_ms` 别名
 
 
 - [ ] `isolation=worktree`（**WT0/WT1**；可写并行刚需）  

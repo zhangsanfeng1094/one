@@ -1439,8 +1439,8 @@ pub enum JoinMode {
 impl JoinMode {
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "all" | "join" => Some(Self::All),
-            "any" | "next" => Some(Self::Any),
+            "all" | "join" | "wait_all" | "waitall" | "wait-all" => Some(Self::All),
+            "any" | "next" | "wait_any" | "waitany" | "wait-any" => Some(Self::Any),
             _ => None,
         }
     }

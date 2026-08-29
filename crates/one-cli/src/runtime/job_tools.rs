@@ -43,9 +43,9 @@ impl Tool for JobOutputTool {
 Get status and summary of a background agent job (`job_*`), bash task (`bg_*`), or monitor (`mon_*`). \
 Omit job_id to list agent jobs and bash tasks. \
 Omit wait_ms (or pass 0) for an immediate snapshot. \
-To actually wait, pass wait_ms >= 15000 (milliseconds) — 1000 is one second and will \
-almost always time out on explore jobs. Prefer wait_tasks without wait_ms to block \
-until completion."
+A positive wait_ms waits up to that many milliseconds, then returns the current \
+status — still-running is a successful snapshot, not an error. You will be notified \
+when the job completes; do not tight-poll."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -56,8 +56,7 @@ until completion."
                     },
                     "wait_ms": {
                         "type": "integer",
-                        "description": "0/omit = snapshot now. To block, milliseconds >= 15000. \
-                                        Do not pass 1000 — that is 1 second."
+                        "description": "0/omit = snapshot now. Positive = wait up to this many milliseconds."
                     }
                 }
             }),
@@ -74,8 +73,7 @@ until completion."
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        let wait_ms = parse_wait_ms(&call.arguments, WaitMsMode::SnapshotOrBlock)
-            .map_err(|msg| invalid_args("job_output", msg))?;
+        let wait_ms = parse_wait_ms(&call.arguments, WaitMsMode::SnapshotOrBlock);
 
         if job_id.is_none() {
             let jobs = self.jobs.list();
@@ -138,7 +136,13 @@ until completion."
             .map_err(|e| tool_error("job_output", e))?;
 
         let running = snap.state == JobState::Running;
-        let text = format_job_snapshot(&snap);
+        let mut text = format_job_snapshot(&snap);
+        if running && wait_ms.unwrap_or(0) > 0 {
+            text.push_str(
+                "\nWaited; still running. You will be notified when it completes. \
+                 Do not poll job_output again.\n",
+            );
+        }
         Ok(ToolOutput::text_with_details(
             text,
             json!({
@@ -186,10 +190,12 @@ impl Tool for WaitTasksTool {
 Wait for background work to finish — agent jobs from task(background=true) (`job_*`) \
 and/or bash tasks (`bg_*`) and monitors (`mon_*`). \
 Use ONLY after you have spawned all needed background work and have nothing else useful to do. \
+Prefer job_output with a positive wait_ms for a single id. \
 mode=all (default) waits for every target; mode=any returns when the next running task \
-completes. Omit job_ids to wait on all currently running agent jobs and bash tasks. \
-Omit wait_ms to block until completion (preferred). If you must cap the wait, pass \
-wait_ms >= 15000 (milliseconds). Do not pass 1000 — that is 1 second and will time out."
+completes (aliases: wait_all / wait_any). Omit job_ids to wait on all currently running \
+agent jobs and bash tasks. Omit wait_ms to block until completion. wait_ms=0 waits up to \
+30s (not a snapshot). A timeout while still running is success — you will be notified \
+when work completes; do not call wait_tasks again."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -201,13 +207,12 @@ wait_ms >= 15000 (milliseconds). Do not pass 1000 — that is 1 second and will 
                     },
                     "mode": {
                         "type": "string",
-                        "enum": ["all", "any"],
-                        "description": "all = wait for every target (default). any = wait for the next completion only."
+                        "enum": ["all", "any", "wait_all", "wait_any"],
+                        "description": "all / wait_all = wait for every target (default). any / wait_any = next completion only."
                     },
                     "wait_ms": {
                         "type": "integer",
-                        "description": "Optional cap in milliseconds (>= 15000). Omit to wait until done. \
-                                        1000 is 1 second — do not use it."
+                        "description": "Optional cap in milliseconds. Omit = wait until done. 0 = 30s default wait."
                     }
                 }
             }),
@@ -222,8 +227,7 @@ wait_ms >= 15000 (milliseconds). Do not pass 1000 — that is 1 second and will 
             .and_then(JoinMode::parse)
             .unwrap_or(JoinMode::All);
 
-        let wait_ms = parse_wait_ms(&call.arguments, WaitMsMode::BlockUntilDone)
-            .map_err(|msg| invalid_args("wait_tasks", msg))?;
+        let wait_ms = parse_wait_ms(&call.arguments, WaitMsMode::BlockUntilDone);
 
         let explicit = parse_id_list(call, &["job_ids", "task_ids"]);
         let report = unified_join(
@@ -236,10 +240,15 @@ wait_ms >= 15000 (milliseconds). Do not pass 1000 — that is 1 second and will 
         .await
         .map_err(|e| tool_error("wait_tasks", e))?;
 
+        let still_running = report
+            .finals
+            .iter()
+            .any(|f| f.get("running").and_then(|v| v.as_bool()).unwrap_or(false));
         Ok(ToolOutput::text_with_details(
             report.message,
             json!({
                 "ok": report.ok,
+                "running": still_running,
                 "mode": mode.as_str(),
                 "timed_out": report.timed_out,
                 "completed_events": report.events.len(),
@@ -349,39 +358,28 @@ fn looks_like_bash_id(id: &str) -> bool {
     id.starts_with("bg_") || id.starts_with("mon_")
 }
 
-/// Short waits are almost always the model meaning "wait a second" and then
-/// treating a timeout as progress. 15s is the floor for a *blocking* wait.
-const MIN_BLOCKING_WAIT_MS: u64 = 15_000;
+/// Grok Build `wait_tasks` default when `timeout_ms` is omitted or 0.
+/// (`get_task_output` / `job_output` still treat 0 as a snapshot.)
+const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
 
 #[derive(Clone, Copy)]
 enum WaitMsMode {
-    /// `job_output`: 0 / omit = snapshot; positive must be a real wait.
+    /// `job_output`: 0 / omit = snapshot; any positive value waits.
     SnapshotOrBlock,
-    /// `wait_tasks`: omit = wait until done; 0 is not a snapshot.
+    /// `wait_tasks`: omit = wait until done; 0 = 30s default wait (Grok).
     BlockUntilDone,
 }
 
-fn parse_wait_ms(
-    args: &serde_json::Value,
-    mode: WaitMsMode,
-) -> std::result::Result<Option<u64>, String> {
+fn parse_wait_ms(args: &serde_json::Value, mode: WaitMsMode) -> Option<u64> {
     let raw = args
         .get("wait_ms")
+        .or_else(|| args.get("timeout_ms"))
         .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)));
     match (mode, raw) {
-        (_, None) => Ok(None),
-        (WaitMsMode::SnapshotOrBlock, Some(0)) => Ok(Some(0)),
-        (WaitMsMode::BlockUntilDone, Some(0)) => Err(format!(
-            "wait_ms=0 is not a snapshot on wait_tasks. Omit wait_ms to block until \
-             completion, or pass at least {MIN_BLOCKING_WAIT_MS} (milliseconds)."
-        )),
-        (_, Some(ms)) if ms < MIN_BLOCKING_WAIT_MS => Err(format!(
-            "wait_ms={ms} is only {}s; agent/explore jobs typically take 30s–5min. \
-             Omit wait_ms to wait until completion, or pass at least {MIN_BLOCKING_WAIT_MS} \
-             (milliseconds). Do not pass 1000 — that is 1 second.",
-            ms / 1000
-        )),
-        (_, Some(ms)) => Ok(Some(ms)),
+        (_, None) => None,
+        (WaitMsMode::SnapshotOrBlock, Some(0)) => Some(0),
+        (WaitMsMode::BlockUntilDone, Some(0)) => Some(DEFAULT_WAIT_TIMEOUT_MS),
+        (_, Some(ms)) => Some(ms),
     }
 }
 
@@ -533,7 +531,7 @@ async fn unified_join(
 
     if targets.iter().all(|id| seen_terminal.contains(id)) {
         let finals = snapshot_finals(&jobs, &bash, &targets);
-        let message = format_unified_report(mode, false, &events, &finals);
+        let message = format_unified_report(mode, false, wait_ms, &events, &finals);
         return Ok(UnifiedJoinReport {
             ok: true,
             timed_out: false,
@@ -589,23 +587,12 @@ async fn unified_join(
     }
 
     let finals = snapshot_finals(&jobs, &bash, &targets);
-    let all_terminal = finals.iter().all(|f| {
-        f.get("running")
-            .and_then(|v| v.as_bool())
-            .map(|r| !r)
-            .unwrap_or(true)
-    });
-    let ok = if timed_out {
-        false
-    } else {
-        match mode {
-            JoinMode::All => all_terminal,
-            JoinMode::Any => !events.is_empty(),
-        }
-    };
-    let message = format_unified_report(mode, timed_out, &events, &finals);
+    // Timeout while still running is a successful wait (Grok Build): the
+    // completion notice will arrive later. Marking ok=false makes the TUI
+    // show ✗ and the model retries wait_tasks in a doom loop.
+    let message = format_unified_report(mode, timed_out, wait_ms, &events, &finals);
     Ok(UnifiedJoinReport {
-        ok,
+        ok: true,
         timed_out,
         message,
         events,
@@ -650,6 +637,7 @@ fn snapshot_finals(
 fn format_unified_report(
     mode: JoinMode,
     timed_out: bool,
+    wait_ms: Option<u64>,
     events: &[serde_json::Value],
     finals: &[serde_json::Value],
 ) -> String {
@@ -665,14 +653,25 @@ fn format_unified_report(
         out.push_str(&format!("- {kind} {id}: {state}\n"));
     }
     out.push_str("finals:\n");
+    let mut any_running = false;
     for f in finals {
         let id = f.get("id").and_then(|v| v.as_str()).unwrap_or("?");
         let kind = f.get("kind").and_then(|v| v.as_str()).unwrap_or("?");
         let state = f.get("state").and_then(|v| v.as_str()).unwrap_or("?");
         let running = f.get("running").and_then(|v| v.as_bool()).unwrap_or(false);
+        any_running |= running;
         out.push_str(&format!(
             "- {kind} {id}: {state}{}\n",
             if running { " (running)" } else { "" }
+        ));
+    }
+    if timed_out && any_running {
+        let waited = wait_ms
+            .map(|ms| format!("{}s", ms / 1000))
+            .unwrap_or_else(|| "the allotted time".to_string());
+        out.push_str(&format!(
+            "\nWaited {waited}; still running. You will be notified when it completes. \
+             Do not call wait_tasks again.\n"
         ));
     }
     out
@@ -685,32 +684,63 @@ mod tests {
 
     #[test]
     fn wait_ms_snapshot_allows_zero_and_omit() {
+        assert_eq!(parse_wait_ms(&json!({}), WaitMsMode::SnapshotOrBlock), None);
         assert_eq!(
-            parse_wait_ms(&json!({}), WaitMsMode::SnapshotOrBlock).unwrap(),
-            None
-        );
-        assert_eq!(
-            parse_wait_ms(&json!({"wait_ms": 0}), WaitMsMode::SnapshotOrBlock).unwrap(),
+            parse_wait_ms(&json!({"wait_ms": 0}), WaitMsMode::SnapshotOrBlock),
             Some(0)
         );
         assert_eq!(
-            parse_wait_ms(&json!({"wait_ms": 30_000}), WaitMsMode::SnapshotOrBlock).unwrap(),
+            parse_wait_ms(&json!({"wait_ms": 30_000}), WaitMsMode::SnapshotOrBlock),
             Some(30_000)
+        );
+        assert_eq!(
+            parse_wait_ms(&json!({"timeout_ms": 5_000}), WaitMsMode::SnapshotOrBlock),
+            Some(5_000)
         );
     }
 
     #[test]
-    fn wait_ms_rejects_one_second_pretend_wait() {
-        let err =
-            parse_wait_ms(&json!({"wait_ms": 1000}), WaitMsMode::SnapshotOrBlock).unwrap_err();
-        assert!(err.contains("wait_ms=1000"), "{err}");
-        assert!(err.contains("1 second") || err.contains("1s"), "{err}");
+    fn wait_ms_block_zero_is_default_thirty_seconds() {
+        assert_eq!(parse_wait_ms(&json!({}), WaitMsMode::BlockUntilDone), None);
+        assert_eq!(
+            parse_wait_ms(&json!({"wait_ms": 0}), WaitMsMode::BlockUntilDone),
+            Some(DEFAULT_WAIT_TIMEOUT_MS)
+        );
+        assert_eq!(
+            parse_wait_ms(&json!({"wait_ms": 1000}), WaitMsMode::BlockUntilDone),
+            Some(1000)
+        );
+        assert_eq!(
+            parse_wait_ms(&json!({"timeout_ms": 0}), WaitMsMode::BlockUntilDone),
+            Some(DEFAULT_WAIT_TIMEOUT_MS)
+        );
+    }
 
-        let err = parse_wait_ms(&json!({"wait_ms": 1000}), WaitMsMode::BlockUntilDone).unwrap_err();
-        assert!(err.contains("1000"), "{err}");
+    #[test]
+    fn wait_tasks_timeout_is_success_with_notify_hint() {
+        let msg = format_unified_report(
+            JoinMode::All,
+            true,
+            Some(15_000),
+            &[],
+            &[json!({
+                "id": "job_1",
+                "kind": "agent",
+                "state": "running",
+                "running": true,
+            })],
+        );
+        assert!(msg.contains("timed_out: true"), "{msg}");
+        assert!(msg.contains("still running"), "{msg}");
+        assert!(msg.contains("Do not call wait_tasks again"), "{msg}");
+        assert!(msg.contains("15s"), "{msg}");
+    }
 
-        let err = parse_wait_ms(&json!({"wait_ms": 0}), WaitMsMode::BlockUntilDone).unwrap_err();
-        assert!(err.contains("wait_ms=0"), "{err}");
+    #[test]
+    fn join_mode_accepts_grok_wait_all_alias() {
+        assert_eq!(JoinMode::parse("wait_all"), Some(JoinMode::All));
+        assert_eq!(JoinMode::parse("wait_any"), Some(JoinMode::Any));
+        assert_eq!(JoinMode::parse("all"), Some(JoinMode::All));
     }
 
     #[test]
