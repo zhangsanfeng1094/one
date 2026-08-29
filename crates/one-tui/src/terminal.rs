@@ -88,7 +88,7 @@ impl Command for DisableAlternateScroll {
 
 const POLL_IDLE: Duration = Duration::from_millis(50);
 const POLL_BUSY: Duration = Duration::from_millis(40);
-const CURSOR_BLINK: Duration = Duration::from_millis(530);
+const FRAME_TICK: Duration = Duration::from_millis(120);
 const WHEEL_LINES: usize = 3;
 const SELECT_RELEASE_REARM: Duration = Duration::from_millis(800);
 /// Max events pulled in one drain so a huge unbracketed paste cannot stall forever.
@@ -108,16 +108,23 @@ fn mouse_capture_default() -> bool {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseDragTarget {
+    None,
+    Chat,
+    Prompt,
+}
+
 /// Ratatui terminal session — whole interactive lifetime, not per keystroke.
 pub struct TerminalSession {
     terminal: Terminal<CrosstermBackend<Stdout>>,
-    last_blink: Instant,
+    last_frame_tick: Instant,
     restored: bool,
     mouse_want: bool,
     mouse_armed: bool,
     select_release_at: Option<Instant>,
-    /// Left button currently down in chat (in-app select).
-    left_down: bool,
+    /// Active in-app mouse selection target.
+    drag_target: MouseDragTarget,
 }
 
 impl TerminalSession {
@@ -128,6 +135,7 @@ impl TerminalSession {
         stdout.execute(EnterAlternateScreen)?;
         stdout.execute(Clear(ClearType::All))?;
         apply_input_modes(&mut stdout, mouse_want)?;
+        stdout.execute(crossterm::cursor::SetCursorStyle::DefaultUserShape)?;
         stdout.execute(crossterm::cursor::Hide)?;
         stdout.flush()?;
 
@@ -136,12 +144,12 @@ impl TerminalSession {
         terminal.clear()?;
         Ok(Self {
             terminal,
-            last_blink: Instant::now(),
+            last_frame_tick: Instant::now(),
             restored: false,
             mouse_want,
             mouse_armed: mouse_want,
             select_release_at: None,
-            left_down: false,
+            drag_target: MouseDragTarget::None,
         })
     }
 
@@ -221,12 +229,12 @@ impl TerminalSession {
         Ok(())
     }
 
-    fn tick_blink(&mut self, app: &mut App) -> bool {
-        // Also poll here so jobs complete even when idle without redraw churn.
+    fn tick_frame(&mut self, app: &mut App) -> bool {
+        // Keep polling here so jobs complete while idle without redraw churn.
         app.poll_image_jobs();
-        if self.last_blink.elapsed() >= CURSOR_BLINK {
+        if self.last_frame_tick.elapsed() >= FRAME_TICK {
             app.toggle_cursor();
-            self.last_blink = Instant::now();
+            self.last_frame_tick = Instant::now();
             true
         } else {
             false
@@ -241,7 +249,7 @@ impl TerminalSession {
                 | MouseEventKind::Drag(_)
                 | MouseEventKind::Moved
                 | MouseEventKind::Up(_) => {
-                    self.left_down = false;
+                    self.drag_target = MouseDragTarget::None;
                     self.release_mouse_for_native_select();
                 }
                 MouseEventKind::ScrollUp => app.scroll_up(WHEEL_LINES),
@@ -263,6 +271,8 @@ impl TerminalSession {
         // Chat pane in absolute terminal rows (below the grok header / sticky).
         let chat_h = app.chat_view_height as u16;
         let in_chat = app.mouse_to_chat_row(mouse.row).is_some();
+        let in_prompt = mouse.row >= app.prompt_content_y
+            && (mouse.row - app.prompt_content_y) < app.prompt_visible_line_starts.len() as u16;
         // Relative to the painted transcript; saturating so a drag onto the
         // header still hits row 0 (edge-scroll up).
         let row = mouse.row.saturating_sub(app.chat_content_y);
@@ -270,7 +280,7 @@ impl TerminalSession {
 
         match mouse.kind {
             MouseEventKind::ScrollUp => {
-                self.left_down = false;
+                self.drag_target = MouseDragTarget::None;
                 // Float (e.g. /tasks live log) steals the wheel from chat.
                 if app.has_float() {
                     app.scroll_float_wheel(true, WHEEL_LINES);
@@ -279,38 +289,59 @@ impl TerminalSession {
                 }
             }
             MouseEventKind::ScrollDown => {
-                self.left_down = false;
+                self.drag_target = MouseDragTarget::None;
                 if app.has_float() {
                     app.scroll_float_wheel(false, WHEEL_LINES);
                 } else {
                     app.scroll_down(WHEEL_LINES);
                 }
             }
+            MouseEventKind::Down(MouseButton::Left) if in_prompt => {
+                self.drag_target = if app.prompt_select_begin(mouse.row, col) {
+                    MouseDragTarget::Prompt
+                } else {
+                    MouseDragTarget::None
+                };
+            }
             MouseEventKind::Down(MouseButton::Left) if in_chat => {
-                self.left_down = true;
+                self.drag_target = MouseDragTarget::Chat;
                 app.select_begin(row as usize, col);
             }
-            // Character / multi-line select: Drag + Moved while held (hosts vary).
-            // Keep tracking even when the pointer leaves the chat pane so the
-            // user can edge-scroll past one viewport of lines.
-            MouseEventKind::Drag(MouseButton::Left) if self.left_down => {
+            // Character / multi-line transcript selection. Keep tracking even
+            // outside chat so a drag can edge-scroll past one viewport.
+            MouseEventKind::Drag(MouseButton::Left)
+                if self.drag_target == MouseDragTarget::Chat =>
+            {
                 app.select_drag(row, col, chat_h);
             }
-            MouseEventKind::Moved if self.left_down => {
+            MouseEventKind::Moved if self.drag_target == MouseDragTarget::Chat => {
                 app.select_drag(row, col, chat_h);
             }
-            MouseEventKind::Up(MouseButton::Left) => {
-                if self.left_down {
-                    self.left_down = false;
-                    // select_finish applies release cell; non-empty drag → auto-copy.
-                    app.select_finish_at(row, col, chat_h);
+            MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Moved
+                if self.drag_target == MouseDragTarget::Prompt =>
+            {
+                let _ = app.prompt_select_update(mouse.row, col);
+            }
+            MouseEventKind::Up(MouseButton::Left) if self.drag_target == MouseDragTarget::Chat => {
+                self.drag_target = MouseDragTarget::None;
+                // select_finish applies release cell; non-empty drag → auto-copy.
+                app.select_finish_at(row, col, chat_h);
+                self.flush_clipboard(app);
+            }
+            MouseEventKind::Up(MouseButton::Left)
+                if self.drag_target == MouseDragTarget::Prompt =>
+            {
+                self.drag_target = MouseDragTarget::None;
+                let _ = app.prompt_select_update(mouse.row, col);
+                if app.copy_input_selection() {
                     self.flush_clipboard(app);
                 }
             }
             MouseEventKind::Down(MouseButton::Left) => {
-                // Click outside chat clears selection. If clicked on sticky bar, jump to message start.
-                self.left_down = false;
+                // Click outside the text surfaces clears both selection kinds.
+                self.drag_target = MouseDragTarget::None;
                 app.clear_selection();
+                app.clear_input_selection();
                 app.click_sticky(mouse.row);
             }
             _ => {}
@@ -326,13 +357,13 @@ impl TerminalSession {
             self.toggle_mouse(app);
             return true;
         }
-        // Ctrl+Shift+C or plain `y` when selection active → OSC 52 copy.
+        // Ctrl+Shift+C copies the active prompt selection first, then a chat selection.
         // (Plain Ctrl+C is progressive dismiss / double-tap quit in App.)
         if matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
             && key.modifiers.contains(KeyModifiers::SHIFT)
         {
-            app.request_copy_selection();
+            let _ = app.copy_input_selection() || app.request_copy_selection();
             self.flush_clipboard(app);
             return true;
         }
@@ -366,7 +397,7 @@ impl TerminalSession {
         loop {
             on_poll(app);
             self.maybe_rearm_after_select();
-            self.tick_blink(app);
+            self.tick_frame(app);
 
             // Skip the idle draw while a paste burst is already in the queue so
             // we never paint thousands of intermediate frames.
@@ -416,7 +447,7 @@ impl TerminalSession {
             self.maybe_rearm_after_select();
             on_tick(app);
             app.sync_stream_message();
-            self.tick_blink(app);
+            self.tick_frame(app);
 
             if app.take_force_quit() {
                 done.abort();
@@ -487,7 +518,7 @@ impl TerminalSession {
             self.maybe_rearm_after_select();
             on_tick(app);
             app.sync_stream_message();
-            self.tick_blink(app);
+            self.tick_frame(app);
 
             if app.take_force_quit() {
                 return Err(ForceQuit);
@@ -580,12 +611,13 @@ impl TerminalSession {
         backend.execute(Clear(ClearType::All))?;
         apply_input_modes(backend, self.mouse_want)?;
         self.mouse_armed = self.mouse_want;
+        backend.execute(crossterm::cursor::SetCursorStyle::DefaultUserShape)?;
         backend.execute(crossterm::cursor::Hide)?;
         let _ = backend.flush();
         self.terminal.clear()?;
         self.restored = false;
         self.select_release_at = None;
-        self.left_down = false;
+        self.drag_target = MouseDragTarget::None;
         // Drop any key/mouse events queued while suspended (login typing, etc.).
         while event::poll(Duration::from_millis(0)).unwrap_or(false) {
             let _ = event::read();

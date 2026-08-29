@@ -201,7 +201,7 @@ fn typed_input_is_visible_in_buffer() {
 }
 
 #[test]
-fn hardware_cursor_anchored_at_input_caret_even_when_streaming() {
+fn native_cursor_anchors_at_input_caret_even_when_streaming() {
     let backend = TestBackend::new(40, 12);
     let mut terminal = Terminal::new(backend).unwrap();
     let mut app = App::new("test");

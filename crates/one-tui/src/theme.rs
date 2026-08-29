@@ -236,6 +236,11 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// Prompt selection highlight (terminal-selection blue).
+    pub fn input_selection() -> Style {
+        Style::default().fg(Self::BG).bg(Self::SECONDARY)
+    }
+
     /// Long-paste chip in the composer (`[文本 · 12 lines · 3KB]`) — solid pill.
     pub fn input_text_chip() -> Style {
         Style::default()

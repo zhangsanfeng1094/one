@@ -51,13 +51,25 @@ impl super::App {
         }
     }
 
-    /// Move caret to end of `input` (history recall, bulk replace, chip append).
-    pub(crate) fn input_cursor_end(&mut self) {
-        self.input_cursor = self.input.chars().count();
+    pub fn input_cursor_home(&mut self) {
+        self.input_cursor = 0;
+        self.clear_input_selection();
     }
 
-    pub(crate) fn input_cursor_home(&mut self) {
-        self.input_cursor = 0;
+    pub(crate) fn input_cursor_end(&mut self) {
+        self.input_cursor = self.input.chars().count();
+        self.clear_input_selection();
+    }
+
+    /// Extend a selection to the beginning or end of the complete input.
+    pub fn extend_input_to_boundary(&mut self, end: bool) {
+        self.clamp_input_cursor();
+        self.input_selection_anchor.get_or_insert(self.input_cursor);
+        self.input_cursor = if end { self.input.chars().count() } else { 0 };
+        if self.input_selection_anchor == Some(self.input_cursor) {
+            self.clear_input_selection();
+        }
+        self.cursor_on = true;
     }
 
     /// Byte index in `input` for the current char cursor.
@@ -69,12 +81,174 @@ impl super::App {
             .sum()
     }
 
-    /// Left/right caret movement inside the main prompt.
+    /// Move caret, collapsing an active selection to its directional edge.
     pub fn move_input_cursor(&mut self, delta: isize) {
-        let len = self.input.chars().count() as isize;
-        let next = (self.input_cursor as isize + delta).clamp(0, len);
-        self.input_cursor = next as usize;
+        if let Some((start, end)) = self.input_selection_range() {
+            self.input_cursor = if delta < 0 { start } else { end };
+            self.clear_input_selection();
+        } else {
+            let len = self.input.chars().count() as isize;
+            let next = (self.input_cursor as isize + delta).clamp(0, len);
+            self.input_cursor = next as usize;
+        }
         self.cursor_on = true;
+    }
+
+    /// Extend the prompt selection by one character in either direction.
+    pub fn extend_input_selection(&mut self, delta: isize) {
+        self.clamp_input_cursor();
+        let anchor = self.input_selection_anchor.get_or_insert(self.input_cursor);
+        let len = self.input.chars().count() as isize;
+        self.input_cursor = (self.input_cursor as isize + delta).clamp(0, len) as usize;
+        if *anchor == self.input_cursor {
+            self.input_selection_anchor = None;
+        }
+        self.cursor_on = true;
+    }
+
+    pub fn select_all_input(&mut self) {
+        if self.input.is_empty() {
+            self.clear_input_selection();
+            return;
+        }
+        self.input_selection_anchor = Some(0);
+        self.input_cursor = self.input.chars().count();
+        self.cursor_on = true;
+    }
+
+    pub fn clear_input_selection(&mut self) {
+        self.input_selection_anchor = None;
+    }
+
+    pub fn input_selection_range(&self) -> Option<(usize, usize)> {
+        let anchor = self.input_selection_anchor?;
+        let caret = self.input_cursor.min(self.input.chars().count());
+        let anchor = anchor.min(self.input.chars().count());
+        (anchor != caret).then(|| (anchor.min(caret), anchor.max(caret)))
+    }
+
+    pub fn selected_input_text(&self) -> Option<String> {
+        let (start, end) = self.input_selection_range()?;
+        Some(self.input.chars().skip(start).take(end - start).collect())
+    }
+
+    pub fn copy_input_selection(&mut self) -> bool {
+        let Some(text) = self.selected_input_text() else {
+            return false;
+        };
+        self.clipboard_pending = Some(text);
+        self.set_notice("copied selection");
+        true
+    }
+
+    pub fn cut_input_selection(&mut self) -> bool {
+        if !self.copy_input_selection() {
+            return false;
+        }
+        self.delete_input_selection();
+        true
+    }
+
+    /// Selection bounds expanded to whole attachment tokens, preserving the
+    /// composer invariant that text/image chips are always atomic.
+    fn normalized_input_selection_range(&self) -> Option<(usize, usize)> {
+        let (mut start, mut end) = self.input_selection_range()?;
+        let mut removed_chip = false;
+        let mut byte = 0usize;
+        while byte < self.input.len() {
+            let rest = &self.input[byte..];
+            let token_len = one_core::image::parse_image_token_at(rest)
+                .map(|(_, len)| len)
+                .or_else(|| one_core::image::parse_text_token_at(rest).map(|(_, len)| len));
+            let len = token_len.unwrap_or_else(|| rest.chars().next().unwrap().len_utf8());
+            let token_start = self.input[..byte].chars().count();
+            let token_end = token_start + self.input[byte..byte + len].chars().count();
+            if token_len.is_some() && start < token_end && end > token_start {
+                removed_chip = true;
+                start = start.min(token_start);
+                end = end.max(token_end);
+            }
+            byte += len;
+        }
+        // Chips are inserted with one separating space. If a selected range
+        // removes a chip, consume that separator too so no orphan space stays
+        // in an otherwise empty composer.
+        let end_byte = self
+            .input
+            .chars()
+            .take(end)
+            .map(char::len_utf8)
+            .sum::<usize>();
+        if removed_chip && self.input[end_byte..].starts_with(' ') {
+            end += 1;
+        }
+        Some((start, end))
+    }
+
+    /// Remove the selected range and put the caret at its beginning.
+    pub fn delete_input_selection(&mut self) -> bool {
+        let Some((start, end)) = self.normalized_input_selection_range() else {
+            return false;
+        };
+        let start_byte = self
+            .input
+            .chars()
+            .take(start)
+            .map(char::len_utf8)
+            .sum::<usize>();
+        let end_byte = self
+            .input
+            .chars()
+            .take(end)
+            .map(char::len_utf8)
+            .sum::<usize>();
+        self.input.replace_range(start_byte..end_byte, "");
+        self.input_cursor = start;
+        self.clear_input_selection();
+        self.sync_pending_chips();
+        self.cursor_on = true;
+        true
+    }
+
+    pub fn prompt_select_begin(&mut self, terminal_row: u16, terminal_col: u16) -> bool {
+        let Some(caret) = self.prompt_caret_at(terminal_row, terminal_col) else {
+            return false;
+        };
+        self.clear_selection();
+        self.input_cursor = caret;
+        self.input_selection_anchor = Some(caret);
+        self.cursor_on = true;
+        true
+    }
+
+    pub fn prompt_select_update(&mut self, terminal_row: u16, terminal_col: u16) -> bool {
+        let Some(caret) = self.prompt_caret_at(terminal_row, terminal_col) else {
+            return false;
+        };
+        self.input_cursor = caret;
+        self.cursor_on = true;
+        true
+    }
+
+    fn prompt_caret_at(&self, terminal_row: u16, terminal_col: u16) -> Option<usize> {
+        let row = terminal_row.checked_sub(self.prompt_content_y)? as usize;
+        let line_start = *self.prompt_visible_line_starts.get(row)?;
+        let line = self
+            .input
+            .chars()
+            .skip(line_start)
+            .take_while(|c| *c != '\n');
+        let mut chars = 0usize;
+        let mut col = self.prompt_content_x;
+        for ch in line {
+            let width = unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0) as u16;
+            if terminal_col < col.saturating_add(width.max(1)) {
+                break;
+            }
+            col = col.saturating_add(width);
+            chars += 1;
+        }
+        Some(line_start + chars)
     }
 
     /// Split `input` at the caret for rendering: (before, after).
@@ -94,6 +268,7 @@ impl super::App {
             return;
         }
         self.clear_chat_focus();
+        self.delete_input_selection();
         self.clamp_input_cursor();
         let idx = self.input_byte_at_cursor();
         self.input.insert(idx, ch);
@@ -111,6 +286,7 @@ impl super::App {
             return;
         }
         self.clear_chat_focus();
+        self.delete_input_selection();
         self.clamp_input_cursor();
         let idx = self.input_byte_at_cursor();
         let n = cleaned.chars().count();
@@ -122,6 +298,7 @@ impl super::App {
     pub(crate) fn insert_chip_token(&mut self, token: &str) {
         // Prefer a leading space when inserting mid-buffer after non-whitespace.
         self.clear_chat_focus();
+        self.delete_input_selection();
         self.clamp_input_cursor();
         let idx = self.input_byte_at_cursor();
         let need_lead = idx > 0
@@ -335,6 +512,10 @@ impl super::App {
 
     /// Backspace: delete one character (or an entire paste chip) before the caret.
     pub fn pop_input(&mut self) {
+        if self.delete_input_selection() {
+            self.clear_notice();
+            return;
+        }
         if self.input_cursor == 0 || self.input.is_empty() {
             return;
         }
@@ -362,6 +543,10 @@ impl super::App {
 
     /// Delete: remove one character (or paste chip) at/after the caret.
     pub fn delete_input_forward(&mut self) {
+        if self.delete_input_selection() {
+            self.clear_notice();
+            return;
+        }
         if self.input_cursor >= self.input.chars().count() {
             return;
         }

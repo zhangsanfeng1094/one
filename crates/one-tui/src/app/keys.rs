@@ -104,6 +104,15 @@ impl super::App {
                 self.open_new_session_confirm();
                 RunOutcome::Noop
             }
+            // Ctrl+A selects the whole composer; Ctrl+E keeps readline end-of-input.
+            KeyCode::Char('a')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.select_all_input();
+                RunOutcome::Noop
+            }
             // Ctrl+A / Ctrl+E → caret home / end (readline).
             KeyCode::Char('a')
                 if key.modifiers.contains(KeyModifiers::CONTROL)
@@ -119,6 +128,13 @@ impl super::App {
             {
                 self.input_cursor_end();
                 self.cursor_on = true;
+                RunOutcome::Noop
+            }
+            KeyCode::Char('x')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let _ = self.cut_input_selection();
                 RunOutcome::Noop
             }
             // Ctrl+L → model select (docked above input)
@@ -249,6 +265,10 @@ impl super::App {
             }
             // Esc Esc: clear draft → history, or open rewind when empty (Claude Code).
             KeyCode::Esc => {
+                if self.input_selection_range().is_some() {
+                    self.clear_input_selection();
+                    return RunOutcome::Noop;
+                }
                 if self.slash_menu_visible() {
                     // Dismiss slash: clear incomplete command.
                     self.input.clear();
@@ -362,7 +382,15 @@ impl super::App {
                 }
                 RunOutcome::Noop
             }
-            // ←→ move caret inside the prompt (Home/End still scroll transcript).
+            // ←→ / Home / End edit the prompt; Shift extends its selection.
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.extend_input_selection(-1);
+                RunOutcome::Noop
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.extend_input_selection(1);
+                RunOutcome::Noop
+            }
             KeyCode::Left => {
                 self.move_input_cursor(-1);
                 RunOutcome::Noop
@@ -380,12 +408,20 @@ impl super::App {
                 self.scroll_down(self.page_lines());
                 RunOutcome::Noop
             }
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.extend_input_to_boundary(false);
+                RunOutcome::Noop
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.extend_input_to_boundary(true);
+                RunOutcome::Noop
+            }
             KeyCode::Home => {
-                self.scroll_to_top();
+                self.input_cursor_home();
                 RunOutcome::Noop
             }
             KeyCode::End => {
-                self.scroll_to_bottom();
+                self.input_cursor_end();
                 RunOutcome::Noop
             }
             // ↑/↓: slash menu when open, else prompt history.

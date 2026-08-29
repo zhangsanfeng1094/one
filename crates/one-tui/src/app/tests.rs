@@ -48,6 +48,42 @@ fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
 }
 
 #[test]
+fn prompt_selection_extends_replaces_and_collapses() {
+    let mut app = App::new("test");
+    app.input = "hello 世界".into();
+    app.input_cursor = app.input.chars().count();
+
+    app.extend_input_selection(-1);
+    app.extend_input_selection(-1);
+    assert_eq!(app.selected_input_text().as_deref(), Some("世界"));
+
+    app.insert_input_str("team");
+    assert_eq!(app.input, "hello team");
+    assert_eq!(app.input_selection_range(), None);
+
+    app.extend_input_to_boundary(false);
+    assert_eq!(app.selected_input_text().as_deref(), Some("hello team"));
+    app.move_input_cursor(-1);
+    assert_eq!(app.input_cursor, 0);
+    assert_eq!(app.input_selection_range(), None);
+}
+
+#[test]
+fn prompt_selection_deletes_entire_overlapping_attachment_chip() {
+    let mut app = App::new("test");
+    app.attach_text_blob("large pasted body".into());
+    let token_len = app.input.chars().count();
+    app.input_cursor = 1;
+    app.input_selection_anchor = Some(0);
+
+    assert!(app.delete_input_selection());
+    assert!(app.input.is_empty());
+    assert_eq!(app.input_cursor, 0);
+    assert!(app.pending_texts.is_empty());
+    assert!(token_len > 1);
+}
+
+#[test]
 fn enter_submits_prompt() {
     let mut app = App::new("test");
     app.input = "hello".into();
@@ -1452,8 +1488,8 @@ fn paste_into_float_edit_does_not_touch_main_input() {
 }
 
 #[test]
-fn transcript_browse_unfocuses_prompt_caret_until_typing() {
-    // Grok-style: j/k browse owns focus — no blinking prompt caret.
+fn transcript_browse_keeps_native_caret_hidden_until_typing() {
+    // j/k browse owns focus, so the prompt must not expose a native cursor.
     let mut app = App::new("test");
     assert!(app.prompt_focused());
     assert!(!app.transcript_browse_focused());
@@ -1463,13 +1499,9 @@ fn transcript_browse_unfocuses_prompt_caret_until_typing() {
     assert!(app.transcript_browse_focused());
     assert!(!app.prompt_focused());
 
-    // Blink tick while unfocused must not leave caret mid-off.
+    // The low-frequency frame tick must not change focus ownership.
     app.cursor_on = false;
     app.toggle_cursor();
-    assert!(
-        app.cursor_on,
-        "unfocused blink keeps caret ready for refocus"
-    );
     assert!(!app.prompt_focused());
 
     // Typing returns to the composer and clears row focus.

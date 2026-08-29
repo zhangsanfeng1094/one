@@ -13,7 +13,7 @@ use super::text::{display_width, tokenize_input_chips, InputChipKind};
 
 const INDENT: &str = "  ";
 
-/// Soft left bar + multi-line input + software typewriter caret.
+/// Soft left bar + multi-line input backed by the terminal's native caret.
 ///
 /// **Layout contract (each fact once):**
 /// - Meta left  → session identity (agent / model / provider)
@@ -21,9 +21,10 @@ const INDENT: &str = "  ";
 /// - Status left → contextual keybindings
 /// - Status right → session stats (think level / token usage)
 ///
-/// Caret sits on a **dedicated 1-column slot** after the text (or before the
-/// placeholder when empty). Hardware cursor stays hidden.
-pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
+/// The terminal owns the caret shape and blink phase. The prompt only reports
+/// its desired screen position to Ratatui while it has interaction focus; the
+/// user's terminal cursor preference supplies the visual style.
+pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let box_area = area;
 
     // Left rail + caret track real interaction focus (not just "no modal").
@@ -51,28 +52,19 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "Message…"
     };
 
-    // Software caret (█) so the typewriter is visible even when the hardware
-    // I-beam is hidden by the emulator / tmux / mouse reporting.
-    // Hidden while float / select / empty-prompt transcript browse owns focus
-    // (Grok: inactive pane hides caret so focus is unambiguous).
-    let caret = if prompt_focused && app.cursor_on {
-        Span::styled("█", Theme::input_cursor_on())
-    } else if prompt_focused {
-        Span::styled(" ", Theme::input_cursor_off())
-    } else {
-        // Unfocused: no caret slot (empty input still shows placeholder only).
-        Span::raw("")
-    };
-
-    // Multi-line input: one Line per input row; caret at `input_cursor`.
-    // Long paste / images render as solid chips (`[文本 · 12 lines · 3KB]` /
-    // `[图片.img]`), not as the raw body fanned across the composer.
+    // Multi-line input: one Line per input row; the native caret follows
+    // `input_cursor`. Long paste / images render as solid chips (`[文本 · 12
+    // lines · 3KB]` / `[图片.img]`), not as the raw body fanned across the
+    // composer.
     let mut content: Vec<Line> = vec![Line::from("")]; // top padding
     let mut cursor_pos: Option<(u16, u16)> = None;
+    app.prompt_content_x = box_area.x + 3;
+    app.prompt_content_y = box_area.y + 1;
+    app.prompt_visible_line_starts.clear();
     if app.input.is_empty() {
+        app.prompt_visible_line_starts.push(0);
         content.push(Line::from(vec![
             Span::raw(INDENT),
-            caret.clone(),
             Span::styled(placeholder, Theme::input_placeholder()),
         ]));
         if prompt_focused {
@@ -80,8 +72,14 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         }
     } else {
         // Place caret using char offset (matches App::input_cursor).
-        let mut remaining = app.input_cursor.min(app.input.chars().count());
         let lines: Vec<&str> = app.input.split('\n').collect();
+        let mut remaining = app.input_cursor.min(app.input.chars().count());
+        let mut line_starts = Vec::with_capacity(lines.len());
+        let mut offset = 0usize;
+        for line in &lines {
+            line_starts.push(offset);
+            offset += line.chars().count() + 1;
+        }
         let last = lines.len().saturating_sub(1);
         let mut caret_line = last;
         let mut caret_col = lines[last].chars().count();
@@ -116,10 +114,11 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
         for (vis_i, line) in lines[start..end].iter().enumerate() {
             let abs_i = start + vis_i;
             let caret_here = abs_i == caret_line;
+            app.prompt_visible_line_starts.push(line_starts[abs_i]);
             content.push(paint_prompt_line(
                 line,
-                caret_here.then_some(caret_col),
-                caret.clone(),
+                line_starts[abs_i],
+                app.input_selection_range(),
             ));
             if caret_here && prompt_focused {
                 let col = caret_col.min(line.chars().count());
@@ -151,54 +150,48 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 }
 
-fn paint_prompt_line(line: &str, caret_col: Option<usize>, caret: Span<'static>) -> Line<'static> {
+fn paint_prompt_line(
+    line: &str,
+    line_start: usize,
+    selection: Option<(usize, usize)>,
+) -> Line<'static> {
     let mut spans: Vec<Span<'static>> = vec![Span::raw(INDENT)];
-    let segs = tokenize_input_chips(line);
-    if segs.is_empty() {
-        if caret_col.is_some() {
-            spans.push(caret);
-        }
-        return Line::from(spans);
-    }
-    let mut char_i = 0usize;
-    let mut caret_placed = false;
-    for (text, kind) in segs {
+    let line_len = line.chars().count();
+    let (selected_start, selected_end) = selection.unwrap_or((usize::MAX, usize::MAX));
+    let selection_start = selected_start.saturating_sub(line_start).min(line_len);
+    let selection_end = selected_end.saturating_sub(line_start).min(line_len);
+
+    let mut char_offset = 0usize;
+    for (text, kind) in tokenize_input_chips(line) {
         let style = match kind {
             Some(InputChipKind::Text) => Theme::input_text_chip(),
             Some(InputChipKind::Image) => Theme::input_image_chip(),
             None => Theme::input_text(),
         };
-        let n = text.chars().count();
-        if let Some(col) = caret_col {
-            if !caret_placed && col >= char_i && col <= char_i + n {
-                let local = col - char_i;
-                let byte = text
-                    .chars()
-                    .take(local)
-                    .map(|c| c.len_utf8())
-                    .sum::<usize>()
-                    .min(text.len());
-                let before = &text[..byte];
-                let after = &text[byte..];
-                if !before.is_empty() {
-                    spans.push(Span::styled(before.to_string(), style));
-                }
-                spans.push(caret.clone());
-                if !after.is_empty() {
-                    spans.push(Span::styled(after.to_string(), style));
-                }
-                caret_placed = true;
-                char_i += n;
-                continue;
+        let run_len = text.chars().count();
+        let run_start = char_offset;
+        let run_end = run_start + run_len;
+        let overlap_start = selection_start.max(run_start).min(run_end);
+        let overlap_end = selection_end.max(run_start).min(run_end);
+        if overlap_start < overlap_end {
+            let split_at =
+                |index: usize| text.chars().take(index).map(char::len_utf8).sum::<usize>();
+            let before = split_at(overlap_start - run_start);
+            let selected = split_at(overlap_end - run_start);
+            if before > 0 {
+                spans.push(Span::styled(text[..before].to_string(), style));
             }
-        }
-        if !text.is_empty() {
+            spans.push(Span::styled(
+                text[before..selected].to_string(),
+                Theme::input_selection(),
+            ));
+            if selected < text.len() {
+                spans.push(Span::styled(text[selected..].to_string(), style));
+            }
+        } else if !text.is_empty() {
             spans.push(Span::styled(text, style));
         }
-        char_i += n;
-    }
-    if caret_col.is_some() && !caret_placed {
-        spans.push(caret);
+        char_offset = run_end;
     }
     Line::from(spans)
 }

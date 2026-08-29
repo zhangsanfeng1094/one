@@ -71,6 +71,19 @@ impl super::App {
         }
 
         match key.code {
+            KeyCode::Char('a')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.select_all_input();
+            }
+            KeyCode::Char('x')
+                if key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT) =>
+            {
+                let _ = self.cut_input_selection();
+            }
             KeyCode::Esc => {
                 if self.slash_menu_visible() {
                     self.input.clear();
@@ -134,12 +147,22 @@ impl super::App {
                     self.clamp_slash_selection();
                 }
             }
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.extend_input_selection(-1)
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.extend_input_selection(1)
+            }
             KeyCode::Left => self.move_input_cursor(-1),
             KeyCode::Right => self.move_input_cursor(1),
-            KeyCode::PageUp => self.scroll_up(self.page_lines()),
-            KeyCode::PageDown => self.scroll_down(self.page_lines()),
-            KeyCode::Home => self.scroll_to_top(),
-            KeyCode::End => self.scroll_to_bottom(),
+            KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.extend_input_to_boundary(false)
+            }
+            KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.extend_input_to_boundary(true)
+            }
+            KeyCode::Home => self.input_cursor_home(),
+            KeyCode::End => self.input_cursor_end(),
             // Slash menu owns ↑/↓ when open; otherwise scroll transcript.
             KeyCode::Up => {
                 if self.slash_menu_visible() {

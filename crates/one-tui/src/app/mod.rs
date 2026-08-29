@@ -64,10 +64,9 @@ pub struct App {
     pub title: String,
     pub messages: Vec<Message>,
     pub input: String,
-    /// Char index of the software caret in `input` (0 = before first char).
-    ///
-    /// Left/Right move this; insert/backspace/delete operate at this position.
-    /// Always clamped to `input.chars().count()` after mutations.
+    /// Character index of the native terminal caret in `input` (0 = before the
+    /// first character). Left/Right move it; all mutations keep it within
+    /// `input.chars().count()`.
     pub input_cursor: usize,
     pub status: String,
     pub stream_buffer: String,
@@ -131,6 +130,16 @@ pub struct App {
     pub chat_line_text: Vec<String>,
     /// Pending clipboard payload set by UI; terminal session writes OSC 52.
     pub clipboard_pending: Option<String>,
+    /// Character position where the prompt selection began. `None` means no
+    /// prompt selection; a value equal to `input_cursor` is an empty range.
+    pub input_selection_anchor: Option<usize>,
+    /// Last-drawn prompt input origin for mouse hit-testing.
+    pub prompt_content_x: u16,
+    pub prompt_content_y: u16,
+    /// Character offsets of logical input lines currently visible in the composer.
+    pub prompt_visible_line_starts: Vec<usize>,
+    /// Legacy software-caret phase retained for float text editors. The main
+    /// prompt uses the terminal's native caret.
     pub cursor_on: bool,
     /// Compact model label for turn footers (usually just the model id).
     pub mode_label: String,
@@ -352,6 +361,10 @@ impl App {
             select_dragging: false,
             chat_line_text: Vec::new(),
             clipboard_pending: None,
+            input_selection_anchor: None,
+            prompt_content_x: 0,
+            prompt_content_y: 0,
+            prompt_visible_line_starts: Vec::new(),
             cursor_on: true,
             mode_label: String::new(),
             agent_label: "Build".into(),

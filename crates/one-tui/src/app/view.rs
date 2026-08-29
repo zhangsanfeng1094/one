@@ -600,15 +600,9 @@ impl super::App {
     }
 
     pub fn toggle_cursor(&mut self) {
-        // Blink only while the main prompt owns focus. Elsewhere keep
-        // `cursor_on = true` so the caret is immediately visible when focus
-        // returns (no mid-off phase), and do not advance the blink phase
-        // during float / select / j/k transcript browse.
-        if self.prompt_focused() {
-            self.cursor_on = !self.cursor_on;
-        } else {
-            self.cursor_on = true;
-        }
+        // The prompt uses the terminal's native steady bar, so there is no
+        // application-managed blink phase to advance. Keep this timer as the
+        // low-frequency animation clock for the busy spinner.
         if self.busy {
             self.spinner_frame = self.spinner_frame.wrapping_add(1);
         }
