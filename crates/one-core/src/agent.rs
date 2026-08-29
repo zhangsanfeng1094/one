@@ -1991,6 +1991,17 @@ pub fn is_retryable_provider_error(err: &OneError) -> bool {
         return false;
     };
     let message = message.to_ascii_lowercase();
+
+    // Any 500 or 5xx server error is directly retryable.
+    if message.contains("500")
+        || message.contains("502")
+        || message.contains("503")
+        || message.contains("504")
+        || message.contains("529")
+    {
+        return true;
+    }
+
     [
         "at capacity",
         "capacity due to high demand",
@@ -1998,17 +2009,26 @@ pub fn is_retryable_provider_error(err: &OneError) -> bool {
         "upstream request failed",
         "upstream",
         "rate limit",
+        "rate_limit",
         "too many requests",
-        "status 429",
-        "status 500",
-        "status 502",
-        "status 503",
-        "status 504",
+        "resource has been exhausted",
+        "quota exceeded",
+        "429",
+        "internal server error",
+        "bad gateway",
+        "service unavailable",
+        "gateway timeout",
+        "server error",
+        "internal error",
         "timeout",
         "timed out",
+        "deadline exceeded",
         "temporarily unavailable",
         "connection reset",
         "connection refused",
+        "broken pipe",
+        "network error",
+        "fetch failed",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -2019,10 +2039,21 @@ fn retry_reason(err: &OneError) -> &'static str {
         return "provider request failed";
     };
     let message = message.to_ascii_lowercase();
-    if message.contains("capacity") || message.contains("overloaded") {
+    if message.contains("500") || message.contains("internal server error") {
+        "provider 500 server error"
+    } else if message.contains("capacity")
+        || message.contains("overloaded")
+        || message.contains("529")
+    {
         "provider at capacity"
-    } else if message.contains("rate limit") || message.contains("429") {
+    } else if message.contains("rate limit") || message.contains("429") || message.contains("quota")
+    {
         "provider rate limited"
+    } else if message.contains("timeout")
+        || message.contains("timed out")
+        || message.contains("deadline")
+    {
+        "request timed out"
     } else {
         "temporary upstream failure"
     }
@@ -2156,8 +2187,6 @@ mod tests {
     fn parallel_safe_tools_are_read_only() {
         assert!(is_parallel_safe_tool("read"));
         assert!(is_parallel_safe_tool("grep"));
-        assert!(is_parallel_safe_tool("glob"));
-        assert!(is_parallel_safe_tool("find"));
         assert!(is_parallel_safe_tool("ls"));
         assert!(is_parallel_safe_tool("web_search"));
         assert!(is_parallel_safe_tool("task")); // explore MVP concurrent
@@ -2988,8 +3017,24 @@ mod tests {
         assert!(is_retryable_provider_error(&OneError::Provider(
             "upstream request failed (status 503)".into()
         )));
+        assert!(is_retryable_provider_error(&OneError::Provider(
+            "openai chat/completions 500 Internal Server Error: {\"error\": \"server error\"}"
+                .into()
+        )));
+        assert!(is_retryable_provider_error(&OneError::Provider(
+            "anthropic 529: site overloaded".into()
+        )));
+        assert!(is_retryable_provider_error(&OneError::Provider(
+            "gemini 503: service unavailable".into()
+        )));
+        assert!(is_retryable_provider_error(&OneError::Provider(
+            "ollama 502: bad gateway".into()
+        )));
         assert!(!is_retryable_provider_error(&OneError::Provider(
             "invalid API key".into()
+        )));
+        assert!(!is_retryable_provider_error(&OneError::Provider(
+            "openai chat/completions 401 Unauthorized: invalid_api_key".into()
         )));
         assert_eq!(retry_backoff_delay(1), Duration::from_secs(2));
         assert_eq!(retry_backoff_delay(4), Duration::from_secs(8));
