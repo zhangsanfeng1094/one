@@ -305,6 +305,14 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         }
     }
 
+    // `one bot` — Multi-channel Bot Gateway.
+    if matches!(&cli.command, Some(Commands::Bot(_))) {
+        if let Some(Commands::Bot(bot)) = cli.command.take() {
+            modes::run_bot(cli, Some(bot)).await?;
+            return Ok(ExitCode::SUCCESS);
+        }
+    }
+
     if let Some(Commands::Mcp(mcp)) = cli.command {
         mcp_cmd::run_mcp(mcp).await?;
         return Ok(ExitCode::SUCCESS);
@@ -390,6 +398,12 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     // Web mode runs ACP server over WebSocket.
     if matches!(run_mode, RunMode::Web) {
         modes::run_web_server(cli, "127.0.0.1", 3000, false).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    // Bot mode runs Bot Gateway.
+    if matches!(run_mode, RunMode::Bot) {
+        modes::run_bot(cli, None).await?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -491,6 +505,10 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         RunMode::Web => {
             // Handled before AppRuntime::build.
             unreachable!("web mode exits earlier");
+        }
+        RunMode::Bot => {
+            // Handled before AppRuntime::build.
+            unreachable!("bot mode exits earlier");
         }
         RunMode::Interactive => {
             // `-p` / `--tui -p` seeds the first user turn inside the TUI.

@@ -1,0 +1,77 @@
+# ==============================================================================
+# One Bot Gateway Configuration (Hermes / Grok Multi-Channel Gateway)
+# ==============================================================================
+
+# Default LLM model for bot conversations (overrides global default when in bot mode)
+default_model = "grok-4"
+
+# Maximum concurrent sessions
+max_concurrent_sessions = 50
+
+# Path to custom directory containing dynamic connectors (default: ~/.one/connectors)
+# connectors_dir = "~/.one/connectors"
+
+# ------------------------------------------------------------------------------
+# Security & HITL (Human-in-the-Loop) Configuration
+# ------------------------------------------------------------------------------
+[security]
+# Admin user IDs allowed to run dangerous commands or change models
+# Empty list means all users are permitted (open mode)
+admin_users = ["tg_user_123456", "discord_user_999"]
+
+# Allowed channel/group IDs (empty list means all channels allowed)
+allowed_channels = []
+
+# Require interactive button approval for bash commands / dangerous operations
+require_approval_for_bash = true
+
+# ------------------------------------------------------------------------------
+# Native Telegram Adapter
+# ------------------------------------------------------------------------------
+[telegram]
+enabled = false
+bot_token = "123456789:ABC-DEF1234ghIkl-zyx57W2v1u123ew11"
+api_base = "https://api.telegram.org"
+stream_edit_interval_ms = 1000
+
+# ------------------------------------------------------------------------------
+# Native Discord Adapter
+# ------------------------------------------------------------------------------
+[discord]
+enabled = false
+bot_token = "YOUR_DISCORD_BOT_TOKEN"
+application_id = "YOUR_DISCORD_APP_ID"
+
+# ------------------------------------------------------------------------------
+# Native Feishu / Lark Adapter
+# ------------------------------------------------------------------------------
+[feishu]
+enabled = false
+app_id = "cli_a1b2c3d4e5f6"
+app_secret = "YOUR_FEISHU_APP_SECRET"
+
+# ------------------------------------------------------------------------------
+# Native Slack Adapter
+# ------------------------------------------------------------------------------
+[slack]
+enabled = false
+bot_token = "xoxb-YOUR-SLACK-BOT-TOKEN"
+app_token = "xapp-YOUR-SLACK-APP-TOKEN"
+
+# ------------------------------------------------------------------------------
+# External Dynamic Subprocess Connectors (Scheme 1 IPC / Hermes-aligned)
+# ------------------------------------------------------------------------------
+# You can define multiple external connectors (Python, Go, Node.js, Rust executables)
+# communicating via Stdio JSON-RPC 2.0.
+
+# [[connectors]]
+# name = "wecom"
+# command = "python3"
+# args = ["./connectors/wecom_connector.py", "--port", "8080"]
+# enabled = true
+
+# [[connectors]]
+# name = "dingtalk"
+# command = "./connectors/dingtalk_bot"
+# args = []
+# enabled = true

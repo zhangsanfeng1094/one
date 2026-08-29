@@ -63,7 +63,7 @@ impl AppRuntime {
             agent.token_usage
         };
 
-        let result: Result<String, Box<dyn std::error::Error>> = async {
+        let result: Result<String, OneError> = async {
             match {
                 let mut agent = self.agent.lock().await;
                 agent.prompt(provider, &text).await
@@ -71,9 +71,12 @@ impl AppRuntime {
                 Ok(out) => Ok(out),
                 Err(err) if is_overflow_err(&err) => {
                     drop(err);
-                    let _ = self
+                    if let Err(e) = self
                         .maybe_compact(provider, CompactRequest::overflow())
-                        .await?;
+                        .await
+                    {
+                        return Err(OneError::Provider(e.to_string()));
+                    }
                     // Buffer shrank. Re-base so we (1) don't panic on `[before..]` and
                     // (2) still persist the in-flight user turn (never written yet) without
                     // re-appending already-on-disk kept history.
@@ -92,12 +95,12 @@ impl AppRuntime {
                         .map(|m| matches!(m, AgentMessage::User(_)))
                         .unwrap_or(false)
                     {
-                        Ok(agent.run(provider).await?)
+                        agent.run(provider).await
                     } else {
-                        Ok(agent.prompt(provider, &text).await?)
+                        agent.prompt(provider, &text).await
                     }
                 }
-                Err(err) => Err(err.into()),
+                Err(err) => Err(err),
             }
         }
         .await;
@@ -114,18 +117,80 @@ impl AppRuntime {
 
         // Grok Build–style: durable turn failure without polluting chat history.
         if let Err(ref err) = result {
-            if let Some(one) = err.downcast_ref::<OneError>() {
-                self.persist_run_error_one(one).await;
-            } else {
-                self.persist_run_error("unknown", &err.to_string(), "error")
-                    .await;
-            }
+            self.persist_run_error_one(err).await;
         }
 
         if result.is_ok() {
             self.note_sampling_success();
         }
-        result
+        result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
+    }
+
+    pub async fn prompt_with_images(
+        &mut self,
+        provider: &dyn LlmProvider,
+        text: &str,
+        images: Vec<(String, String)>,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        if images.is_empty() {
+            return self.prompt(provider, text).await;
+        }
+
+        if self.mcp.is_loading() && self.mcp.tool_count() == 0 {
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
+            while self.mcp.is_loading()
+                && self.mcp.tool_count() == 0
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        }
+        self.sync_mcp_tools().await?;
+        self.inject_mcp_reminder().await;
+
+        let text = self.resources.resolve_prompt(text);
+        self.inject_graph_intent_reminder(&text).await;
+        let _ = self.maybe_compact(provider, CompactRequest::auto()).await?;
+
+        self.memory_lookups.reset_turn();
+
+        let _ = self
+            .extensions
+            .emit(&ExtensionEvent::UserPromptSubmit { text: text.clone() })
+            .await;
+
+        let before = {
+            let agent = self.agent.lock().await;
+            agent.messages.len()
+        };
+        self.begin_run_meta();
+        let usage_before = {
+            let agent = self.agent.lock().await;
+            agent.token_usage
+        };
+
+        let result: Result<String, OneError> = async {
+            let mut agent = self.agent.lock().await;
+            agent.prompt_with_images(provider, &text, images).await
+        }
+        .await;
+
+        if let Err(e) = self.append_session_delta(before).await {
+            tracing::warn!(error = %e, "failed to append session messages after prompt");
+        }
+        if let Err(e) = self.persist_extension_state().await {
+            tracing::warn!(error = %e, "failed to persist extension state after prompt");
+        }
+        self.persist_run_meta(usage_before, before).await;
+
+        if let Err(ref err) = result {
+            self.persist_run_error_one(err).await;
+        }
+
+        if result.is_ok() {
+            self.note_sampling_success();
+        }
+        result.map_err(|e| Box::new(e) as Box<dyn std::error::Error>)
     }
 
     /// Append agent messages from `before..` onto the session (best-effort bounds).

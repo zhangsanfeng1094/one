@@ -17,6 +17,8 @@ flowchart TB
   subgraph UI["入口层"]
     CLI["one-cli<br/>CLI / modes"]
     TUI["one-tui<br/>Interactive"]
+    WEB["one-web<br/>Web UI"]
+    BOT["one-bot<br/>Bot Gateway"]
   end
 
   subgraph ORCH["编排层 · AppRuntime"]
@@ -93,6 +95,7 @@ flowchart TB
 | Prompt 模板 `/name` | ✅ | `one-resources/prompts` | |
 | Compaction | ✅ | `one-core/compaction` + runtime | 默认 85% 阈值 + 每轮 turn-age prune + `/compact` 指令进 prompt + overflow 重试 + sticky suppression；two-pass/prefire 可选；`<system-reminder>` 用于空读/spill/后台完成/compact 状态 |
 | 五模式 Interactive/Print/JSON/RPC/ACP | ✅ | `one-cli/modes` | ACP：`one acp` / `--mode acp`，见 [acp.md](./acp.md) |
+| 多渠道 Bot 网关 (Telegram/Discord/飞书) | ✅ | `one-bot` + `one-cli/modes/bot` | `one bot` / `--mode bot`，Hermes/Grok 架构对齐，支持流式防抖与 Inline HITL 审批 |
 | 执行轨迹 / harness 评测 | ✅ | `one-core/trace` + Langfuse `--trace` / `one bench` | 可选 TraceSink → Langfuse；见 [harness-eval.md](./harness-eval.md) |
 | Plan / Act 模式 | ✅ | runtime + tools/plan | 硬工具门控 |
 | MCP 平台客户端 | ✅ | `one-mcp` | stdio + streamable HTTP；**只加载 One 配置** |

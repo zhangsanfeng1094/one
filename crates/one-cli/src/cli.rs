@@ -69,6 +69,8 @@ pub enum RunMode {
     /// Web UI server (ACP over WebSocket).
     /// Accessible via browser at `http://127.0.0.1:3000/`.
     Web,
+    /// Multi-channel Bot Gateway (Hermes / Grok Bot for Telegram, Discord, Feishu, etc.).
+    Bot,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -260,6 +262,40 @@ pub enum Commands {
     ///
     /// Open the web interface to interact with One via browser.
     Web(WebCli),
+    /// Multi-channel Bot Gateway (Telegram / Discord / Feishu / Slack).
+    Bot(BotCli),
+}
+
+/// CLI: `one bot` — Multi-channel Bot Gateway.
+#[derive(Debug, Clone, clap::Args)]
+pub struct BotCli {
+    /// Path to bot.toml or bot.json configuration file.
+    #[arg(long, short = 'C')]
+    pub config: Option<PathBuf>,
+
+    /// Telegram Bot Token override (or TELEGRAM_BOT_TOKEN env).
+    #[arg(long)]
+    pub telegram_token: Option<String>,
+
+    /// Discord Bot Token override (or DISCORD_BOT_TOKEN env).
+    #[arg(long)]
+    pub discord_token: Option<String>,
+
+    /// Feishu / Lark App ID override (or FEISHU_APP_ID env).
+    #[arg(long)]
+    pub feishu_app_id: Option<String>,
+
+    /// Feishu / Lark App Secret override (or FEISHU_APP_SECRET env).
+    #[arg(long)]
+    pub feishu_app_secret: Option<String>,
+
+    /// External connector commands/executables to dynamically load (e.g. `--connector ./my-feishu-bot`).
+    #[arg(long = "connector", value_name = "COMMAND")]
+    pub connectors: Vec<String>,
+
+    /// Directory to auto-discover and load dynamic connector executables (default: ~/.one/connectors).
+    #[arg(long = "connectors-dir", value_name = "DIR")]
+    pub connectors_dir: Option<PathBuf>,
 }
 
 /// CLI: `one web` — Web UI server (ACP over WebSocket).
