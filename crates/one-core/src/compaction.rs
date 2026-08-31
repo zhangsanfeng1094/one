@@ -179,6 +179,59 @@ pub const DEFAULT_PRUNE_PROTECT_TOKENS: usize = 40_000;
 pub const DEFAULT_PRUNE_MAX_CHARS: usize = 2_000;
 /// Marker left in place of cleared tool output (idempotent for re-prune).
 pub const PRUNED_TOOL_PLACEHOLDER: &str = "[Old tool result content cleared]";
+
+/// How a raw tool result was reduced in the model-facing context.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PruneKind {
+    SoftTrim,
+    HardClear,
+}
+
+/// Durable correlation data for one tool result changed by pruning.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrunedToolResult {
+    pub message_index: usize,
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub kind: PruneKind,
+    pub original_bytes: usize,
+    pub original_fingerprint: String,
+    pub replacement_fingerprint: String,
+}
+
+/// All model-context changes made by one pruning pass.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PruneOutcome {
+    pub changes: Vec<PrunedToolResult>,
+}
+
+impl PruneOutcome {
+    pub fn modified_count(&self) -> usize {
+        self.changes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.changes.is_empty()
+    }
+}
+
+/// Stable, non-cryptographic content fingerprint used to correlate persisted
+/// context projections with trace events without duplicating their contents.
+pub fn messages_fingerprint(messages: &[AgentMessage]) -> String {
+    let encoded = serde_json::to_vec(messages).unwrap_or_default();
+    bytes_fingerprint(&encoded)
+}
+
+fn bytes_fingerprint(bytes: &[u8]) -> String {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("fp1:{hash:016x}:{}", bytes.len())
+}
+
 /// Soft-trim ellipsis between kept head and tail.
 pub const SOFT_TRIM_MARKER: &str = "\n…\n";
 /// Lead below the auto-compact limit at which two-pass Pass-1 may prefire (Grok 10%).
@@ -572,17 +625,20 @@ fn take_chars_end(s: &str, n: usize) -> String {
 /// - Older than that and over `prune_soft_trim_threshold` chars: keep head + tail.
 /// - Age ≥ `prune_hard_clear_age_turns`: replace with [`PRUNED_TOOL_PLACEHOLDER`].
 ///
-/// Returns the number of tool results that were modified.
-pub fn prune_old_tool_outputs(messages: &mut [AgentMessage], config: &CompactionConfig) -> usize {
+/// Returns structured provenance for each tool result that was modified.
+pub fn prune_old_tool_outputs(
+    messages: &mut [AgentMessage],
+    config: &CompactionConfig,
+) -> PruneOutcome {
     if !config.prune {
-        return 0;
+        return PruneOutcome::default();
     }
     let keep_turns = config.prune_keep_last_n_turns.max(1);
     let hard_age = config.prune_hard_clear_age_turns.max(keep_turns);
     let soft_threshold = config.prune_soft_trim_threshold;
     let head_n = config.prune_soft_trim_head;
     let tail_n = config.prune_soft_trim_tail;
-    let mut pruned = 0usize;
+    let mut changes = Vec::new();
 
     for i in 0..messages.len() {
         let age = user_turns_after(messages, i);
@@ -596,11 +652,21 @@ pub fn prune_old_tool_outputs(messages: &mut [AgentMessage], config: &Compaction
             continue;
         }
         let text = tool_result_text(result);
+        let original_bytes = text.len();
+        let original_fingerprint = bytes_fingerprint(text.as_bytes());
         if age >= hard_age {
             result.content = vec![TextOrImage::Text {
                 text: PRUNED_TOOL_PLACEHOLDER.to_string(),
             }];
-            pruned += 1;
+            changes.push(PrunedToolResult {
+                message_index: i,
+                tool_call_id: result.tool_call_id.clone(),
+                tool_name: result.tool_name.clone(),
+                kind: PruneKind::HardClear,
+                original_bytes,
+                original_fingerprint,
+                replacement_fingerprint: bytes_fingerprint(PRUNED_TOOL_PLACEHOLDER.as_bytes()),
+            });
             continue;
         }
         let chars = text.chars().count();
@@ -608,11 +674,20 @@ pub fn prune_old_tool_outputs(messages: &mut [AgentMessage], config: &Compaction
             let head = take_chars(&text, head_n);
             let tail = take_chars_end(&text, tail_n);
             let body = format!("{head}{SOFT_TRIM_MARKER}{tail}");
+            let replacement_fingerprint = bytes_fingerprint(body.as_bytes());
             result.content = vec![TextOrImage::Text { text: body }];
-            pruned += 1;
+            changes.push(PrunedToolResult {
+                message_index: i,
+                tool_call_id: result.tool_call_id.clone(),
+                tool_name: result.tool_name.clone(),
+                kind: PruneKind::SoftTrim,
+                original_bytes,
+                original_fingerprint,
+                replacement_fingerprint,
+            });
         }
     }
-    pruned
+    PruneOutcome { changes }
 }
 
 /// Start index of each user turn (the `User` message; assistant/tools follow).
@@ -656,6 +731,12 @@ pub fn split_for_compaction_forced<'a>(
     }
 
     let starts = user_turn_starts(messages);
+    // A long tool loop commonly has one user request followed by many completed
+    // assistant/tool-result batches. Once the threshold is crossed, retaining
+    // that whole batch defeats intra-turn compaction; summarize it as a unit.
+    if force && starts.len() == 1 {
+        return Some((messages, &[]));
+    }
     let split = if starts.len() > keep_turns {
         starts[starts.len() - keep_turns]
     } else if force && starts.len() >= 2 {
@@ -1402,8 +1483,12 @@ mod tests {
             prune_soft_trim_tail: 20,
             ..Default::default()
         };
-        let n = prune_old_tool_outputs(&mut messages, &config);
-        assert!(n >= 2, "expected old+mid pruned, got {n}");
+        let outcome = prune_old_tool_outputs(&mut messages, &config);
+        assert!(
+            outcome.modified_count() >= 2,
+            "expected old+mid pruned, got {}",
+            outcome.modified_count()
+        );
         // recent (age 0) stays full
         if let AgentMessage::ToolResult(r) = &messages[5] {
             let t = match &r.content[0] {
@@ -1437,7 +1522,7 @@ mod tests {
             panic!("expected tool result");
         }
         // Second prune is idempotent on hard-cleared; mid already under threshold.
-        assert_eq!(prune_old_tool_outputs(&mut messages, &config), 0);
+        assert!(prune_old_tool_outputs(&mut messages, &config).is_empty());
     }
 
     #[test]
@@ -1458,7 +1543,7 @@ mod tests {
             prune_soft_trim_threshold: 100,
             ..Default::default()
         };
-        assert_eq!(prune_old_tool_outputs(&mut messages, &config), 0);
+        assert!(prune_old_tool_outputs(&mut messages, &config).is_empty());
         for m in &messages {
             if let AgentMessage::ToolResult(r) = m {
                 let t = match &r.content[0] {
@@ -1484,7 +1569,7 @@ mod tests {
             prune_hard_clear_age_turns: 1,
             ..Default::default()
         };
-        assert_eq!(prune_old_tool_outputs(&mut messages, &config), 0);
+        assert!(prune_old_tool_outputs(&mut messages, &config).is_empty());
     }
 
     #[test]

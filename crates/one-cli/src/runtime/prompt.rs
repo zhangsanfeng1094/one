@@ -5,8 +5,8 @@ use std::sync::Arc;
 use one_core::agent::{CompletionRequest, LlmProvider, ThinkingLevel};
 use one_core::compaction::{
     attach_compaction_reminder, compact_messages_forced, compacted_live_messages,
-    edited_paths_from_messages, estimate_tokens, prefix_fingerprint, prune_old_tool_outputs,
-    should_compact_tokens, should_prefire_two_pass, split_for_compaction,
+    edited_paths_from_messages, estimate_tokens, messages_fingerprint, prefix_fingerprint,
+    prune_old_tool_outputs, should_compact_tokens, should_prefire_two_pass, split_for_compaction,
     split_for_compaction_forced, split_two_pass, summarization_prompt, tokens_for_compaction,
     two_pass_pass1_prompt, two_pass_pass2_prompt, user_turn_count, CompactApplied, CompactRequest,
     CompactionConfig, CompactionStateContext, CompactionSuppression, PrefireCandidate,
@@ -14,6 +14,8 @@ use one_core::compaction::{
 use one_core::error::OneError;
 use one_core::message::AgentMessage;
 use one_ext::ExtensionEvent;
+
+use one_session::meta::{ContextProjectionMeta, ProjectionToolResultProvenance};
 
 use super::helpers::is_overflow_err;
 use super::AppRuntime;
@@ -109,6 +111,12 @@ impl AppRuntime {
         if let Err(e) = self.append_session_delta(before).await {
             tracing::warn!(error = %e, "failed to append session messages after prompt");
         }
+        if let Err(e) = self.persist_intra_turn_compaction().await {
+            tracing::warn!(error = %e, "failed to persist intra-turn compaction after prompt");
+        }
+        if let Err(e) = self.persist_context_projections().await {
+            tracing::warn!(error = %e, "failed to persist context projection after prompt");
+        }
         if let Err(e) = self.persist_extension_state().await {
             tracing::warn!(error = %e, "failed to persist extension state after prompt");
         }
@@ -178,6 +186,12 @@ impl AppRuntime {
         if let Err(e) = self.append_session_delta(before).await {
             tracing::warn!(error = %e, "failed to append session messages after prompt");
         }
+        if let Err(e) = self.persist_intra_turn_compaction().await {
+            tracing::warn!(error = %e, "failed to persist intra-turn compaction after prompt");
+        }
+        if let Err(e) = self.persist_context_projections().await {
+            tracing::warn!(error = %e, "failed to persist context projection after prompt");
+        }
         if let Err(e) = self.persist_extension_state().await {
             tracing::warn!(error = %e, "failed to persist extension state after prompt");
         }
@@ -202,12 +216,121 @@ impl AppRuntime {
             return Ok(());
         };
         let agent = self.agent.lock().await;
-        let start = before.min(agent.messages.len());
-        let messages = agent.messages[start..].to_vec();
+        let messages = if agent.last_run_transcript().is_empty() {
+            let start = before.min(agent.messages.len());
+            agent.messages[start..].to_vec()
+        } else {
+            agent.last_run_transcript().to_vec()
+        };
         drop(agent);
         for message in messages {
             session.append_message(message).await?;
         }
+        Ok(())
+    }
+
+    /// Persist an automatic compaction that happened while the agent was looping.
+    ///
+    /// The raw run transcript is appended first, so the compaction marker can
+    /// point at the exact retained tail and session resume can rebuild the same
+    /// model-facing context without losing the long task's tool history.
+    pub async fn persist_intra_turn_compaction(
+        &mut self,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(session) = &mut self.session else {
+            return Ok(());
+        };
+        let (compaction, kept_messages) = {
+            let agent = self.agent.lock().await;
+            let compaction = agent.intra_turn_compaction().cloned();
+            let kept_messages = agent.messages.len().saturating_sub(1);
+            (compaction, kept_messages)
+        };
+        let Some(compaction) = compaction else {
+            return Ok(());
+        };
+        let first_kept = session.first_kept_entry_id_for_tail(kept_messages);
+        session
+            .append_compaction_with_details(
+                &compaction.summary,
+                first_kept,
+                compaction.applied.tokens_before,
+                Some(serde_json::json!({
+                    "kept_turns": compaction.applied.kept_turns,
+                    "tokens_after": compaction.applied.tokens_after,
+                    "intra_turn": true,
+                })),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Persist model-facing snapshots separately from the raw transcript.
+    ///
+    /// Historical snapshots allow trace hashes to be inspected later; the final
+    /// checkpoint is the exact buffer that session resume should restore.
+    pub async fn persist_context_projections(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(session) = &mut self.session else {
+            return Ok(());
+        };
+        let (snapshots, final_messages) = {
+            let agent = self.agent.lock().await;
+            (agent.context_projections().to_vec(), agent.messages.clone())
+        };
+        if snapshots.is_empty() {
+            return Ok(());
+        }
+
+        for snapshot in snapshots {
+            let provenance = snapshot
+                .pruned_tool_results
+                .iter()
+                .map(|change| ProjectionToolResultProvenance {
+                    tool_call_id: change.tool_call_id.clone(),
+                    tool_name: change.tool_name.clone(),
+                    raw_entry_id: session.active_tool_result_entry_id(&change.tool_call_id),
+                    projection_message_index: snapshot.messages.iter().position(|message| {
+                        matches!(message, AgentMessage::ToolResult(result)
+                            if result.tool_call_id == change.tool_call_id)
+                    }),
+                    kind: match change.kind {
+                        one_core::compaction::PruneKind::SoftTrim => "soft_trim".into(),
+                        one_core::compaction::PruneKind::HardClear => "hard_clear".into(),
+                    },
+                    original_bytes: change.original_bytes,
+                    original_fingerprint: change.original_fingerprint.clone(),
+                    replacement_fingerprint: change.replacement_fingerprint.clone(),
+                })
+                .collect();
+            session
+                .append_context_projection(&ContextProjectionMeta {
+                    schema: one_session::meta::META_SCHEMA,
+                    projection_id: snapshot.id,
+                    projection_hash: snapshot.hash,
+                    reason: snapshot.reason,
+                    resume_checkpoint: false,
+                    messages: snapshot.messages,
+                    pruned_tool_results: provenance,
+                })
+                .await?;
+        }
+
+        let projection_hash = messages_fingerprint(&final_messages);
+        let projection_id = format!(
+            "ctx_{}",
+            projection_hash.trim_start_matches("fp1:").replace(':', "_")
+        );
+        session
+            .append_context_projection(&ContextProjectionMeta {
+                schema: one_session::meta::META_SCHEMA,
+                projection_id,
+                projection_hash,
+                reason: "run_checkpoint".into(),
+                resume_checkpoint: true,
+                messages: final_messages,
+                pruned_tool_results: Vec::new(),
+            })
+            .await?;
         Ok(())
     }
 
@@ -227,8 +350,19 @@ impl AppRuntime {
         provider: Arc<dyn LlmProvider>,
         request: CompactRequest,
     ) -> Result<Option<CompactApplied>, Box<dyn std::error::Error>> {
+        self.maybe_compact_with_notify(provider, request, None)
+            .await
+    }
+
+    /// Compact with an owned provider and optional start notification callback.
+    pub async fn maybe_compact_with_notify(
+        &mut self,
+        provider: Arc<dyn LlmProvider>,
+        request: CompactRequest,
+        on_start: Option<Box<dyn FnOnce(u64) + Send>>,
+    ) -> Result<Option<CompactApplied>, Box<dyn std::error::Error>> {
         let prefire = Arc::clone(&provider);
-        self.maybe_compact_inner(provider.as_ref(), request, Some(prefire))
+        self.maybe_compact_inner(provider.as_ref(), request, Some(prefire), on_start)
             .await
     }
 
@@ -245,7 +379,8 @@ impl AppRuntime {
         provider: &dyn LlmProvider,
         request: CompactRequest,
     ) -> Result<Option<CompactApplied>, Box<dyn std::error::Error>> {
-        self.maybe_compact_inner(provider, request, None).await
+        self.maybe_compact_inner(provider, request, None, None)
+            .await
     }
 
     async fn maybe_compact_inner(
@@ -253,6 +388,7 @@ impl AppRuntime {
         provider: &dyn LlmProvider,
         request: CompactRequest,
         prefire_provider: Option<Arc<dyn LlmProvider>>,
+        on_start: Option<Box<dyn FnOnce(u64) + Send>>,
     ) -> Result<Option<CompactApplied>, Box<dyn std::error::Error>> {
         let settings = crate::settings::load();
         let mut config = settings.compaction_config(self.context_window);
@@ -276,8 +412,8 @@ impl AppRuntime {
 
         // 1) Prune old tool outputs every check (independent of auto-compact).
         if config.prune {
-            let n = prune_old_tool_outputs(&mut messages, &config);
-            if n > 0 {
+            let outcome = prune_old_tool_outputs(&mut messages, &config);
+            if !outcome.is_empty() {
                 tokens = tokens_for_compaction(&messages, None);
                 let mut agent = self.agent.lock().await;
                 agent.messages = messages.clone();
@@ -307,6 +443,10 @@ impl AppRuntime {
         // (user turns) is honored even when the transcript is shorter than N.
         if split_for_compaction_forced(&messages, &config, true).is_none() {
             return Ok(None);
+        }
+
+        if let Some(on_start) = on_start {
+            on_start(tokens as u64);
         }
 
         let matcher = request.trigger.hook_matcher();

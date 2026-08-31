@@ -53,6 +53,14 @@ pub enum AgentEvent {
         usage: crate::agent::TokenUsage,
         context_tokens: u64,
     },
+    /// A context compaction has started.
+    CompactionStart,
+    /// A context compaction has completed.
+    CompactionEnd {
+        tokens_before: u64,
+        tokens_after: u64,
+        kept_turns: usize,
+    },
 }
 
 pub type EventListener = Box<dyn Fn(&AgentEvent) + Send + Sync>;

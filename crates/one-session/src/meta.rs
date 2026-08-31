@@ -3,6 +3,7 @@
 //! These are stored as [`crate::entries::SessionEntry::Custom`] and **must not**
 //! enter the LLM context (see `context::entry_produces_message`).
 
+use one_core::message::AgentMessage;
 use one_core::TokenUsage;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,11 +19,54 @@ pub const CUSTOM_TOOL_AUDIT: &str = "one.tool_audit";
 /// Mirrors Grok `turn_completed` / `retry_state` durability: error is on disk for
 /// resume/debug, but never rebuilt into model messages (see `entry_produces_message`).
 pub const CUSTOM_ERROR: &str = "one.error";
+/// Exact model-facing context checkpoint. Raw `Message` entries remain the
+/// user-visible source of truth; this record only controls resume projection.
+pub const CUSTOM_CONTEXT_PROJECTION: &str = "one.context_projection";
 
 pub const META_SCHEMA: u32 = 1;
 
 /// Inline system-prompt text threshold; larger prompts spill to a sidecar file.
 pub const PROMPT_INLINE_MAX_BYTES: usize = 64 * 1024;
+
+/// Link from a pruned model-context tool result back to the immutable raw entry.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectionToolResultProvenance {
+    pub tool_call_id: String,
+    pub tool_name: String,
+    pub raw_entry_id: Option<String>,
+    pub projection_message_index: Option<usize>,
+    pub kind: String,
+    pub original_bytes: usize,
+    pub original_fingerprint: String,
+    pub replacement_fingerprint: String,
+}
+
+/// A durable snapshot of the messages used to resume the model-facing context.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ContextProjectionMeta {
+    #[serde(default = "meta_schema")]
+    pub schema: u32,
+    pub projection_id: String,
+    pub projection_hash: String,
+    pub reason: String,
+    /// True only for the final snapshot of a run; resume selects this record.
+    #[serde(default)]
+    pub resume_checkpoint: bool,
+    /// Exact message list excluding the system prompt and tool definitions.
+    pub messages: Vec<AgentMessage>,
+    #[serde(default)]
+    pub pruned_tool_results: Vec<ProjectionToolResultProvenance>,
+}
+
+impl ContextProjectionMeta {
+    pub fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+
+    pub fn from_value(data: &Value) -> Option<Self> {
+        serde_json::from_value(data.clone()).ok()
+    }
+}
 
 /// Wire shape for token fields (mirrors [`TokenUsage`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

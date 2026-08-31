@@ -1,6 +1,7 @@
 use one_core::message::AgentMessage;
 
 use crate::entries::SessionEntry;
+use crate::meta::{ContextProjectionMeta, CUSTOM_CONTEXT_PROJECTION};
 
 #[derive(Debug, Clone)]
 pub struct SessionContext {
@@ -125,29 +126,32 @@ pub fn build_session_context(entries: &[SessionEntry], leaf_id: &str) -> Session
         }
     }
 
-    for entry in active {
-        match entry {
-            SessionEntry::Message { message, .. } => messages.push(message),
-            SessionEntry::Compaction { summary, .. } => {
-                messages.push(AgentMessage::assistant_text(
-                    "system",
-                    "compaction",
-                    format!("[Compaction summary]\n{summary}"),
-                ));
-            }
-            SessionEntry::BranchSummary { summary, .. } => {
-                messages.push(AgentMessage::assistant_text(
-                    "system",
-                    "branch",
-                    format!("[Branch summary]\n{summary}"),
-                ));
-            }
-            SessionEntry::CustomMessage { content, .. } => {
-                if let Some(text) = content.as_str() {
-                    messages.push(AgentMessage::user_text(text));
-                }
-            }
-            _ => {}
+    let projection = full_path
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(index, entry)| {
+            let SessionEntry::Custom {
+                custom_type, data, ..
+            } = entry
+            else {
+                return None;
+            };
+            (custom_type == CUSTOM_CONTEXT_PROJECTION)
+                .then(|| ContextProjectionMeta::from_value(data))
+                .flatten()
+                .filter(|meta| meta.resume_checkpoint)
+                .map(|meta| (index, meta))
+        });
+
+    if let Some((checkpoint_index, checkpoint)) = projection {
+        messages = checkpoint.messages;
+        for entry in full_path.iter().skip(checkpoint_index + 1) {
+            append_context_message(&mut messages, entry);
+        }
+    } else {
+        for entry in active {
+            append_context_message(&mut messages, &entry);
         }
     }
 
@@ -156,6 +160,32 @@ pub fn build_session_context(entries: &[SessionEntry], leaf_id: &str) -> Session
         provider,
         model_id,
         thinking_level,
+    }
+}
+
+fn append_context_message(messages: &mut Vec<AgentMessage>, entry: &SessionEntry) {
+    match entry {
+        SessionEntry::Message { message, .. } => messages.push(message.clone()),
+        SessionEntry::Compaction { summary, .. } => {
+            messages.push(AgentMessage::assistant_text(
+                "system",
+                "compaction",
+                format!("[Compaction summary]\n{summary}"),
+            ));
+        }
+        SessionEntry::BranchSummary { summary, .. } => {
+            messages.push(AgentMessage::assistant_text(
+                "system",
+                "branch",
+                format!("[Branch summary]\n{summary}"),
+            ));
+        }
+        SessionEntry::CustomMessage { content, .. } => {
+            if let Some(text) = content.as_str() {
+                messages.push(AgentMessage::user_text(text));
+            }
+        }
+        _ => {}
     }
 }
 

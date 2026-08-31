@@ -6,6 +6,11 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
+use crate::compaction::{
+    compacted_live_messages, extractive_summary, messages_fingerprint, should_compact_tokens,
+    split_for_compaction_forced, summarization_prompt, tokens_for_compaction, CompactApplied,
+    CompactTrigger, PrunedToolResult,
+};
 use crate::error::{OneError, Result};
 use crate::events::{AgentEvent, EventListener};
 use crate::hooks::{AgentHooks, StopDecision};
@@ -154,6 +159,9 @@ const RETRY_BACKOFF_SECS: &[u64] = &[2, 3, 5, 8, 13, 20];
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub system_prompt: String,
+    /// Maximum LLM/tool iterations for one user request. `0` means unlimited:
+    /// interactive sessions continue until the model completes, the user aborts,
+    /// or another execution guard ends the run.
     pub max_turns: usize,
     pub thinking_level: ThinkingLevel,
     /// Request-side only: attach `provider.server_tools()` (hosted web/x search)
@@ -174,7 +182,7 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             system_prompt: DEFAULT_SYSTEM_PROMPT.to_string(),
-            max_turns: 64,
+            max_turns: 0,
             thinking_level: ThinkingLevel::Off,
             server_search: false,
             empty_response_retries: DEFAULT_EMPTY_RESPONSE_RETRIES,
@@ -355,6 +363,27 @@ pub trait LlmProvider: Send + Sync {
     }
 }
 
+/// Summary metadata for automatic compaction performed between tool-loop samples.
+///
+/// The agent retains the full run transcript separately; hosts use this record to
+/// add one durable compaction marker after persisting that transcript.
+#[derive(Debug, Clone)]
+pub struct IntraTurnCompaction {
+    pub summary: String,
+    pub applied: CompactApplied,
+}
+
+/// Exact model-facing context captured after a prune or compaction mutation.
+/// Hosts persist these snapshots separately from the raw user-visible transcript.
+#[derive(Debug, Clone)]
+pub struct ContextProjectionSnapshot {
+    pub id: String,
+    pub hash: String,
+    pub reason: String,
+    pub messages: Vec<AgentMessage>,
+    pub pruned_tool_results: Vec<PrunedToolResult>,
+}
+
 pub struct Agent {
     pub config: AgentConfig,
     pub messages: Vec<AgentMessage>,
@@ -364,6 +393,14 @@ pub struct Agent {
     /// Last completion's prompt/context size (not cumulative). 0 if unknown.
     /// Used by compaction to prefer API usage over char/4 estimates.
     pub last_prompt_tokens: u64,
+    /// Original messages appended during the most recently completed run.
+    /// This stays separate from the compacted model buffer so session storage can
+    /// retain a complete transcript after intra-turn compaction.
+    last_run_transcript: Vec<AgentMessage>,
+    /// Most recent automatic compaction performed inside the current/last run.
+    intra_turn_compaction: Option<IntraTurnCompaction>,
+    /// Snapshots of model context mutations made during the current/last run.
+    context_projections: Vec<ContextProjectionSnapshot>,
     tools: Vec<Arc<dyn Tool>>,
     listeners: Vec<EventListener>,
     steering_queue: Arc<Mutex<Vec<String>>>,
@@ -406,6 +443,9 @@ impl Agent {
             is_busy: false,
             token_usage: TokenUsage::default(),
             last_prompt_tokens: 0,
+            last_run_transcript: Vec::new(),
+            intra_turn_compaction: None,
+            context_projections: Vec::new(),
             tools,
             listeners: Vec::new(),
             steering_queue: Arc::new(Mutex::new(Vec::new())),
@@ -466,6 +506,64 @@ impl Agent {
     /// Update session id for the next run (e.g. after `/new` or `/resume`).
     pub fn set_trace_session_id(&mut self, session_id: Option<String>) {
         self.trace_meta.session_id = session_id;
+    }
+
+    /// Full, uncompacted message delta from the most recently completed run.
+    pub fn last_run_transcript(&self) -> &[AgentMessage] {
+        &self.last_run_transcript
+    }
+
+    /// Metadata for the latest automatic compaction inside the current/last run.
+    pub fn intra_turn_compaction(&self) -> Option<&IntraTurnCompaction> {
+        self.intra_turn_compaction.as_ref()
+    }
+
+    /// Model-facing snapshots created when the live buffer diverged from raw history.
+    pub fn context_projections(&self) -> &[ContextProjectionSnapshot] {
+        &self.context_projections
+    }
+
+    /// Replace the live context after an external runtime prune and record its provenance.
+    pub fn apply_pruned_messages(
+        &mut self,
+        messages: Vec<AgentMessage>,
+        pruned_tool_results: Vec<PrunedToolResult>,
+    ) {
+        self.messages = messages;
+        self.last_prompt_tokens = 0;
+        self.record_context_projection("prune", pruned_tool_results);
+    }
+
+    fn record_context_projection(
+        &mut self,
+        reason: impl Into<String>,
+        pruned_tool_results: Vec<PrunedToolResult>,
+    ) {
+        let hash = messages_fingerprint(&self.messages);
+        let id = format!("ctx_{}", hash.trim_start_matches("fp1:").replace(':', "_"));
+        self.context_projections.push(ContextProjectionSnapshot {
+            id,
+            hash,
+            reason: reason.into(),
+            messages: self.messages.clone(),
+            pruned_tool_results,
+        });
+    }
+
+    fn push_message(&mut self, message: AgentMessage) {
+        if self.is_busy {
+            self.last_run_transcript.push(message.clone());
+        }
+        self.messages.push(message);
+    }
+
+    fn new_messages_since(&self, start_len: usize) -> Vec<AgentMessage> {
+        if !self.last_run_transcript.is_empty() {
+            self.last_run_transcript.clone()
+        } else {
+            let start = start_len.min(self.messages.len());
+            self.messages[start..].to_vec()
+        }
     }
 
     fn record_trace(&self, event: TraceEvent) {
@@ -599,7 +697,7 @@ impl Agent {
         user: AgentMessage,
     ) -> Result<String> {
         debug_assert!(matches!(user, AgentMessage::User(_)));
-        self.messages.push(user);
+        self.push_message(user);
         self.run(provider).await
     }
 
@@ -649,6 +747,14 @@ impl Agent {
         if let Some(hooks) = &self.hooks {
             hooks.on_agent_start().await;
         }
+        self.last_run_transcript = self
+            .messages
+            .iter()
+            .rposition(|message| matches!(message, AgentMessage::User(_)))
+            .map(|start| self.messages[start..].to_vec())
+            .unwrap_or_default();
+        self.intra_turn_compaction = None;
+        self.context_projections.clear();
         self.is_busy = true;
         let start_len = self.messages.len();
         let mut final_text;
@@ -656,7 +762,10 @@ impl Agent {
         let mut stop_continuations = 0usize;
         const MAX_STOP_CONTINUATIONS: usize = 8;
 
-        for turn in 0..self.config.max_turns {
+        for turn in 0usize.. {
+            if self.config.max_turns > 0 && turn >= self.config.max_turns {
+                break;
+            }
             if self.is_aborted() {
                 return self
                     .finish_aborted(
@@ -672,6 +781,7 @@ impl Agent {
             self.drain_steering();
             // Claude-style: background task completions appear as conversation notices.
             self.drain_notifications();
+            self.maybe_compact_before_sample(provider).await;
             // Progress: report the turn about to run (1-based) for job UIs.
             if let Some(p) = &self.turn_progress {
                 p.store((turn as u64) + 1, Ordering::Relaxed);
@@ -712,6 +822,13 @@ impl Agent {
                 &request.messages,
                 self.llm_preview_limit(),
             );
+            let context_projection_hash = messages_fingerprint(&request.messages);
+            let context_projection_id = format!(
+                "ctx_{}",
+                context_projection_hash
+                    .trim_start_matches("fp1:")
+                    .replace(':', "_")
+            );
             // Helper: open a generation span. Re-emitted after empty/provider retries so
             // Langfuse keeps a separate generation per sample attempt.
             let record_llm_request = |this: &Self, run_id: &str, turn: usize| {
@@ -722,6 +839,8 @@ impl Agent {
                     message_count: request.messages.len(),
                     tools_n: request.tools.len(),
                     system_prompt_len: request.system_prompt.len(),
+                    context_projection_id: Some(context_projection_id.clone()),
+                    context_projection_hash: Some(context_projection_hash.clone()),
                     input_preview: input_preview.clone(),
                 });
             };
@@ -973,6 +1092,16 @@ impl Agent {
 
             turns_done = turn + 1;
 
+            if let Some(config) = &mut self.config.compaction_config {
+                if matches!(
+                    config.suppression,
+                    crate::compaction::CompactionSuppression::StickyUntilSuccess
+                        | crate::compaction::CompactionSuppression::Turn
+                ) {
+                    config.suppression = crate::compaction::CompactionSuppression::None;
+                }
+            }
+
             if self.is_aborted() || response.stop_reason == StopReason::Aborted {
                 let assistant = AgentMessage::Assistant(AssistantMessage {
                     content: response.content.clone(),
@@ -982,7 +1111,7 @@ impl Agent {
                     timestamp: crate::message::now_ms(),
                     citations: response.citations.clone(),
                 });
-                self.messages.push(assistant);
+                self.push_message(assistant);
                 return self
                     .finish_aborted(
                         start_len,
@@ -1002,7 +1131,7 @@ impl Agent {
                 timestamp: crate::message::now_ms(),
                 citations: response.citations.clone(),
             });
-            self.messages.push(assistant.clone());
+            self.push_message(assistant.clone());
 
             let mut tool_results = Vec::new();
 
@@ -1015,7 +1144,7 @@ impl Agent {
                             if stop_continuations < MAX_STOP_CONTINUATIONS =>
                         {
                             stop_continuations += 1;
-                            self.messages.push(AgentMessage::User(UserMessage {
+                            self.push_message(AgentMessage::User(UserMessage {
                                 content: UserContent::Text(format!(
                                     "[Stop Hook Feedback] {reason}"
                                 )),
@@ -1047,7 +1176,7 @@ impl Agent {
                 }
                 self.is_busy = false;
                 self.emit(AgentEvent::AgentEnd {
-                    new_messages: self.messages[start_len..].to_vec(),
+                    new_messages: self.new_messages_since(start_len),
                 });
                 if let Some(hooks) = &self.hooks {
                     hooks.on_agent_end().await;
@@ -1100,9 +1229,15 @@ impl Agent {
                 ToolBatchOutcome::Continue => {}
             }
 
-            if let Some(compaction_cfg) = &self.config.compaction_config {
+            if let Some(compaction_cfg) = self.config.compaction_config.clone() {
                 if compaction_cfg.prune {
-                    crate::compaction::prune_old_tool_outputs(&mut self.messages, compaction_cfg);
+                    let outcome = crate::compaction::prune_old_tool_outputs(
+                        &mut self.messages,
+                        &compaction_cfg,
+                    );
+                    if !outcome.is_empty() {
+                        self.record_context_projection("prune", outcome.changes);
+                    }
                 }
             }
 
@@ -1132,7 +1267,7 @@ impl Agent {
             error: Some(format!("max turns ({})", self.config.max_turns)),
         });
         self.emit(AgentEvent::AgentEnd {
-            new_messages: self.messages[start_len..].to_vec(),
+            new_messages: self.new_messages_since(start_len),
         });
         Err(OneError::MaxTurns {
             max: self.config.max_turns,
@@ -1149,7 +1284,7 @@ impl Agent {
     ) -> Result<String> {
         self.is_busy = false;
         self.emit(AgentEvent::AgentEnd {
-            new_messages: self.messages[start_len..].to_vec(),
+            new_messages: self.new_messages_since(start_len),
         });
         if let Some(hooks) = &self.hooks {
             hooks.on_agent_end().await;
@@ -1168,12 +1303,88 @@ impl Agent {
         Err(OneError::Aborted)
     }
 
+    async fn maybe_compact_before_sample(&mut self, provider: &dyn LlmProvider) {
+        let Some(config) = self.config.compaction_config.clone() else {
+            return;
+        };
+        let observed = (self.last_prompt_tokens > 0).then_some(self.last_prompt_tokens);
+        let tokens = tokens_for_compaction(&self.messages, observed);
+        if !should_compact_tokens(tokens, &config) {
+            return;
+        }
+
+        let (older, kept) = {
+            let Some((older_slice, kept_slice)) =
+                split_for_compaction_forced(&self.messages, &config, true)
+            else {
+                return;
+            };
+            if older_slice.is_empty() {
+                return;
+            }
+            (older_slice.to_vec(), kept_slice.to_vec())
+        };
+
+        self.emit(AgentEvent::CompactionStart);
+
+        let prompt = summarization_prompt(&older, None);
+        let summary = match provider
+            .complete(CompletionRequest {
+                system_prompt: "You summarize coding-agent conversations for context compaction."
+                    .into(),
+                messages: vec![AgentMessage::user_text(prompt)],
+                tools: Vec::new(),
+                server_tools: Vec::new(),
+                thinking_level: ThinkingLevel::Off,
+            })
+            .await
+        {
+            Ok(response) => {
+                let text = extract_text(&response.content).trim().to_string();
+                if text.is_empty() {
+                    extractive_summary(&older, config.max_summary_chars)
+                } else {
+                    text
+                }
+            }
+            Err(_error) => extractive_summary(&older, config.max_summary_chars),
+        };
+        if summary.trim().is_empty() {
+            return;
+        }
+
+        let tokens_after =
+            tokens_for_compaction(&compacted_live_messages(&summary, kept.clone()), None);
+        self.messages = compacted_live_messages(&summary, kept);
+        self.last_prompt_tokens = 0;
+        self.record_context_projection("compaction", Vec::new());
+        if let Some(config) = &mut self.config.compaction_config {
+            config.suppression = crate::compaction::CompactionSuppression::StickyUntilSuccess;
+        }
+        let kept_turns = crate::compaction::user_turn_count(&self.messages[1..]);
+        self.intra_turn_compaction = Some(IntraTurnCompaction {
+            summary,
+            applied: CompactApplied {
+                tokens_before: tokens as u64,
+                tokens_after: tokens_after as u64,
+                trigger: CompactTrigger::Auto,
+                kept_turns,
+            },
+        });
+        self.emit(AgentEvent::CompactionEnd {
+            tokens_before: tokens as u64,
+            tokens_after: tokens_after as u64,
+            kept_turns,
+        });
+    }
+
     fn drain_steering(&mut self) {
         let mut queue = self.steering_queue.lock().expect("steering queue lock");
         // Preserve FIFO order (push to end, drain from front).
         let items: Vec<_> = queue.drain(..).collect();
+        drop(queue);
         for text in items {
-            self.messages.push(AgentMessage::user_text(text));
+            self.push_message(AgentMessage::user_text(text));
         }
     }
 
@@ -1191,7 +1402,7 @@ impl Agent {
             } else {
                 crate::reminder::system_reminder(text)
             };
-            self.messages.push(AgentMessage::user_text(text));
+            self.push_message(AgentMessage::user_text(text));
         }
     }
 
@@ -1203,7 +1414,7 @@ impl Agent {
         let items: Vec<_> = queue.drain(..).collect();
         drop(queue);
         for text in items {
-            self.messages.push(AgentMessage::user_text(text));
+            self.push_message(AgentMessage::user_text(text));
         }
         true
     }
@@ -1778,7 +1989,7 @@ impl Agent {
             is_error: execution.is_error,
             timestamp: crate::message::now_ms(),
         });
-        self.messages.push(result.clone());
+        self.push_message(result.clone());
         tool_results.push(result);
     }
 
@@ -2029,6 +2240,10 @@ pub fn is_retryable_provider_error(err: &OneError) -> bool {
         "broken pipe",
         "network error",
         "fetch failed",
+        "error decoding response body",
+        "decoding response body",
+        "connection closed",
+        "stream error",
     ]
     .iter()
     .any(|needle| message.contains(needle))
@@ -2054,6 +2269,11 @@ fn retry_reason(err: &OneError) -> &'static str {
         || message.contains("deadline")
     {
         "request timed out"
+    } else if message.contains("decoding response body")
+        || message.contains("connection closed")
+        || message.contains("stream error")
+    {
+        "stream interrupted"
     } else {
         "temporary upstream failure"
     }
@@ -2622,6 +2842,190 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unlimited_turn_budget_continues_past_64_tool_loops() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct LoopingProvider {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for LoopingProvider {
+            fn name(&self) -> &str {
+                "unlimited-turn-test"
+            }
+
+            fn model(&self) -> &str {
+                "test"
+            }
+
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                let call = self.calls.fetch_add(1, Ordering::SeqCst);
+                let content = if call < 65 {
+                    vec![ContentBlock::ToolCall {
+                        id: format!("tool-{call}"),
+                        name: "missing_tool".into(),
+                        arguments: serde_json::json!({}),
+                    }]
+                } else {
+                    vec![ContentBlock::Text {
+                        text: "completed".into(),
+                    }]
+                };
+                Ok(CompletionResponse {
+                    provider: self.name().into(),
+                    model: self.model().into(),
+                    content,
+                    stop_reason: if call < 65 {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::Stop
+                    },
+                    usage: TokenUsage::default(),
+                    citations: Vec::new(),
+                })
+            }
+        }
+
+        let provider = LoopingProvider {
+            calls: AtomicUsize::new(0),
+        };
+        let mut agent = Agent::new(
+            AgentConfig {
+                max_turns: 0,
+                ..AgentConfig::default()
+            },
+            Vec::new(),
+        );
+
+        assert_eq!(
+            agent.prompt(&provider, "finish the task").await.unwrap(),
+            "completed"
+        );
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 66);
+    }
+
+    #[tokio::test]
+    async fn intra_turn_compaction_runs_before_the_next_model_sample() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct CompactionProvider {
+            main_calls: AtomicUsize,
+            summary_calls: AtomicUsize,
+            saw_summary_on_second_sample: AtomicBool,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for CompactionProvider {
+            fn name(&self) -> &str {
+                "intra-turn-compaction"
+            }
+
+            fn model(&self) -> &str {
+                "test"
+            }
+
+            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+                if request
+                    .system_prompt
+                    .starts_with("You summarize coding-agent")
+                {
+                    self.summary_calls.fetch_add(1, Ordering::SeqCst);
+                    return Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("durable compact summary")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    });
+                }
+
+                let call = self.main_calls.fetch_add(1, Ordering::SeqCst);
+                if call == 1 {
+                    self.saw_summary_on_second_sample.store(
+                        request.messages.iter().any(|message| match message {
+                            AgentMessage::Assistant(assistant) => assistant.content.iter().any(|block| {
+                                matches!(block, ContentBlock::Text { text }
+                                    if text.contains("[Compaction summary]\ndurable compact summary"))
+                            }),
+                            _ => false,
+                        }),
+                        Ordering::SeqCst,
+                    );
+                }
+                let content = if call == 0 {
+                    vec![ContentBlock::ToolCall {
+                        id: "tool-1".into(),
+                        name: "missing_tool".into(),
+                        arguments: serde_json::json!({}),
+                    }]
+                } else {
+                    vec![ContentBlock::text("done")]
+                };
+                Ok(CompletionResponse {
+                    provider: self.name().into(),
+                    model: self.model().into(),
+                    content,
+                    stop_reason: if call == 0 {
+                        StopReason::ToolUse
+                    } else {
+                        StopReason::Stop
+                    },
+                    usage: TokenUsage {
+                        input_tokens: if call == 0 { 1_000 } else { 20 },
+                        ..TokenUsage::default()
+                    },
+                    citations: Vec::new(),
+                })
+            }
+        }
+
+        let provider = CompactionProvider {
+            main_calls: AtomicUsize::new(0),
+            summary_calls: AtomicUsize::new(0),
+            saw_summary_on_second_sample: AtomicBool::new(false),
+        };
+        let mut config = AgentConfig::default();
+        let mut compact = crate::compaction::CompactionConfig::from_context_window(10_000);
+        compact.token_threshold = 500;
+        config.compaction_config = Some(compact);
+        let mut agent = Agent::new(config, Vec::new());
+        let end_events = Arc::new(AtomicUsize::new(0));
+        let end_events_clone = end_events.clone();
+        agent.subscribe(Box::new(move |event| {
+            if let AgentEvent::AgentEnd { new_messages } = event {
+                end_events_clone.fetch_add(1, Ordering::SeqCst);
+                assert!(!new_messages.is_empty());
+            }
+        }));
+
+        assert_eq!(
+            agent.prompt(&provider, "finish the task").await.unwrap(),
+            "done"
+        );
+        assert_eq!(provider.main_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(provider.summary_calls.load(Ordering::SeqCst), 1);
+        assert!(provider.saw_summary_on_second_sample.load(Ordering::SeqCst));
+        assert!(agent.intra_turn_compaction().is_some());
+        assert_eq!(end_events.load(Ordering::SeqCst), 1);
+        assert!(agent
+            .last_run_transcript()
+            .iter()
+            .any(|message| matches!(message, AgentMessage::ToolResult(_))));
+        assert!(!agent
+            .last_run_transcript()
+            .iter()
+            .any(|message| match message {
+                AgentMessage::Assistant(assistant) => assistant.content.iter().any(|block| {
+                    matches!(block, ContentBlock::Text { text }
+                    if text.contains("[Compaction summary]"))
+                }),
+                _ => false,
+            }));
+    }
+
+    #[tokio::test]
     async fn abort_stops_agent_run() {
         struct AbortingProvider;
 
@@ -3029,6 +3433,12 @@ mod tests {
         )));
         assert!(is_retryable_provider_error(&OneError::Provider(
             "ollama 502: bad gateway".into()
+        )));
+        assert!(is_retryable_provider_error(&OneError::Provider(
+            "error decoding response body: connection closed before message completed".into()
+        )));
+        assert!(is_retryable_provider_error(&OneError::Provider(
+            "error decoding response body".into()
         )));
         assert!(!is_retryable_provider_error(&OneError::Provider(
             "invalid API key".into()

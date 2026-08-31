@@ -14,8 +14,9 @@ use crate::context::{
 use crate::entries::{new_entry_base, new_session_header, RewindMode, SessionEntry, SessionHeader};
 use crate::error::{Result, SessionError};
 use crate::meta::{
-    ErrorMeta, PromptSnapshotMeta, ToolAuditMeta, UsageFields, UsageMeta, CUSTOM_ERROR,
-    CUSTOM_PROMPT_SNAPSHOT, CUSTOM_TOOL_AUDIT, CUSTOM_USAGE, PROMPT_INLINE_MAX_BYTES,
+    ContextProjectionMeta, ErrorMeta, PromptSnapshotMeta, ToolAuditMeta, UsageFields, UsageMeta,
+    CUSTOM_CONTEXT_PROJECTION, CUSTOM_ERROR, CUSTOM_PROMPT_SNAPSHOT, CUSTOM_TOOL_AUDIT,
+    CUSTOM_USAGE, PROMPT_INLINE_MAX_BYTES,
 };
 use crate::paths::session_dir_for_cwd;
 use crate::summary::{load_summary, system_prompt_path_for, write_summary_file, SessionSummary};
@@ -628,6 +629,48 @@ impl SessionManager {
         self.leaf_id = Some(id.clone());
         self.append_entry(self.entries.last().unwrap()).await?;
         Ok(id)
+    }
+
+    /// Persist a model-facing context checkpoint without altering the raw transcript.
+    pub async fn append_context_projection(
+        &mut self,
+        meta: &ContextProjectionMeta,
+    ) -> Result<String> {
+        self.append_custom(CUSTOM_CONTEXT_PROJECTION, meta.to_value())
+            .await
+    }
+
+    /// Latest resume checkpoint on the active branch.
+    pub fn latest_context_projection(&self) -> Option<ContextProjectionMeta> {
+        self.active_path_entries()
+            .into_iter()
+            .rev()
+            .find_map(|entry| {
+                let SessionEntry::Custom {
+                    custom_type, data, ..
+                } = entry
+                else {
+                    return None;
+                };
+                (custom_type == CUSTOM_CONTEXT_PROJECTION)
+                    .then(|| ContextProjectionMeta::from_value(data))
+                    .flatten()
+                    .filter(|meta| meta.resume_checkpoint)
+            })
+    }
+
+    /// Raw session entry for a tool result on the active branch.
+    pub fn active_tool_result_entry_id(&self, tool_call_id: &str) -> Option<String> {
+        self.active_path_entries()
+            .into_iter()
+            .rev()
+            .find_map(|entry| match entry {
+                SessionEntry::Message {
+                    base,
+                    message: AgentMessage::ToolResult(result),
+                } if result.tool_call_id == tool_call_id => Some(base.id.clone()),
+                _ => None,
+            })
     }
 
     pub async fn append_session_info(&mut self, name: impl Into<String>) -> Result<String> {

@@ -710,6 +710,8 @@ impl LangfuseTraceSink {
                 message_count,
                 tools_n,
                 system_prompt_len,
+                context_projection_id,
+                context_projection_hash,
                 input_preview,
             } => {
                 let parent = Self::parent_cx(&state, Some(*turn));
@@ -734,6 +736,12 @@ impl LangfuseTraceSink {
                     KeyValue::new("tools_n", *tools_n as i64),
                     KeyValue::new("system_prompt_len", *system_prompt_len as i64),
                 ];
+                if let Some(id) = context_projection_id {
+                    attrs.push(KeyValue::new("one.context_projection_id", id.clone()));
+                }
+                if let Some(h) = context_projection_hash {
+                    attrs.push(KeyValue::new("one.context_projection_hash", h.clone()));
+                }
                 // Set model early so Langfuse types this as a generation even if the
                 // response never arrives (timeout / abort mid-stream).
                 if let Some(m) = &state.model {
@@ -1375,6 +1383,8 @@ mod tests {
             message_count: 1,
             tools_n: 0,
             system_prompt_len: 10,
+            context_projection_id: None,
+            context_projection_hash: None,
             input_preview: Some("list files".into()),
         });
         // Intermediate empty retry — must not swallow the following success.
@@ -1401,6 +1411,8 @@ mod tests {
             message_count: 1,
             tools_n: 0,
             system_prompt_len: 10,
+            context_projection_id: None,
+            context_projection_hash: None,
             input_preview: Some("list files".into()),
         });
         sink.record(TraceEvent::LlmResponse {
@@ -1453,6 +1465,8 @@ mod tests {
             message_count: 2,
             tools_n: 0,
             system_prompt_len: 10,
+            context_projection_id: None,
+            context_projection_hash: None,
             input_preview: None,
         });
         sink.record(TraceEvent::LlmResponse {

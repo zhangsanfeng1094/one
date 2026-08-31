@@ -207,6 +207,11 @@ pub enum TraceEvent {
         message_count: usize,
         tools_n: usize,
         system_prompt_len: usize,
+        /// Stable ID of the exact model-facing message projection for this sample.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_projection_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_projection_hash: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         input_preview: Option<String>,
     },

@@ -326,6 +326,20 @@ impl JobEventLog {
                 self.push_line(format!("◂ turn {} end", turn + 1));
             }
             AgentEvent::UsageUpdate { .. } => {}
+            AgentEvent::CompactionStart => {
+                self.set_activity("compacting");
+                self.push_line("▸ compacting context");
+            }
+            AgentEvent::CompactionEnd {
+                tokens_before,
+                tokens_after,
+                kept_turns,
+            } => {
+                let line = format!(
+                    "▸ compacted: {tokens_before} → {tokens_after} tokens · kept {kept_turns} turns"
+                );
+                self.push_line(line);
+            }
             AgentEvent::AgentEnd { .. } => {
                 self.set_activity("finishing");
                 self.push_line("▸ finishing");
