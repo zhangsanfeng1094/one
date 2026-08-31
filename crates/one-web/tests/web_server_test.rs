@@ -142,7 +142,7 @@ async fn test_web_server_websocket_rpc_end_to_end() {
                             let mut lines = futures::io::BufReader::new(&mut incoming).lines();
                             while let Some(Ok(line)) = lines.next().await {
                                 eprintln!("Handler received line: {}", line);
-                                let resp = format!("{{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{{\"echo\":true}}}}\n");
+                                let resp = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"echo\":true}}\n";
                                 let _ = outgoing.write_all(resp.as_bytes()).await;
                                 let _ = outgoing.flush().await;
                             }

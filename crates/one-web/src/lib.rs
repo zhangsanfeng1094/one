@@ -5,7 +5,6 @@
 
 pub mod assets;
 pub mod server;
-pub mod sha1;
 pub mod ws;
 
 pub use server::{start_web_server, LocalAcpHandler, LocalBoxFuture, WebServerConfig};

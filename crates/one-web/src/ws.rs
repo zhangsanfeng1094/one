@@ -1,56 +1,31 @@
 //! Minimal WebSocket (RFC 6455) frame parser and encoder.
 
+use base64::Engine;
+use sha1::{Digest, Sha1};
 use std::io;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-
-use crate::sha1::sha1;
 
 const WS_GUID: &[u8] = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
 /// Compute `Sec-WebSocket-Accept` header response value.
 pub fn compute_accept_key(sec_key: &str) -> String {
-    let mut combined = Vec::with_capacity(sec_key.len() + WS_GUID.len());
-    combined.extend_from_slice(sec_key.trim().as_bytes());
-    combined.extend_from_slice(WS_GUID);
-    let hash = sha1(&combined);
+    let mut hasher = Sha1::new();
+    hasher.update(sec_key.trim().as_bytes());
+    hasher.update(WS_GUID);
+    base64::engine::general_purpose::STANDARD.encode(hasher.finalize())
+}
 
-    const BASE64_TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(32);
-    let mut i = 0;
-    while i < hash.len() {
-        let b0 = hash[i] as u32;
-        let b1 = if i + 1 < hash.len() {
-            hash[i + 1] as u32
-        } else {
-            0
-        };
-        let b2 = if i + 2 < hash.len() {
-            hash[i + 2] as u32
-        } else {
-            0
-        };
+#[cfg(test)]
+mod tests {
+    use super::compute_accept_key;
 
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        out.push(BASE64_TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(BASE64_TABLE[((triple >> 12) & 0x3F) as usize] as char);
-
-        if i + 1 < hash.len() {
-            out.push(BASE64_TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-
-        if i + 2 < hash.len() {
-            out.push(BASE64_TABLE[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-
-        i += 3;
+    #[test]
+    fn computes_rfc6455_accept_key() {
+        assert_eq!(
+            compute_accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
     }
-    out
 }
 
 #[derive(Debug)]
