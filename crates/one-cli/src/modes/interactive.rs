@@ -1233,6 +1233,13 @@ async fn apply_config_op(
                             .set_empty_response_retries(s.empty_response_retries())
                             .await;
                     }
+                    if key.eq_ignore_ascii_case("max_turns")
+                        || key.eq_ignore_ascii_case("max-turns")
+                        || key.eq_ignore_ascii_case("maxturns")
+                        || key.eq_ignore_ascii_case("turns")
+                    {
+                        runtime.set_max_turns(s.max_turns()).await;
+                    }
                     let is_enabled_models = matches!(
                         key.to_ascii_lowercase().as_str(),
                         "enabled_models" | "enabled-models" | "enabledmodels"
@@ -1565,7 +1572,6 @@ pub async fn run_interactive(
                             &mut terminal,
                             &mut app,
                             one_core::compaction::CompactRequest::manual(instructions),
-                            true,
                         )
                         .await?
                         {
@@ -1998,7 +2004,6 @@ async fn run_turn_streaming(
         terminal,
         app,
         one_core::compaction::CompactRequest::auto(),
-        false,
     )
     .await?
     {
@@ -2090,14 +2095,12 @@ async fn run_turn_streaming(
     // Overflow recovery: force compact + retry once.
     let prompt_result = match prompt_result {
         Err(err) if is_overflow(&err) => {
-            app.set_notice("context overflow · compacting…");
             match compact_with_live_ui(
                 runtime,
                 provider.clone(),
                 terminal,
                 app,
                 one_core::compaction::CompactRequest::overflow(),
-                false,
             )
             .await?
             {
@@ -2176,6 +2179,12 @@ async fn run_turn_streaming(
     // so tool results and the user prompt are not lost on crash or resume.
     if let Err(e) = runtime.append_session_delta(before).await {
         tracing::warn!(error = %e, "failed to append session messages after turn");
+    }
+    if let Err(e) = runtime.persist_intra_turn_compaction().await {
+        tracing::warn!(error = %e, "failed to persist intra-turn compaction after turn");
+    }
+    if let Err(e) = runtime.persist_context_projections().await {
+        tracing::warn!(error = %e, "failed to persist context projection after turn");
     }
     if let Err(e) = runtime.persist_extension_state().await {
         tracing::warn!(error = %e, "failed to persist extension state after turn");
@@ -2377,6 +2386,24 @@ fn drain_events(
                 app.set_usage_cache(usage.cache_read_tokens, usage.cache_write_tokens);
                 let cost = estimate_cost_usd(&app.current_provider, &app.current_model, &usage);
                 app.set_usage_cost_usd(cost);
+            }
+            AgentEvent::CompactionStart => {
+                app.busy_activity = "compacting".into();
+                app.push_compacting_marker();
+                app.set_notice("context full · compacting…");
+            }
+            AgentEvent::CompactionEnd {
+                tokens_before,
+                tokens_after,
+                kept_turns,
+            } => {
+                app.finish_compacting_marker(tokens_before, tokens_after, kept_turns);
+                app.set_notice(one_tui::Message::context_compacted_text(
+                    tokens_before,
+                    tokens_after,
+                    kept_turns,
+                ));
+                app.busy_activity.clear();
             }
             _ => {}
         }
@@ -3377,6 +3404,13 @@ async fn handle_slash(
                                 .set_empty_response_retries(s.empty_response_retries())
                                 .await;
                         }
+                        if key.eq_ignore_ascii_case("max_turns")
+                            || key.eq_ignore_ascii_case("max-turns")
+                            || key.eq_ignore_ascii_case("maxturns")
+                            || key.eq_ignore_ascii_case("turns")
+                        {
+                            runtime.set_max_turns(s.max_turns()).await;
+                        }
                         if key.eq_ignore_ascii_case("context_window")
                             || key.eq_ignore_ascii_case("context-window")
                             || key.eq_ignore_ascii_case("context")
@@ -3638,39 +3672,52 @@ fn compact_result_notice(applied: &one_core::compaction::CompactApplied) -> Stri
 
 /// Run compaction while the TUI keeps painting.
 ///
-/// `loading_marker` is for manual `/compact`: in-transcript spinner, then the
-/// result divider. Auto/overflow already have a busy turn, so they only pump
-/// frames and insert the finished marker.
+/// If compaction is triggered (manual, auto, or overflow), a live spinner
+/// marker and status activity are shown in the TUI, replaced by the finished
+/// result divider upon completion.
 async fn compact_with_live_ui(
     runtime: &mut AppRuntime,
     provider: std::sync::Arc<dyn LlmProvider>,
     terminal: &mut TerminalSession,
     app: &mut App,
     request: one_core::compaction::CompactRequest,
-    loading_marker: bool,
 ) -> Result<TurnEnd, Box<dyn std::error::Error>> {
     let was_busy = app.busy;
     if !was_busy {
         app.begin_busy();
     }
-    if loading_marker {
-        app.busy_activity = "compacting".into();
-        app.push_compacting_marker();
-        if let Some(instr) = request.instructions.as_deref() {
-            app.set_notice(format!("compacting… ({instr})"));
-        } else {
-            app.set_notice("compacting…");
-        }
-        let _ = terminal.draw(app);
-    }
+    let (start_tx, mut start_rx) = tokio::sync::oneshot::channel::<u64>();
+    let on_start: Box<dyn FnOnce(u64) + Send> = Box::new(move |tokens| {
+        let _ = start_tx.send(tokens);
+    });
+
+    let mut marker_pushed = false;
+    let instr_opt = request.instructions.clone();
+    let trigger = request.trigger;
 
     let result = terminal
         .run_until(
             app,
             |app| {
                 app.spinner_frame = app.spinner_frame.wrapping_add(1);
+                if !marker_pushed {
+                    if let Ok(_tokens) = start_rx.try_recv() {
+                        marker_pushed = true;
+                        app.busy_activity = "compacting".into();
+                        app.push_compacting_marker();
+                        if let Some(instr) = instr_opt.as_deref() {
+                            app.set_notice(format!("compacting… ({instr})"));
+                        } else if trigger == one_core::compaction::CompactTrigger::Auto {
+                            app.set_notice("context full · compacting…");
+                        } else if trigger == one_core::compaction::CompactTrigger::Overflow {
+                            app.set_notice("context overflow · compacting…");
+                        } else {
+                            app.set_notice("compacting…");
+                        }
+                    }
+                }
             },
-            runtime.maybe_compact_with(provider, request),
+            runtime.maybe_compact_with_notify(provider, request, Some(on_start)),
         )
         .await;
 
@@ -3678,7 +3725,7 @@ async fn compact_with_live_ui(
 
     match result {
         Ok(Ok(Some(applied))) => {
-            if loading_marker {
+            if marker_pushed {
                 app.finish_compacting_marker(
                     applied.tokens_before,
                     applied.tokens_after,
@@ -3694,8 +3741,10 @@ async fn compact_with_live_ui(
             Ok(TurnEnd::Continue)
         }
         Ok(Ok(None)) => {
-            if loading_marker {
+            if marker_pushed {
                 app.cancel_compacting_marker();
+            }
+            if trigger == one_core::compaction::CompactTrigger::Manual {
                 app.set_notice("nothing to compact");
             }
             if !was_busy {
@@ -3704,22 +3753,21 @@ async fn compact_with_live_ui(
             Ok(TurnEnd::Continue)
         }
         Ok(Err(err)) => {
-            if loading_marker {
+            if marker_pushed {
                 app.cancel_compacting_marker();
-                app.set_notice(format!("compact failed: {err}"));
-                if !was_busy {
-                    app.end_busy();
-                }
+            }
+            app.set_notice(format!("compact failed: {err}"));
+            if !was_busy {
+                app.end_busy();
+            }
+            if trigger == one_core::compaction::CompactTrigger::Manual {
                 Ok(TurnEnd::Continue)
             } else {
-                if !was_busy {
-                    app.end_busy();
-                }
                 Err(err)
             }
         }
         Err(ForceQuit) => {
-            if loading_marker {
+            if marker_pushed {
                 app.cancel_compacting_marker();
             }
             if !was_busy {

@@ -13,6 +13,10 @@ one --mode acp               # 同上
 one web                      # Web 网页模式（ACP over WebSocket；默认 http://127.0.0.1:3000）
 one web --port 3000 --open   # 启动并自动在浏览器打开 Web UI
 one --mode web               # 同上
+one bot                      # 多渠道 Bot 网关模式（Telegram/Discord/飞书，以及外部 connector）
+one bot init                 # 交互式自动配置向导（Hermes 风格自动生成 bot.toml）
+one bot -C ./bot.toml        # 指定配置文件启动 Bot
+one --mode bot               # 同上
 one --continue / -c          # 继续最近 session
 one --resume / -r            # 交互：打开 session 选择器；非交互：最近 session
 one resume                   # 退出后恢复：同 `one -r`（TUI 选择器）
@@ -88,7 +92,7 @@ one --permission-mode <MODE> # 权限模式：default | acceptEdits | auto | don
 one --no-mcp                 # 本 session 不连 MCP
 one --no-skills              # 不注入 skills catalog（评测隔离）
 one --no-subagent            # 关闭 subagent 能力包（task/job 工具 + 提示词）
-one --max-turns 16           # 单 prompt 最大 tool 循环
+one --max-turns 16           # 为自动化任务设置最大 tool 循环；默认 0 表示不限
 ```
 
 凭证存 `~/.one/agent/auth.json`（`0600`）。Codex / xAI OAuth 过期自动 refresh。OpenCode 与 `OPENCODE_API_KEY` 共用。
@@ -334,6 +338,7 @@ one --list-models
   "sandbox": "workspace-write",
   "additional_directories": [],
   "empty_response_retries": 2,
+  "max_turns": 0,
   "enabledModels": ["deepseek:deepseek-chat", "openai:gpt-4o"],
   "features": {
     "subagent": true
@@ -352,11 +357,15 @@ one --list-models
 
 **空回复重试**（`empty_response_retries`）：模型结束 turn 时既无正文也无 tool call（仅 thinking 也算空）时，自动再采样的次数。默认 **2**（共最多 3 次请求）；`0` 表示不重试、首次空即报错。环境变量 `ONE_EMPTY_RESPONSE_RETRIES` 可覆盖 settings。
 
+**单轮最大 Turns**（`max_turns`）：每条用户 Prompt 允许 Agent 执行工具循环的最大轮数。默认 **0**（无限制）；可设置正整数限制循环深度。环境变量 `ONE_MAX_TURNS` 或 CLI `--max-turns <N>` 可覆盖 settings。
+
 交互内：
 
 ```text
 /settings                  # 查看（居中面板）
 /settings thinking high    # 写入并立即生效（thinking）
+/settings max_turns 20     # 设置最大 20 轮工具循环
+/settings max_turns 0      # 设为 0 / unlimited 解除限制
 /settings empty_response_retries 2
 /settings empty_response_retries 0   # 关闭重试
 /settings empty_response_retries default

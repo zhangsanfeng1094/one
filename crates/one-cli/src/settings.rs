@@ -296,6 +296,14 @@ pub struct Settings {
     /// `0` disables automatic retries. Override with env
     /// `ONE_EMPTY_RESPONSE_RETRIES` when set.
     pub empty_response_retries: Option<usize>,
+    /// Maximum agent turns per user prompt. `0` or `None` means unlimited.
+    #[serde(
+        default,
+        rename = "maxTurns",
+        alias = "max_turns",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub max_turns: Option<usize>,
     /// Models shown in the Ctrl+L / `/model` switcher (`provider:id` specs).
     ///
     /// Missing / empty / omitted → show **all** catalog models (no filter).
@@ -346,6 +354,16 @@ impl Settings {
         }
         self.empty_response_retries
             .unwrap_or(one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES)
+    }
+
+    /// Maximum agent turns per user prompt (`0` = unlimited).
+    pub fn max_turns(&self) -> usize {
+        if let Ok(v) = std::env::var("ONE_MAX_TURNS") {
+            if let Ok(n) = v.trim().parse::<usize>() {
+                return n;
+            }
+        }
+        self.max_turns.unwrap_or(0)
     }
 
     pub fn compaction_or_default(&self) -> CompactionSettings {
@@ -735,6 +753,21 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
                 settings.empty_response_retries = Some(n);
             }
         }
+        "max_turns" | "max-turns" | "maxturns" | "turns" => {
+            let v = value.trim().to_ascii_lowercase();
+            if matches!(
+                v.as_str(),
+                "default" | "auto" | "clear" | "unlimited" | "0" | ""
+            ) {
+                settings.max_turns = None;
+            } else {
+                let n: usize = v.parse().map_err(|_| {
+                    "max_turns must be a non-negative integer (0 or default for unlimited)"
+                        .to_string()
+                })?;
+                settings.max_turns = if n == 0 { None } else { Some(n) };
+            }
+        }
         "memory.enabled" | "memory_enabled" | "memory" => {
             let v = value.trim().to_ascii_lowercase();
             let m = settings.memory_mut();
@@ -1006,6 +1039,13 @@ pub fn rows(settings: &Settings) -> Vec<(String, String)> {
                 ),
             },
         ),
+        (
+            "max_turns".into(),
+            match settings.max_turns {
+                Some(n) if n > 0 => n.to_string(),
+                _ => "0 (unlimited)".into(),
+            },
+        ),
         ("path".into(), path_display()),
     ]
 }
@@ -1086,6 +1126,7 @@ mod tests {
                 archive_compaction: Some(true),
             }),
             empty_response_retries: Some(3),
+            max_turns: Some(32),
             enabled_models: Some(vec![
                 "openai:gpt-4o".into(),
                 "anthropic:claude-sonnet-4-20250514".into(),
@@ -1134,6 +1175,22 @@ mod tests {
             one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES
         );
         assert!(set_key(&mut s, "empty_response_retries", "nope").is_err());
+    }
+
+    #[test]
+    fn max_turns_set_key_and_effective() {
+        let mut s = Settings::default();
+        assert_eq!(s.max_turns(), 0);
+        set_key(&mut s, "max_turns", "20").unwrap();
+        assert_eq!(s.max_turns, Some(20));
+        assert_eq!(s.max_turns(), 20);
+        set_key(&mut s, "max_turns", "0").unwrap();
+        assert_eq!(s.max_turns, None);
+        assert_eq!(s.max_turns(), 0);
+        set_key(&mut s, "max_turns", "unlimited").unwrap();
+        assert_eq!(s.max_turns, None);
+        assert_eq!(s.max_turns(), 0);
+        assert!(set_key(&mut s, "max_turns", "nope").is_err());
     }
 
     #[test]

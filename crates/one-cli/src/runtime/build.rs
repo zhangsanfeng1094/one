@@ -281,7 +281,11 @@ impl AppRuntime {
         } else {
             base_system_prompt.clone()
         };
-        let max_turns = cli.max_turns.max(1);
+        let max_turns = if cli.max_turns > 0 {
+            cli.max_turns
+        } else {
+            user_settings.max_turns()
+        };
         let empty_response_retries = user_settings.empty_response_retries();
         let mut agent = Agent::new(
             AgentConfig {

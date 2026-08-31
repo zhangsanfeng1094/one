@@ -454,6 +454,11 @@ impl AppRuntime {
     /// Update the model context window used for auto-compact thresholds.
     pub fn set_context_window(&mut self, window: usize) {
         self.context_window = window;
+        let settings = crate::settings::load();
+        let config = settings.compaction_config(window);
+        if let Ok(mut agent) = self.agent.try_lock() {
+            agent.set_compaction_config(Some(config));
+        }
     }
 
     /// Context window currently used for auto-compaction thresholds.

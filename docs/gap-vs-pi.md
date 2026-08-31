@@ -50,7 +50,7 @@ RPC/SDK  ██████░░░░░░░░░░░░░░  30%
 | 能力 | Pi | One | 备注 |
 |------|----|-----|------|
 | 默认 coding tools + 搜索 | ✅ | ✅ | + `bash_output` / `bash_kill` / `ask_user` |
-| Agent tool-calling 循环 | ✅ | ✅ | `one-core::Agent`，`--max-turns` 默认 64 |
+| Agent tool-calling 循环 | ✅ | ✅ | `one-core::Agent`；交互模式默认按目标完成，`--max-turns N` 可为自动化设定上限 |
 | Streaming text / thinking | ✅ | ✅ | SSE 多厂商 + TUI Ctrl+T 折叠 |
 | 四种运行模式 | Interactive / Print / JSON / RPC | 同左 | RPC 方法面仍薄于 Pi |
 | JSONL session 树 | ✅ v3 | ✅ v3 子集 | `~/.one/agent/sessions/` |

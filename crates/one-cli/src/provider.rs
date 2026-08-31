@@ -177,7 +177,7 @@ impl ProviderSet {
             no_memory: false,
             trace: false,
             trace_full: false,
-            max_turns: 64,
+            max_turns: 0,
             output_format: None,
             command: None,
         };

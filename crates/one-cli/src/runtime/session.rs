@@ -161,6 +161,15 @@ impl AppRuntime {
         self.agent.lock().await.config.empty_response_retries
     }
 
+    /// Live-update max turns per prompt (from `/settings`).
+    pub async fn set_max_turns(&self, max_turns: usize) {
+        self.agent.lock().await.config.max_turns = max_turns;
+    }
+
+    pub async fn max_turns(&self) -> usize {
+        self.agent.lock().await.config.max_turns
+    }
+
     pub async fn estimated_tokens(&self) -> usize {
         let agent = self.agent.lock().await;
         one_core::estimate_tokens(&agent.messages)

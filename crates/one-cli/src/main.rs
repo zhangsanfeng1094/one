@@ -1,3 +1,5 @@
+#![recursion_limit = "1024"]
+
 mod agent_cmd;
 mod approval;
 mod auth_cmd;

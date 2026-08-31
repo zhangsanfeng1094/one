@@ -222,8 +222,9 @@ pub struct Cli {
     #[arg(long = "trace-full")]
     pub trace_full: bool,
 
-    /// Max agent turns per user prompt (tool-call loops). Default 64.
-    #[arg(long = "max-turns", default_value_t = 64)]
+    /// Maximum agent turns per user prompt. `0` (the default) is unlimited;
+    /// set a positive value to enforce a tool-loop budget for automation.
+    #[arg(long = "max-turns", default_value_t = 0)]
     pub max_turns: usize,
 
     /// Machine-readable result: `text` | `json` (RunResult envelope). See docs/protocol.md.
@@ -266,9 +267,20 @@ pub enum Commands {
     Bot(BotCli),
 }
 
+/// CLI: `one bot` action subcommands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum BotAction {
+    /// Run interactive configuration wizard to generate bot.toml.
+    Init,
+}
+
 /// CLI: `one bot` — Multi-channel Bot Gateway.
 #[derive(Debug, Clone, clap::Args)]
 pub struct BotCli {
+    /// Subcommand action (`init` to run interactive setup wizard).
+    #[arg(value_name = "ACTION")]
+    pub action: Option<BotAction>,
+
     /// Path to bot.toml or bot.json configuration file.
     #[arg(long, short = 'C')]
     pub config: Option<PathBuf>,
