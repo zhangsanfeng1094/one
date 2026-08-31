@@ -11,7 +11,7 @@ use crate::events::{BotOutboundMessage, MessageHandle, MessageTarget};
 pub struct StreamThrottler {
     adapter: Arc<dyn PlatformAdapter>,
     target: MessageTarget,
-    handle: Mutex<Option<MessageHandle>>,
+    handles: Mutex<Vec<MessageHandle>>,
     current_text: Mutex<String>,
     current_thinking: Mutex<Option<String>>,
     current_tool_status: Mutex<Option<String>>,
@@ -29,7 +29,7 @@ impl StreamThrottler {
         Self {
             adapter,
             target,
-            handle: Mutex::new(None),
+            handles: Mutex::new(Vec::new()),
             current_text: Mutex::new(String::new()),
             current_thinking: Mutex::new(None),
             current_tool_status: Mutex::new(None),
@@ -96,7 +96,7 @@ impl StreamThrottler {
     }
 
     async fn flush_internal(&self, is_final: bool) {
-        let msg = {
+        let base_message = {
             let text = self.current_text.lock().await.clone();
             let thinking = self.current_thinking.lock().await.clone();
             let tool_status = self.current_tool_status.lock().await.clone();
@@ -109,20 +109,53 @@ impl StreamThrottler {
             }
         };
 
-        let mut handle_guard = self.handle.lock().await;
-        if let Some(handle) = &*handle_guard {
-            if let Err(e) = self.adapter.edit_message(handle, &msg).await {
-                debug!("Stream throttler edit_message error: {}", e);
+        let max_len = self.adapter.capabilities().max_message_length.max(1);
+        let text_chunks = crate::chunker::chunk_markdown(&base_message.text, max_len);
+        let chunk_count = text_chunks.len();
+        let mut handles = self.handles.lock().await;
+
+        for (index, text) in text_chunks.into_iter().enumerate() {
+            let message = BotOutboundMessage {
+                text,
+                thinking: if index == 0 {
+                    base_message.thinking.clone()
+                } else {
+                    None
+                },
+                tool_status: if index == 0 {
+                    base_message.tool_status.clone()
+                } else {
+                    None
+                },
+                buttons: Vec::new(),
+                is_final,
+            };
+
+            if let Some(handle) = handles.get(index) {
+                if let Err(e) = self.adapter.edit_message(handle, &message).await {
+                    debug!(chunk = index, "stream throttler edit_message error: {e}");
+                }
+            } else {
+                match self.adapter.send_message(&self.target, &message).await {
+                    Ok(handle) => handles.push(handle),
+                    Err(e) => debug!(chunk = index, "stream throttler send_message error: {e}"),
+                }
             }
-        } else {
-            // First time sending message
-            match self.adapter.send_message(&self.target, &msg).await {
-                Ok(h) => {
-                    *handle_guard = Some(h);
-                }
-                Err(e) => {
-                    debug!("Stream throttler send_message error: {}", e);
-                }
+        }
+
+        // A later streamed render never normally shrinks, but editing old
+        // surplus chunks avoids leaving stale text should an adapter retry or
+        // a caller reset its output buffer.
+        for handle in handles.iter().skip(chunk_count) {
+            let cleared = BotOutboundMessage {
+                text: "…".to_string(),
+                thinking: None,
+                tool_status: None,
+                buttons: Vec::new(),
+                is_final,
+            };
+            if let Err(e) = self.adapter.edit_message(handle, &cleared).await {
+                debug!("stream throttler stale-chunk cleanup error: {e}");
             }
         }
 
@@ -143,13 +176,19 @@ mod tests {
     struct MockAdapter {
         sent: Mutex<Vec<BotOutboundMessage>>,
         edited: Mutex<Vec<BotOutboundMessage>>,
+        max_message_length: usize,
     }
 
     impl MockAdapter {
         fn new() -> Self {
+            Self::with_max_message_length(4_000)
+        }
+
+        fn with_max_message_length(max_message_length: usize) -> Self {
             Self {
                 sent: Mutex::new(Vec::new()),
                 edited: Mutex::new(Vec::new()),
+                max_message_length,
             }
         }
     }
@@ -158,6 +197,13 @@ mod tests {
     impl PlatformAdapter for MockAdapter {
         fn platform_id(&self) -> &'static str {
             "mock"
+        }
+
+        fn capabilities(&self) -> crate::events::PlatformCapabilities {
+            crate::events::PlatformCapabilities {
+                max_message_length: self.max_message_length,
+                ..Default::default()
+            }
         }
 
         async fn start_listening(
@@ -193,6 +239,20 @@ mod tests {
         async fn send_typing(&self, _target: &MessageTarget) -> Result<()> {
             Ok(())
         }
+    }
+
+    #[tokio::test]
+    async fn test_throttler_chunks_long_streams() {
+        let adapter = Arc::new(MockAdapter::with_max_message_length(4_000));
+        let target = MessageTarget::new("mock", "c1", None, Some("u1".into()));
+        let throttler = StreamThrottler::new(adapter.clone(), target, 10);
+        throttler.push_text_delta(&"x".repeat(9_000)).await;
+        throttler.finish().await;
+
+        let sent = adapter.sent.lock().await;
+        assert_eq!(sent.len(), 3);
+        assert!(sent.iter().all(|message| message.text.len() <= 4_000));
+        assert!(sent.iter().all(|message| message.is_final));
     }
 
     #[tokio::test]

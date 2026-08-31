@@ -263,6 +263,14 @@ impl PlatformAdapter for ProcessConnectorAdapter {
                                     let dec = ApprovalDecision {
                                         request_id: decision.request_id,
                                         user_id: decision.user_id,
+                                        target: decision.target.map(|target| {
+                                            MessageTarget::new(
+                                                target.platform,
+                                                target.channel_id,
+                                                target.thread_id,
+                                                target.user_id,
+                                            )
+                                        }),
                                         approved: decision.approved,
                                         always_allow: decision.always_allow.unwrap_or(false),
                                     };
@@ -440,6 +448,8 @@ struct BotInboundMessageDto {
 struct ApprovalDecisionDto {
     request_id: String,
     user_id: String,
+    #[serde(default)]
+    target: Option<MessageTargetDto>,
     approved: bool,
     always_allow: Option<bool>,
 }

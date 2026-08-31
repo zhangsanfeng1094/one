@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use one_core::ToolGate;
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex, RwLock, Semaphore};
+use tokio::task::LocalSet;
 use tracing::{debug, error, info, warn};
 
 use crate::adapters::PlatformAdapter;
@@ -62,8 +63,15 @@ impl BotStreamSink for ThrottlerSink {
 }
 
 /// Agent execution hook invoked by the Bot Gateway to run turns against one-core.
-#[async_trait]
+#[async_trait(?Send)]
 pub trait BotAgentExecutor: Send + Sync {
+    /// Ensure an isolated runtime exists before a turn is spawned. Keeping
+    /// cold-start construction outside `tokio::spawn` avoids carrying the
+    /// resource-loader's deeply nested future into the Send task type.
+    async fn ensure_session(&self, _session_key: &BotSessionKey) -> Result<()> {
+        Ok(())
+    }
+
     async fn execute_prompt(
         &self,
         prompt: String,
@@ -77,6 +85,12 @@ pub trait BotAgentExecutor: Send + Sync {
     async fn reset_session(&self, _session_key: &BotSessionKey) -> Result<()> {
         Ok(())
     }
+
+    /// Interrupt an active turn for this IM session. `/stop` is routed outside
+    /// the normal per-session work guard so it stays responsive.
+    async fn abort_session(&self, _session_key: &BotSessionKey) -> Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Central Gateway orchestrating multi-channel bots.
@@ -87,6 +101,8 @@ pub struct BotGateway {
     approval_manager: BotApprovalManager,
     notification_engine: NotificationEngine,
     executor: Arc<dyn BotAgentExecutor>,
+    active_sessions: Arc<Mutex<HashSet<String>>>,
+    session_limit: Arc<Semaphore>,
 }
 
 impl BotGateway {
@@ -97,6 +113,7 @@ impl BotGateway {
         let approval_manager = BotApprovalManager::new();
         let notification_engine = NotificationEngine::new();
 
+        let session_limit = config.max_concurrent_sessions.max(1);
         Self {
             config,
             adapters: Arc::new(RwLock::new(HashMap::new())),
@@ -104,6 +121,8 @@ impl BotGateway {
             approval_manager,
             notification_engine,
             executor,
+            active_sessions: Arc::new(Mutex::new(HashSet::new())),
+            session_limit: Arc::new(Semaphore::new(session_limit)),
         }
     }
 
@@ -141,26 +160,48 @@ impl BotGateway {
 
         info!("🤖 One Bot Gateway is running and ready to process messages.");
 
-        while let Some(event) = rx.recv().await {
-            match event {
-                BotInboundEvent::Message(msg) => {
-                    self.handle_inbound_message(msg).await;
+        // `AppRuntime::build` contains resource-loading futures that are not
+        // Send. Hermes-style per-session runtimes therefore execute on this
+        // dedicated local task set, while platform pollers remain regular
+        // Tokio tasks and communicate through the bounded event channel.
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                while let Some(event) = rx.recv().await {
+                    match event {
+                        BotInboundEvent::Message(msg) => {
+                            self.handle_inbound_message(msg).await;
+                        }
+                        BotInboundEvent::ApprovalDecision(decision) => {
+                            self.handle_approval_decision(decision).await;
+                        }
+                    }
                 }
-                BotInboundEvent::ApprovalDecision(decision) => {
-                    self.handle_approval_decision(decision).await;
-                }
-            }
-        }
+            })
+            .await;
 
         Ok(())
     }
 
     async fn handle_approval_decision(&self, decision: ApprovalDecision) {
-        info!(
-            "Received approval decision for request {} by user {}: approved={}",
-            decision.request_id, decision.user_id, decision.approved
-        );
-        self.approval_manager.submit_decision(decision).await;
+        let request_id = decision.request_id.clone();
+        let user_id = decision.user_id.clone();
+        let approved = decision.approved;
+        let accepted = self.approval_manager.submit_decision(decision).await;
+        if accepted {
+            info!(
+                request_id = %request_id,
+                user_id = %user_id,
+                approved,
+                "accepted bot approval decision"
+            );
+        } else {
+            warn!(
+                request_id = %request_id,
+                user_id = %user_id,
+                "ignored unknown or unauthorized bot approval decision"
+            );
+        }
     }
 
     async fn handle_inbound_message(&self, msg: BotInboundMessage) {
@@ -169,10 +210,15 @@ impl BotGateway {
 
         // 1. ACL Check
         if !self.config.security.is_channel_allowed(&target.channel_id) {
-            debug!(
-                "Ignored message from unauthorized channel: {}",
-                target.channel_id
-            );
+            debug!(channel_id = %target.channel_id, "ignored bot message from unauthorized channel");
+            return;
+        }
+        if !self
+            .config
+            .security
+            .is_user_allowed(&msg.session_key.user_id)
+        {
+            debug!(user_id = %msg.session_key.user_id, "ignored bot message from unauthorized user");
             return;
         }
 
@@ -214,9 +260,42 @@ impl BotGateway {
             return;
         }
 
+        if base_cmd == "/stop" || base_cmd == "/cancel" {
+            let stopped = self
+                .executor
+                .abort_session(&msg.session_key)
+                .await
+                .unwrap_or(false);
+            let reply = BotOutboundMessage {
+                text: if stopped {
+                    "⏹️ 已请求停止当前任务。".to_string()
+                } else {
+                    "当前会话没有正在执行的任务。".to_string()
+                },
+                thinking: None,
+                tool_status: None,
+                buttons: Vec::new(),
+                is_final: true,
+            };
+            let _ = adapter.send_message(&target, &reply).await;
+            return;
+        }
+
         if base_cmd == "/new" || base_cmd == "/reset" || base_cmd == "/clear" {
+            let _ = self.executor.abort_session(&msg.session_key).await;
             self.session_mapper.reset_session(&msg.session_key).await;
-            let _ = self.executor.reset_session(&msg.session_key).await;
+            if let Err(err) = self.executor.reset_session(&msg.session_key).await {
+                error!(session = %msg.session_key.to_string_key(), error = %err, "failed to reset bot session");
+                let reply = BotOutboundMessage {
+                    text: "❌ 无法重置会话，请稍后重试。".to_string(),
+                    thinking: None,
+                    tool_status: None,
+                    buttons: Vec::new(),
+                    is_final: true,
+                };
+                let _ = adapter.send_message(&target, &reply).await;
+                return;
+            }
             let reply = BotOutboundMessage {
                 text: "✨ 会话已重置，历史上下文已清空。您可以开始新的任务。".to_string(),
                 thinking: None,
@@ -229,6 +308,17 @@ impl BotGateway {
         }
 
         if base_cmd == "/model" {
+            if !self.config.security.is_user_admin(&msg.session_key.user_id) {
+                let reply = BotOutboundMessage {
+                    text: "🔒 只有管理员可以切换模型。".to_string(),
+                    thinking: None,
+                    tool_status: None,
+                    buttons: Vec::new(),
+                    is_final: true,
+                };
+                let _ = adapter.send_message(&target, &reply).await;
+                return;
+            }
             if !cmd_args.is_empty() {
                 let model_name = cmd_args.to_string();
                 self.session_mapper
@@ -285,7 +375,40 @@ impl BotGateway {
             return;
         }
 
-        // 3. Normal Agent Prompt Execution
+        // 3. Normal Agent Prompt Execution. A session only has one active
+        // turn, so its agent history and streaming listener cannot cross-talk.
+        let session_id = msg.session_key.to_string_key();
+        {
+            let mut active = self.active_sessions.lock().await;
+            if !active.insert(session_id.clone()) {
+                let reply = BotOutboundMessage {
+                    text: "⏳ 当前会话仍在执行。发送 `/stop` 取消，或等待完成后继续。".to_string(),
+                    thinking: None,
+                    tool_status: None,
+                    buttons: Vec::new(),
+                    is_final: true,
+                };
+                let _ = adapter.send_message(&target, &reply).await;
+                return;
+            }
+        }
+
+        let permit = match self.session_limit.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(_) => {
+                self.active_sessions.lock().await.remove(&session_id);
+                let reply = BotOutboundMessage {
+                    text: "⏳ Bot 正在处理过多会话，请稍后重试。".to_string(),
+                    thinking: None,
+                    tool_status: None,
+                    buttons: Vec::new(),
+                    is_final: true,
+                };
+                let _ = adapter.send_message(&target, &reply).await;
+                return;
+            }
+        };
+
         let edit_interval = self.config.telegram.stream_edit_interval_ms;
         let throttler = Arc::new(StreamThrottler::new(
             adapter.clone(),
@@ -302,16 +425,38 @@ impl BotGateway {
             self.config.security.require_approval_for_bash,
         ));
 
+        if let Err(err) = self.executor.ensure_session(&msg.session_key).await {
+            error!(
+                session = %msg.session_key.to_string_key(),
+                error = %err,
+                "failed to initialize bot session"
+            );
+            self.active_sessions.lock().await.remove(&session_id);
+            let reply = BotOutboundMessage {
+                text: "❌ 无法初始化会话，请稍后重试。".to_string(),
+                thinking: None,
+                tool_status: None,
+                buttons: Vec::new(),
+                is_final: true,
+            };
+            let _ = adapter.send_message(&target, &reply).await;
+            return;
+        }
+
         let current_model = self.session_mapper.get_model(&msg.session_key).await;
         let prompt = msg.text.clone();
         let attachments = msg.attachments.clone();
         let session_key = msg.session_key.clone();
         let executor = self.executor.clone();
+        let active_sessions = self.active_sessions.clone();
 
-        // Send typing indicator
+        // Send typing indicator before the potentially expensive session build.
         let _ = adapter.send_typing(&target).await;
 
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
+            // Keep the owned semaphore permit until the agent turn and final
+            // stream flush both finish.
+            let _permit = permit;
             if let Err(err) = executor
                 .execute_prompt(
                     prompt,
@@ -333,6 +478,7 @@ impl BotGateway {
                     .await;
             }
             throttler.finish().await;
+            active_sessions.lock().await.remove(&session_id);
         });
     }
 }

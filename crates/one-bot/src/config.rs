@@ -16,6 +16,8 @@ pub struct BotConfig {
     pub discord: DiscordConfig,
     #[serde(default)]
     pub feishu: FeishuConfig,
+    /// Deprecated: a native Slack adapter is not implemented. Use a subprocess
+    /// connector instead; enabling this section produces a startup error.
     #[serde(default)]
     pub slack: SlackConfig,
     #[serde(default)]
@@ -104,6 +106,17 @@ impl BotConfig {
         cfg
     }
 
+    /// Validate configuration values that cannot be handled by a registered adapter.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.slack.enabled {
+            return Err(
+                "native Slack support is not implemented; configure Slack through an external subprocess connector instead"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
     /// Merge loaded config with self, giving priority to non-default values in `other`.
     pub fn merge(&mut self, other: Self) {
         if other.default_model != default_model() {
@@ -129,6 +142,9 @@ impl BotConfig {
         }
         if other.connectors_dir.is_some() {
             self.connectors_dir = other.connectors_dir;
+        }
+        if !other.security.allowed_users.is_empty() {
+            self.security.allowed_users = other.security.allowed_users;
         }
         if !other.security.admin_users.is_empty() {
             self.security.admin_users = other.security.admin_users;
@@ -161,6 +177,13 @@ impl BotConfig {
                 config.feishu.app_id = app_id;
                 config.feishu.app_secret = app_secret;
             }
+        }
+        if let Ok(users) = std::env::var("ONE_BOT_ALLOWED_USERS") {
+            config.security.allowed_users = users
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
         }
         if let Ok(admins) = std::env::var("ONE_BOT_ADMINS") {
             config.security.admin_users = admins
@@ -197,6 +220,11 @@ pub struct ConnectorConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityConfig {
+    /// Users allowed to start bot conversations. Empty means open access.
+    #[serde(default)]
+    pub allowed_users: Vec<String>,
+    /// Administrators may change session-wide bot settings. Approval callbacks
+    /// always belong to the original requester, even for administrators.
     #[serde(default)]
     pub admin_users: Vec<String>,
     #[serde(default)]
@@ -218,6 +246,7 @@ fn default_workspace_root() -> PathBuf {
 impl Default for SecurityConfig {
     fn default() -> Self {
         Self {
+            allowed_users: Vec::new(),
             admin_users: Vec::new(),
             allowed_channels: Vec::new(),
             require_approval_for_bash: true,
@@ -227,10 +256,13 @@ impl Default for SecurityConfig {
 }
 
 impl SecurityConfig {
+    /// An empty allowlist deliberately keeps development installations open.
+    /// Production configs should explicitly set `allowed_users`.
+    pub fn is_user_allowed(&self, user_id: &str) -> bool {
+        self.allowed_users.is_empty() || self.allowed_users.iter().any(|u| u == user_id)
+    }
+
     pub fn is_user_admin(&self, user_id: &str) -> bool {
-        if self.admin_users.is_empty() {
-            return true; // No admins configured: open mode
-        }
         self.admin_users.iter().any(|u| u == user_id)
     }
 
@@ -340,6 +372,21 @@ enabled = true
         assert_eq!(cfg.connectors[0].args, vec!["--port", "8080"]);
         assert!(cfg.security.is_user_admin("user_1"));
         assert!(!cfg.security.is_user_admin("user_other"));
+    }
+
+    #[test]
+    fn rejects_unimplemented_native_slack_adapter() {
+        let cfg = BotConfig::load_from_str(
+            r#"
+[slack]
+enabled = true
+bot_token = "xoxb-test"
+"#,
+            "toml",
+        )
+        .unwrap();
+
+        assert!(cfg.validate().unwrap_err().contains("not implemented"));
     }
 
     #[test]

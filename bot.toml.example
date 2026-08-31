@@ -15,8 +15,12 @@ max_concurrent_sessions = 50
 # Security & HITL (Human-in-the-Loop) Configuration
 # ------------------------------------------------------------------------------
 [security]
-# Admin user IDs allowed to run dangerous commands or change models
-# Empty list means all users are permitted (open mode)
+# User IDs allowed to create bot sessions. Empty is open mode and intended
+# only for isolated local testing.
+allowed_users = ["tg_user_123456", "discord_user_999"]
+
+# Admin user IDs allowed to change models. Tool approvals remain bound to the
+# user and conversation that started the tool request.
 admin_users = ["tg_user_123456", "discord_user_999"]
 
 # Allowed channel/group IDs (empty list means all channels allowed)
@@ -51,12 +55,10 @@ app_id = "cli_a1b2c3d4e5f6"
 app_secret = "YOUR_FEISHU_APP_SECRET"
 
 # ------------------------------------------------------------------------------
-# Native Slack Adapter
+# Slack
 # ------------------------------------------------------------------------------
-[slack]
-enabled = false
-bot_token = "xoxb-YOUR-SLACK-BOT-TOKEN"
-app_token = "xapp-YOUR-SLACK-APP-TOKEN"
+# Native Slack support is not implemented. Use an external subprocess connector
+# for Slack (see the connector examples below).
 
 # ------------------------------------------------------------------------------
 # External Dynamic Subprocess Connectors (Scheme 1 IPC / Hermes-aligned)

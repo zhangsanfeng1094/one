@@ -155,6 +155,10 @@ pub struct ApprovalRequest {
 pub struct ApprovalDecision {
     pub request_id: String,
     pub user_id: String,
+    /// The callback's origin, populated by native adapters when the platform
+    /// supplies it. The gateway rejects a decision from another conversation.
+    #[serde(default)]
+    pub target: Option<MessageTarget>,
     pub approved: bool,
     pub always_allow: bool,
 }

@@ -12,10 +12,16 @@ use crate::events::{
     ApprovalDecision, BotOutboundMessage, BotSessionKey, InlineButton, MessageTarget,
 };
 
+struct PendingApproval {
+    sender: oneshot::Sender<ApprovalDecision>,
+    requester_user_id: String,
+    target: MessageTarget,
+}
+
 /// Approval Manager managing pending HITL requests across IM channels.
 #[derive(Clone)]
 pub struct BotApprovalManager {
-    pending: Arc<Mutex<HashMap<String, oneshot::Sender<ApprovalDecision>>>>,
+    pending: Arc<Mutex<HashMap<String, PendingApproval>>>,
 }
 
 impl Default for BotApprovalManager {
@@ -31,15 +37,35 @@ impl BotApprovalManager {
         Self::default()
     }
 
-    /// Submit a user decision from an inline button callback.
+    /// Submit a callback only if it came from the original user and from the
+    /// same platform conversation. Administrators can manage bot settings,
+    /// but cannot authorize another user's tool execution.
     pub async fn submit_decision(&self, decision: ApprovalDecision) -> bool {
         let mut map = self.pending.lock().await;
-        if let Some(tx) = map.remove(&decision.request_id) {
-            let _ = tx.send(decision);
-            true
-        } else {
-            false
+        let Some(pending) = map.get(&decision.request_id) else {
+            return false;
+        };
+
+        let same_target = decision.target.as_ref().is_none_or(|target| {
+            target.platform == pending.target.platform
+                && target.channel_id == pending.target.channel_id
+                && target.thread_id == pending.target.thread_id
+        });
+        let allowed_actor = decision.user_id == pending.requester_user_id;
+        if !same_target || !allowed_actor {
+            warn!(
+                request_id = %decision.request_id,
+                user_id = %decision.user_id,
+                "rejected unauthorized bot approval callback"
+            );
+            return false;
         }
+
+        let pending = map
+            .remove(&decision.request_id)
+            .expect("pending approval exists after authorization");
+        let _ = pending.sender.send(decision);
+        true
     }
 
     /// Request interactive approval on the IM platform and wait for user's decision.
@@ -54,10 +80,18 @@ impl BotApprovalManager {
     ) -> bool {
         let request_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
         let (tx, rx) = oneshot::channel();
+        let requester_user_id = target.user_id.clone().unwrap_or_default();
 
         {
             let mut map = self.pending.lock().await;
-            map.insert(request_id.clone(), tx);
+            map.insert(
+                request_id.clone(),
+                PendingApproval {
+                    sender: tx,
+                    requester_user_id,
+                    target: target.clone(),
+                },
+            );
         }
 
         let args_str = serde_json::to_string_pretty(tool_args).unwrap_or_default();
@@ -190,17 +224,48 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn rejects_decision_from_another_user_or_conversation() {
+        let manager = BotApprovalManager::new();
+        let target = MessageTarget::new("telegram", "chat_a", None, Some("owner".into()));
+        let (sender, _receiver) = oneshot::channel();
+        manager.pending.lock().await.insert(
+            "req_123".to_string(),
+            PendingApproval {
+                sender,
+                requester_user_id: "owner".to_string(),
+                target,
+            },
+        );
+
+        let intruder = ApprovalDecision {
+            request_id: "req_123".to_string(),
+            user_id: "intruder".to_string(),
+            target: Some(MessageTarget::new(
+                "telegram",
+                "chat_a",
+                None,
+                Some("intruder".into()),
+            )),
+            approved: true,
+            always_allow: false,
+        };
+        assert!(!manager.submit_decision(intruder).await);
+        assert!(manager.pending.lock().await.contains_key("req_123"));
+    }
+
+    #[tokio::test]
     async fn test_approval_manager_flow() {
         let manager = BotApprovalManager::new();
 
         let decision = ApprovalDecision {
             request_id: "req_123".to_string(),
             user_id: "user1".to_string(),
+            target: None,
             approved: true,
             always_allow: false,
         };
 
-        // Submitting to non-existent request should return false
-        assert!(!manager.submit_decision(decision.clone()).await);
+        // Submitting to non-existent request should return false.
+        assert!(!manager.submit_decision(decision).await);
     }
 }

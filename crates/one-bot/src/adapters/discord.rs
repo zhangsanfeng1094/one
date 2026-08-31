@@ -283,6 +283,10 @@ impl DiscordAdapter {
                 let dec = ApprovalDecision {
                     request_id: req_id.to_string(),
                     user_id: user_id.to_string(),
+                    // Gateway interactions do not expose parent-thread routing in
+                    // every Discord payload. The pending request still binds the
+                    // actor; adapters that can provide a precise target do so.
+                    target: None,
                     approved,
                     always_allow: always,
                 };

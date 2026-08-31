@@ -1,5 +1,6 @@
 pub mod acp;
 pub mod bot;
+pub mod bot_setup;
 pub mod interactive;
 pub mod print;
 pub mod rpc;

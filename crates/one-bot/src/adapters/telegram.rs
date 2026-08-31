@@ -436,9 +436,26 @@ impl PlatformAdapter for TelegramAdapter {
                                                 }
 
                                                 if !req_id.is_empty() {
+                                                    let target = cb
+                                                        .get("message")
+                                                        .and_then(|m| m.get("chat"))
+                                                        .and_then(|c| c.get("id"))
+                                                        .map(|chat_id| {
+                                                            MessageTarget::new(
+                                                                "telegram",
+                                                                chat_id.to_string(),
+                                                                cb.get("message")
+                                                                    .and_then(|m| {
+                                                                        m.get("message_thread_id")
+                                                                    })
+                                                                    .map(|id| id.to_string()),
+                                                                Some(from_id.clone()),
+                                                            )
+                                                        });
                                                     let decision = ApprovalDecision {
                                                         request_id: req_id.to_string(),
                                                         user_id: from_id,
+                                                        target,
                                                         approved,
                                                         always_allow: always,
                                                     };
