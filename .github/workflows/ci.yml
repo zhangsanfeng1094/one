@@ -14,9 +14,22 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: crates/one-web/web/package-lock.json
+      - name: Build Web UI
+        working-directory: crates/one-web/web
+        run: |
+          npm ci
+          npm run build
+          git diff --exit-code -- dist
       - name: Format
         run: cargo fmt --all -- --check
       - name: Clippy
+        run: cargo clippy --workspace --all-targets
+      - name: Core lint gate
         run: cargo clippy -p one-core --all-targets -- -D warnings
       - name: Check
         run: cargo check --all-targets
