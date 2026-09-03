@@ -16,7 +16,7 @@ pub fn system_reminder(body: impl AsRef<str>) -> String {
     if body.is_empty() {
         return format!("{SYSTEM_REMINDER_OPEN}\n{SYSTEM_REMINDER_CLOSE}");
     }
-    if body.contains(SYSTEM_REMINDER_OPEN) {
+    if body.starts_with(SYSTEM_REMINDER_OPEN) && body.ends_with(SYSTEM_REMINDER_CLOSE) {
         return body.to_string();
     }
     format!("{SYSTEM_REMINDER_OPEN}\n{body}\n{SYSTEM_REMINDER_CLOSE}")

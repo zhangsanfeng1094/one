@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::Paragraph;
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -20,17 +20,18 @@ use super::text::{
 use super::SPINNER;
 
 pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
-    // Outer padding: left gutter · content · right gutter (also scrollbar track).
+    // Outer padding: left gutter · content · right gap · right gutter (scrollbar track).
     let pad = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(1),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .split(area);
     let content = pad[1];
-    let sb_col = pad[2];
+    let sb_col = pad[3];
     // Render across the full viewport width.
     let row_width = (content.width as usize).max(16);
     let wrap_width = row_width;
@@ -201,6 +202,51 @@ pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if total > view_h && view_h > 0 && sb_col.width > 0 && sb_col.height > 0 {
         draw_chat_scrollbar(frame, sb_col, total, view_h, start);
     }
+
+    // Floating "Jump to bottom" badge when scrolled up into history.
+    let show_jump_to_bottom = !app.follow_bottom && total > view_h;
+    if show_jump_to_bottom && chat_area.height >= 4 && chat_area.width >= 34 {
+        let badge_w = 31u16;
+        let badge_h = 3u16;
+        let badge_x = chat_area
+            .x
+            .saturating_add(chat_area.width.saturating_sub(badge_w + 2));
+        let badge_y = chat_area
+            .y
+            .saturating_add(chat_area.height.saturating_sub(badge_h + 1));
+        let badge_area = Rect {
+            x: badge_x,
+            y: badge_y,
+            width: badge_w,
+            height: badge_h,
+        };
+        app.chat_jump_to_bottom_rect = Some(badge_area);
+        draw_jump_to_bottom_badge(frame, badge_area);
+    } else {
+        app.chat_jump_to_bottom_rect = None;
+    }
+}
+
+/// Floating helper card shown when viewing history above the live bottom.
+fn draw_jump_to_bottom_badge(frame: &mut Frame<'_>, area: Rect) {
+    frame.render_widget(Clear, area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Plain)
+        .border_style(Style::default().fg(Theme::BORDER).bg(Theme::PANEL))
+        .style(Style::default().bg(Theme::PANEL));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let line = Line::from(vec![
+        Span::styled(" Jump to bottom ", Style::default().fg(Theme::FG)),
+        Span::styled("(ctrl+End)", Style::default().fg(Theme::MUTED)),
+        Span::styled(" ↓ ", Style::default().fg(Theme::PRIMARY)),
+    ]);
+    frame.render_widget(
+        Paragraph::new(line).style(Style::default().bg(Theme::PANEL)),
+        inner,
+    );
 }
 
 /// Main transcript scrollbar (right gutter). Thumb tracks the visible window.
@@ -370,7 +416,6 @@ fn build_chat_lines(
 
     let mut i = 0;
     let mut skip_folded_turn = false;
-    let mut turn_spine = false;
     while i < app.messages.len() {
         let msg = &app.messages[i];
         if skip_folded_turn {
@@ -410,11 +455,7 @@ fn build_chat_lines(
                 let prev_was_tool = i > 0 && app.messages[i - 1].role == MessageRole::Tool;
                 if !prev_was_tool {
                     let blank = Line::from(Span::styled("", Theme::bg()));
-                    lines.push(if turn_spine {
-                        with_turn_spine(blank)
-                    } else {
-                        blank
-                    });
+                    lines.push(blank);
                     owners.push(None);
                 }
             }
@@ -425,7 +466,7 @@ fn build_chat_lines(
                 push_owned(
                     &mut lines,
                     &mut owners,
-                    spine_lines(group_lines, turn_spine),
+                    group_lines,
                     Some(ChatLineTarget::ToolGroup(i)),
                 );
                 i += streak;
@@ -437,7 +478,7 @@ fn build_chat_lines(
                 push_owned(
                     &mut lines,
                     &mut owners,
-                    spine_lines(header, turn_spine),
+                    header,
                     Some(ChatLineTarget::ToolGroup(i)),
                 );
                 for (k, tmsg) in slice.iter().enumerate() {
@@ -446,7 +487,7 @@ fn build_chat_lines(
                         push_owned(
                             &mut lines,
                             &mut owners,
-                            spine_lines(chunk, turn_spine),
+                            chunk,
                             Some(ChatLineTarget::Message(i + k)),
                         );
                     }
@@ -462,7 +503,7 @@ fn build_chat_lines(
                 push_owned(
                     &mut lines,
                     &mut owners,
-                    spine_lines(header, turn_spine),
+                    header,
                     Some(ChatLineTarget::ToolGroup(i)),
                 );
             }
@@ -486,7 +527,7 @@ fn build_chat_lines(
                         push_owned(
                             &mut lines,
                             &mut owners,
-                            spine_lines(merged, turn_spine),
+                            merged,
                             Some(ChatLineTarget::Message(i + k)),
                         );
                         k += same;
@@ -504,7 +545,7 @@ fn build_chat_lines(
                 push_owned(
                     &mut lines,
                     &mut owners,
-                    spine_lines(chunk, turn_spine),
+                    chunk,
                     Some(ChatLineTarget::Message(i + k)),
                 );
                 k += 1;
@@ -532,9 +573,8 @@ fn build_chat_lines(
                 None
             };
             let turn_folded = turn.as_ref().is_some_and(|t| t.folded);
-            let focused = is_real && turn_owns_focus(&app.messages, i, app.chat_focus);
+            let focused = is_real && app.chat_focus == Some(i);
             if is_real {
-                turn_spine = !turn_folded && turn.is_some();
                 let start_line = lines.len();
                 let paint = render_user(
                     msg,
@@ -563,18 +603,13 @@ fn build_chat_lines(
                 }
                 if turn_folded {
                     skip_folded_turn = true;
-                    turn_spine = false;
                 }
             }
             if !turn_folded {
                 for reminder in &extracted.reminders {
                     if !lines.is_empty() {
                         let blank = Line::from(Span::raw(""));
-                        lines.push(if turn_spine {
-                            with_turn_spine(blank)
-                        } else {
-                            blank
-                        });
+                        lines.push(blank);
                         owners.push(None);
                     }
                     let rem =
@@ -582,7 +617,7 @@ fn build_chat_lines(
                     push_owned(
                         &mut lines,
                         &mut owners,
-                        spine_lines(rem, turn_spine),
+                        rem,
                         Some(ChatLineTarget::Message(i)),
                     );
                 }
@@ -599,11 +634,7 @@ fn build_chat_lines(
 
         if !lines.is_empty() {
             let blank = Line::from(Span::styled("", Theme::bg()));
-            lines.push(if turn_spine {
-                with_turn_spine(blank)
-            } else {
-                blank
-            });
+            lines.push(blank);
             owners.push(None);
         }
         if msg.role == MessageRole::Assistant && turn_answer.is_none() {
@@ -617,12 +648,7 @@ fn build_chat_lines(
         } else {
             None
         };
-        push_owned(
-            &mut lines,
-            &mut owners,
-            spine_lines(chunk, turn_spine),
-            owner,
-        );
+        push_owned(&mut lines, &mut owners, chunk, owner);
         i += 1;
     }
 
@@ -634,11 +660,7 @@ fn build_chat_lines(
         if show {
             if !lines.is_empty() {
                 let blank = Line::from("");
-                lines.push(if turn_spine {
-                    with_turn_spine(blank)
-                } else {
-                    blank
-                });
+                lines.push(blank);
                 owners.push(None);
             }
             let spin = SPINNER[app.spinner_frame % SPINNER.len()];
@@ -667,11 +689,7 @@ fn build_chat_lines(
                 Span::styled(format!("{spin} "), Theme::tool_icon_running()),
                 Span::styled(label, Theme::busy()),
             ]);
-            lines.push(if turn_spine {
-                with_turn_spine(wait)
-            } else {
-                wait
-            });
+            lines.push(wait);
             owners.push(None);
         }
     }
@@ -1233,8 +1251,29 @@ pub(super) struct ExtractedUserContent {
     pub reminders: Vec<String>,
 }
 
+fn is_system_notification_or_meta(text: &str) -> bool {
+    let trimmed = text.trim();
+    trimmed.starts_with("[Background task completed]")
+        || trimmed.starts_with("[job completed]")
+        || trimmed.starts_with("[Monitor stopped]")
+        || trimmed.starts_with("[System reminder]")
+        || trimmed.starts_with("<env>")
+        || trimmed.starts_with("<context>")
+        || trimmed.starts_with("<memory-catalog>")
+        || trimmed.starts_with("### Learned Tool Intent")
+        || trimmed.starts_with("### Graph Intent Guidance")
+}
+
 /// Extract user visible text and `<system-reminder>...</system-reminder>` blocks.
 pub(super) fn extract_user_and_reminders(text: &str) -> ExtractedUserContent {
+    let trimmed = text.trim();
+    if is_system_notification_or_meta(trimmed) {
+        return ExtractedUserContent {
+            user_text: String::new(),
+            reminders: vec![trimmed.to_string()],
+        };
+    }
+
     let mut reminders = Vec::new();
     let mut user_parts = Vec::new();
     let mut rest = text;
@@ -1289,8 +1328,17 @@ pub(super) fn extract_user_and_reminders(text: &str) -> ExtractedUserContent {
         }
     }
 
+    let mut real_user_parts = Vec::new();
+    for part in user_parts {
+        if is_system_notification_or_meta(part) {
+            reminders.push(part.to_string());
+        } else {
+            real_user_parts.push(part);
+        }
+    }
+
     ExtractedUserContent {
-        user_text: user_parts.join("\n\n"),
+        user_text: real_user_parts.join("\n\n"),
         reminders,
     }
 }
@@ -1699,59 +1747,6 @@ fn format_user_clock(ts: std::time::SystemTime) -> String {
 /// `┃ `/`  ` + `HH:MM` + two spaces before the question.
 const TURN_TIME_COL: usize = 9;
 
-fn turn_owns_focus(messages: &[Message], user_idx: usize, focus: Option<usize>) -> bool {
-    let Some(f) = focus else {
-        return false;
-    };
-    if f == user_idx {
-        return true;
-    }
-    let end = crate::user_fold::turn_end(messages, user_idx);
-    f > user_idx && f < end
-}
-
-fn spine_lines(lines: Vec<Line<'static>>, spine: bool) -> Vec<Line<'static>> {
-    if !spine {
-        return lines;
-    }
-    lines.into_iter().map(with_turn_spine).collect()
-}
-
-fn with_turn_spine(line: Line<'static>) -> Line<'static> {
-    let rail = Span::styled("┃", Theme::turn_rail());
-    let gap = Span::raw(" ");
-    if line.spans.is_empty() {
-        return Line::from(vec![rail, gap]);
-    }
-    let first = line.spans[0].content.as_ref();
-    if first.starts_with('┃') {
-        return line;
-    }
-    if first == "▌ " || first == "▌" || first == "  " {
-        let mut spans = vec![rail, gap];
-        spans.extend(line.spans.into_iter().skip(1));
-        return Line::from(spans);
-    }
-    if let Some(rest) = first.strip_prefix("  ") {
-        let rest = rest.to_string();
-        let style = line.spans[0].style;
-        let mut spans = vec![rail, gap];
-        if !rest.is_empty() {
-            spans.push(Span::styled(rest, style));
-        }
-        spans.extend(line.spans.into_iter().skip(1));
-        return Line::from(spans);
-    }
-    if first.is_empty() {
-        let mut spans = vec![rail, gap];
-        spans.extend(line.spans.into_iter().skip(1));
-        return Line::from(spans);
-    }
-    let mut spans = vec![rail, gap];
-    spans.extend(line.spans);
-    Line::from(spans)
-}
-
 fn timeline_prefix(rail: bool) -> Vec<Span<'static>> {
     if rail {
         vec![
@@ -1855,7 +1850,7 @@ fn render_user(
     let clock = format_user_clock(msg.created_at);
     let turn_foldable = turn.is_some();
     let turn_folded = turn.is_some_and(|t| t.folded);
-    let rail = focused || (turn_foldable && !turn_folded);
+    let rail = focused;
     let dim = turn_folded && !is_current && !focused;
     let chevron = if turn_foldable {
         Some(if turn_folded { '▸' } else { '▾' })

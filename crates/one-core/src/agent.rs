@@ -1397,11 +1397,7 @@ impl Agent {
         drop(queue);
         for text in items {
             // Prefer harness-style system-reminder so models do not treat notices as user chat.
-            let text = if crate::reminder::has_system_reminder(&text) {
-                text
-            } else {
-                crate::reminder::system_reminder(text)
-            };
+            let text = crate::reminder::system_reminder(text);
             self.push_message(AgentMessage::user_text(text));
         }
     }

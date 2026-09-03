@@ -1693,6 +1693,15 @@ fn strip_system_reminders_removes_injected_blocks() {
 
     let generic = "Fix CSS styles <reminder>internal rule</reminder>";
     assert_eq!(strip_system_reminders(generic), "Fix CSS styles");
+
+    let bg_completion = "[Background task completed]\ntask_id: bg_1\nexit: 0\n";
+    assert_eq!(strip_system_reminders(bg_completion), "");
+
+    let bg_with_internal_reminder = "[Background task completed]\ntask_id: bg_1\n<system-reminder>\nOutput truncated\n</system-reminder>\nwarning: code snippet\n";
+    assert_eq!(strip_system_reminders(bg_with_internal_reminder), "");
+
+    let job_completion = "[job completed]\nkind: explore\nid: job_1\nstatus: completed\n";
+    assert_eq!(strip_system_reminders(job_completion), "");
 }
 
 #[test]
@@ -1917,8 +1926,8 @@ fn current_turn_with_reply_shows_fold_button() {
         "current turn with a reply shows a collapse chevron: {flat}"
     );
     assert!(
-        flat.contains('┃'),
-        "expanded current turn uses the left spine: {flat}"
+        !flat.contains('┃'),
+        "turn spine is removed for clean markdown output: {flat}"
     );
     assert!(
         !compact.contains("折叠") && !compact.contains("Alt+Z"),
@@ -2180,5 +2189,141 @@ fn folded_turns_stack_as_single_timeline_rows() {
     assert!(
         !flat.contains("unique-reply-alpha") && !flat.contains("unique-reply-beta"),
         "folded follow-up stays hidden: {flat}"
+    );
+}
+
+#[test]
+fn jump_to_bottom_badge_renders_when_scrolled_up() {
+    let backend = TestBackend::new(80, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    // Add many messages so transcript is taller than viewport.
+    for i in 0..30 {
+        app.messages.push(Message::user(format!("question {i}")));
+        app.messages.push(Message::assistant(format!("answer {i}")));
+    }
+
+    // When following bottom, badge is not rendered.
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(app.chat_jump_to_bottom_rect.is_none());
+    let flat_bottom = terminal_flat(&terminal);
+    assert!(!flat_bottom.contains("Jump to bottom"));
+
+    // Scroll up into history.
+    app.scroll_to_top();
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    // Now badge should be rendered and rect populated.
+    assert!(app.chat_jump_to_bottom_rect.is_some());
+    let rect = app.chat_jump_to_bottom_rect.unwrap();
+    assert_eq!(rect.width, 31);
+    assert_eq!(rect.height, 3);
+
+    let flat_scrolled = terminal_flat(&terminal);
+    assert!(
+        flat_scrolled.contains("Jump to bottom"),
+        "scrolled view must contain Jump to bottom badge: {flat_scrolled}"
+    );
+    assert!(
+        flat_scrolled.contains("(ctrl+End)"),
+        "scrolled view must contain (ctrl+End) shortcut: {flat_scrolled}"
+    );
+
+    // Clicking the badge jumps back to bottom.
+    let handled = app.click_jump_to_bottom(rect.x + 2, rect.y + 1);
+    assert!(handled, "click inside badge must be handled");
+    assert!(app.follow_bottom, "must re-enter live follow bottom");
+    assert_eq!(app.chat_scroll, 0);
+
+    // After scrolling to bottom and drawing again, badge disappears.
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    assert!(app.chat_jump_to_bottom_rect.is_none());
+}
+
+#[test]
+fn jump_to_bottom_and_top_chords() {
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    let mut app = App::new("test");
+    for i in 0..30 {
+        app.messages.push(Message::user(format!("question {i}")));
+        app.messages.push(Message::assistant(format!("answer {i}")));
+    }
+    app.chat_view_height = 10;
+    app.chat_total_lines = 60;
+
+    // Ctrl+Home jumps to top.
+    let ctrl_home = KeyEvent::new(KeyCode::Home, KeyModifiers::CONTROL);
+    app.handle_key(ctrl_home);
+    assert!(!app.follow_bottom);
+    assert_eq!(app.chat_scroll, 0);
+
+    // Ctrl+End jumps to bottom.
+    let ctrl_end = KeyEvent::new(KeyCode::End, KeyModifiers::CONTROL);
+    app.handle_key(ctrl_end);
+    assert!(app.follow_bottom);
+    assert_eq!(app.chat_scroll, 0);
+
+    // Alt+G also jumps to bottom.
+    app.scroll_to_top();
+    assert!(!app.follow_bottom);
+    let alt_g = KeyEvent::new(KeyCode::Char('g'), KeyModifiers::ALT);
+    app.handle_key(alt_g);
+    assert!(app.follow_bottom);
+    assert_eq!(app.chat_scroll, 0);
+
+    // While busy, Ctrl+End and Ctrl+Home still work.
+    app.busy = true;
+    app.scroll_to_top();
+    assert!(!app.follow_bottom);
+    app.handle_busy_key(ctrl_end);
+    assert!(app.follow_bottom);
+    assert_eq!(app.chat_scroll, 0);
+
+    app.handle_busy_key(ctrl_home);
+    assert!(!app.follow_bottom);
+}
+
+#[test]
+fn prompt_soft_wraps_long_single_line_and_tracks_cursor() {
+    let backend = TestBackend::new(40, 16);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    // usable_w = 40 - 4 = 36 cols.
+    // "niiis" (5 cols) + 20 "水" (40 cols) = 45 cols total -> wraps into 2 visual rows.
+    // Row 0: "niiis" + 15 "水" = 5 + 30 = 35 cols. (20 chars: 5 ascii + 15 CJK)
+    // Row 1: 5 "水" = 10 cols. (5 chars: chars 20..25)
+    let text = format!("niiis{}", "水".repeat(20));
+    app.input = text;
+    app.input_cursor = 25; // at end of input (on visual row 1, col 5 chars = width 10)
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let pos = terminal.get_cursor_position().unwrap();
+    // Prompt height: input_lines = 2, prompt_h = (2 + 2) = 4.
+    // Top header = 1. Status = 2. Transcript = 16 - 1 - 0 - 4 - 2 = 9.
+    // Prompt starts at y = 10 (box_area.y = 10).
+    // Visual row 0 at y = 11. Visual row 1 at y = 12.
+    // Caret is on visual row 1: y = 12.
+    // Caret x: box_area.x (0) + 3 + display_width("水"*5 = 10) = 13.
+    assert_eq!(pos.y, 12);
+    assert_eq!(pos.x, 13);
+    assert!(pos.x < 40, "Cursor must remain within screen width");
+
+    // Test cursor positioned on 1st char of row 1 (char 21: after 1 "水")
+    app.input_cursor = 21;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+    let pos2 = terminal.get_cursor_position().unwrap();
+    assert_eq!(pos2.y, 12);
+    assert_eq!(pos2.x, 5); // 3 + 2 (1 CJK char width) = 5
+
+    // Check buffer content contains both rows
+    let buffer = terminal.backend().buffer();
+    let flat: String = buffer.content().iter().map(|c| c.symbol()).collect();
+    assert!(
+        flat.contains("niiis水"),
+        "first row should contain start of text"
     );
 }

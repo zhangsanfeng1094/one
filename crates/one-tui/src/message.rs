@@ -322,6 +322,12 @@ pub fn strip_ansi_for_ui(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut i = 0;
     while i < bytes.len() {
+        // Safety net: never index mid-character (orphan continuation after a
+        // mis-parsed ESC in binary payloads).
+        if (bytes[i] & 0xc0) == 0x80 {
+            i += 1;
+            continue;
+        }
         let b = bytes[i];
         if b == 0x1b {
             // ESC …
@@ -356,17 +362,19 @@ pub fn strip_ansi_for_ui(input: &str) -> String {
                         i += 1;
                     }
                 }
+                // Charset designators: ESC ( B, ESC ) 0, etc. — both args ASCII.
+                // Advance one *character* (not one byte) so multi-byte UTF-8
+                // after a malformed sequence stays on a char boundary.
                 b'(' | b')' | b'*' | b'+' | b'-' | b'.' | b'/' => {
-                    // Character-set designation: ESC ( B etc.
                     i += 1;
                     if i < bytes.len() {
-                        i += 1;
+                        i = advance_one_utf8_char(bytes, i);
                     }
                 }
-                _ => {
-                    // Other single-char escapes (ESC c, ESC 7, …)
-                    i += 1;
-                }
+                // Unknown ESC-introducer: drop only the ESC. Do **not** skip
+                // the following byte — it may be the lead of a multi-byte char
+                // (common in binary tool output / `file` on ELF + paths).
+                _ => {}
             }
             continue;
         }
@@ -381,11 +389,28 @@ pub fn strip_ansi_for_ui(input: &str) -> String {
             continue;
         }
         // Copy one UTF-8 char starting at i.
-        let ch = input[i..].chars().next().unwrap_or('\u{fffd}');
+        let ch = input.get(i..).and_then(|s| s.chars().next()).unwrap_or('\u{fffd}');
         out.push(ch);
         i += ch.len_utf8();
     }
     out
+}
+
+/// Advance `i` past one UTF-8 character starting at `i` (or one byte if
+/// the lead is invalid / truncated).
+fn advance_one_utf8_char(bytes: &[u8], i: usize) -> usize {
+    if i >= bytes.len() {
+        return i;
+    }
+    let width = match bytes[i] {
+        0x00..=0x7f => 1,
+        0xc0..=0xdf => 2,
+        0xe0..=0xef => 3,
+        0xf0..=0xf7 => 4,
+        // Continuation or illegal lead: skip a single byte.
+        _ => 1,
+    };
+    (i + width).min(bytes.len())
 }
 
 /// Cap stored tool output for the TUI (agent still has the full result).
@@ -406,3 +431,35 @@ pub fn truncate_tool_output_for_ui(output: &str, max_chars: usize) -> String {
     out.push_str("\n… (truncated in UI · full result still in model context)");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_strip_ansi_basic() {
+        let raw = "\x1b[31m-old\x1b[0m\n\x1b[32m+new\x1b[m\x0f";
+        let clean = strip_ansi_for_ui(raw);
+        assert_eq!(clean, "-old\n+new");
+    }
+
+    #[test]
+    fn test_strip_ansi_esc_before_multibyte_utf8_no_panic() {
+        let raw = "\u{1b}\u{30f}tail";
+        let clean = strip_ansi_for_ui(raw);
+        assert!(clean.contains('t'));
+
+        let raw = "7\u{1b}月 15";
+        let clean = strip_ansi_for_ui(raw);
+        assert_eq!(clean, "7月 15");
+
+        let raw = "\u{1b}(月x";
+        let _ = strip_ansi_for_ui(raw);
+
+        // Binary-like payload with ESC followed by multibyte characters (as from web responses / gzip)
+        let raw = "URL: https://antigravity.google/docs/hooks\nStatus: 200 OK\n\x1b)SnY\u{fffd}\u{fffd}\x1b(֧߽\x1b[m";
+        let clean = strip_ansi_for_ui(raw);
+        assert!(clean.contains("URL: https://antigravity.google/docs/hooks"));
+    }
+}
+

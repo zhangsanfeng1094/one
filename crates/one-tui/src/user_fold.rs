@@ -85,10 +85,31 @@ pub fn code_blocks(lines: &[&str]) -> Vec<CodeBlock> {
 
 /// Drop injected reminder blocks so fold math matches what the bubble paints.
 pub fn visible_user_text(content: &str) -> String {
+    let trimmed = content.trim();
+    if is_pure_system_notification_or_meta(trimmed) {
+        return String::new();
+    }
     let without_sys = strip_tag_blocks(content, "<system-reminder>", "</system-reminder>");
-    strip_tag_blocks(&without_sys, "<reminder>", "</reminder>")
+    let stripped = strip_tag_blocks(&without_sys, "<reminder>", "</reminder>")
         .trim()
-        .to_string()
+        .to_string();
+    if is_pure_system_notification_or_meta(stripped.trim()) {
+        String::new()
+    } else {
+        stripped
+    }
+}
+
+fn is_pure_system_notification_or_meta(trimmed: &str) -> bool {
+    trimmed.starts_with("[Background task completed]")
+        || trimmed.starts_with("[job completed]")
+        || trimmed.starts_with("[Monitor stopped]")
+        || trimmed.starts_with("[System reminder]")
+        || trimmed.starts_with("<env>")
+        || trimmed.starts_with("<context>")
+        || trimmed.starts_with("<memory-catalog>")
+        || trimmed.starts_with("### Learned Tool Intent")
+        || trimmed.starts_with("### Graph Intent Guidance")
 }
 
 fn strip_tag_blocks(text: &str, open: &str, close: &str) -> String {
