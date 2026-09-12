@@ -64,6 +64,13 @@ impl Tool for ReadTool {
                     "description": "Maximum lines to read (text only; still subject to 50KB cap)"
                 }),
             );
+            obj.insert(
+                "description".into(),
+                json!({
+                    "type": "string",
+                    "description": "Optional short explanation of why this file is being read"
+                }),
+            );
         }
         ToolDefinition {
             name: "read".to_string(),
@@ -91,7 +98,11 @@ impl Tool for ReadTool {
 
         let resolved = self
             .policy
-            .resolve(path, AccessKind::Read)
+            .resolve_with_token(
+                path,
+                AccessKind::Read,
+                crate::tool_args::one_time_permission_token(&call.arguments, &call.id),
+            )
             .map_err(|err| tool_error("read", err))?;
 
         let metadata = tokio::fs::metadata(&resolved).await.map_err(|err| {

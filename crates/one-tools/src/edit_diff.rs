@@ -105,8 +105,10 @@ impl EditApplyError {
             EditApplyError::NotFound => {
                 "Could not find old_string in the file (exact and relaxed match strategies failed). \
                  If you just edited this file, re-read it — the buffer has changed. \
-                 Do not include read-tool line-number prefixes (e.g. `12|`); \
-                 provide more surrounding context; check indentation, whitespace, and quotes."
+                 Tips: re-read the file with `read` to inspect the exact current buffer; \
+                 prefer short unique anchors (2-4 lines of exact code); \
+                 do not include read-tool line-number prefixes (e.g. `12|`); \
+                 check indentation, whitespace, and quotes."
                     .to_string()
             }
             EditApplyError::Multiple { count } => {
@@ -326,6 +328,44 @@ pub fn find_whitespace_normalized_matches(content: &str, needle: &str) -> Vec<Ma
             }
         }
     }
+    if !out.is_empty() {
+        return out;
+    }
+
+    // Secondary flexible-window pass: accommodates code formatters (e.g. rustfmt, gofmt)
+    // that wrap single-line calls across multiple lines or vice versa.
+    let needle_code_ws = collapse_code_whitespace(needle);
+    let max_window = needle_lines
+        .len()
+        .saturating_add(8)
+        .min(content_lines.len());
+    for i in 0..content_lines.len() {
+        for w in 1..=max_window {
+            if i + w > content_lines.len() {
+                break;
+            }
+            if w == needle_lines.len() {
+                continue; // Already checked in standard pass
+            }
+            let block: String = content_lines[i..i + w]
+                .iter()
+                .map(|l| l.text)
+                .collect::<Vec<_>>()
+                .join("\n");
+            if collapse_whitespace(&block) == needle_ws
+                || collapse_code_whitespace(&block) == needle_code_ws
+            {
+                out.push(span_for_window(
+                    content,
+                    &content_lines,
+                    i,
+                    w,
+                    needle.ends_with('\n'),
+                ));
+                break;
+            }
+        }
+    }
     out
 }
 
@@ -526,6 +566,29 @@ fn collapse_whitespace(s: &str) -> String {
     out.trim().to_string()
 }
 
+/// Collapses whitespace and additionally normalizes spacing around common code
+/// delimiters `([{})],;:` to absorb formatting differences (e.g. rustfmt/gofmt line wrapping).
+fn collapse_code_whitespace(s: &str) -> String {
+    let collapsed = collapse_whitespace(s);
+    let mut out = String::with_capacity(collapsed.len());
+    let mut chars = collapsed.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == ' ' {
+            let next = chars.peek().copied();
+            let prev = out.chars().last();
+            let is_delim =
+                |c: char| matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';' | ':');
+            if prev.map_or(false, is_delim) || next.map_or(false, is_delim) {
+                continue;
+            }
+            out.push(' ');
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
 fn dedent_lines(lines: &[&str]) -> String {
     let non_empty: Vec<&str> = lines
         .iter()
@@ -576,6 +639,13 @@ fn levenshtein(a: &str, b: &str) -> usize {
 
 /// OpenCode guard: refuse when fuzzy span is much larger than the model’s old_string.
 pub fn is_disproportionate_match(search: &str, old_string: &str) -> bool {
+    let old_len = old_string.trim().len();
+    let search_len = search.trim().len();
+    // If character count is roughly comparable (e.g. line wrapping by rustfmt/prettier),
+    // it is not disproportionate.
+    if search_len <= old_len.saturating_mul(2) + 60 {
+        return false;
+    }
     let old_lines = old_string.lines().count().max(1);
     let search_lines = search.lines().count().max(1);
     if search_lines >= old_lines.saturating_add(3).max(old_lines.saturating_mul(2)) {
@@ -584,8 +654,6 @@ pub fn is_disproportionate_match(search: &str, old_string: &str) -> bool {
     if old_lines == 1 {
         return false;
     }
-    let old_len = old_string.trim().len();
-    let search_len = search.trim().len();
     search_len > (old_len + 500).max(old_len.saturating_mul(4))
 }
 
@@ -1188,6 +1256,118 @@ fn group_hunks(edits: &[DiffEdit], _old_len: usize, _new_len: usize, context: us
     hunks
 }
 
+/// Search `content` for the most relevant lines matching `needle` when an edit fails,
+/// returning `(1_based_line_number, formatted_snippet)`.
+pub fn find_closest_match_snippet(content: &str, needle: &str) -> Option<(usize, String)> {
+    let stripped = strip_line_number_prefixes(needle);
+    let n_lines: Vec<&str> = stripped
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !is_weak_block_anchor(l))
+        .collect();
+    if n_lines.is_empty() {
+        return None;
+    }
+
+    let c_lines: Vec<&str> = content.lines().collect();
+    if c_lines.is_empty() {
+        return None;
+    }
+
+    let mut best_score = 0.0f64;
+    let mut best_idx = 0usize;
+
+    // 1. Line-by-line Levenshtein against distinctive needle lines
+    for target in n_lines.iter().take(3) {
+        if target.len() < 3 {
+            continue;
+        }
+        for (i, line) in c_lines.iter().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let max_len = trimmed.chars().count().max(target.chars().count());
+            if max_len == 0 {
+                continue;
+            }
+            let dist = levenshtein(trimmed, target);
+            let sim = 1.0 - (dist as f64 / max_len as f64);
+            if sim > best_score {
+                best_score = sim;
+                best_idx = i;
+            }
+        }
+    }
+
+    // 2. Token overlap fallback if line similarity is below threshold
+    if best_score < 0.45 && n_lines.len() > 1 {
+        let needle_tokens: std::collections::HashSet<&str> = stripped
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|w| w.len() > 2)
+            .collect();
+        if !needle_tokens.is_empty() {
+            let win_size = n_lines.len().clamp(2, 8);
+            for i in 0..c_lines.len() {
+                let end = (i + win_size).min(c_lines.len());
+                let window_text = c_lines[i..end].join(" ");
+                let count = window_text
+                    .split(|c: char| !c.is_alphanumeric() && c != '_')
+                    .filter(|w| needle_tokens.contains(w))
+                    .count();
+                let score = count as f64 / needle_tokens.len() as f64;
+                if score > best_score {
+                    best_score = score;
+                    best_idx = i;
+                }
+            }
+        }
+    }
+
+    if best_score < 0.25 {
+        return None;
+    }
+
+    // Window around best_idx with 1-based line numbers
+    let start = best_idx.saturating_sub(1);
+    let end = (start + n_lines.len().clamp(3, 6)).min(c_lines.len());
+    let gutter_width = format!("{}", end).len();
+
+    let mut snippet = String::new();
+    for line_idx in start..end {
+        let num = line_idx + 1;
+        snippet.push_str(&format!("{:>gutter_width$} | {}\n", num, c_lines[line_idx]));
+    }
+    let trimmed = snippet.trim_end().to_string();
+    Some((start + 1, trimmed))
+}
+
+/// Format an actionable error message for the model when old_string is not found.
+pub fn format_not_found_message(path: &str, content: &str, needle: &str) -> String {
+    let mut msg = format!(
+        "Could not find old_string in `{path}` (exact and relaxed match strategies failed)."
+    );
+
+    if let Some((line_no, snippet)) = find_closest_match_snippet(content, needle) {
+        msg.push_str(&format!(
+            "\n\nClosest match found in `{path}` near line {line_no}:\n\
+             --------------------------------------------------\n\
+             {snippet}\n\
+             --------------------------------------------------\n\n\
+             To fix:\n\
+             1. Re-read the file with `read` (path: \"{path}\", offset: {line_no}, limit: 25) to see the exact buffer.\n\
+             2. Use shorter unique anchors (2-4 lines of exact code) instead of large blocks.\n\
+             3. Do not include read-tool line numbers (e.g. `12|`); check indentation and line breaks."
+        ));
+    } else {
+        msg.push_str(&format!(
+            "\n\nTips: re-read `{path}` with `read` to check the exact buffer before editing; \
+             prefer short unique anchors (2-4 lines of exact code); avoid guessing unread code."
+        ));
+    }
+    msg
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1518,5 +1698,58 @@ start_block {
         );
         // Not numbered → unchanged
         assert_eq!(strip_line_number_prefixes("fn main() {}"), "fn main() {}");
+    }
+
+    #[test]
+    fn whitespace_normalized_matches_multiline_formatting() {
+        // Model wrote call on one line; file was formatted across 4 lines by rustfmt.
+        let content = "\
+fn test() {
+    debug!(
+        \"Ignored message: {}\",
+        target_id
+    );
+    return;
+}
+";
+        let old = "    debug!(\"Ignored message: {}\", target_id);";
+        let new = "    info!(\"Accepted: {}\", target_id);";
+
+        let applied = apply_edit_lf(content, old, new, false).expect("should match wrapped format");
+        assert!(applied
+            .content_lf
+            .contains("info!(\"Accepted: {}\", target_id);"));
+        assert!(!applied.content_lf.contains("Ignored message"));
+    }
+
+    #[test]
+    fn closest_match_snippet_suggests_exact_line_on_not_found() {
+        let content = "\
+func handle() {
+\tif len(pending) == 0 {
+\t\treturn
+\t}
+\t// 1. Emit all tool messages contiguously (critical for Gemini/OpenAI parallel tool call invariants)
+\tfor _, tr := range pending {
+\t\ttoolMsg := schemas.ChatMessage{
+\t\t}
+\t}
+}
+";
+        // Model wrote slightly hallucinated comment
+        let needle = "\
+\t// 1. Emit all pending tool messages contiguously
+\tfor _, tr := range pending {
+";
+        let snippet = find_closest_match_snippet(content, needle);
+        assert!(snippet.is_some(), "should find closest matching snippet");
+        let (line_no, formatted) = snippet.unwrap();
+        assert_eq!(line_no, 5);
+        assert!(formatted.contains("Emit all tool messages contiguously"));
+
+        let not_found_msg = format_not_found_message("request.go", content, needle);
+        assert!(not_found_msg.contains("Closest match found in `request.go` near line 5:"));
+        assert!(not_found_msg.contains("To fix:"));
+        assert!(not_found_msg.contains("offset: 5"));
     }
 }

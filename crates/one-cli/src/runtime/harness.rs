@@ -8,7 +8,7 @@ use std::time::Instant;
 use one_core::agent::{Agent, AgentConfig, LlmProvider, ThinkingLevel};
 use one_core::error::OneError;
 use one_resources::{load_memory_catalog_sync, memory_readable_roots};
-use one_tools::{ExportedReadGrants, PathPolicy};
+use one_tools::{ExportedReadGrants, PathPolicy, PermissionRules};
 
 use super::tool_materialize::{
     harness_build_context, harness_registry, materialize_tools, resolve_names,
@@ -48,6 +48,11 @@ pub struct HarnessOptions {
     pub dynamic_tools: Vec<std::sync::Arc<dyn one_core::tool::Tool>>,
     /// Snapshot of parent session read grants applied as detached child dynamic grants.
     pub parent_read_grants: ParentReadGrants,
+    /// Parent policy is authoritative for subagents. A child may change cwd,
+    /// but never manufacture new roots from it or its AgentSpec.
+    pub parent_path_policy: Option<PathPolicy>,
+    /// Effective rules snapshot, propagated through every harness level.
+    pub permission_rules: PermissionRules,
 }
 
 impl std::fmt::Debug for HarnessOptions {
@@ -58,6 +63,7 @@ impl std::fmt::Debug for HarnessOptions {
             .field("add_dirs", &self.add_dirs)
             .field("auto_approve", &self.auto_approve)
             .field("dynamic_tools", &self.dynamic_tools.len())
+            .field("has_parent_path_policy", &self.parent_path_policy.is_some())
             .field(
                 "parent_read_grants",
                 &(
@@ -78,6 +84,8 @@ impl HarnessOptions {
             auto_approve: true,
             dynamic_tools: vec![],
             parent_read_grants: ParentReadGrants::default(),
+            parent_path_policy: None,
+            permission_rules: PermissionRules::default(),
         }
     }
 }
@@ -205,7 +213,7 @@ pub async fn run_with_control(
     let harness_policy = build_policy(&harness_cwd, &effective_opts, &req.agent);
     let perm_mode = resolve_permission_mode(&req.agent, effective_opts.auto_approve);
     let gate = PermissionGate::with_permission_mode_and_policy(
-        one_tools::PermissionRules::default(),
+        effective_opts.permission_rules.clone(),
         perm_mode,
         false,
         Some(harness_policy),
@@ -363,6 +371,11 @@ fn apply_isolation(
         .unwrap_or_else(|| opts.cwd.clone());
     let handle = super::worktree::WorktreeManager::create(&base, &job_id)?;
     opts.cwd = handle.path.clone();
+    // A worktree is created by the host, so it is the one explicit exception
+    // to inherited roots. Agent-provided cwd never receives this treatment.
+    if let Some(parent) = opts.parent_path_policy.take() {
+        opts.parent_path_policy = Some(parent.with_additional_dirs([handle.path.clone()]));
+    }
     req.agent.cwd = Some(handle.path.display().to_string());
     let note = format!(
         "You are running in an isolated git worktree at {} (branch {}). \
@@ -524,19 +537,25 @@ fn resolve_cwd(spec: &AgentSpec, opts: &HarnessOptions) -> PathBuf {
 }
 
 fn build_policy(cwd: &Path, opts: &HarnessOptions, spec: &AgentSpec) -> PathPolicy {
-    if opts.full_access || spec.sandbox.as_deref() == Some("full-access") {
+    if opts.full_access
+        || (opts.parent_path_policy.is_none() && spec.sandbox.as_deref() == Some("full-access"))
+    {
         return PathPolicy::full_access(cwd.to_path_buf());
     }
     // read_only sandbox: still PathPolicy workspace (file tools may write if
     // registered); callers should use ToolsSpec deny for write tools.
-    let mut dirs: Vec<PathBuf> = opts.add_dirs.clone();
-    for d in &spec.add_dirs {
-        dirs.push(PathBuf::from(d));
-    }
-    // workspace() creates a **new** dynamic Arc (detached from parent).
-    let mut policy = PathPolicy::workspace(cwd.to_path_buf()).with_additional_dirs(dirs);
+    let inherited = opts.parent_path_policy.is_some();
+    let mut policy = if let Some(parent) = &opts.parent_path_policy {
+        parent.derive_for_child(cwd.to_path_buf())
+    } else {
+        let mut dirs: Vec<PathBuf> = opts.add_dirs.clone();
+        for d in &spec.add_dirs {
+            dirs.push(PathBuf::from(d));
+        }
+        PathPolicy::workspace(cwd.to_path_buf()).with_additional_dirs(dirs)
+    };
     // M4: memory readable roots only when resources.memory = index + feature on.
-    if matches!(spec.resources.memory, MemoryResourceMode::Index) {
+    if !inherited && matches!(spec.resources.memory, MemoryResourceMode::Index) {
         let settings = crate::settings::load();
         let features = crate::runtime::features::FeatureState::from_settings(&settings)
             .with_process_overrides(false, crate::runtime::features::env_no_memory());
@@ -670,6 +689,27 @@ mod tests {
         // Should not list agent memory as writable/readable via additional only —
         // readable_roots still include skill defaults; memory path not required.
         let _ = policy;
+    }
+
+    #[test]
+    fn child_cwd_and_full_access_request_cannot_expand_parent_policy() {
+        let workspace =
+            std::env::temp_dir().join(format!("one-harness-parent-{}", std::process::id()));
+        let outside = std::env::current_dir().expect("current directory");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let mut opts = HarnessOptions::from_cwd(workspace.clone());
+        opts.parent_path_policy = Some(PathPolicy::workspace(workspace.clone()));
+        let mut child = AgentSpec::builtin_explore();
+        child.cwd = Some(outside.display().to_string());
+        child.sandbox = Some("full-access".into());
+        let policy = build_policy(&outside, &opts, &child);
+        policy
+            .check(&workspace.join("ok.txt"), one_tools::AccessKind::Write)
+            .expect("parent root remains available");
+        policy
+            .check(&outside.join("escape.txt"), one_tools::AccessKind::Write)
+            .expect_err("child request must not expand roots");
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     #[test]

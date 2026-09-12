@@ -29,7 +29,10 @@ impl Tool for WriteTool {
             "any path".to_string()
         } else {
             format!(
-                "paths under workspace `{}` (and --add-dir roots)",
+                "paths under workspace `{}` (and --add-dir roots); \
+                 `/tmp`, `/var/tmp`, and `$TMPDIR` are writable; \
+                 `~/` is `$HOME`; `~/.one/agent/{{models,settings,mcp}}.json` are writable; \
+                 other outside paths prompt in interactive sessions",
                 self.policy.cwd().display()
             )
         };
@@ -40,6 +43,13 @@ impl Tool for WriteTool {
                 json!({
                     "type": "string",
                     "description": "Full new file contents"
+                }),
+            );
+            obj.insert(
+                "description".into(),
+                json!({
+                    "type": "string",
+                    "description": "Optional short summary of what file is being written"
                 }),
             );
         }
@@ -73,7 +83,11 @@ impl Tool for WriteTool {
 
         let resolved = self
             .policy
-            .resolve(path, AccessKind::Write)
+            .resolve_with_token(
+                path,
+                AccessKind::Write,
+                crate::tool_args::one_time_permission_token(&call.arguments, &call.id),
+            )
             .map_err(|err| tool_error("write", err))?;
         if let Some(parent) = resolved.parent() {
             tokio::fs::create_dir_all(parent)

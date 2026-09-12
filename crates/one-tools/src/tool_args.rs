@@ -14,6 +14,18 @@ use one_core::tool::invalid_args;
 /// Runtime-accepted path keys. Only [`path_properties`] is shown to the model.
 pub const PATH_ARG_KEYS: &[&str] = &["path", "file_path", "filePath"];
 
+/// Internal capability set only on a gate-rewritten effective call. The token
+/// embeds the provider tool-call ID, so it cannot be replayed by another call.
+pub fn one_time_permission_token<'a>(args: &'a Value, call_id: &str) -> Option<&'a str> {
+    let token = args
+        .get("__one_permission_token")
+        .and_then(|v| v.as_str())?;
+    token
+        .strip_suffix(call_id)
+        .filter(|prefix| prefix.ends_with(':'))
+        .map(|_| token)
+}
+
 /// Resolve a filesystem path from tool args.
 ///
 /// Accepts One `path`, Claude `file_path`, or OpenCode `filePath`. Empty strings
@@ -227,5 +239,15 @@ mod tests {
             ),
             Some(false)
         );
+    }
+
+    #[test]
+    fn one_time_token_is_bound_to_call_id() {
+        let args = json!({ "__one_permission_token": "path-once:7:call-a" });
+        assert_eq!(
+            one_time_permission_token(&args, "call-a"),
+            Some("path-once:7:call-a")
+        );
+        assert_eq!(one_time_permission_token(&args, "call-b"), None);
     }
 }

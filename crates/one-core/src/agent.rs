@@ -48,10 +48,13 @@ If you find unexpected state — unfamiliar files, branches, or configuration �
 </action_safety>
 
 <tool_calling>
+- When you need to read multiple files, inspect several directory paths, or run multiple searches, CALL THEM IN PARALLEL in a single turn instead of issuing them one by one across separate turns. Independent observation calls (e.g. `read`, `grep`, `ls`, `web_search`, `web_fetch`) should be batched together to minimize round-trips and latency.
 - Use specialized tools instead of bash commands when possible. Prefer `read` over cat/head/tail, `edit`/`write` over sed/awk/heredoc, `grep` over grep/ripgrep, and `ls` over `bash ls`, `find`/locate, `ls -R`, or `wc`/`stat` just to inspect files. `ls` already includes line counts for text files and size for binaries.
 - Never guess file paths. Derive paths directly from context (e.g. `use`/`import` statements) or verify with `ls`/`grep` before calling `read`. If a file is not found, stop guessing and search with `grep` or `ls`.
 - Use `grep` for content search (including `files_with_matches` when locating files) and `ls` for directory inventories.
 - Reserve bash for actual system commands and terminal operations. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.
+- Do not write inline python or node scripts with complex nested quotes inside bash commands. If a custom script is needed, write it to a temporary file via `write` first and then execute it, or use standard heredocs (`python3 - << 'EOF'`).
+- Always set `description` on tools that support it (such as bash, monitor, task) to a concise human-readable summary of what the action does (3–8 words) for display in the UI and logs.
 </tool_calling>
 
 <background_tasks>
@@ -2088,15 +2091,27 @@ enum GateOutcome {
 
 /// Tools that only observe state and are safe to run concurrently with each other.
 ///
-/// Everything else (writes, shell, MCP, ask_user, plan tools, unknown names) runs serially.
+/// Everything else (writes, shell, destructive MCP, ask_user, plan tools, unknown names) runs serially.
 pub fn is_parallel_safe_tool(name: &str) -> bool {
+    let resolved = resolve_tool_name(name);
     matches!(
-        resolve_tool_name(name),
+        resolved,
         // `task` is explore-only (read-only research) in MVP → concurrent-safe.
         // When general/write subagents land, keep them serial via a different
         // name or gate classification on mode.
-        "read" | "grep" | "ls" | "bash_output" | "web_search" | "web_fetch" | "task"
-    )
+        "read"
+            | "grep"
+            | "ls"
+            | "bash_output"
+            | "web_search"
+            | "web_fetch"
+            | "task"
+            | "memory_search"
+            | "search_tool"
+            | "mcp_status"
+            | "status"
+    ) || resolved.starts_with("deepwiki__read_")
+        || resolved.starts_with("deepwiki__ask_")
 }
 
 /// Detect soft failures that still return `Ok(ToolOutput)` (e.g. bash exit ≠ 0, MCP is_error).
@@ -2406,6 +2421,12 @@ mod tests {
         assert!(is_parallel_safe_tool("ls"));
         assert!(is_parallel_safe_tool("web_search"));
         assert!(is_parallel_safe_tool("task")); // explore MVP concurrent
+        assert!(is_parallel_safe_tool("memory_search"));
+        assert!(is_parallel_safe_tool("search_tool"));
+        assert!(is_parallel_safe_tool("mcp_status"));
+        assert!(is_parallel_safe_tool("status"));
+        assert!(is_parallel_safe_tool("deepwiki__read_wiki_structure"));
+        assert!(is_parallel_safe_tool("deepwiki__ask_question"));
         assert!(!is_parallel_safe_tool("write"));
         assert!(!is_parallel_safe_tool("edit"));
         assert!(!is_parallel_safe_tool("bash"));

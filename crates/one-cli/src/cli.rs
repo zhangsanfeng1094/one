@@ -56,7 +56,7 @@ impl From<OpenaiApi> for one_ai::ProviderApi {
     }
 }
 
-#[derive(Debug, Clone, ValueEnum, Default)]
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
 pub enum RunMode {
     #[default]
     Interactive,
@@ -71,6 +71,13 @@ pub enum RunMode {
     Web,
     /// Multi-channel Bot Gateway (Hermes / Grok Bot for Telegram, Discord, Feishu, etc.).
     Bot,
+}
+
+impl RunMode {
+    /// TUI, ACP stdio, and ACP-over-WebSocket can prompt the user.
+    pub fn is_hitl(self) -> bool {
+        matches!(self, Self::Interactive | Self::Acp | Self::Web)
+    }
 }
 
 #[derive(Parser, Debug, Clone)]

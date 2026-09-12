@@ -26,27 +26,52 @@ impl AppRuntime {
                 .unwrap_or(false)
     }
 
-    /// Append task + job poll/kill tools when the feature + spawn policy allow.
+    /// Append task + job poll/kill tools.
     ///
-    /// Job poll/wait/kill also accept bash `bg_*` ids (unified task surface).
+    /// Grok-named get/wait/kill are always registered so background bash works
+    /// even when the subagent feature is off. `task` / `spawn_subagent` and the
+    /// `job_*` names still require spawn policy.
     pub(super) fn push_task_tools(&self, tools: &mut Vec<Arc<dyn Tool>>) {
-        if !self.should_register_task_tools() {
-            return;
-        }
-        let Some(host) = &self.task_host else {
-            return;
-        };
         let bash = self.bg_registry.clone();
-        tools.push(Arc::new(TaskTool::new(host.clone())));
-        tools.push(Arc::new(JobOutputTool::with_bash(
-            host.jobs(),
+        let jobs = self
+            .task_host
+            .as_ref()
+            .map(|h| h.jobs())
+            .unwrap_or_else(|| {
+                super::jobs::AgentJobRegistry::new(self.bg_registry.notification_queue())
+            });
+
+        if self.should_register_task_tools() {
+            if let Some(host) = &self.task_host {
+                tools.push(Arc::new(TaskTool::new(host.clone())));
+                tools.push(Arc::new(TaskTool::named(host.clone(), "spawn_subagent")));
+                tools.push(Arc::new(JobOutputTool::with_bash(
+                    host.jobs(),
+                    bash.clone(),
+                )));
+                tools.push(Arc::new(WaitTasksTool::with_bash(
+                    host.jobs(),
+                    bash.clone(),
+                )));
+                tools.push(Arc::new(JobKillTool::with_bash(host.jobs(), bash.clone())));
+            }
+        }
+
+        tools.push(Arc::new(JobOutputTool::named(
+            jobs.clone(),
             bash.clone(),
+            "get_command_or_subagent_output",
         )));
-        tools.push(Arc::new(WaitTasksTool::with_bash(
-            host.jobs(),
+        tools.push(Arc::new(WaitTasksTool::named(
+            jobs.clone(),
             bash.clone(),
+            "wait_commands_or_subagents",
         )));
-        tools.push(Arc::new(JobKillTool::with_bash(host.jobs(), bash)));
+        tools.push(Arc::new(JobKillTool::named(
+            jobs,
+            bash,
+            "kill_command_or_subagent",
+        )));
     }
 
     pub(super) async fn apply_act_tools_and_prompt(

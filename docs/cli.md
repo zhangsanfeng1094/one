@@ -103,32 +103,41 @@ one --max-turns 16           # 为自动化任务设置最大 tool 循环；默�
 
 默认 **`workspace-write`**：`read` / `write` / `edit` / `grep` / `glob` / `ls` 只能访问：
 
+工具路径里的 `~/` / `~` 展开为 `$HOME`（与 `/home/you/...` 等价），**不会**当成工作区下的字面量 `~` 目录。
+
 | 范围 | 权限 |
 |------|------|
 | `--cwd`（工作区根） | 读 + 写 |
 | `--add-dir` / settings `additional_directories` | 读 + 写 |
+| `/tmp` · `/var/tmp` · `$TMPDIR` | **读 + 写**（临时目录；探针脚本、上传文件） |
 | `~/.one/agent`（plans / builtin-skills / one skills） | **仅读** |
+| `~/.one/agent/models.json` · `settings.json` · `mcp.json` | **读 + 写**（agent 自身配置；`auth.json` / sessions / `.env` 仍拒写） |
 | `~/.agents/skills`（跨客户端通用 skill 安装位） | **仅读** |
 | `~/.codex/skills` · `~/.claude/skills` · `~/.grok/skills`（兼容） | **仅读** |
 | 已发现 skill 的 package 目录（含 symlink 真实路径） | **仅读** |
+| 可读根的祖先目录（如 `grep`/`ls` `~/.one`） | **自动收窄**到其下可读子树，不列出兄弟项 |
 | 其它绝对路径 / `../` 逃逸 | **拒绝**（见下：交互读可审批） |
 
-### 越界读审批（交互）
+### 越界读/写审批（交互）
 
-Interactive 模式下，`read` / `grep` / `glob` / `ls` 访问工作区外路径时弹出 **路径读审批**（与 bash 高危审批同一 Select 通道）：
+Interactive 模式下，工作区外路径弹出 **路径审批**（与 bash 高危审批同一 Select 通道），而不是静默硬拒：
 
-| 选项 | 语义 |
+| 工具 | 标题 |
 |------|------|
-| Yes, allow this path only | 本进程内只读放行该路径（目录则含子孙） |
-| Yes, add session root `…` | 本进程只读放行建议根目录（敏感树如 `~/.ssh` 不提供此项） |
-| No, deny | 保持边界拒绝 |
+| `read` / `grep` / `glob` / `ls` | Allow read outside workspace? |
+| `write` / `edit` | Allow write outside workspace? |
+
+| 选项 | 读 | 写 |
+|------|----|----|
+| Yes, allow this path only | 本进程只读放行该路径（目录则含子孙） | 本进程读写放行该路径 |
+| Yes, add session root `…` | 本进程只读放行建议根目录 | 本进程读写放行建议根目录（`~/.one/agent`、`~/.ssh` 等敏感树不提供此项，只给 Once） |
+| No, deny | 保持边界拒绝 | 保持边界拒绝 |
 
 - **无 Always**；不会因此进入 always-approve。
-- `write` / `edit` 越界仍 **硬拒**（不弹窗）。
 - `--yes` / Auto / bash **Always** 之后：路径边界仍硬拒、**不弹窗**（路径与 bash 自动化解耦）。
 - `ONE_AUTO_APPROVE=1` 且仍为 Interactive：仍弹路径审批（不自动放行）。
 - 关闭：`ONE_PATH_READ_ESCALATE=0`。
-- 子 agent 继承父会话已批准的只读 grants（detached 快照，不可写）。
+- 子 agent 继承父会话已批准的**只读** grants（detached 快照，写 grants 不传给子 agent）。
 
 ```bash
 # 默认：只能改当前项目
@@ -718,6 +727,10 @@ Settings
 | `BRAVE_API_KEY` | `web_search` 优先用 Brave，否则 DDG HTML |
 | `ONE_AUTO_APPROVE` | 等同 `-y` |
 | `ONE_BASH_SANDBOX` | `0` 关闭 bwrap |
+| `ONE_BASH_AUTO_BACKGROUND` | `0` 关闭前台超时自动转后台（Ctrl+B 仍可用） |
+| `ONE_BASH_FOREGROUND_BUDGET_MS` | 前台阻塞预算，默认 15000 |
+| `ONE_BASH_MAX_BACKGROUND` | 同时 running 的后台 bash/monitor 上限，默认 10；`0` 不限制 |
+| `ONE_BASH_OUTPUT_FILE_MAX_BYTES` | 后台日志文件上限，默认 64MiB |
 | `ONE_DISABLE_SKILLS` | 等同 `--no-skills` |
 | `ONE_TRACE` | 等同 `--trace` |
 | `LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` | Langfuse |
@@ -795,8 +808,8 @@ Slash 命令：
 | 工具 | 模式 | 说明 |
 |------|------|------|
 | `read` / `write` / `edit` | Act（write/edit 仅 Act） | 文件读写与补丁 |
-| `bash` | Act | shell；`run_in_background=true` → 立即返回 `task_id`（**session-owned**，见下） |
-| `bash_output` | Act | 轮询/等待后台 bash 输出（`task_id` 可省略则列 `/ps` 式快照） |
+| `bash` | Act | shell；`run_in_background=true` → 立即返回 `task_id`（**session-owned**，见下）。前台是 dump/replay 持久会话（cwd / export / alias / function / shopt；不是常驻 PTY），结果正文含 `cwd:` 行。后台继承快照但不回写。file tools 仍在 workspace 根。超过 ~15s 或 TUI **Ctrl+B** 会转入后台。同时最多 10 个 running 后台任务（`ONE_BASH_MAX_BACKGROUND`）。后台 stdout/stderr 始终写入 `~/.one/agent/tool-outputs/tasks/<id>.log` |
+| `bash_output` | Act | 轮询/等待后台 bash 输出（`task_id` 可省略则列 `/ps` 式快照）；详情含 `outputFile` |
 | `bash_kill` | Act | 终止指定后台 bash 任务 |
 | `grep` / `glob` / `ls` | Act / Plan / read-only | 搜索与列举 |
 | `task` | Act / Plan / read-only | 子 agent（默认 explore）→ 同一 `harness::run`；见 [protocol.md](./protocol.md)。观测面与 bash **分层**：chip `task:N`、`/tasks` TV4 画框；点击 / Enter / Ctrl+F 打开（**不**进 `/ps`） |
@@ -811,6 +824,7 @@ Slash 命令：
 |------|-----------------|----------------------------------------|
 | 进程退出、`/new`、`/resume`（切换会话） | **全部 kill**；**不**往下一 session 注入 teardown 完成通知 | **全部 kill**；通知队列一并清空 |
 | 运行中 `Esc` / RPC `abort`（软取消当前 turn） | **保留**（`npm run dev` 等长驻进程可继续） | **kill_all**（与父 turn 绑定） |
+| 运行中 **Ctrl+B** | 把当前**前台** bash 踢进 registry（不杀进程，不 abort turn） | 无（subagent 不是前台 bash） |
 | 显式 `bash_kill` / `job_kill` | 按 id 终止 | 按 id 终止 |
 
 ### Edit / Write 的 TUI diff 展示

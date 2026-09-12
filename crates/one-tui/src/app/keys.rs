@@ -41,6 +41,10 @@ impl super::App {
             self.scroll_to_bottom();
             return RunOutcome::Noop;
         }
+        if Self::is_goto_top_key(key) {
+            self.scroll_to_top();
+            return RunOutcome::Noop;
+        }
 
         // Docked select (model / field edit / ask) captures keys before float.
         if self.select.is_some() {
@@ -452,11 +456,34 @@ impl super::App {
             && !key.modifiers.contains(KeyModifiers::ALT)
     }
 
-    /// Alt+G jumps to the live transcript without stealing Ctrl+G Settings or Shift+G uppercase typing.
+    /// Ctrl+B — send the running foreground bash to the background (Grok-aligned).
+    /// Also accept legacy ASCII STX (0x02) from hosts that strip CONTROL.
+    pub(crate) fn is_ctrl_b(key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('b') | KeyCode::Char('B') => {
+                key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SHIFT)
+            }
+            KeyCode::Char('\u{02}') => true,
+            _ => false,
+        }
+    }
+
+    /// Jump to the live transcript without stealing Ctrl+G Settings or Shift+G uppercase typing:
+    /// - Alt+G / Alt+g
+    /// - Ctrl+End
     pub(crate) fn is_goto_bottom_key(key: KeyEvent) -> bool {
-        matches!(key.code, KeyCode::Char('G') | KeyCode::Char('g'))
+        (matches!(key.code, KeyCode::Char('G') | KeyCode::Char('g'))
             && key.modifiers.contains(KeyModifiers::ALT)
-            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !key.modifiers.contains(KeyModifiers::CONTROL))
+            || (matches!(key.code, KeyCode::End) && key.modifiers.contains(KeyModifiers::CONTROL))
+    }
+
+    /// Jump to the top of transcript history:
+    /// - Ctrl+Home
+    pub(crate) fn is_goto_top_key(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Home) && key.modifiers.contains(KeyModifiers::CONTROL)
     }
 
     /// Alt+Z — fold / expand the focused (or current) user turn.

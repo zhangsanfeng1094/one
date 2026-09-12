@@ -5,7 +5,7 @@ use one_core::error::Result;
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
-use crate::path_policy::{AccessKind, PathPolicy};
+use crate::path_policy::{PathPolicy, ReadCoverage};
 use crate::tool_args::{path_arg_or, u64_arg};
 
 /// Soft cap so `ls` on `node_modules` cannot dump tens of thousands of rows.
@@ -34,7 +34,9 @@ impl Tool for LsTool {
             name: "ls".to_string(),
             description: "List files in a directory. Text files include a line count (same \
                  semantics as `read`); binaries and files over 1MB show size. Default is \
-                 the workspace root; paths outside need interactive approval or --add-dir."
+                 the workspace root. `~/` is `$HOME`. Paths outside need interactive \
+                 approval or --add-dir; a parent of readable roots is listed as those \
+                 roots only (siblings stay hidden)."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -59,10 +61,19 @@ impl Tool for LsTool {
         let limit = u64_arg(&call.arguments, "limit")
             .map(|n| n.max(1) as usize)
             .unwrap_or(DEFAULT_LIMIT);
-        let resolved = self
+        let coverage = self
             .policy
-            .resolve(path, AccessKind::Read)
+            .resolve_read_with_token(
+                path,
+                crate::tool_args::one_time_permission_token(&call.arguments, &call.id),
+            )
             .map_err(|err| tool_error("ls", err))?;
+
+        if let ReadCoverage::Narrowed { requested, roots } = &coverage {
+            return list_narrowed(&requested, roots, limit);
+        }
+
+        let resolved = coverage.requested().to_path_buf();
 
         let meta = tokio::fs::metadata(&resolved)
             .await
@@ -127,6 +138,45 @@ impl Tool for LsTool {
             }),
         ))
     }
+}
+
+/// List overlapping readable roots without readdir of the denied ancestor.
+fn list_narrowed(requested: &Path, roots: &[PathBuf], limit: usize) -> Result<ToolOutput> {
+    let mut rows: Vec<(String, String)> = Vec::new();
+    for root in roots {
+        let rel = root
+            .strip_prefix(requested)
+            .ok()
+            .map(|p| p.display().to_string().replace('\\', "/"))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| root.display().to_string());
+        let line = if root.is_file() {
+            format!("{rel} [file] (readable)")
+        } else {
+            format!("{rel} [dir] (readable)")
+        };
+        rows.push((rel, line));
+    }
+    rows.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
+    let total = rows.len();
+    let truncated = total > limit;
+    let mut lines: Vec<String> = rows.into_iter().take(limit).map(|(_, line)| line).collect();
+    lines.push(format!(
+        "(listing narrowed to readable roots under {}; other entries hidden)",
+        requested.display()
+    ));
+    if truncated {
+        lines.push(format!("... (truncated at {limit} entries, {total} total)"));
+    }
+    Ok(ToolOutput::text_with_details(
+        lines.join("\n"),
+        json!({
+            "path": requested.display().to_string(),
+            "entries": total,
+            "truncated": truncated,
+            "narrowed": true,
+        }),
+    ))
 }
 
 /// Line count for text files (matches `read`'s `str::lines()`), size otherwise.
@@ -279,5 +329,43 @@ mod tests {
         assert_eq!(format_line_count(2), "2 lines");
         assert_eq!(format_size(4), "4 bytes");
         assert_eq!(format_size(1536), "1.5K");
+    }
+
+    #[tokio::test]
+    async fn parent_of_readable_root_lists_only_allowed() {
+        let dir = temp_workspace();
+        let parent = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("target")
+            .join(format!(
+                "one-ls-narrow-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let allowed = parent.join("allowed");
+        let secret = parent.join("secret");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("leak.txt"), "no").unwrap();
+
+        let policy = PathPolicy::workspace(dir.clone()).with_readable_root(allowed.clone());
+        let tool = LsTool::with_policy(policy);
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "ls".into(),
+                arguments: json!({ "path": parent.to_str().unwrap() }),
+            })
+            .await
+            .unwrap();
+        let text = out.as_text();
+        assert!(text.contains("allowed [dir] (readable)"), "{text}");
+        assert!(!text.contains("secret"), "sibling leak:\n{text}");
+        assert!(text.contains("listing narrowed"), "{text}");
+        let _ = std::fs::remove_dir_all(&parent);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

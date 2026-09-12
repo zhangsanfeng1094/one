@@ -25,6 +25,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::time::Instant;
 
+use ratatui::layout::Rect;
+
 use crate::float::FloatMenu;
 use crate::message::{AlertLevel, ChatLineTarget, Message};
 use crate::slash::ModelChoice;
@@ -120,6 +122,8 @@ pub struct App {
     pub chat_sticky_line: Option<usize>,
     /// Terminal row where the sticky bar is rendered (`None` when not visible).
     pub chat_sticky_y: Option<u16>,
+    /// Terminal Rect where the "Jump to bottom" badge is rendered (`None` when hidden).
+    pub chat_jump_to_bottom_rect: Option<Rect>,
     /// In-app transcript selection (character carets on absolute display lines).
     /// App-owned select + OSC 52 copy — does not need native terminal drag-select.
     pub select_anchor: Option<SelectPos>,
@@ -266,6 +270,8 @@ pub struct App {
     followup_pending: Option<String>,
     steer_pending: Option<String>,
     abort_pending: bool,
+    /// Ctrl+B: send the in-flight foreground bash to the background (does not abort).
+    background_now_pending: bool,
     /// UI outcomes queued while streaming (e.g. `/ps`) for the CLI busy tick.
     busy_ui_queue: VecDeque<RunOutcome>,
     /// Ctrl+C force-quit: leave interactive immediately (not soft cancel).
@@ -356,6 +362,7 @@ impl App {
             chat_content_y: 0,
             chat_sticky_line: None,
             chat_sticky_y: None,
+            chat_jump_to_bottom_rect: None,
             select_anchor: None,
             select_end: None,
             select_dragging: false,
@@ -434,6 +441,7 @@ impl App {
             followup_pending: None,
             steer_pending: None,
             abort_pending: false,
+            background_now_pending: false,
             busy_ui_queue: VecDeque::new(),
             force_quit_pending: false,
             pending_images: Vec::new(),

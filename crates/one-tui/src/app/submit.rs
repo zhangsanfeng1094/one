@@ -21,6 +21,8 @@ impl super::App {
             self.pending_texts.clear();
             self.committed_images.clear();
             self.input.clear();
+            self.input_cursor = 0;
+            self.clear_input_selection();
             return RunOutcome::Quit;
         }
         if text == "/help" {
@@ -35,6 +37,8 @@ impl super::App {
             self.pending_texts.clear();
             self.committed_images.clear();
             self.input.clear();
+            self.input_cursor = 0;
+            self.clear_input_selection();
             self.chat_scroll = 0;
             self.follow_bottom = true;
             self.set_notice("chat cleared");
@@ -49,6 +53,8 @@ impl super::App {
         // Also skip ↑ prompt history: recalling `/model` / `/session` is noise.
         if is_ui_slash(&text) {
             self.input.clear();
+            self.input_cursor = 0;
+            self.clear_input_selection();
             return RunOutcome::Prompt(text);
         }
 
@@ -77,6 +83,8 @@ impl super::App {
         // Transcript keeps compact chips (`[图片.img]` / `[文本.txt]`), not the full paste.
         self.push_prompt_history(&text);
         self.input.clear();
+        self.input_cursor = 0;
+        self.clear_input_selection();
         self.push_user(&text);
         RunOutcome::Prompt(expanded)
     }
@@ -89,6 +97,8 @@ impl super::App {
         }
         let expanded = self.take_materialized_text(&text);
         self.input.clear();
+        self.input_cursor = 0;
+        self.clear_input_selection();
         self.push_user(&text);
         self.followup_pending = Some(expanded.clone());
         RunOutcome::FollowUp(expanded)
@@ -102,6 +112,8 @@ impl super::App {
         }
         let expanded = self.take_materialized_text(&text);
         self.input.clear();
+        self.input_cursor = 0;
+        self.clear_input_selection();
         self.push_user(&text);
         self.steer_pending = Some(expanded.clone());
         RunOutcome::Steer(expanded)

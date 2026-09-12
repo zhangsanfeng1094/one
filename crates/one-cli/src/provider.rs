@@ -1854,7 +1854,7 @@ pub(crate) fn heuristic_context_window(model: &str) -> usize {
             128_000
         }
     } else if lower.contains("deepseek") {
-        64_000
+        256_000
     } else if lower.contains("qwen") {
         128_000
     } else if lower.contains("gpt-4o")
@@ -1869,5 +1869,37 @@ pub(crate) fn heuristic_context_window(model: &str) -> usize {
         128_000
     } else {
         0
+    }
+}
+
+#[cfg(test)]
+mod heuristic_context_window_tests {
+    use super::heuristic_context_window;
+
+    #[test]
+    fn deepseek_series_defaults_to_256k() {
+        // Whole deepseek family shares one default; covers V3/V4 and the
+        // `deepseek/deepseek-*` ids used by aggregator providers.
+        for model in [
+            "deepseek-chat",
+            "deepseek-reasoner",
+            "deepseek-v3.2",
+            "deepseek-v4-flash",
+            "deepseek-v4-flash:free",
+            "deepseek-v4-pro",
+            "deepseek-v4.1-flash",
+            "DeepSeek-V4.1-Flash",
+            "deepseek/deepseek-v4-pro",
+        ] {
+            assert_eq!(heuristic_context_window(model), 256_000, "model={model}");
+        }
+    }
+
+    #[test]
+    fn unrelated_families_are_unchanged() {
+        assert_eq!(heuristic_context_window("claude-sonnet-4.6"), 200_000);
+        assert_eq!(heuristic_context_window("gemini-3-flash"), 1_000_000);
+        assert_eq!(heuristic_context_window("grok-4.5"), 256_000);
+        assert_eq!(heuristic_context_window("glm-5.3"), 0);
     }
 }

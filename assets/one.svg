@@ -1,0 +1,70 @@
+<svg
+  width="600"
+  height="600"
+  viewBox="0 0 600 600"
+  fill="none"
+  xmlns="http://www.w3.org/2000/svg"
+>
+
+  <defs>
+    <!-- 单根辐射线 -->
+    <line id="spoke" x1="300" y1="182" x2="300" y2="128" />
+
+    <!-- 单个外部圆点 -->
+    <circle id="node" cx="300" cy="110" r="18" />
+  </defs>
+
+  <!-- 白色结构线 -->
+  <g
+    stroke="#F3F3F3"
+    stroke-width="10"
+    stroke-linecap="round"
+    stroke-linejoin="round"
+    fill="none"
+  >
+    <!-- 8 根辐射线 -->
+    <use href="#spoke" />
+    <use href="#spoke" transform="rotate(45 300 300)" />
+    <use href="#spoke" transform="rotate(90 300 300)" />
+    <use href="#spoke" transform="rotate(135 300 300)" />
+    <use href="#spoke" transform="rotate(180 300 300)" />
+    <use href="#spoke" transform="rotate(225 300 300)" />
+    <use href="#spoke" transform="rotate(270 300 300)" />
+    <use href="#spoke" transform="rotate(315 300 300)" />
+
+    <!-- 中间 8 个内凹弧组成的主体 -->
+    <path d="
+      M300 182
+      Q323.7 242.7 383.4 216.6
+      Q357.3 276.3 418 300
+      Q357.3 323.7 383.4 383.4
+      Q323.7 357.3 300 418
+      Q276.3 357.3 216.6 383.4
+      Q242.7 323.7 182 300
+      Q242.7 276.3 216.6 216.6
+      Q276.3 242.7 300 182
+      Z
+    " />
+  </g>
+
+  <!-- 中心圆环 -->
+  <circle
+    cx="300"
+    cy="300"
+    r="43"
+    stroke="#74E8B1"
+    stroke-width="12"
+  />
+
+  <!-- 8 个绿色节点 -->
+  <g fill="#74E8B1">
+    <use href="#node" />
+    <use href="#node" transform="rotate(45 300 300)" />
+    <use href="#node" transform="rotate(90 300 300)" />
+    <use href="#node" transform="rotate(135 300 300)" />
+    <use href="#node" transform="rotate(180 300 300)" />
+    <use href="#node" transform="rotate(225 300 300)" />
+    <use href="#node" transform="rotate(270 300 300)" />
+    <use href="#node" transform="rotate(315 300 300)" />
+  </g>
+</svg>

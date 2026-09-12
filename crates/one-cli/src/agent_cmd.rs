@@ -198,6 +198,9 @@ async fn execute_run(
     opts.add_dirs = global.add_dir.clone();
     opts.auto_approve = global.auto_approve
         || std::env::var_os("ONE_AUTO_APPROVE").is_some_and(|v| v != "0" && v != "false");
+    opts.permission_rules = crate::settings::load()
+        .permissions
+        .unwrap_or_else(one_tools::PermissionRules::default);
 
     // Optional Langfuse on the same path as main agent / nested task (control.trace).
     let mut control = RunControl::default();

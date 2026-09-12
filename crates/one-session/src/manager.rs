@@ -1313,6 +1313,11 @@ mod tests {
     fn rehydrate_swaps_display_label_text_for_real_image_blocks() {
         use one_core::message::{TextOrImage, UserContent, UserMessage};
 
+        let temp_media =
+            std::env::temp_dir().join(format!("one-test-media-{}", uuid::Uuid::new_v4().simple()));
+        let _ = std::fs::create_dir_all(&temp_media);
+        let prev_media = one_core::image::set_media_dir_override(Some(temp_media.clone()));
+
         let tiny = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
         let (media_path, mime) =
             one_core::image::store_image_base64(tiny, Some("image/png")).unwrap();
@@ -1391,6 +1396,9 @@ mod tests {
         assert_eq!(imgs.len(), 1);
         assert_eq!(imgs[0].0, "image/png");
         assert!(std::path::Path::new(&imgs[0].1).is_file());
+
+        let _ = one_core::image::set_media_dir_override(prev_media);
+        let _ = std::fs::remove_dir_all(&temp_media);
     }
 
     #[test]
@@ -1473,8 +1481,16 @@ mod tests {
         assert_eq!(summary.usage_total.unwrap().input_tokens, 11);
     }
 
+    static TEST_OVERRIDE_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[tokio::test]
     async fn summary_sidecar_roundtrip_and_list() {
+        let _guard = TEST_OVERRIDE_MUTEX.lock().unwrap();
+        let temp_agent =
+            std::env::temp_dir().join(format!("one-test-agent-{}", uuid::Uuid::new_v4().simple()));
+        let _ = std::fs::create_dir_all(&temp_agent);
+        let prev_agent = crate::paths::set_agent_dir_override(Some(temp_agent.clone()));
+
         let cwd = std::env::temp_dir().join(format!(
             "one-session-summary-{}",
             uuid::Uuid::new_v4().simple()
@@ -1511,10 +1527,8 @@ mod tests {
         assert_eq!(hit.model.as_deref(), Some("grok-test"));
         assert!(hit.display_label().contains("summary list probe"));
 
-        // Clean session dir under ~/.one for this cwd encoding.
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
+        let _ = crate::paths::set_agent_dir_override(prev_agent);
+        let _ = std::fs::remove_dir_all(&temp_agent);
         let _ = std::fs::remove_dir_all(&cwd);
     }
 
@@ -1522,6 +1536,12 @@ mod tests {
     async fn list_is_lightweight_and_newest_first() {
         use std::time::Duration;
         use tokio::time::sleep;
+
+        let _guard = TEST_OVERRIDE_MUTEX.lock().unwrap();
+        let temp_agent =
+            std::env::temp_dir().join(format!("one-test-agent-{}", uuid::Uuid::new_v4().simple()));
+        let _ = std::fs::create_dir_all(&temp_agent);
+        let prev_agent = crate::paths::set_agent_dir_override(Some(temp_agent.clone()));
 
         let dir = std::env::temp_dir().join(format!(
             "one-session-list-{}",
@@ -1583,6 +1603,8 @@ mod tests {
         let info = SessionManager::list_info(&list[0].path).await.unwrap();
         assert_eq!(info.id, list[0].id);
 
+        let _ = crate::paths::set_agent_dir_override(prev_agent);
+        let _ = std::fs::remove_dir_all(&temp_agent);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

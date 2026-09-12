@@ -460,6 +460,57 @@ fn build_chat_lines(
                 }
             }
 
+            let is_in_flight_tail = app.busy && (i + streak == app.messages.len());
+
+            // During an active in-flight turn, keep the active/running tool prominently
+            // visible on the outside as a full single tool call row, while folding preceding
+            // completed tools once there are at least 2 of them.
+            if is_in_flight_tail && !any_ungroup && streak >= 2 {
+                let last_k = streak - 1;
+                let prev_slice = &slice[..last_k];
+                let has_group_header = prev_slice.len() >= 2
+                    && tool_view::streak_can_collapse(&app.messages, i, last_k);
+                if has_group_header {
+                    let header = render_tool_group(prev_slice, wrap_width, row_width, false);
+                    push_owned(
+                        &mut lines,
+                        &mut owners,
+                        header,
+                        Some(ChatLineTarget::ToolGroup(i)),
+                    );
+                } else {
+                    for k in 0..last_k {
+                        let tmsg = &slice[k];
+                        let chunk = message_lines(tmsg, app, wrap_width, row_width, i + k, None);
+                        push_owned(
+                            &mut lines,
+                            &mut owners,
+                            chunk,
+                            Some(ChatLineTarget::Message(i + k)),
+                        );
+                    }
+                }
+
+                // Active tool (running or newly completed awaiting model next turn)
+                // If preceded by a group header, connect with a visual tree branch `└ `
+                let group_child = if has_group_header {
+                    Some(GroupChild { is_last: true })
+                } else {
+                    None
+                };
+                let tmsg = &slice[last_k];
+                let chunk =
+                    message_lines(tmsg, app, wrap_width, row_width, i + last_k, group_child);
+                push_owned(
+                    &mut lines,
+                    &mut owners,
+                    chunk,
+                    Some(ChatLineTarget::Message(i + last_k)),
+                );
+                i += streak;
+                continue;
+            }
+
             if tool_view::streak_can_collapse(&app.messages, i, streak) {
                 let group_lines =
                     render_tool_group(&app.messages[i..i + streak], wrap_width, row_width, false);
@@ -474,15 +525,33 @@ fn build_chat_lines(
             }
 
             if summary_running {
-                let header = render_tool_group(slice, wrap_width, row_width, false);
-                push_owned(
-                    &mut lines,
-                    &mut owners,
-                    header,
-                    Some(ChatLineTarget::ToolGroup(i)),
-                );
-                for (k, tmsg) in slice.iter().enumerate() {
-                    if tmsg.tool_status == Some(ToolStatus::Running) {
+                let done_indices: Vec<usize> = slice
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| m.tool_status == Some(ToolStatus::Done))
+                    .map(|(k, _)| k)
+                    .collect();
+                let running_indices: Vec<usize> = slice
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, m)| m.tool_status == Some(ToolStatus::Running))
+                    .map(|(k, _)| k)
+                    .collect();
+
+                let has_done_header = done_indices.len() >= 2;
+                if has_done_header {
+                    let done_slice: Vec<Message> =
+                        done_indices.iter().map(|&k| slice[k].clone()).collect();
+                    let header = render_tool_group(&done_slice, wrap_width, row_width, false);
+                    push_owned(
+                        &mut lines,
+                        &mut owners,
+                        header,
+                        Some(ChatLineTarget::ToolGroup(i)),
+                    );
+                } else {
+                    for &k in &done_indices {
+                        let tmsg = &slice[k];
                         let chunk = message_lines(tmsg, app, wrap_width, row_width, i + k, None);
                         push_owned(
                             &mut lines,
@@ -491,6 +560,26 @@ fn build_chat_lines(
                             Some(ChatLineTarget::Message(i + k)),
                         );
                     }
+                }
+
+                // In-flight running tools stay prominently visible outside/below with tree branches
+                let n_running = running_indices.len();
+                for (rn, &k) in running_indices.iter().enumerate() {
+                    let tmsg = &slice[k];
+                    let group_child = if has_done_header {
+                        Some(GroupChild {
+                            is_last: rn + 1 == n_running,
+                        })
+                    } else {
+                        None
+                    };
+                    let chunk = message_lines(tmsg, app, wrap_width, row_width, i + k, group_child);
+                    push_owned(
+                        &mut lines,
+                        &mut owners,
+                        chunk,
+                        Some(ChatLineTarget::Message(i + k)),
+                    );
                 }
                 i += streak;
                 continue;
@@ -652,45 +741,42 @@ fn build_chat_lines(
         i += 1;
     }
 
-    // Spinner while waiting for first token, or while only thinking has started.
-    // Running tools already show their own cyan spinners — keep this row neutral
-    // so it doesn't collide with blue focus or peach user chrome.
+    // Spinner while waiting for first token or while waiting for model next step.
+    // Actively running tools are already rendered prominently on the outside as full tool call rows.
     if app.busy && app.stream_buffer.is_empty() && app.thinking_buffer.is_empty() {
         let show = app.messages.last().map(|m| !m.streaming).unwrap_or(true);
         if show {
-            if !lines.is_empty() {
-                let blank = Line::from("");
-                lines.push(blank);
-                owners.push(None);
-            }
-            let spin = SPINNER[app.spinner_frame % SPINNER.len()];
             let running_n = app
                 .messages
                 .iter()
                 .filter(|m| m.tool_status == Some(ToolStatus::Running))
                 .count();
-            // Prefer "Running…" while tools are in flight. Once every tool row
-            // is sealed (e.g. foreground `task` finished) but the parent is still
-            // busy on the next model call, say so explicitly — "Thinking…" was
-            // misleading when the subagent had already returned and the hang was
-            // the parent waiting on the next LLM turn.
-            let label = if running_n > 0 {
-                if running_n == 1 {
-                    "Running…".into()
-                } else {
-                    format!("Running ({running_n})…")
+
+            if running_n == 0 {
+                let prev_is_tool = app
+                    .messages
+                    .last()
+                    .map(|m| m.role == MessageRole::Tool)
+                    .unwrap_or(false);
+                if !prev_is_tool && !lines.is_empty() {
+                    let blank = Line::from("");
+                    lines.push(blank);
+                    owners.push(None);
                 }
-            } else {
-                "Waiting for model…".into()
-            };
-            // Cyan spinner family — same as running tools (not focus blue / user peach).
-            let wait = Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("{spin} "), Theme::tool_icon_running()),
-                Span::styled(label, Theme::busy()),
-            ]);
-            lines.push(wait);
-            owners.push(None);
+                let spin = SPINNER[app.spinner_frame % SPINNER.len()];
+                let label: &'static str = if app.busy_activity == "compacting" {
+                    "Compacting context…"
+                } else {
+                    "Waiting for model…"
+                };
+                let wait = Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{spin} "), Theme::tool_icon_running()),
+                    Span::styled(label, Theme::busy()),
+                ]);
+                lines.push(wait);
+                owners.push(None);
+            }
         }
     }
 
@@ -846,17 +932,21 @@ pub(super) fn render_tool_group(
             tool_view::tool_display_name(raw, &t.content)
         })
         .collect();
-    let mut joined = tool_view::aggregate_tool_names(&names);
+    let joined = tool_view::aggregate_tool_names(&names);
     let dur = format_ms(tool_view::tools_duration_ms(tools));
     let running = tool_view::first_running(tools);
-    let chevron = if expanded { "▾" } else { "▸" };
+    let chevron = if expanded { "▾" } else { "⮜" };
+
+    let streak_title = tool_view::format_tool_streak_summary(tools);
 
     let mut left = vec![
         Span::raw("  "),
-        Span::styled(chevron, Theme::tool_icon_done()),
-        Span::styled(format!(" {n} tools"), Theme::tool_group_title()),
+        Span::styled(format!("{chevron} "), Theme::tool_icon_done()),
+        Span::styled(format!("{n} tools"), Theme::tool_group_title()),
     ];
-    if let Some(d) = &dur {
+    if let Some(streak) = &streak_title {
+        left.push(Span::styled(format!(" · {streak}"), Theme::meta()));
+    } else if let Some(d) = &dur {
         left.push(Span::styled(format!(" · {d}"), Theme::meta()));
     }
 
@@ -870,10 +960,11 @@ pub(super) fn render_tool_group(
         ]
     } else {
         let budget = wrap_width.saturating_sub(18).max(8);
-        if display_width(&joined) > budget {
-            joined = truncate_display(&joined, budget);
+        let mut j = joined.clone();
+        if display_width(&j) > budget {
+            j = truncate_display(&j, budget);
         }
-        vec![Span::styled(joined, Theme::tool_group())]
+        vec![Span::styled(j, Theme::tool_group())]
     };
 
     let left_w: usize = left.iter().map(|s| display_width(s.content.as_ref())).sum();
@@ -1227,7 +1318,22 @@ fn thinking_preview(content: &str, max_cols: usize) -> String {
 }
 
 fn duration_label(message: &Message) -> Option<String> {
-    message.duration_ms.and_then(format_ms)
+    if let Some(ms) = message.duration_ms {
+        if ms == 0 {
+            Some("<1ms".to_string())
+        } else {
+            format_ms(ms)
+        }
+    } else if let Some(t0) = message.started_at {
+        let s = t0.elapsed().as_secs_f32();
+        if s < 10.0 {
+            Some(format!("{:.1}s", s))
+        } else {
+            Some(format!("{}s", s as u64))
+        }
+    } else {
+        None
+    }
 }
 
 fn format_ms(ms: u64) -> Option<String> {
@@ -2310,17 +2416,39 @@ fn render_tool(
 ) -> Vec<Line<'static>> {
     let raw_name = message.tool_name.clone().unwrap_or_else(|| "tool".into());
     let detail = message.content.trim();
-    let name = tool_view::tool_display_name(&raw_name, detail);
     let status = message.tool_status.unwrap_or(ToolStatus::Done);
     let cwd = app.history_cwd.as_deref();
     let is_error = status == ToolStatus::Error;
+    let dur = duration_label(message);
+
+    let name = if raw_name == "task" {
+        match status {
+            ToolStatus::Running => "Task started:".to_string(),
+            ToolStatus::Done => {
+                if let Some(d) = &dur {
+                    format!("Task completed in {d}:")
+                } else {
+                    "Task completed:".to_string()
+                }
+            }
+            ToolStatus::Error => "Task failed:".to_string(),
+        }
+    } else {
+        tool_view::tool_display_name(&raw_name, detail)
+    };
 
     let (icon, icon_style) = match status {
         ToolStatus::Running => {
             let spin = SPINNER[app.spinner_frame % SPINNER.len()];
             (spin.to_string(), Theme::tool_icon_running())
         }
-        ToolStatus::Done => ("✓".into(), Theme::tool_icon_done()),
+        ToolStatus::Done => {
+            if group_child.is_none() {
+                ("◆".into(), Theme::tool_icon_done())
+            } else {
+                ("✓".into(), Theme::tool_icon_done())
+            }
+        }
         ToolStatus::Error => ("✗".into(), Theme::tool_icon_error()),
     };
 
@@ -2341,7 +2469,6 @@ fn render_tool(
     } else {
         tool_view::single_line_preview(&tool_view::shorten_paths_in_text(summary_raw, cwd), 48)
     };
-    let dur = duration_label(message);
     let metrics = {
         let mut parts: Vec<String> = Vec::new();
         if !summary_clean.is_empty() {
@@ -2357,7 +2484,7 @@ fn render_tool(
         }
     };
 
-    let lead_w = if group_child.is_some() { 4 } else { 2 };
+    let lead_w = if group_child.is_some() { 6 } else { 4 };
     let name_w = display_width(&name).max(4).min(16);
     let result_w = 10usize;
     let time_w = 6usize;

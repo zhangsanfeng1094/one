@@ -16,3 +16,7 @@ benches/out/
 benches/**/target/
 benches/projects/**/target/
 benches/projects/**/Cargo.lock
+
+# Code intelligence
+.codegraph/
+

@@ -25,6 +25,7 @@ use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
 use super::coordinator::{CoordinatorConfig, SpawnSpec, SubagentCoordinator};
+use super::effective_config::EffectiveRuntimeConfig;
 use super::harness::{self, HarnessOptions, ParentReadGrants};
 use super::jobs::{AgentJobRegistry, SpawnOptions};
 use super::presets;
@@ -33,7 +34,7 @@ use crate::protocol::{
     ProtocolError, RunParent, RunRequest, RunResult, SessionMode, TaskExitStatus, ToolProfile,
     ToolsSpec,
 };
-use one_tools::PathPolicy;
+use one_tools::{PathPolicy, PermissionRules};
 
 /// Cap tool_result text so a long child summary does not flood the parent.
 const SUMMARY_MAX_CHARS: usize = DEFAULT_MAX_BYTES;
@@ -183,8 +184,10 @@ impl TaskToolHost {
     /// Snapshot parent grants into harness opts at spawn time.
     pub async fn child_harness_opts(&self) -> HarnessOptions {
         let mut opts = self.opts.read().await.clone();
-        let exported = self.parent_path_policy.read().await.export_read_grants();
+        let parent = self.parent_path_policy.read().await.clone();
+        let exported = parent.export_read_grants();
         opts.parent_read_grants = ParentReadGrants::from(exported);
+        opts.parent_path_policy = Some(parent);
         opts
     }
 
@@ -281,10 +284,11 @@ impl TaskHarness for DefaultTaskHarness {
     }
 }
 
-/// Meta-tool `task` — only registered on parent agents that may spawn.
+/// Meta-tool `spawn_subagent` / `task` — only registered on parent agents that may spawn.
 pub struct TaskTool {
     harness: Arc<dyn TaskHarness>,
     host: Arc<TaskToolHost>,
+    name: String,
 }
 
 impl TaskTool {
@@ -292,12 +296,25 @@ impl TaskTool {
         Self {
             harness: Arc::new(DefaultTaskHarness::new(host.clone())),
             host,
+            name: "task".into(),
+        }
+    }
+
+    pub fn named(host: Arc<TaskToolHost>, name: impl Into<String>) -> Self {
+        Self {
+            harness: Arc::new(DefaultTaskHarness::new(host.clone())),
+            host,
+            name: name.into(),
         }
     }
 
     /// Test / alternate injection.
     pub fn with_harness(host: Arc<TaskToolHost>, harness: Arc<dyn TaskHarness>) -> Self {
-        Self { harness, host }
+        Self {
+            harness,
+            host,
+            name: "task".into(),
+        }
     }
 }
 
@@ -332,7 +349,7 @@ impl Tool for TaskTool {
             Err(_) => String::new(),
         };
         ToolDefinition {
-            name: "task".into(),
+            name: self.name.clone(),
             description: format!(
                 "Spawn a sub-agent (same harness as `one agent run`). Isolated context; \
 returns a summary so this conversation stays small. Do not use for a single trivial file read. \
@@ -414,58 +431,10 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
-        let prompt = call
-            .arguments
-            .get("prompt")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| invalid_args("task", "missing non-empty `prompt`"))?
-            .to_string();
-
-        let description = call
-            .arguments
-            .get("description")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-
-        let agent_name = resolve_agent_name(&call.arguments);
-        let background = parse_background(&call.arguments);
-        let isolation_arg = call
-            .arguments
-            .get("isolation")
-            .and_then(|v| v.as_str())
-            .and_then(IsolationMode::parse);
-        let capability_mode = call
-            .arguments
-            .get("capability_mode")
-            .and_then(|v| v.as_str())
-            .and_then(CapabilityMode::parse);
-        let resume_from = call
-            .arguments
-            .get("resume_from")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let cwd_arg = call
-            .arguments
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-        let model_override = call
-            .arguments
-            .get("model")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(str::to_string);
-
         let parent_agent = self.host.parent_agent.read().await.clone();
         let parent_depth = self.host.parent_depth.load(Ordering::Relaxed);
         let child_depth = parent_depth + 1;
+        let base_cwd = self.host.opts.read().await.cwd.clone();
 
         let parent_meta = RunParent {
             run_id: self.host.parent_run_id.read().await.clone(),
@@ -475,13 +444,39 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             depth: child_depth,
         };
 
+        let config = match EffectiveRuntimeConfig::resolve(
+            &parent_agent,
+            &parent_meta,
+            &call.arguments,
+            &base_cwd,
+        ) {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(format_task_output(
+                    "explore",
+                    None,
+                    &RunResult::failure(e, 0).with_status(TaskExitStatus::RuntimeError),
+                ));
+            }
+        };
+
+        if config.prompt.is_empty() {
+            return Err(invalid_args(&self.name, "missing non-empty `prompt`"));
+        }
+
+        let agent_name = config.agent_name.clone();
+        let description = config.description.clone();
+        let background = config.run_in_background;
+        let resume_from = config.resume_from.clone();
+        let cwd_arg = config.cwd.as_ref().map(|p| p.display().to_string());
+
         let mut req = match build_child_request(
             &parent_agent,
             &agent_name,
-            &prompt,
+            &config.prompt,
             parent_meta.clone(),
             call.arguments.get("agent_spec"),
-            &self.host.opts.read().await.cwd,
+            &base_cwd,
         ) {
             Ok(r) => r,
             Err(e) => {
@@ -494,16 +489,14 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
         };
         // M4: settings.memory.subagent may opt-in Index for children still at Off.
         apply_subagent_memory_settings(&mut req.agent);
-        if let Some(mode) = capability_mode {
-            apply_capability_mode(&mut req.agent, mode);
-        }
+        apply_capability_mode(&mut req.agent, config.capability_mode);
         apply_mcp_inheritance(&mut req.agent);
-        if let Some(ref mid) = model_override {
+        if let Some(ref mid) = config.model {
             req.agent.model.id = Some(mid.clone());
             req.agent.model.inherit = false;
         }
-        if let Some(iso) = isolation_arg {
-            req.agent.isolation = iso;
+        if config.isolation == IsolationMode::Worktree {
+            req.agent.isolation = IsolationMode::Worktree;
         }
         // resume_from: inherit transcript / cwd; isolation=worktree + explicit cwd ignored.
         if let Some(ref src_id) = resume_from {
@@ -548,7 +541,7 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
 
         // Fail closed: read-only explore cannot inspect VCS via bash — do not burn
         // 10+ turns reading `.git/index` and return a fake success summary.
-        if child_lacks_bash(&req.agent) && prompt_looks_like_vcs_workflow(&prompt) {
+        if child_lacks_bash(&req.agent) && prompt_looks_like_vcs_workflow(&config.prompt) {
             let msg = "ERROR: need bash (explore/read-only subagent has no shell; \
 parent must run `git status --short` / `git diff --stat` / stage+commit directly). \
 Do not re-delegate git workflows to explore.";
@@ -1299,6 +1292,7 @@ pub fn harness_opts_from_policy(
     full_access: bool,
     add_dirs: Vec<PathBuf>,
     auto_approve: bool,
+    permission_rules: PermissionRules,
 ) -> HarnessOptions {
     HarnessOptions {
         cwd,
@@ -1307,6 +1301,8 @@ pub fn harness_opts_from_policy(
         auto_approve,
         dynamic_tools: vec![],
         parent_read_grants: ParentReadGrants::default(),
+        parent_path_policy: None,
+        permission_rules,
     }
 }
 

@@ -2327,3 +2327,126 @@ fn prompt_soft_wraps_long_single_line_and_tracks_cursor() {
         "first row should contain start of text"
     );
 }
+
+#[test]
+fn in_flight_tool_shows_full_tool_row_and_folds_after_turn_finishes() {
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    // Turn is busy (in flight)
+    app.busy = true;
+    app.push_tool_call("grep", r#"{"pattern":"agent loop"}"#);
+    app.finish_tool_with_output("grep", false, Some("142 lines".into()));
+    if let Some(last) = app.messages.last_mut() {
+        last.tool_expanded = false;
+    }
+
+    // Now push second tool: read (still running)
+    app.push_tool_call("read", r#"{"path":"crates/one-core/src/agent.rs"}"#);
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let flat1: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    // In-flight running tool must be rendered outside as a full tool call row!
+    assert!(
+        flat1.contains("read") && flat1.contains("crates/one-core/src/agent.rs"),
+        "Running tool must be rendered as a full tool call row outside: {flat1}"
+    );
+
+    // Second tool finishes, but model is still busy waiting on next response:
+    app.finish_tool_with_output("read", false, Some("240 lines".into()));
+    if let Some(last) = app.messages.last_mut() {
+        last.tool_expanded = false;
+    }
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let flat2: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    // Second tool must STILL be visible outside as a full tool call row (NOT collapsed into group yet)!
+    assert!(
+        flat2.contains("read") && flat2.contains("crates/one-core/src/agent.rs"),
+        "Newly completed tool must remain a full tool call row outside during waiting: {flat2}"
+    );
+    assert!(
+        flat2.contains("Waiting for model"),
+        "Waiting line should cleanly state waiting for model: {flat2}"
+    );
+
+    // Turn completes (e.g. model response received, busy becomes false)
+    app.busy = false;
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let flat3: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+    // After turn finishes, the 2 tools collapse into group!
+    assert!(
+        flat3.contains("2 tools"),
+        "After turn completes, completed tools collapse into group: {flat3}"
+    );
+}
+
+#[test]
+fn in_flight_branch_rail_after_collapsed_group() {
+    let backend = TestBackend::new(100, 20);
+    let mut terminal = Terminal::new(backend).unwrap();
+    let mut app = App::new("test");
+
+    // 2 preceding completed tools that collapse
+    app.busy = true;
+    for (name, args) in [
+        ("grep", r#"{"pattern":"p1"}"#),
+        ("grep", r#"{"pattern":"p2"}"#),
+    ] {
+        app.push_tool_call(name, args);
+        app.finish_tool_with_output(name, false, Some("done".into()));
+        if let Some(last) = app.messages.last_mut() {
+            last.tool_expanded = false;
+        }
+    }
+
+    // 3rd tool active (read)
+    app.push_tool_call("read", r#"{"path":"test.rs"}"#);
+    app.finish_tool_with_output("read", false, Some("42 lines".into()));
+    if let Some(last) = app.messages.last_mut() {
+        last.tool_expanded = false;
+    }
+
+    terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+    let flat: String = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|c| c.symbol().to_string())
+        .collect();
+
+    assert!(
+        flat.contains("2 tools"),
+        "Preceding tools should collapse into header: {flat}"
+    );
+    assert!(
+        flat.contains("└") || flat.contains("read"),
+        "Active tool should connect with a tree branch under the group: {flat}"
+    );
+    assert!(
+        flat.contains("<1ms") || flat.contains("42 lines"),
+        "Should display duration or line metrics: {flat}"
+    );
+}

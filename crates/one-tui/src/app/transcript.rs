@@ -1054,6 +1054,14 @@ impl super::App {
         std::mem::take(&mut self.abort_pending)
     }
 
+    pub fn request_background_now(&mut self) {
+        self.background_now_pending = true;
+    }
+
+    pub fn take_background_now(&mut self) -> bool {
+        std::mem::take(&mut self.background_now_pending)
+    }
+
     /// Request immediate interactive exit (Ctrl+C). Distinct from soft abort (`q` / Esc).
     pub fn request_force_quit(&mut self) {
         self.force_quit_pending = true;

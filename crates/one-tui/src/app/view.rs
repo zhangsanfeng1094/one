@@ -460,6 +460,21 @@ impl super::App {
         }
     }
 
+    /// Click handler for the floating "Jump to bottom" badge.
+    pub fn click_jump_to_bottom(&mut self, mouse_col: u16, mouse_row: u16) -> bool {
+        if let Some(rect) = self.chat_jump_to_bottom_rect {
+            if mouse_col >= rect.x
+                && mouse_col < rect.x.saturating_add(rect.width)
+                && mouse_row >= rect.y
+                && mouse_row < rect.y.saturating_add(rect.height)
+            {
+                self.scroll_to_bottom();
+                return true;
+            }
+        }
+        false
+    }
+
     /// Jump to the first tool row of the current turn.
     pub fn scroll_to_turn_tools(&mut self) {
         let Some(line) = self.chat_turn_tools_line else {

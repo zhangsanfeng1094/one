@@ -106,7 +106,7 @@ one acp --yolo --provider mock
 
 - 默认：敏感工具走 `session/request_permission`（Allow once / session / always / Deny）
 - `--yes` / `--yolo` / `ONE_AUTO_APPROVE=1`：自动批准
-- PathPolicy 与 Interactive 模式一致
+- PathPolicy 与 Interactive 模式一致（`one web` 同 ACP：越界读/写走 `session/request_permission`，不是静默硬拒）
 
 ---
 

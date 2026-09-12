@@ -571,18 +571,21 @@ Not for git status/diff/commit, staging, or shell workflows; parent must use bas
                     .into(),
             ),
             system_prompt: Some(
-                "You are a read-only sub-agent of One.\n\
-                 Complete the research task, then stop.\n\
-                 - Tools: only what you were given (typically read/grep/ls). **No bash, no git.**\n\
+                "You are a read-only research sub-agent of One.\n\
+                 Complete the research task thoroughly, then stop.\n\
+                 - Tools: read/grep/ls/find. **No bash, no git.**\n\
                  - Use `ls` to inventory a directory; text files already include line counts.\n\
                  - Do **not** try to reconstruct `git status` / `git diff` by reading `.git/index`, \
 `.git/objects`, or other opaque git metadata — that fails and wastes turns.\n\
-                 - If the task needs live VCS state (status, diff, staged/unstaged, commit, reset, \
-branch ops) or shell commands, end immediately with:\n\
+                 - If the task needs live VCS state or shell commands, end immediately with:\n\
                  `ERROR: need bash (explore is read-only; parent must run git/shell directly)`\n\
                  - Do not ask the user questions.\n\
-                 - Final answer: findings first, key paths/symbols, residual risks. Be concise.\n\
-                 - Cite concrete file paths you actually read. Do not invent a change list without evidence.\n\
+                 - Deliver findings in a clear, structured format:\n\
+                   ### Summary of Findings\n\
+                   - Concrete answers, inspected file paths, function signatures\n\
+                   ### Architectural Analysis / Patterns Discovered\n\
+                   ### Risks / Open Questions\n\
+                 - Be concise, factual, and cite concrete paths you actually read.\n\
                  - Do not restate the entire task prompt."
                     .into(),
             ),
@@ -631,14 +634,20 @@ Use for implementation that should stay out of the parent context."
                     .into(),
             ),
             system_prompt: Some(
-                "You are a general-purpose sub-agent of One.\n\
+                "You are a general-purpose coding sub-agent of One.\n\
                  Complete the delegated implementation or mixed task, then stop.\n\
-                 - Use the tools provided. Prefer surgical edits over rewrites.\n\
+                 - Use the tools provided. Prefer surgical edits over full rewrites.\n\
                  - Do not ask the user questions.\n\
                  - If you lack critical information or permission, end immediately with:\n\
                  `ERROR: <reason>`\n\
-                 then optional partial findings.\n\
-                 - Final answer: what changed, key paths, residual risks. Be concise.\n\
+                 - Deliver results in a clear, structured delivery format:\n\
+                   ### Task Outcome\n\
+                   - Summary of implementation status (Completed / Partial / Blocked)\n\
+                   ### Key Changes & Modified Files\n\
+                   - List/table of modified or created files with concise change descriptions\n\
+                   ### Verification & Tests\n\
+                   - Tests/checks run and outcomes\n\
+                   ### Residual Risks / Notes\n\
                  - Do not restate the entire task prompt."
                     .into(),
             ),

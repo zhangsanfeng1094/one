@@ -84,6 +84,37 @@ fn prompt_selection_deletes_entire_overlapping_attachment_chip() {
 }
 
 #[test]
+fn typing_after_prompt_click_does_not_accidentally_select() {
+    let mut app = App::new("test");
+    app.chat_focus = Some(0);
+    assert!(!app.prompt_focused());
+    assert!(app.transcript_browse_focused());
+
+    app.prompt_content_x = 3;
+    app.prompt_content_y = 10;
+    app.prompt_visible_line_starts = vec![0];
+
+    // User clicks the empty prompt area to focus it.
+    assert!(app.prompt_select_begin(10, 3));
+    assert_eq!(app.input_cursor, 0);
+    assert!(app.chat_focus.is_none());
+    assert!(app.prompt_focused());
+    assert!(!app.transcript_browse_focused());
+
+    // Typing first character must not leave a dangling anchor that creates a selection.
+    app.insert_input_char('是');
+    assert_eq!(app.input, "是");
+    assert_eq!(app.input_cursor, 1);
+    assert_eq!(app.input_selection_range(), None);
+
+    // Typing next character must append, not replace.
+    app.insert_input_char('飒');
+    assert_eq!(app.input, "是飒");
+    assert_eq!(app.input_cursor, 2);
+    assert_eq!(app.input_selection_range(), None);
+}
+
+#[test]
 fn enter_submits_prompt() {
     let mut app = App::new("test");
     app.input = "hello".into();
@@ -2031,6 +2062,16 @@ fn busy_esc_aborts_ctrl_c_force_quits() {
     assert!(app.take_force_quit());
     // request_force_quit also trips abort so in-flight work stops.
     assert!(app.take_abort());
+}
+
+#[test]
+fn busy_ctrl_b_requests_background_now() {
+    let mut app = App::new("test");
+    app.begin_busy();
+    app.handle_busy_key(key(KeyCode::Char('b'), KeyModifiers::CONTROL));
+    assert!(app.take_background_now());
+    assert!(!app.take_abort());
+    assert!(!app.force_quit_pending());
 }
 
 #[test]

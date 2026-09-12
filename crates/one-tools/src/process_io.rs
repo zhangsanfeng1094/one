@@ -4,10 +4,13 @@
 //! 1. Spawn with piped stdout/stderr (and a process group on Unix).
 //! 2. Concurrently drain both pipes while waiting for exit (avoids pipe deadlock).
 //! 3. Cap retained bytes per stream; keep reading past the cap so writers never block.
-//! 4. On timeout: kill the process group, then await readers with a short drain timeout
-//!    (grandchildren may inherit fds and keep pipes open forever).
+//! 4. On timeout: SIGTERM the process group, wait [`SIGTERM_GRACE`], then SIGKILL;
+//!    then await readers with a short drain timeout (grandchildren may inherit
+//!    fds and keep pipes open forever).
 
+use std::io::Write;
 use std::process::ExitStatus;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,12 +26,71 @@ use tokio::time::timeout;
 /// truncate via [`crate::truncate::present_tool_output`].
 pub const EXEC_OUTPUT_MAX_BYTES: usize = 8 * 1024 * 1024;
 
+/// Default cap on the on-disk background log (stdout+stderr interleaved).
+pub const DEFAULT_OUTPUT_FILE_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Resolve the on-disk log cap (`ONE_BASH_OUTPUT_FILE_MAX_BYTES`, 0 = default).
+pub fn output_file_max_bytes() -> u64 {
+    std::env::var("ONE_BASH_OUTPUT_FILE_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_OUTPUT_FILE_MAX_BYTES)
+}
+
+/// Shared sink so stdout and stderr readers can tee into one log file.
+#[derive(Clone)]
+pub struct OutputFileSink {
+    file: Arc<Mutex<std::fs::File>>,
+    written: Arc<AtomicU64>,
+    max_bytes: u64,
+}
+
+impl OutputFileSink {
+    pub fn new(file: std::fs::File, max_bytes: u64) -> Self {
+        Self {
+            file: Arc::new(Mutex::new(file)),
+            written: Arc::new(AtomicU64::new(0)),
+            max_bytes: max_bytes.max(1),
+        }
+    }
+
+    pub fn write_bytes(&self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        let prev = self.written.load(Ordering::Relaxed);
+        if prev >= self.max_bytes {
+            return;
+        }
+        let room = (self.max_bytes - prev) as usize;
+        let take = bytes.len().min(room);
+        if take == 0 {
+            return;
+        }
+        if let Ok(mut f) = self.file.lock() {
+            let _ = f.write_all(&bytes[..take]);
+        }
+        self.written.fetch_add(take as u64, Ordering::Relaxed);
+    }
+
+    pub fn flush(&self) {
+        if let Ok(mut f) = self.file.lock() {
+            let _ = f.flush();
+        }
+    }
+}
+
 /// After the child exits (or is killed), how long to wait for pipe readers.
 ///
 /// Codex uses 2s (`IO_DRAIN_TIMEOUT_MS`). Grandchildren that inherited the
 /// child's stdout/stderr can keep pipes open after we kill the direct child;
 /// without this bound, reader tasks block on `read()` forever.
 pub const IO_DRAIN_TIMEOUT: Duration = Duration::from_millis(2_000);
+
+/// SIGTERM → SIGKILL grace (Grok / common harness). Gives `npm`/`cargo` a
+/// chance to reap children and flush before the group is killed.
+pub const SIGTERM_GRACE: Duration = Duration::from_secs(1);
 
 const READ_CHUNK_SIZE: usize = 8_192;
 
@@ -89,14 +151,9 @@ pub async fn consume_child(
                     return Err(err);
                 }
                 Err(_elapsed) => {
-                    // Hard timeout: kill process group + direct child (Codex).
-                    kill_child_process_group(&mut child);
-                    let _ = child.start_kill();
-                    // Reap; ignore errors if already gone.
-                    let status = match child.wait().await {
-                        Ok(s) => s,
-                        Err(_) => synthetic_killed_status(),
-                    };
+                    let status = graceful_kill_child(&mut child)
+                        .await
+                        .unwrap_or_else(synthetic_killed_status);
                     (status, true)
                 }
             }
@@ -122,7 +179,14 @@ pub async fn consume_child(
     })
 }
 
-/// Kill the child's process group (Unix) then signal the direct child.
+/// SIGTERM the child's process group (Unix) then signal the direct child.
+pub fn term_child_process_group(child: &mut Child) {
+    if let Some(pid) = child.id() {
+        term_process_group(pid);
+    }
+}
+
+/// Kill the child's process group (Unix, SIGKILL) then signal the direct child.
 pub fn kill_child_process_group(child: &mut Child) {
     if let Some(pid) = child.id() {
         kill_process_group(pid);
@@ -130,21 +194,48 @@ pub fn kill_child_process_group(child: &mut Child) {
     let _ = child.start_kill();
 }
 
-/// Kill a process group by leader pid (negative pid on Unix).
+/// SIGTERM a process group by leader pid (negative pid on Unix).
+pub fn term_process_group(pid: u32) {
+    signal_process_group(pid, 15);
+}
+
+/// SIGKILL a process group by leader pid (negative pid on Unix).
 pub fn kill_process_group(pid: u32) {
+    signal_process_group(pid, 9);
+}
+
+fn signal_process_group(pid: u32, sig: i32) {
     #[cfg(unix)]
     {
         unsafe {
             extern "C" {
                 fn kill(pid: i32, sig: i32) -> i32;
             }
-            const SIGKILL: i32 = 9;
-            let _ = kill(-(pid as i32), SIGKILL);
+            let _ = kill(-(pid as i32), sig);
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = pid;
+        let _ = (pid, sig);
+    }
+}
+
+/// SIGTERM, wait [`SIGTERM_GRACE`], then SIGKILL. Returns the exit status when
+/// the child was reaped here (so the caller must not `wait` again).
+pub async fn graceful_kill_child(child: &mut Child) -> Option<ExitStatus> {
+    #[cfg(unix)]
+    {
+        term_child_process_group(child);
+        match timeout(SIGTERM_GRACE, child.wait()).await {
+            Ok(Ok(status)) => return Some(status),
+            Ok(Err(_)) => return None,
+            Err(_) => {}
+        }
+    }
+    kill_child_process_group(child);
+    match timeout(Duration::from_secs(2), child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        _ => None,
     }
 }
 
@@ -202,8 +293,21 @@ const STREAM_TRUNCATION_MARKER: &str = "\n...[stream truncated at capture limit]
 /// the next read (not treated as the capture cap). Only a true size limit marks
 /// truncation and drops further content.
 pub async fn stream_pipe_into<R: tokio::io::AsyncRead + Unpin>(
+    reader: R,
+    target: Arc<Mutex<String>>,
+    max_bytes: Option<usize>,
+) -> std::io::Result<()> {
+    stream_pipe_into_tee(reader, target, None, max_bytes).await
+}
+
+/// Like [`stream_pipe_into`], also copying raw bytes to an optional on-disk log.
+///
+/// The file sink is not bound by `max_bytes` (memory cap); it uses its own cap.
+/// Bytes past the memory cap are still written to disk until the file cap.
+pub async fn stream_pipe_into_tee<R: tokio::io::AsyncRead + Unpin>(
     mut reader: R,
     target: Arc<Mutex<String>>,
+    file: Option<OutputFileSink>,
     max_bytes: Option<usize>,
 ) -> std::io::Result<()> {
     let mut chunk = [0u8; READ_CHUNK_SIZE];
@@ -225,10 +329,16 @@ pub async fn stream_pipe_into<R: tokio::io::AsyncRead + Unpin>(
                 );
                 pending.clear();
             }
+            if let Some(ref f) = file {
+                f.flush();
+            }
             break;
         }
+        if let Some(ref f) = file {
+            f.write_bytes(&chunk[..n]);
+        }
         if marked_truncated {
-            // Cap already hit — drain only so the writer never blocks.
+            // Cap already hit — drain (and tee to disk) so the writer never blocks.
             continue;
         }
         pending.extend_from_slice(&chunk[..n]);

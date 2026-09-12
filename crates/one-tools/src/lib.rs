@@ -45,7 +45,9 @@ pub use memory_io::{
 };
 pub use monitor::MonitorTool;
 pub use os_sandbox::OsSandbox;
-pub use path_policy::{AccessKind, DynamicGrants, ExportedReadGrants, PathPolicy, SandboxMode};
+pub use path_policy::{
+    AccessKind, DynamicGrants, ExportedReadGrants, PathPolicy, ReadCoverage, SandboxMode,
+};
 pub use permissions::{
     bash_command, call_fingerprint, call_summary, command_matches_prefix,
     evaluate as evaluate_permissions, evaluate_with_mode, suggested_command_prefix,
@@ -67,7 +69,7 @@ pub use sandbox_permissions::{
 };
 pub use tasks::{
     format_task_list, format_task_output, BackgroundTaskRegistry, TaskMeta, TaskSnapshot,
-    TaskState, DEFAULT_MONITOR_MAX_EVENTS,
+    TaskState, DEFAULT_MAX_RUNNING_TASKS, DEFAULT_MONITOR_MAX_EVENTS,
 };
 pub use todo::{TodoItem, TodoListState, TodoStatus, TodoWriteTool};
 pub use truncate::{

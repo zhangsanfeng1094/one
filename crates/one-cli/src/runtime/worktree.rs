@@ -133,6 +133,43 @@ impl WorktreeManager {
             true // kept for inspection
         }
     }
+
+    /// Clean up stale worktrees under `<repo_root>/.one/worktrees/` older than `max_age`.
+    pub fn gc_stale_worktrees(repo: &Path, max_age: std::time::Duration) -> usize {
+        let Some(repo_root) = find_git_root(repo) else {
+            return 0;
+        };
+        let wt_root = repo_root.join(".one").join(WT_DIR);
+        if !wt_root.is_dir() {
+            return 0;
+        }
+        let mut cleaned = 0;
+        if let Ok(entries) = std::fs::read_dir(&wt_root) {
+            let now = std::time::SystemTime::now();
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if !path.is_dir() {
+                    continue;
+                }
+                let is_stale = entry
+                    .metadata()
+                    .and_then(|m| m.modified())
+                    .ok()
+                    .and_then(|t| now.duration_since(t).ok())
+                    .map(|d| d > max_age)
+                    .unwrap_or(false);
+
+                if is_stale {
+                    let branch = format!("one/task-{}", entry.file_name().to_string_lossy());
+                    if Self::remove_at(&repo_root, &path, &branch, true).is_ok() {
+                        cleaned += 1;
+                    }
+                }
+            }
+        }
+        let _ = git_status(&repo_root, &["worktree", "prune"]);
+        cleaned
+    }
 }
 
 fn sanitize_id(id: &str) -> String {

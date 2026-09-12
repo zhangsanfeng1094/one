@@ -6,7 +6,9 @@ use ratatui::widgets::Block;
 use ratatui::Frame;
 
 use crate::app::App;
+use crate::message::{MessageRole, ToolStatus};
 use crate::theme::Theme;
+use crate::tool_view;
 
 use super::prompt::{identity_spans, ops_spans, render_split_row};
 use super::SPINNER;
@@ -90,13 +92,42 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
     if app.busy {
         let compacting = app.busy_activity == "compacting";
         let mut left = vec![Span::raw("  ")];
-        // Soft cancel vs hard exit — single Ctrl+C never exits (double-tap quit).
-        if !compacting {
-            left.extend(pair("esc", " stop  "));
-        }
-        left.extend(pair("Ctrl+C", "×2 quit  "));
-        if !compacting {
-            left.extend(pair("Ctrl+S", " steer"));
+
+        // Active running tool for Grok-style live action status
+        let running_tool =
+            app.messages.iter().rev().find(|m| {
+                m.role == MessageRole::Tool && m.tool_status == Some(ToolStatus::Running)
+            });
+
+        if let Some(tool) = running_tool {
+            let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
+            let label_raw = tool_view::running_tool_label(tool, app.history_cwd.as_deref());
+            let label = tool_view::single_line_preview(&label_raw, 44);
+            let dur_str = tool
+                .started_at
+                .map(|t| format!("{:.1}s", t.elapsed().as_secs_f32()))
+                .unwrap_or_default();
+            left.push(Span::styled(
+                format!("{spinner} {label} "),
+                Theme::tool_name_running(),
+            ));
+            if !dur_str.is_empty() {
+                left.push(Span::styled(format!("{dur_str}  "), Theme::meta()));
+            }
+            if !compacting {
+                left.extend(pair("esc", " stop  "));
+                left.extend(pair("Ctrl+B", " bg"));
+            }
+        } else {
+            // Soft cancel vs hard exit — single Ctrl+C never exits (double-tap quit).
+            if !compacting {
+                left.extend(pair("esc", " stop  "));
+            }
+            left.extend(pair("Ctrl+C", "×2 quit  "));
+            if !compacting {
+                left.extend(pair("Ctrl+S", " steer  "));
+                left.extend(pair("Ctrl+B", " bg"));
+            }
         }
         // Ops chips (MCP/bg) stay on meta; status only shows activity + stats.
         let mut right = status_stats_spans(app);

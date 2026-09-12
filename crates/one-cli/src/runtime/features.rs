@@ -34,11 +34,20 @@ pub struct FeatureDef {
 pub const FEATURE_REGISTRY: &[FeatureDef] = &[
     FeatureDef {
         id: FEATURE_SUBAGENT,
-        label: "Subagent (task)",
-        description: "task / job_output / wait_tasks / job_kill + prompt policy",
+        label: "Subagent (task / spawn_subagent)",
+        description: "spawn_subagent / task / job_output / wait_tasks / job_kill + prompt policy. Grok get/wait/kill aliases stay available for bash even when this is off",
         default_enabled: true,
         affects_context: true,
-        tool_names: &["task", "job_output", "wait_tasks", "job_kill"],
+        tool_names: &[
+            "spawn_subagent",
+            "task",
+            "get_command_or_subagent_output",
+            "job_output",
+            "wait_commands_or_subagents",
+            "wait_tasks",
+            "kill_command_or_subagent",
+            "job_kill",
+        ],
     },
     FeatureDef {
         id: FEATURE_SERVER_SEARCH,

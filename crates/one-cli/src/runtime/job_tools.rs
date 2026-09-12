@@ -19,6 +19,7 @@ use super::jobs::{format_job_list, format_job_snapshot, AgentJobRegistry, JobSta
 pub struct JobOutputTool {
     jobs: Arc<AgentJobRegistry>,
     bash: Arc<BackgroundTaskRegistry>,
+    name: String,
 }
 
 impl JobOutputTool {
@@ -26,11 +27,28 @@ impl JobOutputTool {
         Self {
             jobs,
             bash: Arc::new(BackgroundTaskRegistry::new()),
+            name: "job_output".into(),
         }
     }
 
     pub fn with_bash(jobs: Arc<AgentJobRegistry>, bash: Arc<BackgroundTaskRegistry>) -> Self {
-        Self { jobs, bash }
+        Self {
+            jobs,
+            bash,
+            name: "job_output".into(),
+        }
+    }
+
+    pub fn named(
+        jobs: Arc<AgentJobRegistry>,
+        bash: Arc<BackgroundTaskRegistry>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            jobs,
+            bash,
+            name: name.into(),
+        }
     }
 }
 
@@ -38,7 +56,7 @@ impl JobOutputTool {
 impl Tool for JobOutputTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "job_output".into(),
+            name: self.name.clone(),
             description: "\
 Get status and summary of a background agent job (`job_*`), bash task (`bg_*`), or monitor (`mon_*`). \
 Omit job_id to list agent jobs and bash tasks. \
@@ -64,6 +82,7 @@ when the job completes; do not tight-poll."
     }
 
     async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
+        let ids = parse_id_list(call, &["job_ids", "task_ids"]).unwrap_or_default();
         let job_id = call
             .arguments
             .get("job_id")
@@ -71,7 +90,8 @@ when the job completes; do not tight-poll."
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| s.to_string());
+            .map(|s| s.to_string())
+            .or_else(|| ids.first().cloned());
 
         let wait_ms = parse_wait_ms(&call.arguments, WaitMsMode::SnapshotOrBlock);
 
@@ -166,6 +186,7 @@ when the job completes; do not tight-poll."
 pub struct WaitTasksTool {
     jobs: Arc<AgentJobRegistry>,
     bash: Arc<BackgroundTaskRegistry>,
+    name: String,
 }
 
 impl WaitTasksTool {
@@ -173,11 +194,28 @@ impl WaitTasksTool {
         Self {
             jobs,
             bash: Arc::new(BackgroundTaskRegistry::new()),
+            name: "wait_tasks".into(),
         }
     }
 
     pub fn with_bash(jobs: Arc<AgentJobRegistry>, bash: Arc<BackgroundTaskRegistry>) -> Self {
-        Self { jobs, bash }
+        Self {
+            jobs,
+            bash,
+            name: "wait_tasks".into(),
+        }
+    }
+
+    pub fn named(
+        jobs: Arc<AgentJobRegistry>,
+        bash: Arc<BackgroundTaskRegistry>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            jobs,
+            bash,
+            name: name.into(),
+        }
     }
 }
 
@@ -185,7 +223,7 @@ impl WaitTasksTool {
 impl Tool for WaitTasksTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "wait_tasks".into(),
+            name: self.name.clone(),
             description: "\
 Wait for background work to finish — agent jobs from task(background=true) (`job_*`) \
 and/or bash tasks (`bg_*`) and monitors (`mon_*`). \
@@ -193,8 +231,8 @@ Use ONLY after you have spawned all needed background work and have nothing else
 Prefer job_output with a positive wait_ms for a single id. \
 mode=all (default) waits for every target; mode=any returns when the next running task \
 completes (aliases: wait_all / wait_any). Omit job_ids to wait on all currently running \
-agent jobs and bash tasks. Omit wait_ms to block until completion. wait_ms=0 waits up to \
-30s (not a snapshot). A timeout while still running is success — you will be notified \
+agent jobs and bash tasks. Omit wait_ms or pass 0 to wait up to 30s (Grok default; \
+not a snapshot). A timeout while still running is success — you will be notified \
 when work completes; do not call wait_tasks again."
                 .into(),
             parameters: json!({
@@ -212,7 +250,7 @@ when work completes; do not call wait_tasks again."
                     },
                     "wait_ms": {
                         "type": "integer",
-                        "description": "Optional cap in milliseconds. Omit = wait until done. 0 = 30s default wait."
+                        "description": "Optional cap in milliseconds. Omit or 0 = 30s default wait (Grok). Pass a large value to wait longer."
                     }
                 }
             }),
@@ -262,6 +300,7 @@ when work completes; do not call wait_tasks again."
 pub struct JobKillTool {
     jobs: Arc<AgentJobRegistry>,
     bash: Arc<BackgroundTaskRegistry>,
+    name: String,
 }
 
 impl JobKillTool {
@@ -269,11 +308,28 @@ impl JobKillTool {
         Self {
             jobs,
             bash: Arc::new(BackgroundTaskRegistry::new()),
+            name: "job_kill".into(),
         }
     }
 
     pub fn with_bash(jobs: Arc<AgentJobRegistry>, bash: Arc<BackgroundTaskRegistry>) -> Self {
-        Self { jobs, bash }
+        Self {
+            jobs,
+            bash,
+            name: "job_kill".into(),
+        }
+    }
+
+    pub fn named(
+        jobs: Arc<AgentJobRegistry>,
+        bash: Arc<BackgroundTaskRegistry>,
+        name: impl Into<String>,
+    ) -> Self {
+        Self {
+            jobs,
+            bash,
+            name: name.into(),
+        }
     }
 }
 
@@ -281,7 +337,7 @@ impl JobKillTool {
 impl Tool for JobKillTool {
     fn definition(&self) -> ToolDefinition {
         ToolDefinition {
-            name: "job_kill".into(),
+            name: self.name.clone(),
             description: "\
 Stop a background agent job (`job_*`), bash task (`bg_*`), or monitor (`mon_*`). \
 Pass `job_id`. No-op if already finished."
@@ -366,7 +422,7 @@ const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
 enum WaitMsMode {
     /// `job_output`: 0 / omit = snapshot; any positive value waits.
     SnapshotOrBlock,
-    /// `wait_tasks`: omit = wait until done; 0 = 30s default wait (Grok).
+    /// `wait_tasks`: omit or 0 = 30s default wait (Grok).
     BlockUntilDone,
 }
 
@@ -376,8 +432,10 @@ fn parse_wait_ms(args: &serde_json::Value, mode: WaitMsMode) -> Option<u64> {
         .or_else(|| args.get("timeout_ms"))
         .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)));
     match (mode, raw) {
-        (_, None) => None,
+        (WaitMsMode::SnapshotOrBlock, None) => None,
         (WaitMsMode::SnapshotOrBlock, Some(0)) => Some(0),
+        // Grok `wait_tasks`: omit and 0 both mean the 30s default wait.
+        (WaitMsMode::BlockUntilDone, None) => Some(DEFAULT_WAIT_TIMEOUT_MS),
         (WaitMsMode::BlockUntilDone, Some(0)) => Some(DEFAULT_WAIT_TIMEOUT_MS),
         (_, Some(ms)) => Some(ms),
     }
@@ -700,8 +758,11 @@ mod tests {
     }
 
     #[test]
-    fn wait_ms_block_zero_is_default_thirty_seconds() {
-        assert_eq!(parse_wait_ms(&json!({}), WaitMsMode::BlockUntilDone), None);
+    fn wait_ms_block_omit_and_zero_are_default_thirty_seconds() {
+        assert_eq!(
+            parse_wait_ms(&json!({}), WaitMsMode::BlockUntilDone),
+            Some(DEFAULT_WAIT_TIMEOUT_MS)
+        );
         assert_eq!(
             parse_wait_ms(&json!({"wait_ms": 0}), WaitMsMode::BlockUntilDone),
             Some(DEFAULT_WAIT_TIMEOUT_MS)

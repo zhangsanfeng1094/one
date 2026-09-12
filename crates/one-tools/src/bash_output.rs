@@ -5,7 +5,9 @@ use one_core::error::Result;
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
 use serde_json::json;
 
-use crate::tasks::{format_task_list, format_task_output, BackgroundTaskRegistry, TaskState};
+use crate::tasks::{
+    format_task_list, format_task_output_presented, BackgroundTaskRegistry, TaskState,
+};
 
 const DEFAULT_MAX_CHARS: usize = 50_000;
 
@@ -59,11 +61,31 @@ to read progress logs; use bash_kill when done."
         let task_id = call
             .arguments
             .get("task_id")
+            .or_else(|| call.arguments.get("job_id"))
             .and_then(|v| v.as_str())
             .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty());
+            .filter(|s| !s.is_empty())
+            .or_else(|| {
+                call.arguments
+                    .get("task_ids")
+                    .and_then(|v| v.as_array())
+                    .and_then(|a| a.first())
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            });
 
-        let timeout_secs = call.arguments.get("timeout_secs").and_then(|v| v.as_u64());
+        let timeout_secs = call
+            .arguments
+            .get("timeout_secs")
+            .and_then(|v| v.as_u64())
+            .or_else(|| {
+                call.arguments
+                    .get("timeout_ms")
+                    .or_else(|| call.arguments.get("wait_ms"))
+                    .and_then(|v| v.as_u64().or_else(|| v.as_i64().map(|n| n.max(0) as u64)))
+                    .map(|ms| (ms.saturating_add(999)) / 1000)
+            });
 
         let max_chars = call
             .arguments
@@ -100,7 +122,7 @@ to read progress logs; use bash_kill when done."
             .await
             .map_err(|err| tool_error("bash_output", err))?;
 
-        let text = format_task_output(&snap, max_chars);
+        let (text, spill_path, truncated) = format_task_output_presented(&snap, max_chars);
         let ok = match snap.state {
             TaskState::Completed => snap.exit_code.unwrap_or(1) == 0,
             TaskState::Running => true, // not a failure — still in progress
@@ -116,6 +138,12 @@ to read progress logs; use bash_kill when done."
                 "command": snap.command,
                 "ok": ok,
                 "running": snap.state == TaskState::Running,
+                "truncated": truncated,
+                "fullOutputPath": spill_path
+                    .as_ref()
+                    .or(snap.output_file.as_ref())
+                    .map(|p| p.display().to_string()),
+                "outputFile": snap.output_file.as_ref().map(|p| p.display().to_string()),
             }),
         ))
     }

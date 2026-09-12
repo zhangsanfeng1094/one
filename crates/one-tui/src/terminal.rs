@@ -296,16 +296,31 @@ impl TerminalSession {
                     app.scroll_down(WHEEL_LINES);
                 }
             }
-            MouseEventKind::Down(MouseButton::Left) if in_prompt => {
-                self.drag_target = if app.prompt_select_begin(mouse.row, col) {
-                    MouseDragTarget::Prompt
+            MouseEventKind::Down(MouseButton::Left) => {
+                if !app.float_open()
+                    && app.select_prompt().is_none()
+                    && app.click_jump_to_bottom(col, mouse.row)
+                {
+                    self.drag_target = MouseDragTarget::None;
+                    return;
+                }
+                if in_prompt {
+                    self.drag_target = if app.prompt_select_begin(mouse.row, col) {
+                        MouseDragTarget::Prompt
+                    } else {
+                        MouseDragTarget::None
+                    };
+                } else if in_chat {
+                    self.drag_target = MouseDragTarget::Chat;
+                    app.clear_input_selection();
+                    app.select_begin(row as usize, col);
                 } else {
-                    MouseDragTarget::None
-                };
-            }
-            MouseEventKind::Down(MouseButton::Left) if in_chat => {
-                self.drag_target = MouseDragTarget::Chat;
-                app.select_begin(row as usize, col);
+                    // Click outside the text surfaces clears both selection kinds.
+                    self.drag_target = MouseDragTarget::None;
+                    app.clear_selection();
+                    app.clear_input_selection();
+                    app.click_sticky(mouse.row);
+                }
             }
             // Character / multi-line transcript selection. Keep tracking even
             // outside chat so a drag can edge-scroll past one viewport.
@@ -333,16 +348,11 @@ impl TerminalSession {
             {
                 self.drag_target = MouseDragTarget::None;
                 let _ = app.prompt_select_update(mouse.row, col);
-                if app.copy_input_selection() {
+                if app.input_selection_range().is_none() {
+                    app.clear_input_selection();
+                } else if app.copy_input_selection() {
                     self.flush_clipboard(app);
                 }
-            }
-            MouseEventKind::Down(MouseButton::Left) => {
-                // Click outside the text surfaces clears both selection kinds.
-                self.drag_target = MouseDragTarget::None;
-                app.clear_selection();
-                app.clear_input_selection();
-                app.click_sticky(mouse.row);
             }
             _ => {}
         }

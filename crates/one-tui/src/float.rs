@@ -2124,7 +2124,7 @@ fn default_command_sections() -> Vec<FloatSection> {
                 item(
                     "ps",
                     "Background Bash",
-                    "shell processes · stdout/stderr · /ps",
+                    "shell processes · stdout/stderr · Ctrl+B to background",
                     "/ps",
                 ),
                 item(

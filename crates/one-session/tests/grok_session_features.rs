@@ -14,9 +14,15 @@ fn unique_temp_dir() -> std::path::PathBuf {
     dir
 }
 
+static TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[tokio::test]
 async fn test_rewind_marker_and_points() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let tmp = unique_temp_dir();
+    let temp_agent = unique_temp_dir();
+    let prev_agent = one_session::set_agent_dir_override(Some(temp_agent.clone()));
+
     let mut sm = SessionManager::create(&tmp).await.unwrap();
 
     let id1 = sm
@@ -57,12 +63,18 @@ async fn test_rewind_marker_and_points() {
     let ctx = sm.build_session_context();
     assert_eq!(ctx.messages.len(), 1);
 
+    let _ = one_session::set_agent_dir_override(prev_agent);
+    let _ = std::fs::remove_dir_all(&temp_agent);
     let _ = std::fs::remove_dir_all(&tmp);
 }
 
 #[tokio::test]
 async fn test_session_fork() {
+    let _guard = TEST_MUTEX.lock().unwrap();
     let tmp = unique_temp_dir();
+    let temp_agent = unique_temp_dir();
+    let prev_agent = one_session::set_agent_dir_override(Some(temp_agent.clone()));
+
     let mut sm = SessionManager::create(&tmp).await.unwrap();
 
     let _id1 = sm
@@ -85,6 +97,8 @@ async fn test_session_fork() {
     let ctx = forked.build_session_context();
     assert_eq!(ctx.messages.len(), 2);
 
+    let _ = one_session::set_agent_dir_override(prev_agent);
+    let _ = std::fs::remove_dir_all(&temp_agent);
     let _ = std::fs::remove_dir_all(&tmp);
 }
 

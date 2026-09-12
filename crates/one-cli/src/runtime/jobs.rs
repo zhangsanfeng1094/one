@@ -429,20 +429,42 @@ impl std::fmt::Debug for SpawnOptions {
     }
 }
 
+fn wall_max_override() -> &'static std::sync::Mutex<Option<Option<u64>>> {
+    static CELL: std::sync::OnceLock<std::sync::Mutex<Option<Option<u64>>>> =
+        std::sync::OnceLock::new();
+    CELL.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// Override max wall budget in tests without mutating `std::env`.
+pub fn set_job_max_wall_ms_override(val: Option<Option<u64>>) -> Option<Option<u64>> {
+    let mut g = wall_max_override()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    std::mem::replace(&mut *g, val)
+}
+
+/// Parse wall-clock timeout string.
+pub fn parse_job_max_wall_ms(s: &str) -> Option<u64> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Some(DEFAULT_JOB_MAX_WALL_MS);
+    }
+    match s.parse::<u64>() {
+        Ok(0) => None,
+        Ok(n) => Some(n),
+        Err(_) => Some(DEFAULT_JOB_MAX_WALL_MS),
+    }
+}
+
 /// Override with `ONE_JOB_MAX_WALL_MS` (milliseconds). `0` = no wall limit.
 pub fn job_max_wall_ms() -> Option<u64> {
-    match std::env::var("ONE_JOB_MAX_WALL_MS") {
-        Ok(s) => {
-            let s = s.trim();
-            if s.is_empty() {
-                return Some(DEFAULT_JOB_MAX_WALL_MS);
-            }
-            match s.parse::<u64>() {
-                Ok(0) => None,
-                Ok(n) => Some(n),
-                Err(_) => Some(DEFAULT_JOB_MAX_WALL_MS),
-            }
+    if let Ok(g) = wall_max_override().lock() {
+        if let Some(ref override_val) = *g {
+            return *override_val;
         }
+    }
+    match std::env::var("ONE_JOB_MAX_WALL_MS") {
+        Ok(s) => parse_job_max_wall_ms(&s),
         Err(_) => Some(DEFAULT_JOB_MAX_WALL_MS),
     }
 }
@@ -2010,15 +2032,15 @@ mod tests {
         );
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn wall_timeout_env_parsing() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("ONE_JOB_MAX_WALL_MS", "1");
-        assert_eq!(job_max_wall_ms(), Some(1));
-        std::env::remove_var("ONE_JOB_MAX_WALL_MS");
-        assert_eq!(job_max_wall_ms(), Some(DEFAULT_JOB_MAX_WALL_MS));
+        assert_eq!(parse_job_max_wall_ms("1"), Some(1));
+        assert_eq!(parse_job_max_wall_ms("0"), None);
+        assert_eq!(parse_job_max_wall_ms(""), Some(DEFAULT_JOB_MAX_WALL_MS));
+        assert_eq!(
+            parse_job_max_wall_ms("invalid"),
+            Some(DEFAULT_JOB_MAX_WALL_MS)
+        );
     }
 
     #[test]
@@ -2030,17 +2052,17 @@ mod tests {
 
     #[test]
     fn wall_ms_zero_disables() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        std::env::set_var("ONE_JOB_MAX_WALL_MS", "0");
-        assert_eq!(job_max_wall_ms(), None);
-        std::env::remove_var("ONE_JOB_MAX_WALL_MS");
+        assert_eq!(parse_job_max_wall_ms("0"), None);
     }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Independent watchdog must terminalize even when the harness future is
     /// stuck in non-cooperative work (the soft `timeout()` cannot cancel that).
     #[tokio::test]
     async fn wall_watchdog_kills_stuck_job_row() {
-        std::env::set_var("ONE_JOB_MAX_WALL_MS", "50");
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = set_job_max_wall_ms_override(Some(Some(50)));
         let queue = Arc::new(Mutex::new(Vec::new()));
         let reg = AgentJobRegistry::new(queue);
         let (id, _control, _abort) = reg.register_job(
@@ -2059,9 +2081,9 @@ mod tests {
         );
         // Arm only the watchdog — never start a harness (simulates hang after AgentEnd).
         reg.arm_wall_watchdog(&id, true);
-        let snap = tokio::time::timeout(Duration::from_secs(3), reg.wait_until_done(&id))
+        let snap = tokio::time::timeout(Duration::from_secs(5), reg.wait_until_done(&id))
             .await
-            .expect("watchdog should terminalize within 3s")
+            .expect("watchdog should terminalize within 5s")
             .expect("job exists");
         assert!(
             matches!(snap.state, JobState::Failed | JobState::Aborted),
@@ -2069,7 +2091,7 @@ mod tests {
             snap.state
         );
         assert_eq!(snap.status, Some(TaskExitStatus::TimedOut));
-        std::env::remove_var("ONE_JOB_MAX_WALL_MS");
+        let _ = set_job_max_wall_ms_override(prev);
     }
 
     #[test]

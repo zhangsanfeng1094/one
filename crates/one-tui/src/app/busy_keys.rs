@@ -27,6 +27,12 @@ impl super::App {
             return;
         }
 
+        // Ctrl+B: demote the in-flight foreground bash (does not abort the turn).
+        if Self::is_ctrl_b(key) {
+            self.request_background_now();
+            return;
+        }
+
         // Ctrl+G → Settings (same as idle; /settings already works mid-stream).
         if matches!(key.code, KeyCode::Char('g') | KeyCode::Char('G'))
             && key.modifiers.contains(KeyModifiers::CONTROL)
@@ -39,6 +45,10 @@ impl super::App {
 
         if Self::is_goto_bottom_key(key) {
             self.scroll_to_bottom();
+            return;
+        }
+        if Self::is_goto_top_key(key) {
+            self.scroll_to_top();
             return;
         }
 

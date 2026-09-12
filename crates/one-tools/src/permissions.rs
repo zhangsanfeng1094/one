@@ -204,11 +204,12 @@ impl ParsedRule {
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
-            "read" | "write" | "edit" | "grep" | "glob" | "find" | "ls" => call
-                .arguments
-                .get("path")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
+            "read" | "write" | "edit" | "grep" | "glob" | "find" | "ls" => {
+                crate::tool_args::path_arg(&call.arguments)
+                    .ok()
+                    .flatten()
+                    .unwrap_or("")
+            }
             "web_fetch" => call
                 .arguments
                 .get("url")
@@ -219,7 +220,18 @@ impl ParsedRule {
                 &call.arguments.to_string()
             }
         };
-        wildcard_match(spec, subject)
+        if wildcard_match(spec, subject) {
+            return true;
+        }
+        // Rules are commonly written relative to the workspace (`Read(.env)`).
+        // Treat that spelling as the same target when a caller supplies an
+        // absolute path, rather than letting representation bypass the rule.
+        matches!(
+            name.as_str(),
+            "read" | "write" | "edit" | "grep" | "glob" | "find" | "ls"
+        ) && subject.starts_with('/')
+            && !spec.starts_with('/')
+            && wildcard_match(&format!("*{spec}"), subject)
     }
 }
 
@@ -368,6 +380,36 @@ pub fn suggested_command_prefix_from_cmd(command: &str) -> Option<String> {
 ///
 /// `cargo test` matches `cargo test` and `cargo test --quiet`, not `cargo testing`.
 pub fn command_matches_prefix(command: &str, prefix: &str) -> bool {
+    // Conservative shell grammar: substitutions, quoting, redirects, compound
+    // commands and glob expansion cannot reuse a command-family approval.
+    if command.chars().chain(prefix.chars()).any(|c| {
+        matches!(
+            c,
+            ';' | '&'
+                | '|'
+                | '$'
+                | '`'
+                | '<'
+                | '>'
+                | '('
+                | ')'
+                | '{'
+                | '}'
+                | '\n'
+                | '\r'
+                | '\\'
+                | '\''
+                | '"'
+                | '*'
+                | '?'
+                | '['
+                | ']'
+                | '~'
+                | '#'
+        )
+    }) {
+        return false;
+    }
     let cmd = command.trim_start();
     let p = prefix.trim();
     if p.is_empty() {
@@ -927,6 +969,42 @@ mod tests {
         assert!(!command_matches_prefix("cargo testing", "cargo test"));
         assert!(!command_matches_prefix("cargotest", "cargo"));
         assert!(command_matches_prefix("cargo", "cargo"));
+        assert!(!command_matches_prefix(
+            "cargo test; rm -rf /tmp/x",
+            "cargo test"
+        ));
+        assert!(!command_matches_prefix("cargo test $(id)", "cargo test"));
+        assert!(!command_matches_prefix("cargo test > out", "cargo test"));
+    }
+
+    #[test]
+    fn path_rules_cover_all_supported_path_aliases() {
+        let rules = vec![PermissionRule::parse(RuleAction::Deny, "Read(.env)").unwrap()];
+        for key in ["path", "file_path", "filePath"] {
+            let mut arguments = serde_json::Map::new();
+            arguments.insert(key.to_string(), serde_json::json!(".env"));
+            let call = ToolCall {
+                id: "1".into(),
+                name: "read".into(),
+                arguments: serde_json::Value::Object(arguments),
+            };
+            assert!(
+                matches!(
+                    evaluate(&call, &rules, false),
+                    PermissionVerdict::Deny { .. }
+                ),
+                "alias={key}"
+            );
+        }
+        let absolute = ToolCall {
+            id: "2".into(),
+            name: "read".into(),
+            arguments: serde_json::json!({ "path": "/workspace/.env" }),
+        };
+        assert!(matches!(
+            evaluate(&absolute, &rules, false),
+            PermissionVerdict::Deny { .. }
+        ));
     }
 
     #[test]

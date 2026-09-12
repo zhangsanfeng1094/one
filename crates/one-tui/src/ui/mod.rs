@@ -62,7 +62,8 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
 
     // Dock above the prompt (priority: HITL select > `/` command menu).
     // Centered float remains for Settings (Ctrl+G) and sessions/tree/etc.
-    let input_lines = app.input_line_count() as u16;
+    let usable_w = (frame.area().width.saturating_sub(4) as usize).max(1);
+    let input_lines = app.input_line_count(usable_w) as u16;
     let prompt_h = (input_lines + 2).clamp(3, 8); // input box only; identity lives on the footer
     let select_h = app.select_dock_height();
     let slash_h = if select_h == 0 {

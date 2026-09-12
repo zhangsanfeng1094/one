@@ -215,6 +215,7 @@ impl super::App {
             return false;
         };
         self.clear_selection();
+        self.clear_chat_focus();
         self.input_cursor = caret;
         self.input_selection_anchor = Some(caret);
         self.cursor_on = true;
@@ -233,11 +234,17 @@ impl super::App {
     fn prompt_caret_at(&self, terminal_row: u16, terminal_col: u16) -> Option<usize> {
         let row = terminal_row.checked_sub(self.prompt_content_y)? as usize;
         let line_start = *self.prompt_visible_line_starts.get(row)?;
+        let max_chars = self
+            .prompt_visible_line_starts
+            .get(row + 1)
+            .map(|&next| next.saturating_sub(line_start))
+            .unwrap_or(usize::MAX);
         let line = self
             .input
             .chars()
             .skip(line_start)
-            .take_while(|c| *c != '\n');
+            .take_while(|c| *c != '\n')
+            .take(max_chars);
         let mut chars = 0usize;
         let mut col = self.prompt_content_x;
         for ch in line {
@@ -269,6 +276,7 @@ impl super::App {
         }
         self.clear_chat_focus();
         self.delete_input_selection();
+        self.clear_input_selection();
         self.clamp_input_cursor();
         let idx = self.input_byte_at_cursor();
         self.input.insert(idx, ch);
@@ -287,6 +295,7 @@ impl super::App {
         }
         self.clear_chat_focus();
         self.delete_input_selection();
+        self.clear_input_selection();
         self.clamp_input_cursor();
         let idx = self.input_byte_at_cursor();
         let n = cleaned.chars().count();
@@ -299,6 +308,7 @@ impl super::App {
         // Prefer a leading space when inserting mid-buffer after non-whitespace.
         self.clear_chat_focus();
         self.delete_input_selection();
+        self.clear_input_selection();
         self.clamp_input_cursor();
         let idx = self.input_byte_at_cursor();
         let need_lead = idx > 0
@@ -688,10 +698,23 @@ impl super::App {
         self.chat_focus = None;
     }
 
-    /// How many visual lines the prompt input currently needs (capped).
-    pub fn input_line_count(&self) -> usize {
-        let n = self.input.split('\n').count().max(1);
-        n.min(6)
+    /// How many visual lines the prompt input currently needs (capped between 1 and 6).
+    pub fn input_line_count(&self, width: usize) -> usize {
+        if self.input.is_empty() {
+            return 1;
+        }
+        let usable_w = width.max(1);
+        let mut total_lines = 0usize;
+        for line in self.input.split('\n') {
+            if line.is_empty() {
+                total_lines += 1;
+                continue;
+            }
+            let line_w = crate::ui::text::display_width(line);
+            let wrapped = (line_w + usable_w - 1) / usable_w;
+            total_lines += wrapped.max(1);
+        }
+        total_lines.clamp(1, 6)
     }
 
     pub fn complete_path_token(&mut self) {

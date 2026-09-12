@@ -3,8 +3,9 @@
 //! Combines fine-grained [`one_tools::PermissionRules`] with session memory and
 //! an optional UI channel for Ask verdicts.
 //!
-//! Also enforces workspace [`PathPolicy`] for path tools: write outside is hard
-//! deny; read outside may escalate via interactive Select (`path read:` reason).
+//! Also enforces workspace [`PathPolicy`] for path tools: read **and write**
+//! outside may escalate via interactive Select (`path read:` / `path write:`).
+//! Auto / fail-closed / session_auto stay hard-deny (no prompt, no auto-grant).
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -16,8 +17,8 @@ use one_core::tool::ToolCall;
 use one_core::tool_gate::{ToolGate, ToolGateDecision};
 use one_tools::{
     bash_command, call_fingerprint, call_summary, command_matches_prefix, evaluate_with_mode,
-    requires_escalation, suggested_command_prefix, tool_args::path_arg, AccessKind, PathPolicy,
-    PermissionRule, PermissionRules, PermissionVerdict,
+    requires_escalation, suggested_command_prefix, tool_args::path_arg, AccessKind, OsSandbox,
+    PathPolicy, PermissionRule, PermissionRules, PermissionVerdict,
 };
 
 pub use one_tools::PermissionMode;
@@ -82,10 +83,20 @@ enum PendingKind {
     Standard,
     /// `sandbox_permissions: require_escalated`.
     SandboxEscalate,
+    /// bwrap is unavailable in workspace-write. This approval is deliberately
+    /// single-use; it permits only this call to fall back to the host shell.
+    SandboxUnavailable,
     /// Out-of-workspace path read. Grants applied here; never enable_session_auto.
     PathRead {
         resolved: PathBuf,
         suggested_root: Option<PathBuf>,
+        token: String,
+    },
+    /// Out-of-workspace path write/edit. Grants applied here; never enable_session_auto.
+    PathWrite {
+        resolved: PathBuf,
+        suggested_root: Option<PathBuf>,
+        token: String,
     },
 }
 
@@ -288,12 +299,13 @@ impl PermissionGate {
                 PendingKind::PathRead {
                     resolved,
                     suggested_root,
+                    token,
                 } => {
                     // Grants applied here; NEVER enable_session_auto for path reads.
                     if let Some(policy) = &self.path_policy {
                         match &choice {
                             ApprovalChoice::Once => {
-                                policy.grant_read_path(resolved);
+                                policy.grant_once(token, resolved, AccessKind::Read);
                             }
                             ApprovalChoice::Session | ApprovalChoice::Prefix => {
                                 if let Some(root) = suggested_root {
@@ -314,6 +326,36 @@ impl PermissionGate {
                         }
                     }
                 }
+                PendingKind::PathWrite {
+                    resolved,
+                    suggested_root,
+                    token,
+                } => {
+                    // Grants applied here; NEVER enable_session_auto for path writes.
+                    if let Some(policy) = &self.path_policy {
+                        match &choice {
+                            ApprovalChoice::Once => {
+                                policy.grant_once(token, resolved, AccessKind::Write);
+                            }
+                            ApprovalChoice::Session | ApprovalChoice::Prefix => {
+                                if let Some(root) = suggested_root {
+                                    policy.grant_writable_root(root);
+                                } else {
+                                    policy.grant_write_path(resolved);
+                                }
+                            }
+                            ApprovalChoice::Always => {
+                                if let Some(root) = suggested_root {
+                                    policy.grant_writable_root(root);
+                                } else {
+                                    policy.grant_write_path(resolved);
+                                }
+                            }
+                            ApprovalChoice::Deny { .. } => {}
+                        }
+                    }
+                }
+                PendingKind::SandboxUnavailable => {}
                 PendingKind::Standard | PendingKind::SandboxEscalate => {
                     let escalate = matches!(pending.kind, PendingKind::SandboxEscalate);
                     match &choice {
@@ -451,6 +493,71 @@ impl ToolGate for PermissionGate {
             return ToolGateDecision::Allow;
         }
 
+        // Work out the effective mode before checking any cached approval. A
+        // cached command family must never shadow a newly-added explicit deny.
+        let env_auto = std::env::var("ONE_AUTO_APPROVE")
+            .or_else(|_| std::env::var("PI_AUTO_APPROVE"))
+            .ok()
+            .as_deref()
+            == Some("1");
+        let mode = self.mode();
+        let perm_mode = self.permission_mode();
+        let auto = env_auto
+            || self.session_auto()
+            || matches!(mode, ApprovalMode::Auto)
+            || perm_mode.is_always_approve();
+        let effective_mode = if auto {
+            PermissionMode::BypassPermissions
+        } else {
+            perm_mode
+        };
+        let preflight = evaluate_with_mode(call, &self.rules, effective_mode);
+        if let PermissionVerdict::Deny { reason } = preflight {
+            return ToolGateDecision::Deny { message: reason };
+        }
+
+        // Workspace-write without bwrap cannot enforce bash writes. Do not run
+        // a best-effort host shell: only an interactive, per-call confirmation
+        // may rewrite this exact execution to the explicit escalated path.
+        let bwrap_missing = matches!(call.name.as_str(), "bash" | "shell")
+            && self
+                .path_policy
+                .as_ref()
+                .is_some_and(|p| !p.is_full_access())
+            && !OsSandbox::bwrap_available();
+        if bwrap_missing {
+            if !self.interactive {
+                return ToolGateDecision::Deny {
+                    message: "bash sandbox is unavailable (bwrap not found); denied in non-interactive mode".into(),
+                };
+            }
+            let request = ApprovalRequest {
+                id: REQ_SEQ.fetch_add(1, Ordering::Relaxed),
+                tool: call.name.clone(),
+                summary: call_summary(call),
+                reason: "bash sandbox is unavailable; run this one command without OS isolation"
+                    .into(),
+                fingerprint: call_fingerprint(call),
+                suggested_prefix: None,
+            };
+            match self
+                .await_approval(request, PendingKind::SandboxUnavailable)
+                .await
+            {
+                ToolGateDecision::Allow => {
+                    let mut arguments = call.arguments.clone();
+                    if let Some(object) = arguments.as_object_mut() {
+                        object.insert(
+                            "sandbox_permissions".into(),
+                            serde_json::json!("require_escalated"),
+                        );
+                    }
+                    return ToolGateDecision::Rewrite { arguments };
+                }
+                deny => return deny,
+            }
+        }
+
         let fp = call_fingerprint(call);
         if self
             .session_allows
@@ -470,25 +577,7 @@ impl ToolGate for PermissionGate {
             return ToolGateDecision::Allow;
         }
 
-        // Env override always wins for automation (permission Ask only).
-        let env_auto = std::env::var("ONE_AUTO_APPROVE")
-            .or_else(|_| std::env::var("PI_AUTO_APPROVE"))
-            .ok()
-            .as_deref()
-            == Some("1");
-
-        let mode = self.mode();
-        let perm_mode = self.permission_mode();
-        let auto = env_auto
-            || self.session_auto()
-            || matches!(mode, ApprovalMode::Auto)
-            || perm_mode.is_always_approve();
-        let effective_mode = if auto {
-            PermissionMode::BypassPermissions
-        } else {
-            perm_mode
-        };
-        let perm = evaluate_with_mode(call, &self.rules, effective_mode);
+        let perm = preflight;
         match perm {
             PermissionVerdict::Deny { reason } => {
                 return ToolGateDecision::Deny { message: reason };
@@ -559,6 +648,23 @@ impl ToolGate for PermissionGate {
         // --- Path boundary phase (after permission rules Allow) ---
         self.check_path_boundary(call).await
     }
+
+    async fn after_tool(
+        &self,
+        call: &ToolCall,
+        _output: &one_core::tool::ToolOutput,
+        _is_error: bool,
+    ) {
+        if let Some(token) = call
+            .arguments
+            .get("__one_permission_token")
+            .and_then(|v| v.as_str())
+        {
+            if let Some(policy) = &self.path_policy {
+                policy.revoke_once(token);
+            }
+        }
+    }
 }
 
 impl PermissionGate {
@@ -581,7 +687,10 @@ impl PermissionGate {
             };
             return match policy.resolve(path_str, AccessKind::Write) {
                 Ok(_) => ToolGateDecision::Allow,
-                Err(msg) => ToolGateDecision::Deny { message: msg },
+                Err(hard_msg) => {
+                    self.prompt_or_deny_path(call, path_str, AccessKind::Write, hard_msg)
+                        .await
+                }
             };
         }
 
@@ -595,42 +704,88 @@ impl PermissionGate {
             Err(msg) => return ToolGateDecision::Deny { message: msg },
         };
 
-        match policy.resolve(&path_str, AccessKind::Read) {
+        // grep/ls may auto-narrow to overlapping readable roots (e.g. `~/.one`
+        // while `~/.one/agent` is readable) without a path-escalation prompt.
+        let coverage = if matches!(name, "grep" | "ls") {
+            policy.resolve_read(&path_str)
+        } else {
+            policy
+                .resolve(&path_str, AccessKind::Read)
+                .map(one_tools::ReadCoverage::Exact)
+        };
+        match coverage {
             Ok(_) => ToolGateDecision::Allow,
             Err(hard_msg) => {
-                // Outside workspace — escalate or hard deny.
-                let mode = self.mode();
-                if !path_prompt_allowed(mode, self.session_auto()) {
-                    return ToolGateDecision::Deny { message: hard_msg };
-                }
-
-                // Resolve path for grant storage (same as resolve would use).
-                let resolved = one_tools::path_policy::resolve_against_cwd(policy.cwd(), &path_str);
-                let suggested_root = policy.suggest_read_root(&resolved);
-
-                let id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
-                let root_note = match &suggested_root {
-                    Some(r) => format!("suggested session root: {}", r.display()),
-                    None => "suggested session root: (none — this path only)".into(),
-                };
-                let reason = format!(
-                    "path read: outside workspace\npath: {}\n{root_note}",
-                    resolved.display()
-                );
-                let request = ApprovalRequest {
-                    id,
-                    tool: call.name.clone(),
-                    summary: format!("read {}", resolved.display()),
-                    reason,
-                    fingerprint: call_fingerprint(call),
-                    suggested_prefix: None,
-                };
-                let kind = PendingKind::PathRead {
-                    resolved: resolved.clone(),
-                    suggested_root: suggested_root.clone(),
-                };
-                self.await_approval(request, kind).await
+                self.prompt_or_deny_path(call, &path_str, AccessKind::Read, hard_msg)
+                    .await
             }
+        }
+    }
+
+    async fn prompt_or_deny_path(
+        &self,
+        call: &ToolCall,
+        path_str: &str,
+        access: AccessKind,
+        hard_msg: String,
+    ) -> ToolGateDecision {
+        let Some(policy) = &self.path_policy else {
+            return ToolGateDecision::Deny { message: hard_msg };
+        };
+        let mode = self.mode();
+        if !path_prompt_allowed(mode, self.session_auto()) {
+            return ToolGateDecision::Deny { message: hard_msg };
+        }
+
+        let resolved = one_tools::path_policy::resolve_against_cwd(policy.cwd(), path_str);
+        let suggested_root = match access {
+            AccessKind::Read => policy.suggest_read_root(&resolved),
+            AccessKind::Write => policy.suggest_write_root(&resolved),
+        };
+
+        let id = REQ_SEQ.fetch_add(1, Ordering::Relaxed);
+        let token = format!("path-once:{id}:{}", call.id);
+        let root_note = match &suggested_root {
+            Some(r) => format!("suggested session root: {}", r.display()),
+            None => "suggested session root: (none — this path only)".into(),
+        };
+        let kind_word = match access {
+            AccessKind::Read => "read",
+            AccessKind::Write => "write",
+        };
+        let reason = format!(
+            "path {kind_word}: outside workspace\npath: {}\n{root_note}",
+            resolved.display()
+        );
+        let request = ApprovalRequest {
+            id,
+            tool: call.name.clone(),
+            summary: format!("{kind_word} {}", resolved.display()),
+            reason,
+            fingerprint: call_fingerprint(call),
+            suggested_prefix: None,
+        };
+        let kind = match access {
+            AccessKind::Read => PendingKind::PathRead {
+                resolved: resolved.clone(),
+                suggested_root: suggested_root.clone(),
+                token: token.clone(),
+            },
+            AccessKind::Write => PendingKind::PathWrite {
+                resolved: resolved.clone(),
+                suggested_root: suggested_root.clone(),
+                token: token.clone(),
+            },
+        };
+        match self.await_approval(request, kind).await {
+            ToolGateDecision::Allow => {
+                let mut arguments = call.arguments.clone();
+                if let Some(object) = arguments.as_object_mut() {
+                    object.insert("__one_permission_token".into(), serde_json::json!(token));
+                }
+                ToolGateDecision::Rewrite { arguments }
+            }
+            deny => deny,
         }
     }
 }
@@ -901,6 +1056,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cached_prefix_cannot_shadow_an_explicit_deny_suffix() {
+        let gate = PermissionGate::with_auto_approve(
+            PermissionRules {
+                deny: vec!["Bash(*rm -rf *)".into()],
+                ..Default::default()
+            },
+            false,
+            true,
+        );
+        let g = gate.clone();
+        let approved = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "git push origin main" }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.respond(ApprovalChoice::Prefix));
+        assert_eq!(approved.await.unwrap(), ToolGateDecision::Allow);
+
+        let denied = gate
+            .check(&ToolCall {
+                id: "2".into(),
+                name: "bash".into(),
+                arguments: json!({ "command": "git push origin main; rm -rf /tmp/x" }),
+            })
+            .await;
+        assert!(matches!(denied, ToolGateDecision::Deny { .. }));
+        assert!(gate.poll_request().is_none());
+    }
+
+    #[tokio::test]
     async fn prefix_escalate_does_not_cover_sandboxed() {
         let gate = PermissionGate::with_auto_approve(PermissionRules::default(), false, true);
         let g = gate.clone();
@@ -1023,11 +1217,11 @@ mod tests {
     }
 
     fn temp_outside() -> PathBuf {
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
-        let dir = home.join(format!(
-            ".one-gate-outside-{}-{}",
+        let base = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("target");
+        let dir = base.join(format!(
+            "one-gate-outside-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -1059,6 +1253,19 @@ mod tests {
             })
             .await;
         assert_eq!(d, ToolGateDecision::Allow);
+        assert!(gate.poll_request().is_none());
+
+        let d = gate
+            .check(&ToolCall {
+                id: "2".into(),
+                name: "write".into(),
+                arguments: json!({
+                    "path": tmp_file.to_str().unwrap(),
+                    "content": "ok",
+                }),
+            })
+            .await;
+        assert_eq!(d, ToolGateDecision::Allow, "write /tmp must not prompt");
         assert!(gate.poll_request().is_none());
 
         let _ = std::fs::remove_file(&tmp_file);
@@ -1125,7 +1332,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_once_grant_visible_to_cloned_policy() {
+    async fn path_once_grant_is_bound_to_the_effective_call() {
         let ws = temp_workspace();
         let outside = temp_outside();
         let file = outside.join("x.txt");
@@ -1167,13 +1374,21 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(gate.respond(ApprovalChoice::Once));
-        assert_eq!(handle.await.unwrap(), ToolGateDecision::Allow);
+        let decision = handle.await.unwrap();
+        let ToolGateDecision::Rewrite { arguments } = decision else {
+            panic!("Once must inject a bound capability");
+        };
+        let token = arguments["__one_permission_token"].as_str().expect("token");
         tool_policy
             .check(&file, AccessKind::Read)
-            .expect("tool clone sees Once grant");
+            .expect_err("ordinary future calls must not inherit Once");
         tool_policy
-            .check(&file, AccessKind::Write)
-            .expect_err("write still denied");
+            .check_with_token(&file, AccessKind::Read, Some(token))
+            .expect("only the rewritten call can read");
+        tool_policy.revoke_once(token);
+        tool_policy
+            .check_with_token(&file, AccessKind::Read, Some(token))
+            .expect_err("failed, cancelled, or repeated calls cannot reuse Once");
         assert!(!gate.session_auto());
 
         let _ = std::fs::remove_dir_all(&outside);
@@ -1212,7 +1427,10 @@ mod tests {
         }
         // Force Always as if UI offered it — must not flip session_auto.
         assert!(gate.respond(ApprovalChoice::Always));
-        assert_eq!(handle.await.unwrap(), ToolGateDecision::Allow);
+        assert!(matches!(
+            handle.await.unwrap(),
+            ToolGateDecision::Rewrite { .. }
+        ));
         assert!(
             !gate.session_auto(),
             "path Always must not enable session_auto"
@@ -1227,7 +1445,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn path_write_outside_hard_deny() {
+    async fn path_write_outside_hard_deny_fail_closed() {
         let ws = temp_workspace();
         let outside = temp_outside();
         let file = outside.join("x.txt");
@@ -1236,7 +1454,7 @@ mod tests {
         let gate = PermissionGate::with_auto_approve_and_policy(
             PermissionRules::default(),
             false,
-            true,
+            false, // fail-closed: no prompt
             Some(policy),
         );
         let d = gate
@@ -1255,6 +1473,172 @@ mod tests {
         }
         assert!(gate.poll_request().is_none());
         let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_write_outside_prompts_interactive() {
+        let ws = temp_workspace();
+        let outside = temp_outside();
+        let file = outside.join("x.txt");
+        std::fs::write(&file, "hi").unwrap();
+
+        let policy = PathPolicy::workspace(ws.clone());
+        let tool_policy = policy.clone();
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            true,
+            Some(policy.clone()),
+        );
+        let g = gate.clone();
+        let path = file.to_str().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "path": path,
+                    "old_string": "hi",
+                    "new_string": "yo",
+                }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if let Some(req) = gate.poll_request() {
+                assert!(req.reason.starts_with("path write:"), "{}", req.reason);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.respond(ApprovalChoice::Once));
+        let ToolGateDecision::Rewrite { arguments } = handle.await.unwrap() else {
+            panic!("Once write must inject a capability");
+        };
+        let token = arguments["__one_permission_token"].as_str().expect("token");
+        tool_policy
+            .check(&file, AccessKind::Write)
+            .expect_err("Once write must not persist");
+        tool_policy
+            .check_with_token(&file, AccessKind::Write, Some(token))
+            .expect("effective write call can use its token");
+        assert!(!gate.session_auto());
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_write_always_does_not_enable_session_auto() {
+        let ws = temp_workspace();
+        let outside = temp_outside();
+        let file = outside.join("x.txt");
+        std::fs::write(&file, "hi").unwrap();
+
+        let policy = PathPolicy::workspace(ws.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            true,
+            Some(policy.clone()),
+        );
+        let g = gate.clone();
+        let path = file.to_str().unwrap().to_string();
+        let handle = tokio::spawn(async move {
+            g.check(&ToolCall {
+                id: "1".into(),
+                name: "write".into(),
+                arguments: json!({ "path": path, "content": "x" }),
+            })
+            .await
+        });
+        for _ in 0..50 {
+            if gate.poll_request().is_some() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(gate.respond(ApprovalChoice::Always));
+        assert!(matches!(
+            handle.await.unwrap(),
+            ToolGateDecision::Rewrite { .. }
+        ));
+        assert!(
+            !gate.session_auto(),
+            "path write Always must not enable session_auto"
+        );
+        policy
+            .check(&file, AccessKind::Write)
+            .expect("Always maps to write grant");
+
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_write_agent_models_json_allows() {
+        let ws = temp_workspace();
+        let policy = PathPolicy::workspace(ws.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            false,
+            Some(policy),
+        );
+        let models = format!(
+            "{}/.one/agent/models.json",
+            std::env::var("HOME").unwrap_or_else(|_| ".".into())
+        );
+        let d = gate
+            .check(&ToolCall {
+                id: "1".into(),
+                name: "write".into(),
+                arguments: json!({ "path": models, "content": "{}" }),
+            })
+            .await;
+        assert_eq!(d, ToolGateDecision::Allow);
+        let _ = std::fs::remove_dir_all(&ws);
+    }
+
+    #[tokio::test]
+    async fn path_grep_parent_of_readable_root_allows_without_prompt() {
+        let ws = temp_workspace();
+        let parent = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("target")
+            .join(format!(
+                "one-gate-narrow-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let allowed = parent.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::write(allowed.join("a.txt"), "x").unwrap();
+
+        let policy = PathPolicy::workspace(ws.clone()).with_readable_root(allowed.clone());
+        let gate = PermissionGate::with_auto_approve_and_policy(
+            PermissionRules::default(),
+            false,
+            false, // fail-closed: would deny if narrowing didn't apply
+            Some(policy),
+        );
+        let d = gate
+            .check(&ToolCall {
+                id: "1".into(),
+                name: "grep".into(),
+                arguments: json!({
+                    "pattern": "x",
+                    "path": parent.to_str().unwrap(),
+                }),
+            })
+            .await;
+        assert_eq!(d, ToolGateDecision::Allow);
+        assert!(gate.poll_request().is_none());
+        let _ = std::fs::remove_dir_all(&parent);
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -1322,7 +1706,10 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(gate.respond(ApprovalChoice::Session));
-        assert_eq!(handle.await.unwrap(), ToolGateDecision::Allow);
+        assert!(matches!(
+            handle.await.unwrap(),
+            ToolGateDecision::Rewrite { .. }
+        ));
         // Sibling under session root should pass without another prompt.
         let d2 = gate
             .check(&ToolCall {

@@ -1354,6 +1354,7 @@ mod inner {
             }
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
+            body["parallel_tool_calls"] = json!(true);
         }
 
         // Prefer Pi compat thinkingFormat; fall back to legacy ThinkingWire::Auto dual-shape.
@@ -1409,6 +1410,7 @@ mod inner {
         if !tools.is_empty() {
             body["tools"] = json!(tools);
             body["tool_choice"] = json!("auto");
+            body["parallel_tool_calls"] = json!(true);
         }
         if native_web_search && include_search_sources {
             body["include"] = json!(["web_search_call.action.sources"]);

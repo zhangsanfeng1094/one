@@ -31,7 +31,10 @@ pub use meta::{
     PROMPT_INLINE_MAX_BYTES,
 };
 pub use migrate::migrate_jsonl;
-pub use paths::{agent_dir, session_dir_for_cwd, session_root};
+pub use paths::{
+    agent_dir, session_dir_for_cwd, session_root, set_agent_dir_override, terminal_dir_for_session,
+    terminal_log_path, TERMINAL_DIR,
+};
 pub use presence::{
     inspect_session_presence, is_process_alive, lock_path_for, Activity, SessionLock,
     SessionPresence,

@@ -18,7 +18,7 @@ use serde_json::json;
 use crate::glob_util::{expand_brace_glob, walk_builder, MAX_WALK_ENTRIES};
 use crate::memory_io::{is_memory_path, MemoryLookupBudget};
 use crate::path_policy::{AccessKind, PathPolicy};
-use crate::tool_args::{bool_arg, path_arg_or, u64_arg};
+use crate::tool_args::{bool_arg, one_time_permission_token, path_arg_or, u64_arg};
 
 pub struct GrepTool {
     policy: PathPolicy,
@@ -85,7 +85,9 @@ impl Tool for GrepTool {
                  (no host `rg` required). Prefer this over bash `rg`/`grep`. Use `glob` or \
                  `type` to narrow files, `output_mode` for files_with_matches/count, and \
                  context lines for surrounding code. Default path is the workspace root; \
-                 paths outside need interactive approval or --add-dir (do not blind-scan ~/.xxx)."
+                 `~/` is `$HOME` (not a workspace-relative folder). Paths outside need \
+                 interactive approval or --add-dir; a parent of readable roots (e.g. `~/.one`) \
+                 is auto-narrowed to those roots instead of a hard deny."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -93,6 +95,10 @@ impl Tool for GrepTool {
                     "pattern": {
                         "type": "string",
                         "description": "Regular expression pattern to search for"
+                    },
+                    "description": {
+                        "type": "string",
+                        "description": "Optional short explanation of what you are searching for"
                     },
                     "path": {
                         "type": "string",
@@ -202,21 +208,24 @@ impl Tool for GrepTool {
             (context_b.unwrap_or(0), context_a.unwrap_or(0))
         };
 
-        let resolved = self
+        let coverage = self
             .policy
-            .resolve(&path, AccessKind::Read)
+            .resolve_read_with_token(&path, one_time_permission_token(&call.arguments, &call.id))
             .map_err(|err| tool_error("grep", err))?;
 
-        if is_memory_path(&resolved) {
-            if let Err(msg) = self.memory_lookups.try_consume() {
-                let text = one_core::system_reminder(msg);
-                return Ok(ToolOutput::text_with_details(
-                    text,
-                    json!({
-                        "path": path,
-                        "memoryLookupBudgetExceeded": true,
-                    }),
-                ));
+        let search_roots: Vec<PathBuf> = coverage.roots().to_vec();
+        for root in &search_roots {
+            if is_memory_path(root) {
+                if let Err(msg) = self.memory_lookups.try_consume() {
+                    let text = one_core::system_reminder(msg);
+                    return Ok(ToolOutput::text_with_details(
+                        text,
+                        json!({
+                            "path": path,
+                            "memoryLookupBudgetExceeded": true,
+                        }),
+                    ));
+                }
             }
         }
 
@@ -234,24 +243,45 @@ impl Tool for GrepTool {
         };
 
         let policy = self.policy.clone();
-        let search_result = tokio::task::spawn_blocking(move || run_search(resolved, opts, policy))
-            .await
-            .map_err(|err| tool_error("grep", format!("search task failed: {err}")))?;
+        let token = one_time_permission_token(&call.arguments, &call.id).map(str::to_owned);
+        let narrowed = coverage.is_narrowed();
+        let requested = coverage.requested().to_path_buf();
+        let search_result = tokio::task::spawn_blocking(move || {
+            run_search_roots(
+                search_roots,
+                opts,
+                policy,
+                narrowed.then_some(requested),
+                token,
+            )
+        })
+        .await
+        .map_err(|err| tool_error("grep", format!("search task failed: {err}")))?;
 
         let result = search_result?;
 
         if result.lines.is_empty() {
+            let text = if let Some(note) = &result.narrow_note {
+                format!("{note}\nno matches")
+            } else {
+                "no matches".to_string()
+            };
             return Ok(ToolOutput::text_with_details(
-                "no matches".to_string(),
+                text,
                 json!({
                     "matches": 0,
                     "output_mode": output_mode_label(output_mode),
+                    "narrowed": narrowed,
                 }),
             ));
         }
 
         let match_count = result.lines.len();
-        let body = result.lines.join("\n");
+        let body = if let Some(note) = &result.narrow_note {
+            format!("{note}\n{}", result.lines.join("\n"))
+        } else {
+            result.lines.join("\n")
+        };
         let text = crate::truncate::present_tool_output(
             &body,
             "grep",
@@ -265,6 +295,7 @@ impl Tool for GrepTool {
             "output_mode": output_mode_label(output_mode),
             "head_limit_applied": result.head_limit_applied,
             "engine": "in-process",
+            "narrowed": narrowed,
         });
         if let Some(obj) = details.as_object_mut() {
             if let Some(ref g) = result.glob {
@@ -285,9 +316,61 @@ struct SearchResult {
     head_limit_applied: bool,
     glob: Option<String>,
     file_type: Option<String>,
+    narrow_note: Option<String>,
 }
 
-fn run_search(root: PathBuf, opts: SearchOpts, policy: PathPolicy) -> Result<SearchResult> {
+fn run_search_roots(
+    roots: Vec<PathBuf>,
+    opts: SearchOpts,
+    policy: PathPolicy,
+    narrowed_from: Option<PathBuf>,
+    token: Option<String>,
+) -> Result<SearchResult> {
+    let narrow_note = narrowed_from.as_ref().map(|requested| {
+        let mut note = format!(
+            "search narrowed to readable roots under {} (other paths hidden):",
+            requested.display()
+        );
+        for root in &roots {
+            note.push_str("\n- ");
+            note.push_str(&root.display().to_string());
+        }
+        note
+    });
+    let mut combined = SearchResult {
+        lines: Vec::new(),
+        total_before_head_limit: 0,
+        head_limit_applied: false,
+        glob: opts.glob.clone(),
+        file_type: opts.file_type.clone(),
+        narrow_note,
+    };
+    let mut remaining = opts.head_limit;
+    for root in roots {
+        let mut step = opts.clone();
+        step.head_limit = remaining;
+        let part = run_search(root, step, policy.clone(), token.as_deref())?;
+        combined.total_before_head_limit += part.total_before_head_limit;
+        combined.head_limit_applied |= part.head_limit_applied;
+        combined.lines.extend(part.lines);
+        if let Some(limit) = remaining {
+            if combined.lines.len() >= limit {
+                combined.head_limit_applied = true;
+                combined.lines.truncate(limit);
+                break;
+            }
+            remaining = Some(limit.saturating_sub(combined.lines.len()));
+        }
+    }
+    Ok(combined)
+}
+
+fn run_search(
+    root: PathBuf,
+    opts: SearchOpts,
+    policy: PathPolicy,
+    token: Option<&str>,
+) -> Result<SearchResult> {
     let mut builder = RegexBuilder::new(&opts.pattern);
     builder.case_insensitive(opts.ignore_case);
     if opts.multiline {
@@ -316,7 +399,7 @@ fn run_search(root: PathBuf, opts: SearchOpts, policy: PathPolicy) -> Result<Sea
     // Prefer explicit glob; else type mapping.
     let effective_glob = opts.glob.clone().or(type_glob);
 
-    let files = collect_files(&root, effective_glob.as_deref(), &policy)?;
+    let files = collect_files(&root, effective_glob.as_deref(), &policy, token)?;
 
     let mut lines: Vec<String> = Vec::new();
     let mut total_hits: usize = 0; // mode-dependent count before head_limit
@@ -482,13 +565,19 @@ fn run_search(root: PathBuf, opts: SearchOpts, policy: PathPolicy) -> Result<Sea
         head_limit_applied,
         glob: opts.glob,
         file_type: opts.file_type,
+        narrow_note: None,
     })
 }
 
-fn collect_files(root: &Path, glob: Option<&str>, policy: &PathPolicy) -> Result<Vec<PathBuf>> {
+fn collect_files(
+    root: &Path,
+    glob: Option<&str>,
+    policy: &PathPolicy,
+    token: Option<&str>,
+) -> Result<Vec<PathBuf>> {
     if root.is_file() {
         policy
-            .check(root, AccessKind::Read)
+            .check_with_token(root, AccessKind::Read, token)
             .map_err(|err| tool_error("grep", err))?;
         return Ok(vec![root.to_path_buf()]);
     }
@@ -510,11 +599,13 @@ fn collect_files(root: &Path, glob: Option<&str>, policy: &PathPolicy) -> Result
 
     let files = std::sync::Mutex::new(Vec::new());
     let err_slot = std::sync::Mutex::new(None::<String>);
+    let token = token.map(str::to_owned);
 
     walker.build_parallel().run(|| {
         let files = &files;
         let err_slot = &err_slot;
         let policy = policy;
+        let token = token.as_deref();
         Box::new(move |entry| {
             let entry = match entry {
                 Ok(e) => e,
@@ -528,7 +619,10 @@ fn collect_files(root: &Path, glob: Option<&str>, policy: &PathPolicy) -> Result
                 return WalkState::Continue;
             }
             let path = entry.path();
-            if policy.check(path, AccessKind::Read).is_err() {
+            if policy
+                .check_with_token(path, AccessKind::Read, token.as_deref())
+                .is_err()
+            {
                 return WalkState::Continue;
             }
             if let Ok(mut guard) = files.lock() {
@@ -731,6 +825,48 @@ mod tests {
         let text = out.as_text();
         assert!(text.contains("a.rs") || text.contains("b.rs"), "{text}");
         assert!(!text.contains("readme.md"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn parent_of_readable_root_narrows_and_hides_siblings() {
+        let dir = temp_workspace();
+        let parent = std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join("target")
+            .join(format!(
+                "one-grep-narrow-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+        let allowed = parent.join("allowed");
+        let secret = parent.join("secret");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(allowed.join("hit.txt"), "OPENAI_BASE_URL=yes\n").unwrap();
+        std::fs::write(secret.join("hit.txt"), "OPENAI_BASE_URL=LEAK\n").unwrap();
+
+        let policy = PathPolicy::workspace(dir.clone()).with_readable_root(allowed.clone());
+        let tool = GrepTool::with_policy(policy);
+        let out = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "grep".into(),
+                arguments: json!({
+                    "pattern": "OPENAI_BASE_URL",
+                    "path": parent.to_str().unwrap(),
+                }),
+            })
+            .await
+            .unwrap();
+        let text = out.as_text();
+        assert!(text.contains("search narrowed"), "{text}");
+        assert!(text.contains("yes"), "{text}");
+        assert!(!text.contains("LEAK"), "sibling leak:\n{text}");
+        let _ = std::fs::remove_dir_all(&parent);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

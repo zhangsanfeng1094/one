@@ -13,8 +13,8 @@ use serde_json::json;
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::edit_diff::{
-    apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success, normalize_to_lf,
-    patch_for_details,
+    apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success,
+    format_not_found_message, normalize_to_lf, patch_for_details, EditApplyError,
 };
 use crate::path_policy::{AccessKind, PathPolicy};
 use crate::tool_args::{
@@ -54,7 +54,10 @@ impl Tool for EditTool {
             "any path".to_string()
         } else {
             format!(
-                "paths under workspace `{}` (and --add-dir roots)",
+                "paths under workspace `{}` (and --add-dir roots); \
+                 `/tmp`, `/var/tmp`, and `$TMPDIR` are writable; \
+                 `~/` is `$HOME`; `~/.one/agent/{{models,settings,mcp}}.json` are writable; \
+                 other outside paths prompt in interactive sessions",
                 self.policy.cwd().display()
             )
         };
@@ -68,7 +71,7 @@ impl Tool for EditTool {
                 "old_string".into(),
                 json!({
                     "type": "string",
-                    "description": "Text to find (aliases: oldString, oldText). Prefer exact match; trailing whitespace / smart quotes are tolerated via fuzzy fallback. Must match uniquely unless replace_all is true. Do not include read-tool line-number prefixes."
+                    "description": "Text to find (aliases: oldString, oldText). Prefer short unique anchors (2-5 lines of exact code) that uniquely locate the change. Must match uniquely unless replace_all is true. Do not guess unread code; check with `read` first. Do not include read-tool line numbers (e.g. `12|`)."
                 }),
             );
             obj.insert(
@@ -85,6 +88,13 @@ impl Tool for EditTool {
                     "description": "If true, replace every occurrence (alias: replaceAll). Default false — then the match must be unique."
                 }),
             );
+            obj.insert(
+                "description".into(),
+                json!({
+                    "type": "string",
+                    "description": "Optional short summary of the edit being made"
+                }),
+            );
         }
         ToolDefinition {
             name: "edit".to_string(),
@@ -93,13 +103,15 @@ impl Tool for EditTool {
                  with `new_string` in an existing file. Always pass `path` on every call — never \
                  omit it when batching multiple edits. Prefer this over `write` \
                  for bugfixes and localized changes. Matching: exact first, then low-risk fuzzy \
-                 (trailing whitespace, smart quotes/dashes), then stricter multi-line fallbacks. \
+                 (trailing whitespace, smart quotes/dashes), then multi-line formatting fallbacks. \
                  If any strategy finds multiple candidates the edit fails — looser strategies do \
                  not guess past ambiguity. By default the match must be unique (fails if 0 or >1); \
                  set `replace_all=true` only for clear bulk renames (exact/normalized equality; \
-                 never similarity-ranked blocks). Include enough surrounding context when not \
-                 using replace_all. Re-read the file immediately before each edit on a file you \
-                 just changed (or after an edit failure) — stale old_string will not match. \
+                 never similarity-ranked blocks). \
+                 Core guidelines: \
+                 (1) Prefer short unique anchors (2-5 lines of exact code) instead of large unchanged blocks. \
+                 (2) Read target lines with `read` immediately before editing; never guess code. \
+                 (3) Re-read the file immediately before each subsequent edit on a file you just changed. \
                  Allowed: {scope}."
             ),
             parameters: json!({
@@ -128,7 +140,11 @@ impl Tool for EditTool {
 
         let resolved = self
             .policy
-            .resolve(path, AccessKind::Write)
+            .resolve_with_token(
+                path,
+                AccessKind::Write,
+                crate::tool_args::one_time_permission_token(&call.arguments, &call.id),
+            )
             .map_err(|err| tool_error("edit", err))?;
 
         let lock = file_lock(&resolved);
@@ -143,8 +159,13 @@ impl Tool for EditTool {
         let old_lf = normalize_to_lf(old_string);
         let new_lf = normalize_to_lf(new_string);
 
-        let applied = apply_edit_lf(&content_lf, &old_lf, &new_lf, replace_all)
-            .map_err(|e| tool_error("edit", e.user_message()))?;
+        let applied = apply_edit_lf(&content_lf, &old_lf, &new_lf, replace_all).map_err(|e| {
+            let msg = match &e {
+                EditApplyError::NotFound => format_not_found_message(path, &content_lf, &old_lf),
+                _ => e.user_message(),
+            };
+            tool_error("edit", msg)
+        })?;
 
         let to_write = apply_line_ending(&applied.content_lf, ending);
         tokio::fs::write(&resolved, to_write)

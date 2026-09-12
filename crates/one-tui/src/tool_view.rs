@@ -11,7 +11,7 @@ use crate::theme::Theme;
 use crate::ui::text::expand_tabs;
 
 /// Max tools shown as a single collapsed “N tools” chip before forcing expand.
-pub const COLLAPSE_GROUP_MIN: usize = 3;
+pub const COLLAPSE_GROUP_MIN: usize = 2;
 
 /// Base eligibility for multi-tool grouping (ignores expand / ungroup flags).
 ///
@@ -109,7 +109,7 @@ pub fn streak_group_eligible(messages: &[Message], start: usize, len: usize) -> 
 
 /// True when the whole streak is done successes and none expanded → show group chip.
 pub fn streak_can_collapse(messages: &[Message], start: usize, len: usize) -> bool {
-    if len < COLLAPSE_GROUP_MIN {
+    if len < 2 {
         return false;
     }
     messages[start..start + len].iter().all(tool_collapsible)
@@ -132,7 +132,11 @@ pub fn tool_display_name(tool_name: &str, args: &str) -> String {
             }
         }
     }
-    tool_name.to_string()
+    match tool_name {
+        "bash" | "shell" => "Run".to_string(),
+        "task" | "spawn_subagent" => "Task".to_string(),
+        _ => tool_name.to_string(),
+    }
 }
 
 /// Short label for a tool in a group header: `bash` / `edit:path` / `linear__save_issue`.
@@ -181,6 +185,92 @@ pub fn aggregate_tool_names(names: &[String]) -> String {
         })
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+/// Format multi-tool streak summary like Grok Build: `Read 2 files`, `Read 6 files, Searched 4 patterns`.
+pub fn format_tool_streak_summary(tools: &[Message]) -> Option<String> {
+    if tools.is_empty() {
+        return None;
+    }
+    let mut read_count = 0usize;
+    let mut search_count = 0usize;
+    let mut edit_count = 0usize;
+    let mut write_count = 0usize;
+    let mut run_count = 0usize;
+    let mut other_count = 0usize;
+
+    for t in tools {
+        let raw = t.tool_name.as_deref().unwrap_or("tool");
+        match raw {
+            "read" | "read_file" => read_count += 1,
+            "grep" | "search" => search_count += 1,
+            "edit" => edit_count += 1,
+            "write" => write_count += 1,
+            "bash" | "shell" => run_count += 1,
+            _ => other_count += 1,
+        }
+    }
+
+    if other_count > 0 {
+        return None;
+    }
+
+    let mut parts = Vec::new();
+    if read_count > 0 {
+        parts.push(if read_count == 1 {
+            "Read 1 file".to_string()
+        } else {
+            format!("Read {read_count} files")
+        });
+    }
+    if search_count > 0 {
+        parts.push(if search_count == 1 {
+            "Searched 1 pattern".to_string()
+        } else {
+            format!("Searched {search_count} patterns")
+        });
+    }
+    if edit_count > 0 {
+        parts.push(if edit_count == 1 {
+            "Edited 1 file".to_string()
+        } else {
+            format!("Edited {edit_count} files")
+        });
+    }
+    if write_count > 0 {
+        parts.push(if write_count == 1 {
+            "Wrote 1 file".to_string()
+        } else {
+            format!("Wrote {write_count} files")
+        });
+    }
+    if run_count > 0 {
+        parts.push(if run_count == 1 {
+            "Ran 1 command".to_string()
+        } else {
+            format!("Ran {run_count} commands")
+        });
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join(", "))
+    }
+}
+
+/// Human-readable label for a currently running tool (Grok-style live status).
+pub fn running_tool_label(msg: &Message, cwd: Option<&Path>) -> String {
+    let raw = msg.tool_name.as_deref().unwrap_or("tool");
+    let display_name = tool_display_name(raw, &msg.content);
+    let detail = pretty_tool_detail(&msg.content, cwd);
+    if detail.is_empty() {
+        display_name
+    } else if display_name == "Run" || display_name == "Task" {
+        detail
+    } else {
+        format!("{display_name} {detail}")
+    }
 }
 
 /// Collapse multi-line / escaped newlines into a single-line preview (`↵` separators).
@@ -385,15 +475,32 @@ fn format_json_args_preview(val: &Value, cwd: Option<&Path>) -> String {
         .or_else(|| obj.get("uri"))
         .and_then(|v| v.as_str());
 
+    let desc_val = obj
+        .get("description")
+        .or_else(|| obj.get("desc"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
     let title_val = obj
         .get("title")
         .or_else(|| obj.get("message"))
         .or_else(|| obj.get("text"))
-        .or_else(|| obj.get("description"))
         .or_else(|| obj.get("name"))
         .and_then(|v| v.as_str());
 
     if let Some(q) = query_val {
+        if let Some(desc) = desc_val {
+            let desc_short = single_line_preview(desc, 160);
+            if let Some(repo) = repo_val {
+                return format!("{repo} · {desc_short}");
+            }
+            if let Some(p) = path_val {
+                let p_short = shorten_display_path(p, cwd);
+                return format!("{p_short} · {desc_short}");
+            }
+            return desc_short;
+        }
         let q_short = single_line_preview(q, 160);
         if let Some(repo) = repo_val {
             return format!("{repo} · \"{q_short}\"");
@@ -406,6 +513,9 @@ fn format_json_args_preview(val: &Value, cwd: Option<&Path>) -> String {
     }
 
     if let Some(cmd) = cmd_val {
+        if let Some(desc) = desc_val {
+            return single_line_preview(desc, 240);
+        }
         let short = shorten_paths_in_text(cmd, cwd);
         return single_line_preview(&short, 240);
     }
@@ -415,7 +525,15 @@ fn format_json_args_preview(val: &Value, cwd: Option<&Path>) -> String {
             let p_short = shorten_display_path(p, cwd);
             return format!("{pat} · {p_short}");
         }
+        if let Some(desc) = desc_val {
+            let p_short = shorten_display_path(p, cwd);
+            return format!("{p_short} · \"{desc}\"");
+        }
         return shorten_display_path(p, cwd);
+    }
+
+    if let Some(desc) = desc_val {
+        return single_line_preview(desc, 240);
     }
 
     if let Some(pat) = pattern_val {
@@ -2634,6 +2752,42 @@ Background job started. Continue other work.
             summarize_tool_special("bash", r#"{"command":"ls"}"#, "exit 0\na\nb\nc\n", false)
                 .unwrap();
         assert_eq!(s_lines, "3 lines");
+    }
+
+    #[test]
+    fn pretty_tool_detail_prefers_description_for_bash_and_task() {
+        let bash_args = r#"{"command":"grep -rn 'DNS' .","description":"Search for DNS rebinding error in mcp-go"}"#;
+        let d = pretty_tool_detail(bash_args, None);
+        assert_eq!(d, "Search for DNS rebinding error in mcp-go");
+
+        let task_args = r#"{"prompt":"Long prompt with 500 chars...","description":"Search for the exact error message"}"#;
+        let d2 = pretty_tool_detail(task_args, None);
+        assert_eq!(d2, "Search for the exact error message");
+
+        assert_eq!(tool_display_name("bash", "{}"), "Run");
+        assert_eq!(tool_display_name("task", "{}"), "Task");
+    }
+
+    #[test]
+    fn format_tool_streak_summary_grok_style() {
+        let tools2 = vec![
+            Message::tool("read", r#"{"path":"a"}"#, ToolStatus::Done),
+            Message::tool("read", r#"{"path":"b"}"#, ToolStatus::Done),
+        ];
+        assert_eq!(
+            format_tool_streak_summary(&tools2),
+            Some("Read 2 files".to_string())
+        );
+
+        let tools_mixed = vec![
+            Message::tool("read", r#"{"path":"a"}"#, ToolStatus::Done),
+            Message::tool("grep", r#"{"pattern":"p1"}"#, ToolStatus::Done),
+            Message::tool("grep", r#"{"pattern":"p2"}"#, ToolStatus::Done),
+        ];
+        assert_eq!(
+            format_tool_streak_summary(&tools_mixed),
+            Some("Read 1 file, Searched 2 patterns".to_string())
+        );
     }
 
     #[test]

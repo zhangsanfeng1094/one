@@ -15,8 +15,9 @@
 //! present (`.codex`, `.one`, `.agents`) — not project `.git`, so `git commit`
 //! inside a workspace still works.
 //!
-//! `full-access` disables wrapping. If `bwrap` is missing, commands run
-//! unsandboxed with a one-time warning (best-effort).
+//! `full-access` disables wrapping. In workspace-write, a missing `bwrap`
+//! produces a failed launch; the permission gate may explicitly reissue one
+//! interactive call as escalated.
 //!
 //! Override: `ONE_BASH_SANDBOX=0` disables the OS sandbox only.
 
@@ -48,11 +49,6 @@ impl OsSandbox {
             SandboxMode::WorkspaceWrite => true,
             SandboxMode::FullAccess => false,
         };
-        // Env override: ONE_BASH_SANDBOX=0 disables OS sandbox only.
-        let enabled = enabled
-            && std::env::var("ONE_BASH_SANDBOX")
-                .map(|v| v != "0" && v != "false" && v != "off")
-                .unwrap_or(true);
 
         Self {
             enabled,
@@ -89,7 +85,8 @@ impl OsSandbox {
                      (install bubblewrap, or set ONE_BASH_SANDBOX=0 to silence)"
                 );
             }
-            return ("bash".into(), vec!["-lc".into(), user_command.to_string()]);
+            // Never execute the payload when isolation cannot be established.
+            return ("/bin/false".into(), vec![]);
         };
 
         let mut args = Vec::new();
@@ -118,7 +115,6 @@ impl OsSandbox {
         for w in &self.writable_roots {
             push_w(w.clone());
         }
-        push_w(self.cwd.clone());
 
         // Codex workspace-write: /tmp + $TMPDIR are writable by default.
         push_w(PathBuf::from("/tmp"));
@@ -257,12 +253,37 @@ mod tests {
         if !OsSandbox::bwrap_available() {
             return;
         }
-        // Workspace under /tmp (writable). Leak target under $HOME (RO via /).
+        // Workspace under /tmp (writable). Leak target outside writable roots (RO via /).
         let dir = unique_dir("one-os-sb-block");
-        let home = std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("/tmp"));
-        let outside = home.join(format!(
+        let temp_roots = [
+            Some(PathBuf::from("/tmp")),
+            Some(PathBuf::from("/var/tmp")),
+            std::env::var_os("TMPDIR").map(PathBuf::from),
+        ]
+        .into_iter()
+        .flatten()
+        .map(|path| path.canonicalize().unwrap_or(path))
+        .filter(|path| path.is_absolute())
+        .collect::<Vec<_>>();
+        let canonical_dir = dir.canonicalize().unwrap_or_else(|_| dir.clone());
+        let outside_base = [
+            std::env::var_os("HOME").map(PathBuf::from),
+            std::env::current_dir().ok(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .filter_map(|path| path.canonicalize().ok())
+        .find(|path| {
+            !path.starts_with(&canonical_dir)
+                && !temp_roots.iter().any(|root| path.starts_with(root))
+        });
+        let Some(outside_base) = outside_base else {
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        };
+
+        let outside = outside_base.join(format!(
             ".one-os-sb-outside-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -286,7 +307,8 @@ mod tests {
         }
         assert!(
             !leaked,
-            "sandbox allowed write outside workspace into $HOME; status={:?} stderr={}",
+            "sandbox allowed write outside workspace into {}; status={:?} stderr={}",
+            outside_base.display(),
             out.status,
             String::from_utf8_lossy(&out.stderr)
         );
@@ -346,5 +368,23 @@ mod tests {
             String::from_utf8_lossy(&out.stderr)
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn persisted_cwd_is_not_added_as_a_writable_bind() {
+        if !OsSandbox::bwrap_available() {
+            return;
+        }
+        let workspace = unique_dir("one-os-sb-root");
+        let outside = std::env::temp_dir().join(format!("one-os-sb-cwd-{}", std::process::id()));
+        std::fs::create_dir_all(&outside).unwrap();
+        let mut sandbox = OsSandbox::from_policy(&PathPolicy::workspace(workspace.clone()));
+        sandbox.cwd = outside.clone();
+        let (_, args) = sandbox.command_line("true");
+        assert!(!args.windows(3).any(|w| w[0] == "--bind"
+            && w[1] == outside.to_string_lossy()
+            && w[2] == outside.to_string_lossy()));
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 }

@@ -2068,6 +2068,14 @@ async fn run_turn_streaming(
                     cancel_hitl(app, &gate, &hitl);
                     runtime.abort();
                 }
+                if app.take_background_now() {
+                    if runtime.bg_registry().has_foreground_waiter() {
+                        runtime.bg_registry().request_background_now();
+                        app.set_notice("backgrounding command…");
+                    } else {
+                        app.set_notice("no foreground command to background");
+                    }
+                }
                 if let Some(text) = app.take_steer() {
                     one_core::agent::Agent::push_queue(&steering, text.clone());
                     app.set_notice(format!("queued steer  {text}"));
@@ -2154,6 +2162,14 @@ async fn run_turn_streaming(
                         if app.take_abort() {
                             cancel_hitl(app, &gate2, &hitl2);
                             runtime.abort();
+                        }
+                        if app.take_background_now() {
+                            if runtime.bg_registry().has_foreground_waiter() {
+                                runtime.bg_registry().request_background_now();
+                                app.set_notice("backgrounding command…");
+                            } else {
+                                app.set_notice("no foreground command to background");
+                            }
                         }
                     },
                     retry,

@@ -389,7 +389,10 @@ pub fn strip_ansi_for_ui(input: &str) -> String {
             continue;
         }
         // Copy one UTF-8 char starting at i.
-        let ch = input.get(i..).and_then(|s| s.chars().next()).unwrap_or('\u{fffd}');
+        let ch = input
+            .get(i..)
+            .and_then(|s| s.chars().next())
+            .unwrap_or('\u{fffd}');
         out.push(ch);
         i += ch.len_utf8();
     }
@@ -462,4 +465,3 @@ mod tests {
         assert!(clean.contains("URL: https://antigravity.google/docs/hooks"));
     }
 }
-

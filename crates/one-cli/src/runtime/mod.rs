@@ -12,6 +12,7 @@
 mod build;
 mod context;
 pub mod coordinator;
+pub mod effective_config;
 pub mod env_context;
 pub mod explore_tools;
 pub mod features;

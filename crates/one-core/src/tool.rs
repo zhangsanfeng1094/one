@@ -153,7 +153,13 @@ pub fn resolve_tool_name(name: &str) -> &str {
         "search_replace" | "str_replace" | "StrReplace" | "Edit" | "ApplyPatch"
         | "replace_in_file" | "multi_edit" => "edit",
         // bash
-        "shell" | "Bash" | "Shell" | "run_terminal_cmd" | "run_command" | "execute"
+        "shell"
+        | "Bash"
+        | "Shell"
+        | "run_terminal_cmd"
+        | "run_terminal_command"
+        | "run_command"
+        | "execute"
         | "terminal" => "bash",
         // grep
         "Grep" | "rg" | "search_codebase" | "codebase_search" | "find" | "Find" | "Glob"
@@ -180,6 +186,8 @@ mod tool_name_tests {
         assert_eq!(resolve_tool_name("search_replace"), "edit");
         assert_eq!(resolve_tool_name("str_replace"), "edit");
         assert_eq!(resolve_tool_name("shell"), "bash");
+        assert_eq!(resolve_tool_name("run_terminal_command"), "bash");
+        assert_eq!(resolve_tool_name("run_terminal_cmd"), "bash");
         assert_eq!(resolve_tool_name("Glob"), "grep");
         assert_eq!(resolve_tool_name("find"), "grep");
         assert_eq!(resolve_tool_name("GlobTool"), "grep");

@@ -12,12 +12,13 @@ use std::time::{Duration, Instant};
 
 use tokio::process::{Child, Command};
 use tokio::sync::Notify;
-use tokio::time::timeout;
+use tokio::time::{sleep, timeout};
 
 use crate::os_sandbox::OsSandbox;
 use crate::process_io::{
-    configure_shell_stdio, kill_child_process_group, kill_process_group, stream_pipe_into,
-    EXEC_OUTPUT_MAX_BYTES, IO_DRAIN_TIMEOUT,
+    configure_shell_stdio, graceful_kill_child, kill_child_process_group, kill_process_group,
+    output_file_max_bytes, stream_pipe_into, stream_pipe_into_tee, term_child_process_group,
+    term_process_group, OutputFileSink, EXEC_OUTPUT_MAX_BYTES, IO_DRAIN_TIMEOUT, SIGTERM_GRACE,
 };
 
 const DEFAULT_OUTPUT_CHARS: usize = 50_000;
@@ -29,6 +30,8 @@ const TERMINAL_TTL: Duration = Duration::from_secs(5 * 60);
 pub const DEFAULT_MONITOR_MAX_EVENTS: usize = 200;
 /// Truncate each monitor event line for the notification payload.
 const MONITOR_LINE_MAX_CHARS: usize = 400;
+/// Default max concurrently *running* bash/monitor tasks (Grok-aligned).
+pub const DEFAULT_MAX_RUNNING_TASKS: usize = 10;
 
 static TASK_SEQ: AtomicU64 = AtomicU64::new(1);
 
@@ -74,6 +77,8 @@ pub struct TaskSnapshot {
     pub error: Option<String>,
     pub elapsed_ms: u64,
     pub notified: bool,
+    /// On-disk combined stdout/stderr log (always written for background tasks).
+    pub output_file: Option<PathBuf>,
 }
 
 /// Lightweight task row for TUI chip / `/ps` list (no stdout/stderr clone).
@@ -111,6 +116,9 @@ struct TaskInner {
     kind: TaskKind,
     /// Monitor line events emitted (flood guard).
     mon_events: usize,
+    /// Suppress completion notification while waiting in the foreground.
+    suppress_notify: bool,
+    output_file: Option<PathBuf>,
 }
 
 impl TaskInner {
@@ -130,6 +138,7 @@ impl TaskInner {
             error: self.error.clone(),
             elapsed_ms: self.elapsed_ms(),
             notified: self.notified,
+            output_file: self.output_file.clone(),
         }
     }
 
@@ -146,6 +155,17 @@ impl TaskInner {
     }
 }
 
+/// RAII count of foreground bash waiters (Ctrl+B / auto-bg).
+pub(crate) struct FgWaitGuard {
+    registry: Arc<BackgroundTaskRegistry>,
+}
+
+impl Drop for FgWaitGuard {
+    fn drop(&mut self) {
+        self.registry.fg_waiters.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 /// Shared registry for background shell tasks.
 pub struct BackgroundTaskRegistry {
     tasks: Mutex<HashMap<String, TaskInner>>,
@@ -153,6 +173,11 @@ pub struct BackgroundTaskRegistry {
     notifications: Arc<Mutex<Vec<String>>>,
     /// OS sandbox applied to every spawned command.
     os_sandbox: Mutex<OsSandbox>,
+    /// Soft cap on concurrently running bash + monitor tasks (`0` = unlimited).
+    max_running: usize,
+    /// Ctrl+B / user kick: wake a foreground waiter without killing the child.
+    fg_kick: Notify,
+    fg_waiters: AtomicU64,
 }
 
 impl Default for BackgroundTaskRegistry {
@@ -172,7 +197,63 @@ impl BackgroundTaskRegistry {
             tasks: Mutex::new(HashMap::new()),
             notifications,
             os_sandbox: Mutex::new(OsSandbox::disabled(std::env::temp_dir())),
+            max_running: resolve_max_running(),
+            fg_kick: Notify::new(),
+            fg_waiters: AtomicU64::new(0),
         }
+    }
+
+    /// Override the running-task soft cap (`0` = unlimited).
+    pub fn with_max_running(mut self, max_running: usize) -> Self {
+        self.max_running = max_running;
+        self
+    }
+
+    /// How many bash/monitor tasks are currently running.
+    pub fn running_count(&self) -> usize {
+        let tasks = self.tasks.lock().expect("tasks lock");
+        running_count_locked(&tasks)
+    }
+
+    /// True while a foreground bash is waiting (auto-bg budget / Ctrl+B).
+    pub fn has_foreground_waiter(&self) -> bool {
+        self.fg_waiters.load(Ordering::SeqCst) > 0
+    }
+
+    /// Wake the current foreground bash waiter so it adopts the child (Ctrl+B).
+    ///
+    /// No-op when nobody is waiting (`Notify::notify_waiters` does not store a permit).
+    pub fn request_background_now(&self) {
+        self.fg_kick.notify_waiters();
+    }
+
+    pub(crate) fn kick_notify(&self) -> &Notify {
+        &self.fg_kick
+    }
+
+    pub(crate) fn enter_fg_wait(self: &Arc<Self>) -> FgWaitGuard {
+        self.fg_waiters.fetch_add(1, Ordering::SeqCst);
+        FgWaitGuard {
+            registry: Arc::clone(self),
+        }
+    }
+
+    fn ensure_can_spawn(&self) -> Result<(), String> {
+        let mut tasks = self.tasks.lock().expect("tasks lock");
+        prune_terminal_tasks(&mut tasks);
+        if self.max_running == 0 {
+            return Ok(());
+        }
+        let running = running_count_locked(&tasks);
+        if running >= self.max_running {
+            return Err(format!(
+                "Maximum running background tasks ({}) reached. \
+Wait with bash_output / get_command_or_subagent_output, or stop one with \
+bash_kill / kill_command_or_subagent.",
+                self.max_running
+            ));
+        }
+        Ok(())
     }
 
     /// Update the OS sandbox used for new background tasks.
@@ -214,12 +295,32 @@ impl BackgroundTaskRegistry {
         timeout_secs: Option<u64>,
         sandbox: OsSandbox,
     ) -> Result<String, String> {
+        self.spawn_with_sandbox_opts(command, cwd, timeout_secs, sandbox, false, None)
+            .await
+    }
+
+    /// Spawn with optional notification suppression (used during foreground budget wait).
+    ///
+    /// `script`, when set, is what the shell actually runs; `command` stays the
+    /// display string in `/ps` / bash_output (so persist wrappers stay hidden).
+    pub async fn spawn_with_sandbox_opts(
+        self: &Arc<Self>,
+        command: String,
+        cwd: PathBuf,
+        timeout_secs: Option<u64>,
+        sandbox: OsSandbox,
+        suppress_notify: bool,
+        script: Option<String>,
+    ) -> Result<String, String> {
+        self.ensure_can_spawn()?;
         let (id, seq) = Self::next_id_and_seq();
         let done = Arc::new(Notify::new());
         let stdout_buf = Arc::new(Mutex::new(String::new()));
         let stderr_buf = Arc::new(Mutex::new(String::new()));
+        let (output_file, file_sink) = open_task_log(&id, &command);
 
-        let (prog, args) = sandbox.command_line(&command);
+        let run = script.as_deref().unwrap_or(command.as_str());
+        let (prog, args) = sandbox.command_line(run);
         let mut cmd = Command::new(&prog);
         cmd.args(&args)
             .current_dir(&cwd)
@@ -262,23 +363,31 @@ impl BackgroundTaskRegistry {
                     seq,
                     kind: TaskKind::Bash,
                     mon_events: 0,
+                    suppress_notify,
+                    output_file: output_file.clone(),
                 },
             );
         }
 
         // Stream pipes into shared buffers as chunks arrive (Codex mid-run
         // snapshots). Cap retained bytes; keep draining past the cap so writers
-        // never block on a full pipe.
+        // never block on a full pipe. Always tee to the on-disk log.
         let out_target = stdout_buf.clone();
+        let out_file = file_sink.clone();
         let stdout_handle = tokio::spawn(async move {
             if let Some(out) = stdout {
-                let _ = stream_pipe_into(out, out_target, Some(EXEC_OUTPUT_MAX_BYTES)).await;
+                let _ =
+                    stream_pipe_into_tee(out, out_target, out_file, Some(EXEC_OUTPUT_MAX_BYTES))
+                        .await;
             }
         });
         let err_target = stderr_buf.clone();
+        let err_file = file_sink;
         let stderr_handle = tokio::spawn(async move {
             if let Some(err) = stderr {
-                let _ = stream_pipe_into(err, err_target, Some(EXEC_OUTPUT_MAX_BYTES)).await;
+                let _ =
+                    stream_pipe_into_tee(err, err_target, err_file, Some(EXEC_OUTPUT_MAX_BYTES))
+                        .await;
             }
         });
 
@@ -291,6 +400,63 @@ impl BackgroundTaskRegistry {
             "background command",
         );
 
+        Ok(id)
+    }
+
+    /// Take over an already-running foreground child as a background task.
+    ///
+    /// Used when a short foreground wait expires: pipes are already draining
+    /// into `stdout`/`stderr`, and the process is not killed.
+    pub fn adopt_running(
+        self: &Arc<Self>,
+        command: String,
+        child: tokio::process::Child,
+        stdout: Arc<Mutex<String>>,
+        stderr: Arc<Mutex<String>>,
+        stdout_handle: tokio::task::JoinHandle<()>,
+        stderr_handle: tokio::task::JoinHandle<()>,
+        timeout_secs: Option<u64>,
+        output_file: Option<PathBuf>,
+    ) -> Result<String, String> {
+        // Adopt does not consume a new spawn slot: the process is already running.
+        let (id, seq) = Self::next_id_and_seq();
+        let done = Arc::new(Notify::new());
+        let pid = child.id();
+        {
+            let mut tasks = self.tasks.lock().expect("tasks lock");
+            prune_terminal_tasks(&mut tasks);
+            tasks.insert(
+                id.clone(),
+                TaskInner {
+                    id: id.clone(),
+                    command,
+                    state: TaskState::Running,
+                    exit_code: None,
+                    stdout,
+                    stderr,
+                    error: None,
+                    started: Instant::now(),
+                    finished: None,
+                    notified: false,
+                    pid,
+                    child: Some(child),
+                    done: done.clone(),
+                    seq,
+                    kind: TaskKind::Bash,
+                    mon_events: 0,
+                    suppress_notify: false,
+                    output_file,
+                },
+            );
+        }
+        self.spawn_wait_task(
+            id.clone(),
+            done,
+            timeout_secs,
+            stdout_handle,
+            stderr_handle,
+            "background command",
+        );
         Ok(id)
     }
 
@@ -307,6 +473,7 @@ impl BackgroundTaskRegistry {
         timeout_secs: Option<u64>,
         max_events: usize,
     ) -> Result<String, String> {
+        self.ensure_can_spawn()?;
         let sandbox = self.os_sandbox.lock().expect("os_sandbox lock").clone();
         let (id, seq) = Self::next_monitor_id_and_seq();
         let done = Arc::new(Notify::new());
@@ -352,6 +519,8 @@ impl BackgroundTaskRegistry {
                     seq,
                     kind: TaskKind::Monitor,
                     mon_events: 0,
+                    suppress_notify: false,
+                    output_file: None,
                 },
             );
         }
@@ -423,8 +592,7 @@ impl BackgroundTaskRegistry {
                     Ok(Err(err)) => Err(err.to_string()),
                     Err(_) => {
                         if let Some(ref mut c) = child {
-                            force_kill(c);
-                            let _ = c.wait().await;
+                            let _ = graceful_kill_child(c).await;
                         } else {
                             registry.force_kill_pid(&task_id);
                         }
@@ -534,7 +702,7 @@ impl BackgroundTaskRegistry {
         task.finished = Some(Instant::now());
         task.child = None;
 
-        let notify = if !task.notified {
+        let notify = if !task.notified && !task.suppress_notify {
             task.notified = true;
             Some(task.snapshot())
         } else {
@@ -604,6 +772,70 @@ impl BackgroundTaskRegistry {
         self.get(id).ok_or_else(|| format!("unknown task_id: {id}"))
     }
 
+    /// Wait for a task to reach terminal state up to `budget`.
+    /// Returns `Ok(Some(snapshot))` if completed within budget, or `Ok(None)` if still running.
+    pub async fn wait_budget(
+        &self,
+        id: &str,
+        budget: Duration,
+    ) -> Result<Option<TaskSnapshot>, String> {
+        let done = {
+            let tasks = self.tasks.lock().expect("tasks lock");
+            let task = tasks
+                .get(id)
+                .ok_or_else(|| format!("unknown task_id: {id}"))?;
+            if task.state.is_terminal() {
+                return Ok(Some(task.snapshot()));
+            }
+            task.done.clone()
+        };
+
+        if budget.is_zero() {
+            let tasks = self.tasks.lock().expect("tasks lock");
+            return Ok(tasks
+                .get(id)
+                .filter(|t| t.state.is_terminal())
+                .map(|t| t.snapshot()));
+        }
+
+        match timeout(budget, done.notified()).await {
+            Ok(()) => {
+                let tasks = self.tasks.lock().expect("tasks lock");
+                Ok(tasks
+                    .get(id)
+                    .filter(|t| t.state.is_terminal())
+                    .map(|t| t.snapshot()))
+            }
+            Err(_) => {
+                let tasks = self.tasks.lock().expect("tasks lock");
+                let task = tasks
+                    .get(id)
+                    .ok_or_else(|| format!("unknown task_id: {id}"))?;
+                if task.state.is_terminal() {
+                    Ok(Some(task.snapshot()))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
+    /// Enable completion notifications for an auto-backgrounded task.
+    /// If the task already finished while notifications were suppressed, enqueues the notification now.
+    pub fn unsuppress_notification(&self, id: &str) {
+        let mut tasks = self.tasks.lock().expect("tasks lock");
+        let Some(task) = tasks.get_mut(id) else {
+            return;
+        };
+        task.suppress_notify = false;
+        if task.state.is_terminal() && !task.notified {
+            task.notified = true;
+            let snap = task.snapshot();
+            drop(tasks);
+            self.push_notification(format_completion_notification(&snap));
+        }
+    }
+
     /// Kill a running task (sync mark + signal; reaps child in the background).
     ///
     /// Safe to call from a non-async TUI tick: state becomes [`TaskState::Killed`]
@@ -639,7 +871,7 @@ impl BackgroundTaskRegistry {
         reason: &str,
         notify: bool,
     ) -> Result<TaskSnapshot, String> {
-        let (child, done, note) = {
+        let (mut child, pid, done, note) = {
             let mut tasks = self.tasks.lock().expect("tasks lock");
             let task = tasks
                 .get_mut(id)
@@ -665,33 +897,40 @@ impl BackgroundTaskRegistry {
                 None
             };
             prune_terminal_tasks(&mut tasks);
-            // If child was already taken by the wait task, kill by process group.
-            if child.is_none() {
-                if let Some(pid) = pid {
-                    kill_process_group(pid);
-                }
-            }
-            (child, done, note)
+            (child, pid, done, note)
         };
         if let Some(snap) = note {
             self.push_notification(format_completion_notification(&snap));
         }
 
-        if let Some(mut child) = child {
-            force_kill(&mut child);
-            // Reap in the background when a runtime is available; on process exit
-            // the OS reparents/reaps either way after process-group SIGKILL.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(async move {
-                    let _ = child.wait().await;
-                    done.notify_waiters();
-                });
-            } else {
-                // Best-effort synchronous reap outside async context.
-                let _ = child.start_kill();
+        // SIGTERM now; SIGKILL after grace so servers can flush. Sync callers
+        // (TUI `/ps` x) must not block on the grace period.
+        if let Some(ref mut c) = child {
+            term_child_process_group(c);
+        } else if let Some(pid) = pid {
+            term_process_group(pid);
+        }
+
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                if let Some(mut c) = child {
+                    if timeout(SIGTERM_GRACE, c.wait()).await.is_err() {
+                        kill_child_process_group(&mut c);
+                        let _ = c.wait().await;
+                    }
+                } else if let Some(pid) = pid {
+                    sleep(SIGTERM_GRACE).await;
+                    kill_process_group(pid);
+                }
                 done.notify_waiters();
-            }
+            });
+        } else if let Some(mut c) = child {
+            force_kill(&mut c);
+            done.notify_waiters();
         } else {
+            if let Some(pid) = pid {
+                kill_process_group(pid);
+            }
             done.notify_waiters();
         }
 
@@ -705,6 +944,37 @@ impl BackgroundTaskRegistry {
         tokio::task::yield_now().await;
         self.get(id).ok_or_else(|| format!("unknown task_id: {id}"))
     }
+}
+
+fn resolve_max_running() -> usize {
+    std::env::var("ONE_BASH_MAX_BACKGROUND")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(DEFAULT_MAX_RUNNING_TASKS)
+}
+
+fn running_count_locked(tasks: &HashMap<String, TaskInner>) -> usize {
+    tasks.values().filter(|t| !t.state.is_terminal()).count()
+}
+
+pub(crate) fn open_task_log(id: &str, command: &str) -> (Option<PathBuf>, Option<OutputFileSink>) {
+    let dir = crate::truncate::tool_outputs_root().join("tasks");
+    if std::fs::create_dir_all(&dir).is_err() {
+        return (None, None);
+    }
+    let path = dir.join(format!("{id}.log"));
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&path)
+    else {
+        return (None, None);
+    };
+    use std::io::Write;
+    let _ = writeln!(file, "# one background task {id}\n# command: {command}\n");
+    let sink = OutputFileSink::new(file, output_file_max_bytes());
+    (Some(path), Some(sink))
 }
 
 /// Drop old terminal tasks so `/ps` and the registry stay bounded.
@@ -774,6 +1044,9 @@ pub fn format_completion_notification(snap: &TaskSnapshot) -> String {
     out.push_str(&format!("elapsed_ms: {}\n", snap.elapsed_ms));
     if let Some(err) = &snap.error {
         out.push_str(&format!("error: {err}\n"));
+    }
+    if let Some(ref path) = snap.output_file {
+        out.push_str(&format!("output_file: {}\n", path.display()));
     }
     // Monitors already streamed lines as events — keep completion compact.
     if !is_monitor {
@@ -856,7 +1129,16 @@ async fn stream_monitor_lines<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
 }
 
 pub fn format_task_output(snap: &TaskSnapshot, max_chars: usize) -> String {
+    let (out, _, _) = format_task_output_presented(snap, max_chars);
+    out
+}
+
+pub fn format_task_output_presented(
+    snap: &TaskSnapshot,
+    max_chars: usize,
+) -> (String, Option<PathBuf>, bool) {
     let mut out = String::new();
+    out.push_str(&format!("=== Task {} ===\n", snap.id));
     out.push_str(&format!("task_id: {}\n", snap.id));
     out.push_str(&format!("command: {}\n", snap.command));
     out.push_str(&format!("status: {}\n", snap.state.as_str()));
@@ -871,16 +1153,34 @@ pub fn format_task_output(snap: &TaskSnapshot, max_chars: usize) -> String {
     if let Some(err) = &snap.error {
         out.push_str(&format!("error: {err}\n"));
     }
-    let body = format_output_body(&snap.stdout, &snap.stderr, max_chars);
+    let (body, spill_path, truncated) =
+        format_output_body_presented(&snap.stdout, &snap.stderr, max_chars);
+    if let Some(ref path) = snap.output_file {
+        out.push_str(&format!("output_file: {}\n", path.display()));
+    }
+    if let Some(ref path) = spill_path {
+        if snap.output_file.as_ref() != Some(path) {
+            out.push_str(&format!("output_file: {}\n", path.display()));
+        }
+    }
     if !body.is_empty() {
         out.push_str(&body);
     } else if snap.state == TaskState::Running {
         out.push_str("(no output yet)\n");
     }
-    out
+    (out, spill_path, truncated)
 }
 
 fn format_output_body(stdout: &str, stderr: &str, max_chars: usize) -> String {
+    let (body, _, _) = format_output_body_presented(stdout, stderr, max_chars);
+    body
+}
+
+fn format_output_body_presented(
+    stdout: &str,
+    stderr: &str,
+    max_chars: usize,
+) -> (String, Option<PathBuf>, bool) {
     let mut body = String::new();
     if !stdout.is_empty() {
         body.push_str("--- stdout ---\n");
@@ -892,16 +1192,23 @@ fn format_output_body(stdout: &str, stderr: &str, max_chars: usize) -> String {
         body.push_str(stderr.trim_end());
         body.push('\n');
     }
-    // OpenCode unified spill when over tool_output limits.
+    if body.is_empty() {
+        return (String::new(), None, false);
+    }
+    // OpenCode unified spill when over tool_output limits (Tail preview for logs).
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let presented = crate::truncate::present_tool_output(
         &body,
         "bash_output",
         &cwd,
-        crate::truncate::PreviewStyle::Head,
+        crate::truncate::PreviewStyle::Tail,
     );
-    // Honor caller's max_chars as an extra safety net on the model-facing text.
-    truncate_chars(&presented.text, max_chars)
+    let text = if presented.truncated {
+        presented.text
+    } else {
+        truncate_chars(&presented.text, max_chars)
+    };
+    (text, presented.spill_path, presented.truncated)
 }
 
 pub fn truncate_chars(s: &str, max: usize) -> String {
@@ -1091,5 +1398,135 @@ mod tests {
             "bash_output format should include streamed body:\n{text}"
         );
         assert!(!text.contains("(no output yet)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn large_output_spills_and_shows_tail_preview() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-task-spill-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let _guard = crate::truncate::set_tool_outputs_root_override(Some(dir.clone()));
+
+        let stdout_data = format!(
+            "HEAD_MARKER\n{}\nTAIL_MARKER_END",
+            "padding_line\n".repeat(3000)
+        );
+        let snap = TaskSnapshot {
+            id: "bg_test_spill".into(),
+            command: "long_running_build".into(),
+            state: TaskState::Completed,
+            exit_code: Some(0),
+            stdout: stdout_data,
+            stderr: String::new(),
+            error: None,
+            elapsed_ms: 1500,
+            notified: false,
+            output_file: None,
+        };
+
+        let (text, spill_path, truncated) = format_task_output_presented(&snap, 50_000);
+        assert!(truncated, "3000 lines should be truncated");
+        assert!(spill_path.is_some(), "spill path should be generated");
+        assert!(
+            text.contains("TAIL_MARKER_END"),
+            "output text must contain the tail marker of the logs:\n{text}"
+        );
+        assert!(
+            !text.contains("HEAD_MARKER"),
+            "output text should not contain the head marker when tail preview is used"
+        );
+
+        let _ = crate::truncate::set_tool_outputs_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn spawn_rejects_when_running_cap_reached() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-task-cap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let _guard = crate::truncate::set_tool_outputs_root_override(Some(dir.clone()));
+
+        let reg = Arc::new(BackgroundTaskRegistry::new().with_max_running(1));
+        let id = reg
+            .spawn("sleep 30".into(), std::env::temp_dir(), Some(60))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        let err = reg
+            .spawn("sleep 30".into(), std::env::temp_dir(), Some(60))
+            .await
+            .expect_err("second spawn must hit the soft cap");
+        assert!(
+            err.contains("Maximum running background tasks"),
+            "err={err}"
+        );
+        let _ = reg.kill(&id).await;
+        // After kill, a new spawn should succeed.
+        let id2 = reg
+            .spawn("echo cap-ok".into(), std::env::temp_dir(), Some(10))
+            .await
+            .expect("spawn after free slot");
+        let snap = reg.wait(&id2, Some(5)).await.unwrap();
+        assert_eq!(snap.state, TaskState::Completed);
+        assert!(snap.stdout.contains("cap-ok"));
+
+        let _ = crate::truncate::set_tool_outputs_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn background_output_always_lands_on_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-task-log-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let _guard = crate::truncate::set_tool_outputs_root_override(Some(dir.clone()));
+
+        let reg = Arc::new(BackgroundTaskRegistry::new());
+        let id = reg
+            .spawn(
+                "printf 'hello-on-disk\\n'".into(),
+                std::env::temp_dir(),
+                Some(10),
+            )
+            .await
+            .unwrap();
+        let snap = reg.wait(&id, Some(5)).await.unwrap();
+        assert_eq!(snap.state, TaskState::Completed);
+        let path = snap
+            .output_file
+            .clone()
+            .expect("background tasks write a log");
+        let body = std::fs::read_to_string(&path).expect("log readable");
+        assert!(
+            body.contains("hello-on-disk"),
+            "log should contain stdout:\n{body}"
+        );
+        let formatted = format_task_output(&snap, 8_000);
+        assert!(
+            formatted.contains(&path.display().to_string()),
+            "bash_output should mention the log path:\n{formatted}"
+        );
+
+        let _ = crate::truncate::set_tool_outputs_root_override(None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

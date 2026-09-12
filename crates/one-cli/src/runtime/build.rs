@@ -142,13 +142,13 @@ impl AppRuntime {
 
         // ACP needs the same interactive PermissionGate / HitlChannel so tool
         // approvals and ask_user can be bridged to the client over JSON-RPC.
-        let interactive = matches!(cli.mode, RunMode::Interactive | RunMode::Acp);
+        let interactive = cli.mode.is_hitl();
         let perm_rules = user_settings
             .permissions
             .clone()
             .unwrap_or_else(PermissionRules::default);
         let permission_gate = PermissionGate::with_permission_mode_and_policy(
-            perm_rules,
+            perm_rules.clone(),
             perm_mode,
             interactive,
             Some(path_policy.clone()),
@@ -177,8 +177,13 @@ impl AppRuntime {
         // main agents that can spawn (not pure --read-only research shells).
         let task_host = {
             let add_dirs = cli.add_dir.clone();
-            let opts =
-                harness_opts_from_policy(cwd.clone(), cli.full_access, add_dirs, auto_approve);
+            let opts = harness_opts_from_policy(
+                cwd.clone(),
+                cli.full_access,
+                add_dirs,
+                auto_approve,
+                perm_rules.clone(),
+            );
             Some(TaskToolHost::new(
                 opts,
                 main_agent.clone(),
