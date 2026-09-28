@@ -147,6 +147,10 @@ async fn seed_from_sessions(cwd: &Path) -> Vec<String> {
                 ..
             } = entry
             {
+                // Steers are mid-run injections, not re-usable prompts.
+                if user.is_steer() {
+                    continue;
+                }
                 // Never seed `[image · png · NKB]` labels — re-sending them loses
                 // vision. Multimodal turns contribute plain text only (or skip).
                 let text = if user.content.has_images() {
@@ -154,6 +158,10 @@ async fn seed_from_sessions(cwd: &Path) -> Vec<String> {
                 } else {
                     user.content.as_display_text()
                 };
+                if one_core::is_system_notice_text(&text) {
+                    continue;
+                }
+                let text = one_core::extract_user_query(&text);
                 let text = text.trim();
                 if text.is_empty() {
                     continue;

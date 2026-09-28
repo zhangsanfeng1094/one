@@ -222,6 +222,73 @@ async fn test_session_actor_persistence() {
 }
 
 #[test]
+fn stale_lock_reclaims_and_old_guard_does_not_remove_replacement() {
+    let tmp = unique_temp_dir();
+    let session_file = tmp.join("stale.jsonl");
+    std::fs::write(&session_file, "").unwrap();
+    let lock_path = one_session::lock_path_for(&session_file);
+    std::fs::write(&lock_path, "malformed old lock").unwrap();
+    let guard = SessionLock::acquire(&session_file, "stale-id").unwrap();
+    assert!(lock_path.exists());
+    std::fs::remove_file(&lock_path).unwrap();
+    std::fs::write(&lock_path, "replacement").unwrap();
+    drop(guard);
+    assert_eq!(std::fs::read_to_string(&lock_path).unwrap(), "replacement");
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn stale_metadata_with_current_pid_is_reclaimed_without_os_lock() {
+    let tmp = unique_temp_dir();
+    let session_file = tmp.join("same_pid.jsonl");
+    std::fs::write(&session_file, "").unwrap();
+    let lock_path = one_session::lock_path_for(&session_file);
+    let old = one_session::presence::SessionLockData {
+        session_id: "same-id".into(),
+        pid: std::process::id(),
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+        hostname: "localhost".into(),
+        activity: Activity::Idle,
+    };
+    std::fs::write(&lock_path, serde_json::to_vec(&old).unwrap()).unwrap();
+    let reclaimed = SessionLock::acquire(&session_file, "same-id").unwrap();
+    assert!(lock_path.exists());
+    drop(reclaimed);
+    assert!(!lock_path.exists());
+    let dead = one_session::presence::SessionLockData {
+        pid: u32::MAX,
+        ..old
+    };
+    std::fs::write(&lock_path, serde_json::to_vec(&dead).unwrap()).unwrap();
+    let reclaimed = SessionLock::acquire(&session_file, "same-id").unwrap();
+    drop(reclaimed);
+    assert!(!lock_path.exists());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
+fn same_process_second_acquire_is_blocked_until_owner_drops() {
+    let tmp = unique_temp_dir();
+    let session_file = tmp.join("single_owner.jsonl");
+    std::fs::write(&session_file, "").unwrap();
+    let lock_path = one_session::lock_path_for(&session_file);
+    let first = SessionLock::acquire(&session_file, "single-owner").unwrap();
+    let second = SessionLock::acquire(&session_file, "single-owner");
+    assert_eq!(
+        second.err().unwrap().kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert!(lock_path.exists());
+    drop(first);
+    assert!(!lock_path.exists());
+    let third = SessionLock::acquire(&session_file, "single-owner").unwrap();
+    drop(third);
+    assert!(!lock_path.exists());
+    let _ = std::fs::remove_dir_all(&tmp);
+}
+
+#[test]
 fn test_global_discovery_trait() {
     let discovery = GlobalSessionDiscovery::new();
     let res = discovery.find_sessions("non_existent_random_pattern_xyz_123");

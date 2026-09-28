@@ -88,7 +88,9 @@ pub fn lock_path_for(session_jsonl: &Path) -> PathBuf {
 
 /// Check if a process with the given PID is currently alive on the local OS.
 pub fn is_process_alive(pid: u32) -> bool {
-    if pid == 0 {
+    // `kill -0` interprets negative values as process groups (and -1 as all
+    // processes); never pass a u32 PID that would wrap to a negative pid_t.
+    if pid == 0 || pid > i32::MAX as u32 {
         return false;
     }
     // On Linux /proc/{pid} is the fastest, reliable non-signal check
@@ -120,6 +122,7 @@ pub fn is_process_alive(pid: u32) -> bool {
 /// Try to acquire session lock. Returns `Ok(SessionLock)` on success.
 pub struct SessionLock {
     lock_file: PathBuf,
+    file: std::fs::File,
     pub data: SessionLockData,
 }
 
@@ -127,22 +130,6 @@ impl SessionLock {
     pub fn acquire(session_jsonl: &Path, session_id: &str) -> std::io::Result<Self> {
         let lock_file = lock_path_for(session_jsonl);
         let current_pid = std::process::id();
-
-        // Check if existing lock exists
-        if lock_file.exists() {
-            if let Ok(raw) = std::fs::read_to_string(&lock_file) {
-                if let Ok(data) = serde_json::from_str::<SessionLockData>(&raw) {
-                    if data.pid != current_pid && is_process_alive(data.pid) {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            format!("Session is currently locked by PID {}", data.pid),
-                        ));
-                    }
-                }
-            }
-            // Stale or dead lock - safe to reclaim
-            let _ = std::fs::remove_file(&lock_file);
-        }
 
         let hostname = std::env::var("HOSTNAME").unwrap_or_else(|_| "localhost".to_string());
         let data = SessionLockData {
@@ -156,28 +143,81 @@ impl SessionLock {
 
         let json = serde_json::to_string_pretty(&data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&lock_file, json)?;
-
-        Ok(Self { lock_file, data })
+        // Hold an OS file lock for the session lifetime. The file remains in
+        // place so contenders always lock the same inode; stale JSON is simply
+        // overwritten after the previous process has exited.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(&lock_file)?;
+        file.try_lock().map_err(|err| match err {
+            std::fs::TryLockError::WouldBlock => std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "session is locked by another writer",
+            ),
+            std::fs::TryLockError::Error(err) => err,
+        })?;
+        // A successful OS lock is authoritative. The old JSON may contain a
+        // PID that has since been reused, so always replace it.
+        use std::io::{Seek, Write};
+        file.set_len(0)?;
+        file.rewind()?;
+        file.write_all(json.as_bytes())?;
+        file.sync_data()?;
+        Ok(Self {
+            lock_file,
+            file,
+            data,
+        })
     }
 
     pub fn update_activity(&mut self, activity: Activity) -> std::io::Result<()> {
+        if !self.owns_path() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "session lock path changed",
+            ));
+        }
         self.data.activity = activity;
         self.data.updated_at = Utc::now();
         let json = serde_json::to_string_pretty(&self.data)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        std::fs::write(&self.lock_file, json)?;
+        use std::io::{Seek, Write};
+        self.file.set_len(0)?;
+        self.file.rewind()?;
+        self.file.write_all(json.as_bytes())?;
+        self.file.sync_data()?;
         Ok(())
     }
 
+    fn owns_path(&self) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            return std::fs::metadata(&self.lock_file)
+                .ok()
+                .zip(self.file.metadata().ok())
+                .is_some_and(|(current, owned)| {
+                    current.dev() == owned.dev() && current.ino() == owned.ino()
+                });
+        }
+        #[cfg(not(unix))]
+        {
+            self.lock_file.exists()
+        }
+    }
+
     pub fn release(self) {
-        let _ = std::fs::remove_file(&self.lock_file);
+        drop(self);
     }
 }
 
 impl Drop for SessionLock {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.lock_file);
+        if self.owns_path() {
+            let _ = std::fs::remove_file(&self.lock_file);
+        }
     }
 }
 

@@ -146,6 +146,47 @@ impl SessionManager {
         }
     }
 
+    /// List sessions in the known One session root across all workspaces.
+    /// Workspace identity comes from each session header, never from decoding
+    /// the directory name (whose encoding is not reversible).
+    pub async fn list_all() -> Result<Vec<SessionInfo>> {
+        tokio::task::spawn_blocking(|| {
+            let mut sessions = Vec::new();
+            for dir in crate::discovery::GlobalSessionDiscovery::list_all_workspace_dirs() {
+                let Ok(entries) = std::fs::read_dir(dir) else {
+                    continue;
+                };
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.extension().and_then(|v| v.to_str()) != Some("jsonl")
+                        || path.file_name().and_then(|v| v.to_str()) == Some("prompt_history.jsonl")
+                    {
+                        continue;
+                    }
+                    let Some(modified) = entry.metadata().ok().and_then(|m| m.modified().ok())
+                    else {
+                        continue;
+                    };
+                    if let Some(info) = scan_session_list_info(&path, modified.into()) {
+                        sessions.push(info);
+                    }
+                }
+            }
+            sessions.sort_by(|a, b| {
+                b.modified
+                    .cmp(&a.modified)
+                    .then_with(|| a.path.cmp(&b.path))
+            });
+            sessions
+        })
+        .await
+        .map_err(|err| {
+            SessionError::Io(std::io::Error::other(format!(
+                "list all sessions join: {err}"
+            )))
+        })
+    }
+
     /// Lightweight metadata for a single session file (same fields as [`list`]).
     pub async fn list_info(path: impl AsRef<Path>) -> Option<SessionInfo> {
         let path = path.as_ref().to_path_buf();
@@ -342,8 +383,15 @@ impl SessionManager {
                 message: AgentMessage::User(user),
             } = entry
             {
-                prompt_index += 1;
+                if user.is_steer() {
+                    // Mid-run steer is not a rewindable user turn.
+                    continue;
+                }
                 let text = user.content.as_display_text();
+                if is_system_notice_text(&text) {
+                    continue;
+                }
+                prompt_index += 1;
                 let preview = first_line_preview(&text, 72);
                 out.push(RewindPointInfo {
                     entry_id: base.id.clone(),
@@ -449,7 +497,13 @@ impl SessionManager {
                 message: AgentMessage::User(user),
             } = entry
             {
+                if user.is_steer() {
+                    continue;
+                }
                 let text = user.content.as_display_text();
+                if is_system_notice_text(&text) {
+                    continue;
+                }
                 let preview = first_line_preview(&text, 72);
                 if !preview.is_empty() {
                     out.push((base.id.clone(), preview));
@@ -469,7 +523,9 @@ impl SessionManager {
             SessionEntry::Message {
                 message: AgentMessage::User(user),
                 ..
-            } => Some(user.content.as_display_text()),
+            } => Some(one_core::extract_user_query(
+                &user.content.as_display_text(),
+            )),
             _ => None,
         }
     }
@@ -501,7 +557,13 @@ impl SessionManager {
                 ..
             } = entry
             {
+                if user.is_steer() {
+                    continue;
+                }
                 let text = user.content.as_display_text();
+                if is_system_notice_text(&text) {
+                    continue;
+                }
                 let preview = first_line_preview(&text, 72);
                 if !preview.is_empty() {
                     return Some(preview);
@@ -952,6 +1014,30 @@ impl SessionManager {
         self.build_session_context().messages.len()
     }
 
+    /// Whether the session has no conversation messages and no custom name set.
+    pub fn is_empty(&self) -> bool {
+        self.message_count() == 0 && self.session_name().is_none()
+    }
+
+    /// Delete the session JSONL and summary sidecar from disk.
+    pub async fn delete_from_disk(&self) -> Result<()> {
+        if let Some(file) = &self.file {
+            let summary = crate::summary::summary_path_for(file);
+            let _ = tokio::fs::remove_file(&summary).await;
+            let _ = tokio::fs::remove_file(file).await;
+        }
+        Ok(())
+    }
+
+    /// Sync version of `delete_from_disk`.
+    pub fn delete_from_disk_sync(&self) {
+        if let Some(file) = &self.file {
+            let summary = crate::summary::summary_path_for(file);
+            let _ = std::fs::remove_file(&summary);
+            let _ = std::fs::remove_file(file);
+        }
+    }
+
     /// Entry id for the oldest of the last `kept_count` context messages.
     ///
     /// Used when appending a compaction so resume keeps the full recent window.
@@ -1000,7 +1086,8 @@ impl SessionManager {
 }
 
 fn first_line_preview(text: &str, max_chars: usize) -> String {
-    let line = text.lines().next().unwrap_or(text).trim();
+    let text = one_core::extract_user_query(text);
+    let line = text.lines().next().unwrap_or(&text).trim();
     let mut out: String = line.chars().take(max_chars).collect();
     if line.chars().count() > max_chars {
         out.push('…');
@@ -1105,6 +1192,17 @@ pub(crate) fn scan_session_list_info(
     fs_modified: chrono::DateTime<Utc>,
 ) -> Option<SessionInfo> {
     if let Some(summary) = load_summary(path) {
+        // Skip empty sessions with no user messages and no explicit name.
+        if summary.message_count == 0 && summary.name.is_none() && summary.preview.is_none() {
+            // Clean up stale empty sessions older than 5 minutes so disk isn't cluttered.
+            let age = Utc::now().signed_duration_since(summary.updated_at.max(fs_modified));
+            if age.num_minutes() > 5 {
+                let _ = std::fs::remove_file(path);
+                let sidecar = crate::summary::summary_path_for(path);
+                let _ = std::fs::remove_file(sidecar);
+            }
+            return None;
+        }
         return Some(SessionInfo {
             path: path.to_path_buf(),
             id: summary.id,
@@ -1127,6 +1225,7 @@ pub(crate) fn scan_session_list_info(
     let mut name: Option<String> = None;
     let mut preview: Option<String> = None;
     let mut saw_header = false;
+    let mut saw_message = false;
     let mut lines_read: usize = 0;
 
     // After we have a preview, skip heavy JSON parse unless the line might be
@@ -1170,9 +1269,12 @@ pub(crate) fn scan_session_list_info(
                     }
                 }
             }
-            "message" if preview.is_none() => {
-                if let Some(p) = preview_from_message_value(&value) {
-                    preview = Some(p);
+            "message" => {
+                saw_message = true;
+                if preview.is_none() {
+                    if let Some(p) = preview_from_message_value(&value) {
+                        preview = Some(p);
+                    }
                 }
             }
             _ => {}
@@ -1189,6 +1291,17 @@ pub(crate) fn scan_session_list_info(
     }
 
     if !saw_header || id.is_empty() {
+        return None;
+    }
+
+    // Skip empty sessions with no messages and no custom name.
+    if !saw_message && preview.is_none() && name.is_none() {
+        let age = Utc::now().signed_duration_since(fs_modified);
+        if age.num_minutes() > 5 {
+            let _ = std::fs::remove_file(path);
+            let sidecar = crate::summary::summary_path_for(path);
+            let _ = std::fs::remove_file(sidecar);
+        }
         return None;
     }
 
@@ -1233,12 +1346,21 @@ fn preview_from_message_value(value: &serde_json::Value) -> Option<String> {
         }
         _ => return None,
     };
-    let preview = first_line_preview(&text, 72);
+    let trimmed = text.trim();
+    if is_system_notice_text(trimmed) {
+        return None;
+    }
+    let preview = first_line_preview(trimmed, 72);
     if preview.is_empty() {
         None
     } else {
         Some(preview)
     }
+}
+
+/// Check if a user message is an internal engine notification or `<system-reminder>` notice.
+pub fn is_system_notice_text(text: &str) -> bool {
+    one_core::is_system_notice_text(text)
 }
 
 /// Replace plain-text user turns that are only `as_display_text` snapshots of a
@@ -1286,7 +1408,7 @@ mod tests {
     use super::*;
     use crate::entries::{new_entry_base, new_session_header, SessionEntry};
     use crate::summary::summary_path_for;
-    use one_core::message::AgentMessage;
+    use one_core::message::{AgentMessage, UserMessage};
 
     #[test]
     fn display_label_prefers_name_then_preview_then_id() {
@@ -1342,6 +1464,7 @@ mod tests {
                 message: AgentMessage::User(UserMessage {
                     content: real.clone(),
                     timestamp: 1,
+                    kind: None,
                 }),
             },
             SessionEntry::Message {
@@ -1353,6 +1476,7 @@ mod tests {
                 message: AgentMessage::User(UserMessage {
                     content: UserContent::Text(display.clone()),
                     timestamp: 2,
+                    kind: None,
                 }),
             },
             SessionEntry::Message {
@@ -1366,6 +1490,7 @@ mod tests {
             AgentMessage::User(UserMessage {
                 content: UserContent::Text(display),
                 timestamp: 2,
+                kind: None,
             }),
             AgentMessage::assistant_text("mock", "v1", "only label"),
         ];
@@ -1606,5 +1731,136 @@ mod tests {
         let _ = crate::paths::set_agent_dir_override(prev_agent);
         let _ = std::fs::remove_dir_all(&temp_agent);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn empty_session_is_ignored_in_list_and_deletable() {
+        let _guard = TEST_OVERRIDE_MUTEX.lock().unwrap();
+        let temp_agent =
+            std::env::temp_dir().join(format!("one-test-agent-{}", uuid::Uuid::new_v4().simple()));
+        let _ = std::fs::create_dir_all(&temp_agent);
+        let prev_agent = crate::paths::set_agent_dir_override(Some(temp_agent.clone()));
+
+        let dir = std::env::temp_dir().join(format!(
+            "one-session-empty-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let cwd = dir.join("proj");
+        std::fs::create_dir_all(&cwd).unwrap();
+
+        // 1. Create an empty session without messages.
+        let empty = SessionManager::create(&cwd).await.unwrap();
+        empty.write_summary().unwrap();
+        assert!(empty.is_empty());
+
+        // Empty session must not be listed in session list.
+        let list = SessionManager::list(&cwd).await.unwrap();
+        assert!(
+            list.is_empty(),
+            "empty session must not be returned in list"
+        );
+
+        // 2. Delete empty session from disk.
+        let session_file = empty.session_file().unwrap().to_path_buf();
+        assert!(session_file.is_file());
+        empty.delete_from_disk().await.unwrap();
+        assert!(!session_file.is_file());
+
+        let _ = crate::paths::set_agent_dir_override(prev_agent);
+        let _ = std::fs::remove_dir_all(&temp_agent);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn system_reminders_are_excluded_from_rewind_prompts() {
+        let cwd = std::env::temp_dir().join(format!("proj-{}", uuid::Uuid::new_v4().simple()));
+        let mut sm = SessionManager::in_memory(&cwd);
+
+        // Turn 1: normal user prompt
+        sm.append_message(AgentMessage::user_text("first real prompt"))
+            .await
+            .unwrap();
+
+        // Turn 2: internal system reminder injected as user role
+        sm.append_message(AgentMessage::user_text(
+            "<system-reminder>\n### Graph Intent Guidance\n- use tool\n</system-reminder>",
+        ))
+        .await
+        .unwrap();
+
+        // Turn 3: second user prompt
+        sm.append_message(AgentMessage::user_text("second real prompt"))
+            .await
+            .unwrap();
+
+        let rewind = sm.user_prompts_for_rewind();
+        assert_eq!(rewind.len(), 2, "must only include real user prompts");
+        assert_eq!(rewind[0].1, "second real prompt");
+        assert_eq!(rewind[1].1, "first real prompt");
+        assert!(rewind.iter().all(|(_, p)| !p.contains("system-reminder")));
+
+        sm.append_message(AgentMessage::user_text(
+            "<user_query>\nwrapped prompt\n</user_query>",
+        ))
+        .await
+        .unwrap();
+        let rewind = sm.user_prompts_for_rewind();
+        assert_eq!(rewind[0].1, "wrapped prompt");
+    }
+
+    #[tokio::test]
+    async fn steer_entries_survive_reload_and_stay_excluded_from_prompts() {
+        let cwd = std::env::temp_dir().join(format!("proj-{}", uuid::Uuid::new_v4().simple()));
+        let mut sm = SessionManager::in_memory(&cwd);
+
+        sm.append_message(AgentMessage::user_text("fix the bug"))
+            .await
+            .unwrap();
+        sm.append_message(AgentMessage::steer_text("不要重构 shared package"))
+            .await
+            .unwrap();
+        sm.append_message(AgentMessage::steer_text("先跑测试"))
+            .await
+            .unwrap();
+        sm.append_message(AgentMessage::user_text("next real turn"))
+            .await
+            .unwrap();
+
+        // Rewind / prompt surfaces see only real user turns.
+        let rewind = sm.user_prompts_for_rewind();
+        assert_eq!(rewind.len(), 2, "steers must not become rewind points");
+        assert_eq!(sm.first_user_preview().as_deref(), Some("fix the bug"));
+
+        // Reload from entries: steer identity (kind=steer) must persist.
+        let reloaded: Vec<AgentMessage> = sm
+            .entries()
+            .iter()
+            .filter_map(|e| match e {
+                SessionEntry::Message { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        let steers: Vec<&UserMessage> = reloaded
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::User(u) if u.is_steer() => Some(u),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(steers.len(), 2, "both steers keep kind=steer across reload");
+        assert_eq!(steers[0].content.as_plain_text(), "不要重构 shared package");
+        assert_eq!(steers[1].content.as_plain_text(), "先跑测试");
+
+        // Context rebuild keeps them as user-role messages (LLM replay)…
+        let ctx = sm.build_session_context();
+        assert!(ctx
+            .messages
+            .iter()
+            .any(|m| matches!(m, AgentMessage::User(u) if u.is_steer())));
+        // …but turn counting excludes them.
+        assert_eq!(one_core::compaction::user_turn_count(&ctx.messages), 2);
     }
 }
