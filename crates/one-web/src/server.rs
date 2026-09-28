@@ -1,17 +1,21 @@
 //! Embedded Web server and WebSocket-to-ACP bridge for One Web UI.
+//!
+//! The server is intentionally framework-free: a released `one` binary must run
+//! with no Node.js or other runtime. Routing is a small dispatch chain —
+//! request guard → pluggable API handler → built-in endpoints → embedded SPA.
 
 use std::future::Future;
-use std::net::SocketAddr;
 use std::pin::Pin;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, DuplexStream};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, DuplexStream};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio_util::compat::{Compat, TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
 use crate::assets::get_asset;
+use crate::http::{read_request, HttpRequest, HttpResponse, DEFAULT_MAX_BODY, DEFAULT_MAX_HEAD};
 use crate::ws::{compute_accept_key, read_ws_frame, write_ws_pong, write_ws_text, WsFrame};
 
 pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
@@ -19,11 +23,51 @@ pub type LocalBoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + 'a>>;
 pub type LocalAcpHandler =
     Rc<dyn Fn(Compat<DuplexStream>, Compat<DuplexStream>) -> LocalBoxFuture<'static, ()>>;
 
+/// Future returned by a pluggable API handler.
+pub type ApiFuture = Pin<Box<dyn Future<Output = Option<HttpResponse>> + 'static>>;
+
+/// Pluggable API handler: returns `None` to fall through to the built-in routes.
+pub type ApiHandler = Rc<dyn Fn(HttpRequest) -> ApiFuture>;
+
+/// Pre-dispatch guard (auth, Host/Origin checks). Returning `Err` short-circuits
+/// the request with that response.
+pub type RequestGuard = Rc<dyn Fn(&HttpRequest) -> Result<(), HttpResponse>>;
+
+/// Configuration for [`start_web_server`].
 pub struct WebServerConfig {
+    /// Bind address, e.g. `127.0.0.1`.
     pub host: String,
+    /// Bind port; `0` selects an ephemeral port.
     pub port: u16,
+    /// Open the default browser once the listener is bound.
     pub open_browser: bool,
+    /// Payload served by the built-in `/api/info` endpoint.
     pub info_json: serde_json::Value,
+    /// Replaces the startup banner when set (used by the config studio to print
+    /// a tokenized URL).
+    pub banner: Option<String>,
+    /// Value for `Access-Control-Allow-Origin`. `None` disables CORS entirely,
+    /// which is required for same-origin-only servers such as the config studio.
+    pub cors_allow_origin: Option<String>,
+    /// Runs before any routing decision.
+    pub guard: Option<RequestGuard>,
+    /// Handles `/api/*` routes; `None` responses fall through.
+    pub api: Option<ApiHandler>,
+}
+
+impl Default for WebServerConfig {
+    fn default() -> Self {
+        Self {
+            host: "127.0.0.1".to_string(),
+            port: 3000,
+            open_browser: false,
+            info_json: serde_json::Value::Null,
+            banner: None,
+            cors_allow_origin: Some("*".to_string()),
+            guard: None,
+            api: None,
+        }
+    }
 }
 
 /// Run the Web UI and WebSocket server until interrupted.
@@ -32,7 +76,16 @@ pub async fn start_web_server(
     acp_handler_factory: impl Fn() -> LocalAcpHandler + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let addr = format!("{}:{}", config.host, config.port);
-    let listener = TcpListener::bind(&addr).await?;
+    let listener = TcpListener::bind(&addr).await.map_err(|e| {
+        // A bare `AddrInUse` is unhelpful: the config studio requires a fixed
+        // port (the token lives in the URL), so the actionable fix is "pick
+        // another port" rather than a raw OS error.
+        if e.kind() == std::io::ErrorKind::AddrInUse {
+            format!("无法监听 {addr}：端口已被占用，请用 --port 指定另一个端口（{e}）")
+        } else {
+            format!("无法监听 {addr}：{e}")
+        }
+    })?;
     let local_addr = listener.local_addr()?;
     let is_wildcard = config.host == "0.0.0.0" || config.host == "::";
     let browser_url = if is_wildcard {
@@ -41,28 +94,21 @@ pub async fn start_web_server(
         format!("http://{}:{}/", config.host, local_addr.port())
     };
 
-    eprintln!("╔════════════════════════════════════════════════════════════╗");
-    eprintln!("║       ⚡ One AI Coding Agent — React Web Interface        ║");
-    eprintln!("╠════════════════════════════════════════════════════════════╣");
-    if is_wildcard {
-        eprintln!("║  Local URL:   {:<44} ║", browser_url);
-        eprintln!(
-            "║  Network:     All interfaces (0.0.0.0:{})             ║",
-            local_addr.port()
-        );
-    } else {
-        eprintln!("║  Web UI URL:  {:<44} ║", browser_url);
+    match &config.banner {
+        Some(text) => eprintln!("{text}"),
+        None => print_default_banner(&browser_url, local_addr.port(), is_wildcard),
     }
-    eprintln!("║  Protocol:    Agent Client Protocol v1 over WebSocket      ║");
-    eprintln!("║  Frontend:    Vite + React (Embedded SPA)                  ║");
-    eprintln!("║  Status:      Listening for connections...                 ║");
-    eprintln!("╚════════════════════════════════════════════════════════════╝");
 
     if config.open_browser {
         open_browser_url(&browser_url);
     }
 
-    let info_json = Arc::new(config.info_json);
+    let shared = Arc::new(SharedState {
+        info_json: config.info_json,
+        cors_allow_origin: config.cors_allow_origin,
+        guard: config.guard,
+        api: config.api,
+    });
 
     let local = tokio::task::LocalSet::new();
     local
@@ -76,17 +122,40 @@ pub async fn start_web_server(
                     }
                 };
 
-                let info_clone = Arc::clone(&info_json);
+                let state = Arc::clone(&shared);
                 let acp_handler = acp_handler_factory();
                 tokio::task::spawn_local(async move {
-                    if let Err(err) = handle_connection(stream, peer, info_clone, acp_handler).await
-                    {
+                    if let Err(err) = handle_connection(stream, state, acp_handler).await {
                         tracing::debug!(peer = %peer, error = %err, "web connection closed");
                     }
                 });
             }
         })
         .await
+}
+
+/// State shared by every connection.
+struct SharedState {
+    info_json: serde_json::Value,
+    cors_allow_origin: Option<String>,
+    guard: Option<RequestGuard>,
+    api: Option<ApiHandler>,
+}
+
+fn print_default_banner(browser_url: &str, port: u16, is_wildcard: bool) {
+    eprintln!("╔════════════════════════════════════════════════════════════╗");
+    eprintln!("║       ⚡ One AI Coding Agent — React Web Interface        ║");
+    eprintln!("╠════════════════════════════════════════════════════════════╣");
+    if is_wildcard {
+        eprintln!("║  Local URL:   {browser_url:<44} ║");
+        eprintln!("║  Network:     All interfaces (0.0.0.0:{port})             ║");
+    } else {
+        eprintln!("║  Web UI URL:  {browser_url:<44} ║");
+    }
+    eprintln!("║  Protocol:    Agent Client Protocol v1 over WebSocket      ║");
+    eprintln!("║  Frontend:    Vite + React (Embedded SPA)                  ║");
+    eprintln!("║  Status:      Listening for connections...                 ║");
+    eprintln!("╚════════════════════════════════════════════════════════════╝");
 }
 
 fn open_browser_url(url: &str) {
@@ -102,83 +171,92 @@ fn open_browser_url(url: &str) {
 
 async fn handle_connection(
     mut stream: TcpStream,
-    _peer: SocketAddr,
-    info_json: Arc<serde_json::Value>,
+    state: Arc<SharedState>,
     acp_handler: LocalAcpHandler,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let mut buf = [0u8; 4096];
-    let n = stream.read(&mut buf).await?;
-    if n == 0 {
-        return Ok(());
-    }
-    let req = String::from_utf8_lossy(&buf[..n]);
-
-    let req_line = req.lines().next().unwrap_or_default();
-    let mut parts = req_line.split_whitespace();
-    let _method = parts.next().unwrap_or("GET");
-    let path = parts.next().unwrap_or("/");
-
-    let is_websocket = req.lines().any(|l| {
-        let low = l.to_ascii_lowercase();
-        low.starts_with("upgrade:") && low.contains("websocket")
-    });
-
-    if is_websocket {
-        // Find Sec-WebSocket-Key
-        let sec_key = req
-            .lines()
-            .find(|line| line.to_ascii_lowercase().starts_with("sec-websocket-key:"))
-            .and_then(|line| line.split_once(':'))
-            .map(|(_, val)| val.trim())
-            .unwrap_or_default();
-
-        if sec_key.is_empty() {
-            let resp = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n";
-            stream.write_all(resp.as_bytes()).await?;
+    let request = match read_request(&mut stream, DEFAULT_MAX_HEAD, DEFAULT_MAX_BODY).await {
+        Ok(Some(req)) => req,
+        Ok(None) => return Ok(()),
+        Err(err) => {
+            let resp = HttpResponse::error(400, format!("malformed HTTP request: {err}"));
+            let _ = stream.write_all(&resp.to_bytes()).await;
             return Ok(());
         }
+    };
 
-        let accept_key = compute_accept_key(sec_key);
-        let handshake_resp = format!(
-            "HTTP/1.1 101 Switching Protocols\r\n\
-             Upgrade: websocket\r\n\
-             Connection: Upgrade\r\n\
-             Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
-        );
-        stream.write_all(handshake_resp.as_bytes()).await?;
-        stream.flush().await?;
-
-        // Upgrade complete -> bridge WebSocket stream to ACP handler
-        bridge_websocket_to_acp(stream, acp_handler).await?;
-    } else if path == "/api/info" {
-        let body = info_json.to_string();
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: application/json\r\n\
-             Content-Length: {}\r\n\
-             Access-Control-Allow-Origin: *\r\n\r\n{}",
-            body.len(),
-            body
-        );
-        stream.write_all(resp.as_bytes()).await?;
-    } else if let Some(asset) = get_asset(path) {
-        let body = asset.body();
-        let resp = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: {}\r\n\
-             Content-Length: {}\r\n\
-             Cache-Control: public, max-age=3600\r\n\r\n{}",
-            asset.content_type(),
-            body.len(),
-            body
-        );
-        stream.write_all(resp.as_bytes()).await?;
-    } else {
-        let resp = "HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found";
-        stream.write_all(resp.as_bytes()).await?;
+    // Guards run first so an unauthorized request can never reach the ACP bridge.
+    if let Some(guard) = &state.guard {
+        if let Err(resp) = guard(&request) {
+            stream.write_all(&resp.to_bytes()).await?;
+            stream.flush().await?;
+            return Ok(());
+        }
     }
 
+    let is_websocket = request
+        .header("upgrade")
+        .map(|v| v.to_ascii_lowercase().contains("websocket"))
+        .unwrap_or(false);
+
+    if is_websocket {
+        return upgrade_websocket(stream, &request, acp_handler).await;
+    }
+
+    let response = route(&request, &state).await;
+    stream.write_all(&response.to_bytes()).await?;
+    stream.flush().await?;
     Ok(())
+}
+
+/// Dispatch a non-upgrade request through the API handler, built-ins, and assets.
+async fn route(request: &HttpRequest, state: &SharedState) -> HttpResponse {
+    if let Some(api) = &state.api {
+        if let Some(resp) = api(request.clone()).await {
+            return resp;
+        }
+    }
+
+    if request.path == "/api/info" {
+        let mut resp = HttpResponse::json(200, &state.info_json);
+        if let Some(origin) = &state.cors_allow_origin {
+            resp = resp.with_header("Access-Control-Allow-Origin", origin.clone());
+        }
+        return resp;
+    }
+
+    if let Some(asset) = get_asset(&request.path) {
+        let body = asset.body();
+        return HttpResponse::new(200, asset.content_type(), body.as_bytes().to_vec())
+            .with_header("Cache-Control", "public, max-age=3600");
+    }
+
+    HttpResponse::text(404, "Not Found")
+}
+
+async fn upgrade_websocket(
+    mut stream: TcpStream,
+    request: &HttpRequest,
+    acp_handler: LocalAcpHandler,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let sec_key = request.header("sec-websocket-key").unwrap_or_default();
+    if sec_key.is_empty() {
+        let resp = HttpResponse::error(400, "missing Sec-WebSocket-Key");
+        stream.write_all(&resp.to_bytes()).await?;
+        return Ok(());
+    }
+
+    let accept_key = compute_accept_key(sec_key);
+    let handshake_resp = format!(
+        "HTTP/1.1 101 Switching Protocols\r\n\
+         Upgrade: websocket\r\n\
+         Connection: Upgrade\r\n\
+         Sec-WebSocket-Accept: {accept_key}\r\n\r\n"
+    );
+    stream.write_all(handshake_resp.as_bytes()).await?;
+    stream.flush().await?;
+
+    // Any bytes parsed past the head belong to the WebSocket stream.
+    bridge_websocket_to_acp(stream, request.body.clone(), acp_handler).await
 }
 
 enum OutgoingWsMsg {
@@ -188,6 +266,7 @@ enum OutgoingWsMsg {
 
 async fn bridge_websocket_to_acp(
     stream: TcpStream,
+    initial: Vec<u8>,
     acp_handler: LocalAcpHandler,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (mut ws_rx, mut ws_tx) = tokio::io::split(stream);
@@ -244,6 +323,9 @@ async fn bridge_websocket_to_acp(
 
     // Task 3: WebSocket frames -> Agent input pipe & pongs
     let in_task = tokio::task::spawn_local(async move {
+        if !initial.is_empty() && agent_in_tx.write_all(&initial).await.is_err() {
+            return;
+        }
         loop {
             match read_ws_frame(&mut ws_rx).await {
                 Ok(WsFrame::Text(text)) => {

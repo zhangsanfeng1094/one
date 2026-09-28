@@ -4,7 +4,12 @@
 //! and bridges WebSocket connections directly into Agent Client Protocol (ACP).
 
 pub mod assets;
+pub mod http;
 pub mod server;
 pub mod ws;
 
-pub use server::{start_web_server, LocalAcpHandler, LocalBoxFuture, WebServerConfig};
+pub use http::{HttpRequest, HttpResponse};
+pub use server::{
+    start_web_server, ApiFuture, ApiHandler, LocalAcpHandler, LocalBoxFuture, RequestGuard,
+    WebServerConfig,
+};
