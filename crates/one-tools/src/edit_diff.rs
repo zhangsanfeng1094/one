@@ -1344,9 +1344,31 @@ pub fn find_closest_match_snippet(content: &str, needle: &str) -> Option<(usize,
 
 /// Format an actionable error message for the model when old_string is not found.
 pub fn format_not_found_message(path: &str, content: &str, needle: &str) -> String {
+    format_not_found_message_with_new(path, content, needle, None)
+}
+
+/// Format an actionable error message for the model when `old_string` is not found,
+/// optionally checking whether `old_string` and `new_string` were accidentally swapped.
+pub fn format_not_found_message_with_new(
+    path: &str,
+    content: &str,
+    needle: &str,
+    new_string: Option<&str>,
+) -> String {
     let mut msg = format!(
         "Could not find old_string in `{path}` (exact and relaxed match strategies failed)."
     );
+
+    if let Some(new_s) = new_string.map(str::trim).filter(|s| !s.is_empty()) {
+        if content.contains(new_s) {
+            msg.push_str(
+                "\n\nNote: `new_string` was found in the file while `old_string` was not — \
+                 `old_string` and `new_string` appear to be swapped. Put the existing file \
+                 text in `old_string` and the replacement text in `new_string`.",
+            );
+            return msg;
+        }
+    }
 
     if let Some((line_no, snippet)) = find_closest_match_snippet(content, needle) {
         msg.push_str(&format!(

@@ -14,7 +14,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::edit_diff::{
     apply_edit_lf, apply_line_ending, detect_line_ending, format_edit_success,
-    format_not_found_message, normalize_to_lf, patch_for_details, EditApplyError,
+    format_not_found_message_with_new, normalize_to_lf, patch_for_details, EditApplyError,
 };
 use crate::path_policy::{AccessKind, PathPolicy};
 use crate::tool_args::{
@@ -71,14 +71,14 @@ impl Tool for EditTool {
                 "old_string".into(),
                 json!({
                     "type": "string",
-                    "description": "Text to find (aliases: oldString, oldText). Prefer short unique anchors (2-5 lines of exact code) that uniquely locate the change. Must match uniquely unless replace_all is true. Do not guess unread code; check with `read` first. Do not include read-tool line numbers (e.g. `12|`)."
+                    "description": "The text to replace (aliases: oldString, oldText). Must match existing file content."
                 }),
             );
             obj.insert(
                 "new_string".into(),
                 json!({
                     "type": "string",
-                    "description": "Replacement text (aliases: newString, newText). Must differ from old_string."
+                    "description": "The text to replace it with (aliases: newString, newText). Must differ from old_string."
                 }),
             );
             obj.insert(
@@ -161,7 +161,9 @@ impl Tool for EditTool {
 
         let applied = apply_edit_lf(&content_lf, &old_lf, &new_lf, replace_all).map_err(|e| {
             let msg = match &e {
-                EditApplyError::NotFound => format_not_found_message(path, &content_lf, &old_lf),
+                EditApplyError::NotFound => {
+                    format_not_found_message_with_new(path, &content_lf, &old_lf, Some(&new_lf))
+                }
                 _ => e.user_message(),
             };
             tool_error("edit", msg)
@@ -254,6 +256,48 @@ mod tests {
         assert!(
             !props.contains_key("file_path") && !props.contains_key("filePath"),
             "schema must not advertise path aliases: {props:?}"
+        );
+        let prop_keys: Vec<&str> = props.keys().map(String::as_str).collect();
+        assert_eq!(
+            prop_keys,
+            vec![
+                "path",
+                "old_string",
+                "new_string",
+                "replace_all",
+                "description"
+            ],
+            "schema properties must preserve path -> old_string -> new_string order"
+        );
+    }
+
+    #[tokio::test]
+    async fn swapped_old_and_new_string_reports_swap_hint() {
+        let dir = temp_dir();
+        let file = dir.join("bifrost.go");
+        std::fs::write(
+            &file,
+            "// NewSparkAccount creates an initialized SparkAccount.\nfunc NewSparkAccount() *SparkAccount {\n}\n",
+        )
+        .unwrap();
+
+        let tool = EditTool::new(dir.clone());
+        let err = tool
+            .execute(&ToolCall {
+                id: "swap1".into(),
+                name: "edit".into(),
+                arguments: json!({
+                    "path": file.display().to_string(),
+                    "old_string": "func envProxyURL() string { return \"\" }\n\n// NewSparkAccount creates an initialized SparkAccount.\nfunc NewSparkAccount() *SparkAccount {",
+                    "new_string": "// NewSparkAccount creates an initialized SparkAccount.\nfunc NewSparkAccount() *SparkAccount {",
+                }),
+            })
+            .await
+            .expect_err("swapped edit must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("appear to be swapped"),
+            "expected swap hint in error message, got: {msg}"
         );
     }
 

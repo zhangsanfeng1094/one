@@ -207,27 +207,25 @@ impl BashTool {
         sandbox
     }
 
-    fn sandbox_banner(&self, sandbox: &OsSandbox, escalated: bool) -> (bool, String) {
+    fn sandbox_banner(&self, sandbox: &OsSandbox, escalated: bool) -> (bool, Option<String>) {
         let sandboxed = sandbox.enabled && OsSandbox::bwrap_available();
         // Wording: "OS bwrap off" ≠ "outside workspace". PathPolicy for file
         // tools is unchanged when bash runs without bubblewrap.
         let line = if escalated && !sandboxed {
-            format!(
+            Some(format!(
                 "sandbox: OS bwrap off for this command (path boundary still {})",
                 self.sandbox_mode.as_str()
-            )
+            ))
         } else if sandboxed {
-            format!(
-                "sandbox: bwrap · mode={} · writes limited to workspace (+ --add-dir)",
-                self.sandbox_mode.as_str()
-            )
+            // Default normal sandbox: omit redundant boilerplate banner to keep output clean
+            None
         } else if sandbox.enabled {
-            "sandbox: requested but bwrap missing — bash is UNSANDBOXED".to_string()
+            Some("sandbox: requested but bwrap missing — bash is UNSANDBOXED".to_string())
         } else {
-            format!(
+            Some(format!(
                 "sandbox: off · mode={} (use workspace-write default or unset --full-access)",
                 self.sandbox_mode.as_str()
-            )
+            ))
         };
         (sandboxed, line)
     }
@@ -324,10 +322,12 @@ impl BashTool {
                 None => "command failed (signal)".into(),
             }
         };
-        let mut output = format!(
-            "{status_line}\n{sandbox_line}\ncwd: {}",
-            self.live_cwd().display()
-        );
+        let mut header_lines = vec![status_line, format!("$ {command}")];
+        if let Some(sb) = sandbox_line {
+            header_lines.push(sb);
+        }
+        header_lines.push(format!("cwd: {}", self.live_cwd().display()));
+        let mut output = header_lines.join("\n");
         if escalated_on_failure {
             output.push_str(
                 "\nnote: re-ran without OS bwrap after a sandbox-like denial (user approved); \
@@ -404,10 +404,15 @@ path boundary / workspace mode unchanged",
         }
 
         let (sandboxed, sandbox_line) = self.sandbox_banner(sandbox, escalated);
-        let mut output = format!(
-            "command timed out after {timeout_secs}s\n{sandbox_line}\ncwd: {}",
-            self.live_cwd().display()
-        );
+        let mut header_lines = vec![
+            format!("command timed out after {timeout_secs}s"),
+            format!("$ {command}"),
+        ];
+        if let Some(sb) = sandbox_line {
+            header_lines.push(sb);
+        }
+        header_lines.push(format!("cwd: {}", self.live_cwd().display()));
+        let mut output = header_lines.join("\n");
         let mut truncated = false;
         let mut spill_path: Option<String> = None;
         if !body.is_empty() {
@@ -1301,8 +1306,12 @@ mod tests {
             "success should lead with exit code, got:\n{text}"
         );
         assert!(
-            text.contains("sandbox: bwrap"),
-            "expected visible sandbox banner, got:\n{text}"
+            text.contains("$ echo hello-sandbox"),
+            "expected command line in output, got:\n{text}"
+        );
+        assert!(
+            !text.contains("sandbox: bwrap"),
+            "redundant sandbox banner should be omitted on normal success, got:\n{text}"
         );
         assert!(text.contains("hello-sandbox"), "{text}");
         let sandboxed = out
@@ -1344,8 +1353,8 @@ mod tests {
             "failure title must be command-centric, got:\n{text}"
         );
         assert!(
-            text.contains("sandbox:"),
-            "sandbox banner should still appear on failure:\n{text}"
+            text.contains("$ python3 -c 'raise SystemExit(7)'"),
+            "expected command line in failure output:\n{text}"
         );
         assert!(
             !text.starts_with("exit 7"),

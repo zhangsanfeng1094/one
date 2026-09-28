@@ -28,6 +28,10 @@ pub mod web_fetch;
 pub mod web_search;
 pub mod write;
 
+// Process-group + capped-pipe helpers reused by one-cli's external agent
+// backends (codex / grok CLI runners).
+pub use process_io::{kill_process_group, read_pipe_capped, term_process_group};
+
 use std::sync::Arc;
 
 use one_core::tool::Tool;
@@ -50,9 +54,9 @@ pub use path_policy::{
 };
 pub use permissions::{
     bash_command, call_fingerprint, call_summary, command_matches_prefix,
-    evaluate as evaluate_permissions, evaluate_with_mode, suggested_command_prefix,
-    suggested_command_prefix_from_cmd, PermissionMode, PermissionRule, PermissionRules,
-    PermissionVerdict, RuleAction,
+    evaluate as evaluate_permissions, evaluate_with_cwd, evaluate_with_mode,
+    evaluate_with_mode_and_cwd, suggested_command_prefix, suggested_command_prefix_from_cmd,
+    PermissionMode, PermissionRule, PermissionRules, PermissionVerdict, RuleAction,
 };
 pub use plan::{
     plan_mode_system_overlay, plan_mode_tools, plan_mode_tools_with_policy, ExitPlanModeTool,

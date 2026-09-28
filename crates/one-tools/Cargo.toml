@@ -12,6 +12,7 @@ default = []
 network = ["dep:reqwest"]
 
 [dependencies]
+one-prompt.workspace = true
 one-core.workspace = true
 async-trait.workspace = true
 base64.workspace = true

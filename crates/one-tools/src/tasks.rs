@@ -731,6 +731,18 @@ bash_kill / kill_command_or_subagent.",
             .map(|t| t.snapshot())
     }
 
+    /// Check whether a background task is terminal (or unknown/removed).
+    pub fn is_terminal(&self, id: &str) -> bool {
+        let tasks = self.tasks.lock().expect("tasks lock");
+        tasks.get(id).map_or(true, |t| t.state.is_terminal())
+    }
+
+    /// Completion notifier for a task if present.
+    pub fn done_notifier(&self, id: &str) -> Option<Arc<Notify>> {
+        let tasks = self.tasks.lock().expect("tasks lock");
+        tasks.get(id).map(|t| t.done.clone())
+    }
+
     /// List all tasks (full snapshots including stdout/stderr).
     pub fn list(&self) -> Vec<TaskSnapshot> {
         let mut tasks = self.tasks.lock().expect("tasks lock");
@@ -1047,6 +1059,13 @@ pub fn format_completion_notification(snap: &TaskSnapshot) -> String {
     }
     if let Some(ref path) = snap.output_file {
         out.push_str(&format!("output_file: {}\n", path.display()));
+    }
+    let total_bytes = snap.stdout.len() + snap.stderr.len();
+    let total_chars = snap.stdout.chars().count() + snap.stderr.chars().count();
+    out.push_str(&format!("output_bytes: {total_bytes}\n"));
+    out.push_str(&format!("output_chars: {total_chars}\n"));
+    if total_chars > DEFAULT_OUTPUT_CHARS {
+        out.push_str("output_truncated: true\n");
     }
     // Monitors already streamed lines as events — keep completion compact.
     if !is_monitor {

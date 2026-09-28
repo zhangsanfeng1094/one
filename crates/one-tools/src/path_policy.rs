@@ -328,6 +328,11 @@ impl PathPolicy {
             .retain(|g| g.token != token);
     }
 
+    /// Number of outstanding once grants (tests / lease cleanup asserts).
+    pub fn once_grant_count(&self) -> usize {
+        self.dynamic.lock().expect("dynamic grants lock").once.len()
+    }
+
     /// Session-scoped writable root (dir + descendants). Also grants Read.
     /// Idempotent. Normalizes as existing dir (file → parent).
     pub fn grant_writable_root(&self, root: impl AsRef<Path>) {
@@ -702,7 +707,7 @@ fn dirs_home() -> PathBuf {
 fn default_skill_readable_roots() -> Vec<PathBuf> {
     let home = dirs_home();
     let agent = default_agent_dir();
-    vec![
+    let mut roots = vec![
         agent.clone(),
         agent.join("skills"),
         agent.join("builtin-skills"),
@@ -713,7 +718,21 @@ fn default_skill_readable_roots() -> Vec<PathBuf> {
         home.join(".claude").join("skills"),
         home.join(".codex").join("skills"),
         home.join(".grok").join("skills"),
-    ]
+    ];
+    // When a launcher (e.g. spark) overrides HOME to a wrapper directory and
+    // symlinks entries inside `.one/agent/` back to the real `$HOME/.one/agent/*`,
+    // also allow the real `.one/docs` sibling so user-guide reads work.
+    for sub in ["builtin-skills", "memory", "skills"] {
+        if let Ok(canon) = std::fs::canonicalize(agent.join(sub)) {
+            if let Some(real_one_dir) = canon.parent().and_then(|p| p.parent()) {
+                let real_docs = real_one_dir.join("docs");
+                if !roots.contains(&real_docs) {
+                    roots.push(real_docs);
+                }
+            }
+        }
+    }
+    roots
 }
 
 /// Ephemeral temp roots: readable **and** writable without `--add-dir`.

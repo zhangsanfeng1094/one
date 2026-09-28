@@ -403,31 +403,7 @@ pub fn plan_mode_tools_with_policy(
 
 /// System-prompt overlay injected while plan mode is active.
 pub fn plan_mode_system_overlay(plan_path: &Path) -> String {
-    format!(
-        r#"
-
-## Plan mode is active
-
-The user indicated they do not want you to execute yet. You MUST NOT make any edits \
-to application code, run shell commands, change configs, or make commits. This supersedes \
-other instructions about implementing changes.
-
-You MAY:
-- Read files, search the codebase (grep/ls), and use web tools when needed
-- Ask the user clarifying questions via the `ask_user` tool (single- or multi-select)
-- Write and edit ONLY the plan file at: `{plan}`
-- Call `exit_plan_mode` when the plan is ready for approval
-
-### Workflow
-1. **Understand** — explore relevant code and clarify ambiguous requirements with the user
-2. **Design** — pick one recommended approach (not a laundry list of alternatives)
-3. **Write plan** — write a concise markdown plan to the plan file (overview, critical files, numbered steps)
-4. **Exit** — call `exit_plan_mode` when the plan is clear enough to implement
-
-Keep the plan scannable: short bullets, concrete file paths, ordered steps. Do not implement until approved.
-"#,
-        plan = plan_path.display()
-    )
+    one_prompt::builtin::PLAN_GUIDE.replace("{{plan_path}}", &plan_path.display().to_string())
 }
 
 #[cfg(test)]

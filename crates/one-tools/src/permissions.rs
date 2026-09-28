@@ -4,7 +4,13 @@
 //! - `Tool` — all uses of the tool (e.g. `Bash`, `Write`)
 //! - `Tool(specifier)` — scoped match (e.g. `Bash(git push *)`, `Edit(**/.env*)`)
 //!
-//! Evaluation order: **deny → ask → allow → built-in defaults**.
+//! Evaluation order: **deny → unskippable safety → ask → allow → built-in defaults**.
+//!
+//! Ordinary allow rules authorize the command or path only. They do not grant
+//! OS-sandbox escape (`require_escalated`) and cannot skip hard-blocked or
+//! destructive bash checks.
+
+use std::path::Path;
 
 use one_core::tool::ToolCall;
 use serde::{Deserialize, Serialize};
@@ -190,7 +196,7 @@ impl ParsedRule {
         }
     }
 
-    fn matches(&self, call: &ToolCall) -> bool {
+    fn matches(&self, call: &ToolCall, cwd: Option<&Path>) -> bool {
         let name = call.name.to_ascii_lowercase();
         if self.tool != "*" && self.tool != name {
             return false;
@@ -198,41 +204,100 @@ impl ParsedRule {
         let Some(spec) = &self.specifier else {
             return true;
         };
-        let subject = match name.as_str() {
-            "bash" | "shell" => call
-                .arguments
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
+        match name.as_str() {
+            "bash" | "shell" => {
+                let subject = call
+                    .arguments
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                wildcard_match(spec, subject)
+            }
             "read" | "write" | "edit" | "grep" | "glob" | "find" | "ls" => {
-                crate::tool_args::path_arg(&call.arguments)
+                let subject = crate::tool_args::path_arg(&call.arguments)
                     .ok()
                     .flatten()
-                    .unwrap_or("")
+                    .unwrap_or("");
+                path_rule_matches(spec, subject, cwd)
             }
-            "web_fetch" => call
-                .arguments
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            _ => {
-                // Generic: match against compact JSON args.
-                &call.arguments.to_string()
+            "web_fetch" => {
+                let subject = call
+                    .arguments
+                    .get("url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                wildcard_match(spec, subject)
             }
-        };
-        if wildcard_match(spec, subject) {
-            return true;
+            _ => wildcard_match(spec, &call.arguments.to_string()),
         }
-        // Rules are commonly written relative to the workspace (`Read(.env)`).
-        // Treat that spelling as the same target when a caller supplies an
-        // absolute path, rather than letting representation bypass the rule.
-        matches!(
-            name.as_str(),
-            "read" | "write" | "edit" | "grep" | "glob" | "find" | "ls"
-        ) && subject.starts_with('/')
-            && !spec.starts_with('/')
-            && wildcard_match(&format!("*{spec}"), subject)
     }
+}
+
+fn path_to_match_str(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn push_unique(out: &mut Vec<String>, value: String) {
+    if !value.is_empty() && !out.iter().any(|existing| existing == &value) {
+        out.push(value);
+    }
+}
+
+/// Subjects used for path-rule matching: the raw argument plus cwd-normalized
+/// aliases (`.`, `..`, absolute, symlink-resolved existing prefix).
+fn path_match_subjects(raw: &str, cwd: Option<&Path>) -> Vec<String> {
+    let mut subjects = Vec::new();
+    push_unique(&mut subjects, raw.replace('\\', "/"));
+    let Some(cwd) = cwd else {
+        return subjects;
+    };
+    let resolved = crate::path_policy::resolve_against_cwd(cwd, raw);
+    push_unique(&mut subjects, path_to_match_str(&resolved));
+    if let Ok(rel) = resolved.strip_prefix(cwd) {
+        let rel_s = path_to_match_str(rel);
+        push_unique(&mut subjects, rel_s.clone());
+        if !rel_s.starts_with("./") && rel_s != "." {
+            push_unique(&mut subjects, format!("./{rel_s}"));
+        }
+    }
+    if let Some(name) = resolved.file_name() {
+        push_unique(&mut subjects, name.to_string_lossy().replace('\\', "/"));
+    }
+    subjects
+}
+
+fn path_spec_candidates(spec: &str, cwd: Option<&Path>) -> Vec<String> {
+    let mut specs = Vec::new();
+    push_unique(&mut specs, spec.replace('\\', "/"));
+    if spec.contains('*') || spec.contains('?') {
+        return specs;
+    }
+    if let Some(cwd) = cwd {
+        let resolved = crate::path_policy::resolve_against_cwd(cwd, spec);
+        push_unique(&mut specs, path_to_match_str(&resolved));
+    }
+    specs
+}
+
+fn path_rule_matches(spec: &str, subject: &str, cwd: Option<&Path>) -> bool {
+    let subjects = path_match_subjects(subject, cwd);
+    let specs = path_spec_candidates(spec, cwd);
+    for spec in &specs {
+        for subject in &subjects {
+            if wildcard_match(spec, subject) {
+                return true;
+            }
+            // Relative rules (`Read(.env)`) cover absolute spellings of the
+            // same target without requiring the caller to repeat the cwd.
+            if subject.starts_with('/')
+                && !spec.starts_with('/')
+                && wildcard_match(&format!("*{spec}"), subject)
+            {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Glob-like match: `*` matches any sequence (including empty / spaces).
@@ -354,10 +419,7 @@ pub fn suggested_command_prefix_from_cmd(command: &str) -> Option<String> {
 
     if WRAPPERS.iter().any(|w| head.eq_ignore_ascii_case(w)) {
         // sudo apt install … → "sudo apt"
-        while i < tokens.len() && tokens[i].starts_with('-') {
-            // keep flags out of the prefix (sudo -u root … is too variable)
-            break;
-        }
+        // Flags are kept out of the prefix (sudo -u root … is too variable).
         if i < tokens.len() && !tokens[i].starts_with('-') {
             parts.push(tokens[i]);
         }
@@ -458,10 +520,26 @@ pub fn call_fingerprint(call: &ToolCall) -> String {
     }
 }
 
+/// Collapse a potentially multi-line command into a single line for approval summaries.
+fn collapse_command_line(cmd: &str) -> String {
+    let collapsed: String = cmd
+        .chars()
+        .map(|c| if c == '\n' || c == '\r' { ' ' } else { c })
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if collapsed.is_empty() {
+        "(empty command)".into()
+    } else {
+        collapsed
+    }
+}
+
 /// Human-readable summary for approval UI.
 ///
-/// Prefer a short `description` when the model provided one; otherwise the
-/// command (callers / TUI may further truncate for display).
+/// For `bash`/`shell`, always include the actual command so high-risk approval
+/// prompts never hide what is about to run behind `description` alone.
 pub fn call_summary(call: &ToolCall) -> String {
     match call.name.as_str() {
         "bash" | "shell" => {
@@ -471,21 +549,25 @@ pub fn call_summary(call: &ToolCall) -> String {
                 .and_then(|v| v.as_str())
                 .map(str::trim)
                 .filter(|s| !s.is_empty());
-            let cmd = call
+            let raw_cmd = call
                 .arguments
                 .get("command")
                 .and_then(|v| v.as_str())
-                .unwrap_or("(empty command)");
-            // Prefer human description for the dock; keep command for escalate
-            // body via the same field (format_escalate_body peels prefixes).
-            let core = desc.unwrap_or(cmd);
+                .unwrap_or("");
+            let cmd = collapse_command_line(raw_cmd);
             if crate::sandbox_permissions::requires_escalation(call) {
                 // Prefer command for escalate preview (user should see what runs).
                 // Prefix is peeled by TUI format_escalate_body; means OS bwrap off,
                 // not workspace path escape.
                 format!("[without OS bwrap] {cmd}")
+            } else if let Some(d) = desc {
+                if d == cmd {
+                    format!("$ {cmd}")
+                } else {
+                    format!("{d}\n$ {cmd}")
+                }
             } else {
-                core.to_string()
+                format!("$ {cmd}")
             }
         }
         "write" | "edit" | "read" | "ls" | "grep" | "glob" | "find" => {
@@ -572,24 +654,35 @@ pub fn is_auto_mode_safe_command(command: &str) -> bool {
     }
 }
 
-/// Evaluate configured rules + safe defaults.
+/// Evaluate configured rules + safe defaults against the process cwd.
 ///
 /// `auto_approve` skips **soft** high-risk bash asks (`sudo`, plain `git push`, …)
 /// and configured Ask rules. It does **not** skip:
 /// - hard-blocked patterns (deny)
 /// - **destructive** shapes from [`crate::sandbox::requires_strict_confirmation`]
 ///   (`git checkout`/`restore`/`reset`/`clean`, force-push, recursive `rm`, …)
+/// - OS-sandbox escalation (`require_escalated`), which needs its own Ask
 pub fn evaluate(
     call: &ToolCall,
     rules: &[PermissionRule],
     auto_approve: bool,
+) -> PermissionVerdict {
+    evaluate_with_cwd(call, rules, auto_approve, None)
+}
+
+/// Same as [`evaluate`], resolving relative path rules against `cwd`.
+pub fn evaluate_with_cwd(
+    call: &ToolCall,
+    rules: &[PermissionRule],
+    auto_approve: bool,
+    cwd: Option<&Path>,
 ) -> PermissionVerdict {
     let mode = if auto_approve {
         PermissionMode::BypassPermissions
     } else {
         PermissionMode::Default
     };
-    evaluate_with_mode(call, rules, mode)
+    evaluate_with_mode_and_cwd(call, rules, mode, cwd)
 }
 
 /// Evaluate rules and safe defaults under a specific [`PermissionMode`].
@@ -597,6 +690,16 @@ pub fn evaluate_with_mode(
     call: &ToolCall,
     rules: &[PermissionRule],
     mode: PermissionMode,
+) -> PermissionVerdict {
+    evaluate_with_mode_and_cwd(call, rules, mode, None)
+}
+
+/// Same as [`evaluate_with_mode`], resolving relative path rules against `cwd`.
+pub fn evaluate_with_mode_and_cwd(
+    call: &ToolCall,
+    rules: &[PermissionRule],
+    mode: PermissionMode,
+    cwd: Option<&Path>,
 ) -> PermissionVerdict {
     let mut denials = Vec::new();
     let mut asks = Vec::new();
@@ -609,10 +712,10 @@ pub fn evaluate_with_mode(
         }
     }
 
-    // 1. Denials always win.
+    // 1. Explicit denials always win.
     for r in denials {
         if let Some(parsed) = ParsedRule::parse(&r.rule) {
-            if parsed.matches(call) {
+            if parsed.matches(call, cwd) {
                 return PermissionVerdict::Deny {
                     reason: format!("denied by rule `{}`", r.rule),
                 };
@@ -620,17 +723,23 @@ pub fn evaluate_with_mode(
         }
     }
 
-    // 2. Mode specific early shortcuts:
+    // 2. Unskippable safety (hard-block / destructive / sandbox escalate).
+    // Ordinary allow rules cannot authorize these.
+    if let Some(verdict) = unskippable_safety(call, mode) {
+        return apply_dont_ask(verdict, mode);
+    }
+
+    // 3. Mode specific early shortcuts:
     if mode == PermissionMode::AcceptEdits
         && matches!(call.name.as_str(), "write" | "edit" | "memory_write")
     {
         return PermissionVerdict::Allow;
     }
 
-    // 3. User Ask rules.
+    // 4. User Ask rules.
     for r in asks {
         if let Some(parsed) = ParsedRule::parse(&r.rule) {
-            if parsed.matches(call) {
+            if parsed.matches(call, cwd) {
                 if mode.is_always_approve() {
                     return PermissionVerdict::Allow;
                 }
@@ -646,17 +755,21 @@ pub fn evaluate_with_mode(
         }
     }
 
-    // 4. User Allow rules.
+    // 5. User Allow rules authorize the command/path only — not sandbox escape
+    // (already handled above) and not hard-blocked/destructive shapes.
     for r in allows {
         if let Some(parsed) = ParsedRule::parse(&r.rule) {
-            if parsed.matches(call) {
+            if parsed.matches(call, cwd) {
                 return PermissionVerdict::Allow;
             }
         }
     }
 
-    // 5. Built-in defaults.
-    let verdict = default_verdict_with_mode(call, mode);
+    // 6. Built-in defaults (soft high-risk asks, auto-mode allowlist).
+    apply_dont_ask(default_verdict_with_mode(call, mode), mode)
+}
+
+fn apply_dont_ask(verdict: PermissionVerdict, mode: PermissionMode) -> PermissionVerdict {
     if mode == PermissionMode::DontAsk {
         if let PermissionVerdict::Ask { reason } = verdict {
             return PermissionVerdict::Deny {
@@ -665,6 +778,39 @@ pub fn evaluate_with_mode(
         }
     }
     verdict
+}
+
+/// Constraints that allow rules and session caches must not skip.
+fn unskippable_safety(call: &ToolCall, mode: PermissionMode) -> Option<PermissionVerdict> {
+    if !matches!(call.name.as_str(), "bash" | "shell") {
+        return None;
+    }
+    let command = call
+        .arguments
+        .get("command")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if let Some(pat) = crate::sandbox::is_command_blocked(command) {
+        return Some(PermissionVerdict::Deny {
+            reason: format!("blocked command pattern: {pat}"),
+        });
+    }
+    if let Some(pat) = crate::sandbox::requires_strict_confirmation(command) {
+        return Some(PermissionVerdict::Ask {
+            reason: crate::sandbox::destructive_ask_reason(pat),
+        });
+    }
+    if crate::sandbox_permissions::requires_escalation(call) {
+        if mode.is_always_approve() {
+            return Some(PermissionVerdict::Allow);
+        }
+        let just = crate::sandbox_permissions::justification_of(call)
+            .unwrap_or_else(|| "model requested unsandboxed execution".into());
+        return Some(PermissionVerdict::Ask {
+            reason: format!("sandbox escalation: {just}"),
+        });
+    }
+    None
 }
 
 fn default_verdict_with_mode(call: &ToolCall, mode: PermissionMode) -> PermissionVerdict {
@@ -681,30 +827,8 @@ fn default_verdict_with_mode(call: &ToolCall, mode: PermissionMode) -> Permissio
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            if let Some(pat) = crate::sandbox::is_command_blocked(command) {
-                return PermissionVerdict::Deny {
-                    reason: format!("blocked command pattern: {pat}"),
-                };
-            }
-
-            // Destructive git / recursive rm: always Ask (even with auto_approve).
-            if let Some(pat) = crate::sandbox::requires_strict_confirmation(command) {
-                return PermissionVerdict::Ask {
-                    reason: crate::sandbox::destructive_ask_reason(pat),
-                };
-            }
-
-            // Codex-aligned: model-requested sandbox escape always needs Ask
-            // (unless auto_approve / --yes). Distinct reason prefix drives TUI copy.
-            if crate::sandbox_permissions::requires_escalation(call) {
-                if auto_approve {
-                    return PermissionVerdict::Allow;
-                }
-                let just = crate::sandbox_permissions::justification_of(call)
-                    .unwrap_or_else(|| "model requested unsandboxed execution".into());
-                return PermissionVerdict::Ask {
-                    reason: format!("sandbox escalation: {just}"),
-                };
+            if let Some(verdict) = unskippable_safety(call, mode) {
+                return verdict;
             }
 
             if mode == PermissionMode::Auto && is_auto_mode_safe_command(command) {
@@ -1007,6 +1131,109 @@ mod tests {
         ));
     }
 
+    fn read_path(path: &str) -> ToolCall {
+        ToolCall {
+            id: "1".into(),
+            name: "read".into(),
+            arguments: json!({ "path": path }),
+        }
+    }
+
+    #[test]
+    fn path_deny_covers_equivalent_spellings() {
+        let cwd = std::env::temp_dir().join(format!(
+            "one-perm-path-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(cwd.join("sub")).unwrap();
+        std::fs::write(cwd.join(".env"), "SECRET=1").unwrap();
+        let rules = vec![PermissionRule::parse(RuleAction::Deny, "Read(.env)").unwrap()];
+        let abs = cwd.join(".env").to_string_lossy().to_string();
+        for path in [".env", "./.env", "sub/../.env", abs.as_str()] {
+            let v = evaluate_with_cwd(&read_path(path), &rules, false, Some(cwd.as_path()));
+            assert!(
+                matches!(v, PermissionVerdict::Deny { .. }),
+                "path={path} verdict={v:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn path_deny_covers_symlink_alias() {
+        let cwd = std::env::temp_dir().join(format!(
+            "one-perm-link-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let real = cwd.join(".env");
+        std::fs::write(&real, "SECRET=1").unwrap();
+        let link = cwd.join("env.link");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let rules = vec![PermissionRule::parse(RuleAction::Deny, "Read(.env)").unwrap()];
+            let v = evaluate_with_cwd(
+                &read_path(link.to_str().unwrap()),
+                &rules,
+                false,
+                Some(cwd.as_path()),
+            );
+            assert!(
+                matches!(v, PermissionVerdict::Deny { .. }),
+                "symlink alias must deny: {v:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn allow_does_not_skip_escalation_or_hard_blocks() {
+        let allow_echo = vec![PermissionRule::parse(RuleAction::Allow, "Bash(echo *)").unwrap()];
+        let escalated = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: json!({
+                "command": "echo hi",
+                "sandbox_permissions": "require_escalated",
+                "justification": "need host access"
+            }),
+        };
+        match evaluate(&escalated, &allow_echo, false) {
+            PermissionVerdict::Ask { reason } => {
+                assert!(reason.starts_with("sandbox escalation:"), "{reason}");
+            }
+            other => panic!("escalation must still Ask, got {other:?}"),
+        }
+        assert_eq!(
+            evaluate(&escalated, &allow_echo, true),
+            PermissionVerdict::Allow
+        );
+
+        let allow_bash = vec![PermissionRule::parse(RuleAction::Allow, "Bash").unwrap()];
+        assert!(matches!(
+            evaluate(&bash("rm -rf /"), &allow_bash, true),
+            PermissionVerdict::Deny { .. }
+        ));
+        match evaluate(&bash("rm -rf ./target"), &allow_bash, true) {
+            PermissionVerdict::Ask { reason } => {
+                assert!(
+                    crate::sandbox::is_destructive_ask_reason(&reason),
+                    "{reason}"
+                );
+            }
+            other => panic!("destructive must still Ask, got {other:?}"),
+        }
+    }
+
     #[test]
     fn suggested_prefix_from_call() {
         let call = bash("npm install lodash");
@@ -1020,5 +1247,27 @@ mod tests {
             arguments: json!({ "path": "a.rs", "old_string": "a", "new_string": "b" }),
         };
         assert_eq!(suggested_command_prefix(&edit), None);
+    }
+
+    #[test]
+    fn bash_call_summary_always_includes_command() {
+        let with_desc = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: json!({
+                "command": "git restore --staged serve/ web/",
+                "description": "Unstage serve and web to commit docs first"
+            }),
+        };
+        assert_eq!(
+            call_summary(&with_desc),
+            "Unstage serve and web to commit docs first\n$ git restore --staged serve/ web/"
+        );
+
+        let without_desc = bash("git restore --staged serve/ web/");
+        assert_eq!(
+            call_summary(&without_desc),
+            "$ git restore --staged serve/ web/"
+        );
     }
 }

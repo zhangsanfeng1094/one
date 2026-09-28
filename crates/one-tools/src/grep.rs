@@ -85,9 +85,10 @@ impl Tool for GrepTool {
                  (no host `rg` required). Prefer this over bash `rg`/`grep`. Use `glob` or \
                  `type` to narrow files, `output_mode` for files_with_matches/count, and \
                  context lines for surrounding code. Default path is the workspace root; \
-                 `~/` is `$HOME` (not a workspace-relative folder). Paths outside need \
-                 interactive approval or --add-dir; a parent of readable roots (e.g. `~/.one`) \
-                 is auto-narrowed to those roots instead of a hard deny."
+                 directories named `dist`, `node_modules`, `coverage`, or `.next` are skipped \
+                 unless the search path is inside them. `~/` is `$HOME` (not a workspace-relative \
+                 folder). Paths outside need interactive approval or --add-dir; a parent of \
+                 readable roots (e.g. `~/.one`) is auto-narrowed to those roots instead of a hard deny."
                 .to_string(),
             parameters: json!({
                 "type": "object",
@@ -569,6 +570,12 @@ fn run_search(
     })
 }
 
+fn generated_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| matches!(name, "dist" | "node_modules" | "coverage" | ".next"))
+}
+
 fn collect_files(
     root: &Path,
     glob: Option<&str>,
@@ -615,10 +622,16 @@ fn collect_files(
                     return WalkState::Continue;
                 }
             };
+            let path = entry.path();
+            if entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false) {
+                if path != root && generated_dir(path) {
+                    return WalkState::Skip;
+                }
+                return WalkState::Continue;
+            }
             if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
                 return WalkState::Continue;
             }
-            let path = entry.path();
             if policy
                 .check_with_token(path, AccessKind::Read, token.as_deref())
                 .is_err()
@@ -825,6 +838,50 @@ mod tests {
         let text = out.as_text();
         assert!(text.contains("a.rs") || text.contains("b.rs"), "{text}");
         assert!(!text.contains("readme.md"), "{text}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn skips_generated_dirs_unless_search_root_is_inside() {
+        let dir = temp_workspace();
+        std::fs::create_dir_all(dir.join("web/dist")).unwrap();
+        std::fs::write(dir.join("web/dist/app.js"), "fn alpha() {}\n").unwrap();
+        let tool = GrepTool::new(dir.clone());
+        let wide = tool
+            .execute(&ToolCall {
+                id: "1".into(),
+                name: "grep".into(),
+                arguments: json!({
+                    "pattern": "alpha",
+                    "output_mode": "files_with_matches"
+                }),
+            })
+            .await
+            .unwrap();
+        let wide_text = wide.as_text();
+        assert!(wide_text.contains("a.rs"), "{wide_text}");
+        assert!(
+            !wide_text.contains("app.js"),
+            "dist should be skipped: {wide_text}"
+        );
+
+        let inside = tool
+            .execute(&ToolCall {
+                id: "2".into(),
+                name: "grep".into(),
+                arguments: json!({
+                    "pattern": "alpha",
+                    "path": "web/dist",
+                    "output_mode": "files_with_matches"
+                }),
+            })
+            .await
+            .unwrap();
+        assert!(
+            inside.as_text().contains("app.js"),
+            "explicit dist path should search: {}",
+            inside.as_text()
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
