@@ -26,6 +26,16 @@
 ## 快速开始
 
 ```bash
+# 一键安装最新版本（或指定版本，如 bash -s 0.1.0）
+curl -fsSL https://raw.githubusercontent.com/zhangsanfeng1094/one/main/scripts/install.sh | bash
+
+# 从当前仓库本地编译并安装到 ~/.one/bin/one
+./scripts/install.sh --local
+
+# 检查更新 / 自更新到最新版本
+one update --check
+one update
+
 # 编译（需要 Rust 工具链；推荐安装 build-essential）
 cargo build -p one-cli
 

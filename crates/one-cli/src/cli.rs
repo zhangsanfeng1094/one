@@ -302,6 +302,8 @@ pub enum Commands {
     Config(ConfigCli),
     /// Multi-channel Bot Gateway (Telegram / Discord / Feishu / Slack).
     Bot(BotCli),
+    /// Check for updates and self-update the `one` binary
+    Update(crate::update_cmd::UpdateCli),
 }
 
 #[derive(Debug, Clone, clap::Args)]

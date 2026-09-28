@@ -20,6 +20,7 @@ mod provider;
 mod runtime;
 mod session_cmd;
 mod settings;
+mod update_cmd;
 
 use clap::parser::ValueSource;
 use clap::{CommandFactory, FromArgMatches};
@@ -424,6 +425,10 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if let Some(Commands::Learn(learn)) = cli.command {
         let cwd = cli.cwd.canonicalize().unwrap_or_else(|_| cli.cwd.clone());
         learn_cmd::run_learn(learn, &cwd).await?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if let Some(Commands::Update(update)) = cli.command {
+        update_cmd::run_update(update).await?;
         return Ok(ExitCode::SUCCESS);
     }
     // `one resume …` rewrites into the normal agent path (session open + TUI/print).
