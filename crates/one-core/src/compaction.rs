@@ -8,21 +8,16 @@ use crate::reminder::{
 use serde::{Deserialize, Serialize};
 
 /// Mode of conversation compaction (aligns with `grok-build` CompactionMode).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CompactionMode {
     /// LLM or extractive summary of previous messages (default).
+    #[default]
     Summary,
     /// Keep raw transcript pointer with pruned tool outputs.
     Transcript,
     /// Split conversation into discrete persisted segments.
     Segments,
-}
-
-impl Default for CompactionMode {
-    fn default() -> Self {
-        Self::Summary
-    }
 }
 
 /// Why compact ran. Maps to PreCompact/PostCompact hook matcher `manual` | `auto`.
@@ -1477,7 +1472,7 @@ mod tests {
         let msg =
             AgentMessage::user_with_images("hi", vec![("image/png".into(), "/tmp/x.png".into())]);
         let parts = estimate_message_parts(&[msg]);
-        assert_eq!(parts.messages, (2 / 4 + IMAGE_TOKEN_ESTIMATE) as u64);
+        assert_eq!(parts.messages, IMAGE_TOKEN_ESTIMATE as u64);
         assert_eq!(parts.reasoning, 0);
     }
 

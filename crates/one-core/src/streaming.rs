@@ -45,6 +45,7 @@ pub async fn wait_until_aborted(abort: Option<&AtomicBool>) {
 ///
 /// Dropping `fut` on abort relies on cancel-safe cleanup (e.g. reqwest request
 /// cancel-on-drop, `tokio::process::Command` with `kill_on_drop(true)`).
+#[allow(clippy::result_unit_err)]
 pub async fn race_abort<T>(
     fut: impl std::future::Future<Output = T>,
     abort: Option<&AtomicBool>,

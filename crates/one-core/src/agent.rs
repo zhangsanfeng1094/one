@@ -4571,7 +4571,7 @@ mod tests {
             fn model(&self) -> &str {
                 "test"
             }
-            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
                 let turn = self.turns.fetch_add(1, Ordering::SeqCst);
                 if turn > 0 {
                     return Ok(CompletionResponse {
@@ -5283,7 +5283,7 @@ mod tests {
         let tracker_for_cb = tracker.clone();
         let task_terminal_for_cb = task_terminal.clone();
         agent.subscribe(Box::new(move |event| match event {
-            AgentEvent::AgentStart { .. } => {
+            AgentEvent::AgentStart => {
                 tracker_for_cb.agent_starts.fetch_add(1, Ordering::SeqCst);
             }
             AgentEvent::AgentEnd { .. } => {
