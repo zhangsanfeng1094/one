@@ -77,7 +77,9 @@ detect_os() {
   case "$uname_s" in
     Linux*)  echo "linux" ;;
     Darwin*) echo "macos" ;;
-    MINGW*|MSYS*|CYGWIN*) echo "windows" ;;
+    MINGW*|MSYS*|CYGWIN*)
+      err "Native Windows is not supported (One uses Unix sockets/PTY/process groups). Please run inside WSL2 (Ubuntu/Debian)."
+      ;;
     *) err "unsupported operating system: $uname_s" ;;
   esac
 }
