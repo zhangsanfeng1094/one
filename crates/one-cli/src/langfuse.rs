@@ -477,6 +477,25 @@ impl LangfuseTraceSink {
     fn apply_event(&self, event: &TraceEvent) {
         let mut state = self.state.lock().expect("state");
         match event {
+            TraceEvent::BatchExploration {
+                ts_ms,
+                turn,
+                batch_size,
+                reminder,
+                ..
+            } => {
+                Self::parent_cx(&state, Some(*turn))
+                    .span()
+                    .add_event_with_timestamp(
+                        "batch_exploration",
+                        ms_to_system_time(*ts_ms),
+                        vec![
+                            KeyValue::new("turn", *turn as i64),
+                            KeyValue::new("batch_size", *batch_size as i64),
+                            KeyValue::new("reminder", *reminder),
+                        ],
+                    );
+            }
             TraceEvent::RunStart {
                 ts_ms,
                 run_id,

@@ -28,6 +28,7 @@ pub async fn run_web_server(
         port,
         open_browser,
         info_json,
+        ..Default::default()
     };
 
     let cli_for_factory = cli.clone();

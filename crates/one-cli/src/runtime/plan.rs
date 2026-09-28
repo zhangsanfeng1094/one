@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use one_core::tool::Tool;
-use one_tools::{plan_mode_system_overlay, plan_mode_tools_with_policy};
+use one_tools::plan_mode_tools_with_policy;
 
 use super::helpers::new_plan_path;
 use super::{AgentMode, AppRuntime};
@@ -15,7 +15,6 @@ impl AppRuntime {
         &mut self,
         path: &Path,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.recompose_base_prompt();
         let mut tools: Vec<Arc<dyn Tool>> = plan_mode_tools_with_policy(
             self.path_policy.clone(),
             path.to_path_buf(),
@@ -25,16 +24,16 @@ impl AppRuntime {
         // Explore-only task allowed in plan mode when subagent feature is on.
         self.push_task_tools(&mut tools);
 
-        {
-            let mut agent = self.agent.lock().await;
-            agent.set_tools(tools);
-            // Plan mode: base + plan overlay only (no MCP announcement).
-            agent.config.system_prompt = format!(
-                "{}{}",
-                self.base_system_prompt,
-                plan_mode_system_overlay(path)
-            );
-        }
+        let names = tools
+            .iter()
+            .map(|t| t.definition().name)
+            .collect::<Vec<_>>();
+        let compiled = self.compile_prompt_for_tools(&names, AgentMode::Plan, Some(path))?;
+        let mut agent = self.agent.lock().await;
+        agent.set_tools(tools);
+        agent.config.system_prompt = compiled.text.clone();
+        self.compiled_prompt = compiled;
+        self.prompt_tool_names = names;
         Ok(())
     }
 
@@ -64,9 +63,9 @@ impl AppRuntime {
             state.clear();
         }
 
+        self.apply_plan_tools_and_prompt(&path).await?;
         self.mode = AgentMode::Plan;
         self.plan_path = Some(path.clone());
-        self.apply_plan_tools_and_prompt(&path).await?;
         self.persist_mode().await?;
         Ok(path)
     }
@@ -78,7 +77,10 @@ impl AppRuntime {
         }
         // Flip mode before rebuild so MCP tools are included.
         self.mode = AgentMode::Act;
-        self.apply_act_tools_and_prompt().await?;
+        if let Err(error) = self.apply_act_tools_and_prompt().await {
+            self.mode = AgentMode::Plan;
+            return Err(error);
+        }
         {
             let mut state = self.plan_exit.lock().expect("plan exit lock");
             state.clear();
@@ -140,13 +142,7 @@ impl AppRuntime {
 
         // Start a fresh session to clear exploration context.
         self.new_session().await?;
-        self.mode = AgentMode::Act;
-        self.apply_act_tools_and_prompt().await?;
-        {
-            let mut state = self.plan_exit.lock().expect("plan exit lock");
-            state.clear();
-        }
-        self.persist_mode().await?;
+        self.leave_plan_mode().await?;
 
         Ok(format!(
             "The plan below was approved. Implement it in this fresh session. Follow the steps; \

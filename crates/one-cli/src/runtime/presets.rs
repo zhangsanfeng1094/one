@@ -26,13 +26,18 @@ pub fn load_preset(name: &str, cwd: &Path) -> Result<AgentSpec, ProtocolError> {
 
     // Project then user disk: .json preferred over .md for same stem.
     for dir in agent_search_dirs(cwd) {
-        let json = dir.join(format!("{name}.json"));
-        if json.is_file() {
-            return load_spec_file(&json);
-        }
-        let md = dir.join(format!("{name}.md"));
-        if md.is_file() {
-            return load_spec_file(&md);
+        let candidates: &[&str] = if name == "main" {
+            &["main", "default"]
+        } else {
+            &[name]
+        };
+        for candidate in candidates {
+            for ext in ["json", "md", "markdown"] {
+                let path = dir.join(format!("{candidate}.{ext}"));
+                if path.is_file() {
+                    return load_spec_file(&path);
+                }
+            }
         }
     }
 
@@ -69,9 +74,32 @@ pub fn load_spec_file(path: &Path) -> Result<AgentSpec, ProtocolError> {
         .and_then(|e| e.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    match ext.as_str() {
+    let mut spec = match ext.as_str() {
         "md" | "markdown" => load_spec_markdown(&raw, path),
         _ => load_spec_json(&raw),
+    }
+    .map_err(|e| {
+        ProtocolError::new(
+            error_code::INVALID_AGENT_SPEC,
+            format!("{}: {e}", path.display()),
+        )
+    })?;
+    bind_prompt_paths(&mut spec, path);
+    Ok(spec)
+}
+
+fn bind_prompt_paths(spec: &mut AgentSpec, path: &Path) {
+    let path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    spec.prompt.directory = path.parent().map(Path::to_path_buf);
+    spec.prompt.source = format!("{}: prompt", path.display());
+    for child in spec.agents.values_mut() {
+        bind_prompt_paths(child, &path);
     }
 }
 
@@ -84,7 +112,7 @@ pub fn load_spec_json(raw: &str) -> Result<AgentSpec, ProtocolError> {
     })
 }
 
-/// Markdown agent: YAML frontmatter → AgentSpec fields; body → `system_prompt` if unset.
+/// Markdown agent: YAML frontmatter → AgentSpec fields; body → a `role` slot replacement.
 ///
 /// ```markdown
 /// ---
@@ -123,39 +151,44 @@ pub fn load_spec_markdown(raw: &str, path: &Path) -> Result<AgentSpec, ProtocolE
     })?;
     let body_trim = body.trim();
     if !body_trim.is_empty() {
-        let needs_prompt = match obj.get("system_prompt") {
-            None => true,
-            Some(serde_json::Value::Null) => true,
-            Some(serde_json::Value::String(s)) if s.is_empty() => true,
-            _ => false,
-        };
-        if needs_prompt {
-            obj.insert(
-                "system_prompt".into(),
-                serde_json::Value::String(body_trim.to_string()),
-            );
-        } else if !obj.contains_key("append_system_prompt") {
-            // Keep explicit system_prompt; append body as extra guidance.
-            obj.insert(
-                "append_system_prompt".into(),
-                serde_json::Value::String(body_trim.to_string()),
-            );
-        }
+        let prompt = obj
+            .entry("prompt")
+            .or_insert_with(|| serde_json::json!({"preset": "general"}));
+        let prompt = prompt.as_object_mut().ok_or_else(|| {
+            ProtocolError::new(error_code::INVALID_AGENT_SPEC, "prompt must be an object")
+        })?;
+        let operations = prompt
+            .entry("operations")
+            .or_insert_with(|| serde_json::json!([]));
+        let operations = operations.as_array_mut().ok_or_else(|| {
+            ProtocolError::new(
+                error_code::INVALID_AGENT_SPEC,
+                "prompt.operations must be an array",
+            )
+        })?;
+        operations.push(
+            serde_json::json!({"slot": "role", "op": "replace", "body": {"text": body_trim}}),
+        );
     }
     if !obj.contains_key("name") {
         if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
             obj.insert("name".into(), serde_json::Value::String(stem.to_string()));
         }
     }
-    serde_json::from_value(value).map_err(|e| {
-        ProtocolError::new(
-            error_code::INVALID_AGENT_SPEC,
-            format!(
-                "{}: frontmatter is not a valid AgentSpec: {e}",
-                path.display()
-            ),
-        )
-    })
+    serde_json::from_value(value)
+        .map_err(|e| {
+            ProtocolError::new(
+                error_code::INVALID_AGENT_SPEC,
+                format!(
+                    "{}: frontmatter is not a valid AgentSpec: {e}",
+                    path.display()
+                ),
+            )
+        })
+        .map(|mut spec| {
+            bind_prompt_paths(&mut spec, path);
+            spec
+        })
 }
 
 fn split_frontmatter(content: &str) -> (String, String) {
@@ -370,9 +403,8 @@ pub fn resolve_agent_path(name: &str, cwd: &Path) -> Option<PathBuf> {
 ///   contains `"*"`).
 /// - Ensures `max_depth >= 1` when any workers are present.
 /// - Same stem: `.json` wins over `.md` (project over user via scan order).
-pub fn merge_discovered_agents(parent: &mut AgentSpec, cwd: &Path) {
-    let mut found: std::collections::BTreeMap<String, AgentSpec> =
-        std::collections::BTreeMap::new();
+pub fn merge_discovered_agents(parent: &mut AgentSpec, cwd: &Path) -> Result<(), ProtocolError> {
+    let mut found: std::collections::BTreeMap<String, PathBuf> = std::collections::BTreeMap::new();
     // User first, then project overwrites (project wins).
     for dir in agent_search_dirs(cwd).into_iter().rev() {
         let Ok(rd) = std::fs::read_dir(&dir) else {
@@ -408,21 +440,19 @@ pub fn merge_discovered_agents(parent: &mut AgentSpec, cwd: &Path) {
                 }
             }
         }
-        for (stem, path) in by_stem {
-            if let Ok(mut child) = load_spec_file(&path) {
-                if child.name.is_none() {
-                    child.name = Some(stem.clone());
-                }
-                if child.spawn_policy.allow.is_empty() {
-                    child.spawn_policy = crate::protocol::SpawnPolicy::none();
-                }
-                found.insert(stem, child);
+        found.extend(by_stem);
+    }
+    // Parse only winning paths, so shadowed user files cannot break project agents.
+    let found = found
+        .into_iter()
+        .map(|(name, path)| {
+            let mut child = load_spec_file(&path)?;
+            if child.name.is_none() {
+                child.name = Some(name.clone());
             }
-        }
-    }
-    if found.is_empty() {
-        return;
-    }
+            Ok((name, child))
+        })
+        .collect::<Result<Vec<_>, ProtocolError>>()?;
     let star = parent.spawn_policy.allow.iter().any(|a| a == "*");
     for (name, child) in found {
         parent.agents.entry(name.clone()).or_insert(child);
@@ -436,6 +466,7 @@ pub fn merge_discovered_agents(parent: &mut AgentSpec, cwd: &Path) {
     if parent.spawn_policy.max_concurrent == 0 && parent.can_spawn() {
         parent.spawn_policy.max_concurrent = 4;
     }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -447,7 +478,7 @@ mod tests {
     fn load_explore_builtin() {
         let s = load_preset("explore", &PathBuf::from("/tmp")).unwrap();
         assert_eq!(s.display_name(), "explore");
-        assert!(s.system_prompt.is_some());
+        assert!(s.prompt.preset.is_some());
     }
 
     #[test]
@@ -471,7 +502,7 @@ mod tests {
         let worker = r#"{
             "name": "implementer",
             "description": "Writes code",
-            "system_prompt": "You implement.",
+            "prompt": {"preset": "general", "operations": [{"slot": "role", "op": "replace", "body": {"text": "You implement."}}]},
             "tools": { "profile": "none", "allow": ["read", "write", "edit"] },
             "max_turns": 8,
             "spawn_policy": { "allow": [], "max_depth": 0, "max_concurrent": 0 }
@@ -479,7 +510,7 @@ mod tests {
         std::fs::write(agents.join("implementer.json"), worker).unwrap();
 
         let mut main = AgentSpec::builtin_main();
-        merge_discovered_agents(&mut main, &dir);
+        merge_discovered_agents(&mut main, &dir).unwrap();
         assert!(main.agents.contains_key("implementer"));
         assert!(main.spawn_policy.allow.iter().any(|a| a == "implementer"));
         assert!(main.spawn_policy.max_depth >= 1);
@@ -494,7 +525,7 @@ mod tests {
         std::fs::create_dir_all(&agents).unwrap();
         std::fs::write(
             agents.join("research.json"),
-            r#"{"name":"research","tools":{"profile":"none","allow":["read"]},"system_prompt":"x"}"#,
+            r#"{"name":"research","tools":{"profile":"none","allow":["read"]},"prompt":{"operations":[{"slot":"role","op":"replace","body":{"text":"x"}}]}}"#,
         )
         .unwrap();
         let list = list_agents(&dir);
@@ -535,14 +566,17 @@ You review code. Be concise.
         let spec = load_spec_file(&path).unwrap();
         assert_eq!(spec.display_name(), "reviewer");
         assert_eq!(spec.tools.allow, vec!["read", "grep"]);
-        assert!(spec
-            .system_prompt
+        assert!(spec.prompt.operations[0]
+            .body
+            .as_ref()
+            .unwrap()
+            .text
             .as_deref()
-            .unwrap_or("")
+            .unwrap()
             .contains("review code"));
 
         let mut main = AgentSpec::builtin_main();
-        merge_discovered_agents(&mut main, &dir);
+        merge_discovered_agents(&mut main, &dir).unwrap();
         assert!(main.agents.contains_key("reviewer"));
 
         let _ = std::fs::remove_dir_all(&dir);

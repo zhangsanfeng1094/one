@@ -44,6 +44,9 @@ struct HitlInner {
     /// When false, ask_user fails closed immediately (print / rpc).
     interactive: bool,
     pending: Mutex<Option<Pending>>,
+    /// Fired when `pending` transitions set↔clear (unified runtime status
+    /// projects `waiting_input` without polling).
+    on_pending_change: Mutex<Option<Box<dyn Fn(bool) + Send + Sync>>>,
 }
 
 impl HitlChannel {
@@ -52,7 +55,29 @@ impl HitlChannel {
             inner: Arc::new(HitlInner {
                 interactive,
                 pending: Mutex::new(None),
+                on_pending_change: Mutex::new(None),
             }),
+        }
+    }
+
+    /// Install the pending-change observer (unified runtime status).
+    pub fn set_pending_observer(&self, observer: Box<dyn Fn(bool) + Send + Sync>) {
+        *self
+            .inner
+            .on_pending_change
+            .lock()
+            .expect("hitl observer lock") = Some(observer);
+    }
+
+    fn notify_pending(&self, pending: bool) {
+        if let Some(observer) = self
+            .inner
+            .on_pending_change
+            .lock()
+            .expect("hitl observer lock")
+            .as_ref()
+        {
+            observer(pending);
         }
     }
 
@@ -72,6 +97,7 @@ impl HitlChannel {
     pub fn respond(&self, result: SelectResult) -> bool {
         let mut g = self.inner.pending.lock().expect("hitl lock");
         if let Some(pending) = g.take() {
+            self.notify_pending(false);
             let _ = pending.tx.send(result);
             true
         } else {
@@ -81,6 +107,7 @@ impl HitlChannel {
 
     pub fn cancel_pending(&self) {
         if let Some(pending) = self.inner.pending.lock().expect("hitl lock").take() {
+            self.notify_pending(false);
             let _ = pending.tx.send(SelectResult::Cancelled);
         }
     }
@@ -111,6 +138,7 @@ impl HitlChannel {
                 request: HitlSelectRequest { id, prompt },
                 tx,
             });
+            self.notify_pending(true);
         }
         rx.await
             .map_err(|_| "ask_user cancelled (session aborted)".to_string())

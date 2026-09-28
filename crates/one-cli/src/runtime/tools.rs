@@ -49,9 +49,11 @@ impl AppRuntime {
                     host.jobs(),
                     bash.clone(),
                 )));
-                tools.push(Arc::new(WaitTasksTool::with_bash(
+                tools.push(Arc::new(WaitTasksTool::with_interest(
                     host.jobs(),
                     bash.clone(),
+                    "wait_tasks",
+                    self.wait_interest.clone(),
                 )));
                 tools.push(Arc::new(JobKillTool::with_bash(host.jobs(), bash.clone())));
             }
@@ -62,10 +64,11 @@ impl AppRuntime {
             bash.clone(),
             "get_command_or_subagent_output",
         )));
-        tools.push(Arc::new(WaitTasksTool::named(
+        tools.push(Arc::new(WaitTasksTool::with_interest(
             jobs.clone(),
             bash.clone(),
             "wait_commands_or_subagents",
+            self.wait_interest.clone(),
         )));
         tools.push(Arc::new(JobKillTool::named(
             jobs,
@@ -77,11 +80,7 @@ impl AppRuntime {
     pub(super) async fn apply_act_tools_and_prompt(
         &mut self,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        self.recompose_base_prompt();
-        self.rebuild_act_tools().await?;
-        let mut agent = self.agent.lock().await;
-        agent.config.system_prompt = self.effective_system_prompt();
-        Ok(())
+        self.rebuild_act_tools().await
     }
 
     /// ToolsSpec that drives the live main session (CLI read_only overrides).
@@ -192,7 +191,14 @@ impl AppRuntime {
         // Keep child harness MCP/ext set in sync.
         self.refresh_task_dynamic_tools().await;
 
-        let system_prompt = self.effective_system_prompt();
+        let names = tools
+            .iter()
+            .map(|t| t.definition().name)
+            .collect::<Vec<_>>();
+        let compiled = self.compile_prompt_for_tools(&names, AgentMode::Act, None)?;
+        let system_prompt = compiled.text.clone();
+        self.compiled_prompt = compiled;
+        self.prompt_tool_names = names;
         let mut agent = self.agent.lock().await;
         agent.set_tools(tools);
         // Refresh MCP announcement when the connected set changes (deferred mode).
@@ -318,16 +324,12 @@ impl AppRuntime {
 
                     if let Some(text) = extracted {
                         let trimmed = text.trim();
-                        // Skip internal system notifications/reminders pushed as user messages
-                        let is_system_meta = trimmed.starts_with("<system-reminder>")
-                            || trimmed.starts_with("<env>")
-                            || trimmed.starts_with("<context>")
-                            || trimmed.starts_with("<memory-catalog>")
-                            || trimmed.contains("### Learned Tool Intent")
-                            || trimmed.contains("### Graph Intent Guidance");
-
-                        if !is_system_meta && !trimmed.is_empty() {
-                            last_user_query = Some(trimmed.to_string());
+                        if one_core::is_system_notice_text(trimmed) {
+                            continue;
+                        }
+                        let query = one_core::extract_user_query(trimmed);
+                        if !query.is_empty() {
+                            last_user_query = Some(query);
                             break;
                         }
                     }

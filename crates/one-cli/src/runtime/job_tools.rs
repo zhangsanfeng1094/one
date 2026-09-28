@@ -1,16 +1,19 @@
-//! `job_output` / `wait_tasks` / `job_kill` — poll, wait, or stop background work.
+//! `job_output` / `wait_tasks` / `job_kill` — inspect, wait (event-driven), or stop
+//! background work.
 //!
 //! **Unified IDs**: `wait_tasks` and `job_kill` accept agent job ids (`job_*`),
 //! bash background task ids (`bg_*`), and monitor ids (`mon_*`). Specialized
 //! `bash_output` / `bash_kill`
 //! remain available for shell-only use.
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use one_core::error::Result;
 use one_core::tool::{invalid_args, tool_error, Tool, ToolCall, ToolDefinition, ToolOutput};
+use one_core::{RegisteredWaiter, TaskWaitWaiter, WaitInterest, WaitInterestMode};
 use one_tools::{format_task_list, format_task_output, BackgroundTaskRegistry, TaskState};
 use serde_json::json;
 
@@ -177,8 +180,50 @@ when the job completes; do not tight-poll."
                 "turns": snap.turns,
                 "max_turns": snap.max_turns,
                 "log_path": snap.log_path.as_ref().map(|p| p.display().to_string()),
+                "result_ref": snap.result_ref.as_ref().map(|p| p.display().to_string()),
+                "result_bytes": snap.result_bytes,
+                "result_chars": snap.result_chars,
+                "result_truncated": snap.result_truncated,
             }),
         ))
+    }
+}
+
+/// Combines subagent jobs and background bash tasks into a unified [`TaskWaitWaiter`].
+pub struct CombinedTaskWaiter {
+    jobs: Arc<AgentJobRegistry>,
+    bash: Arc<BackgroundTaskRegistry>,
+}
+
+impl CombinedTaskWaiter {
+    pub fn new(jobs: Arc<AgentJobRegistry>, bash: Arc<BackgroundTaskRegistry>) -> Self {
+        Self { jobs, bash }
+    }
+}
+
+impl TaskWaitWaiter for CombinedTaskWaiter {
+    fn is_terminal(&self, id: &str) -> bool {
+        if looks_like_bash_id(id) || self.bash.get(id).is_some() {
+            self.bash.is_terminal(id)
+        } else {
+            self.jobs.is_terminal(id)
+        }
+    }
+
+    fn subscribe_terminal<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        if looks_like_bash_id(id) || self.bash.get(id).is_some() {
+            if let Some(notify) = self.bash.done_notifier(id) {
+                return Box::pin(RegisteredWaiter::new(notify));
+            }
+        } else {
+            if let Some(notify) = self.jobs.done_notifier(id) {
+                return Box::pin(RegisteredWaiter::new(notify));
+            }
+        }
+        Box::pin(async {})
     }
 }
 
@@ -187,6 +232,7 @@ pub struct WaitTasksTool {
     jobs: Arc<AgentJobRegistry>,
     bash: Arc<BackgroundTaskRegistry>,
     name: String,
+    wait_interest: Arc<Mutex<Option<WaitInterest>>>,
 }
 
 impl WaitTasksTool {
@@ -195,6 +241,7 @@ impl WaitTasksTool {
             jobs,
             bash: Arc::new(BackgroundTaskRegistry::new()),
             name: "wait_tasks".into(),
+            wait_interest: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -203,6 +250,7 @@ impl WaitTasksTool {
             jobs,
             bash,
             name: "wait_tasks".into(),
+            wait_interest: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -215,7 +263,26 @@ impl WaitTasksTool {
             jobs,
             bash,
             name: name.into(),
+            wait_interest: Arc::new(Mutex::new(None)),
         }
+    }
+
+    pub fn with_interest(
+        jobs: Arc<AgentJobRegistry>,
+        bash: Arc<BackgroundTaskRegistry>,
+        name: impl Into<String>,
+        wait_interest: Arc<Mutex<Option<WaitInterest>>>,
+    ) -> Self {
+        Self {
+            jobs,
+            bash,
+            name: name.into(),
+            wait_interest,
+        }
+    }
+
+    pub fn wait_interest_handle(&self) -> Arc<Mutex<Option<WaitInterest>>> {
+        self.wait_interest.clone()
     }
 }
 
@@ -228,12 +295,13 @@ impl Tool for WaitTasksTool {
 Wait for background work to finish — agent jobs from task(background=true) (`job_*`) \
 and/or bash tasks (`bg_*`) and monitors (`mon_*`). \
 Use ONLY after you have spawned all needed background work and have nothing else useful to do. \
+Call wait_tasks ONCE: it checks the current state, and if targets are still running it \
+parks the agent until they finish (event-driven; steer/abort still interrupts). \
 Prefer job_output with a positive wait_ms for a single id. \
 mode=all (default) waits for every target; mode=any returns when the next running task \
 completes (aliases: wait_all / wait_any). Omit job_ids to wait on all currently running \
-agent jobs and bash tasks. Omit wait_ms or pass 0 to wait up to 30s (Grok default; \
-not a snapshot). A timeout while still running is success — you will be notified \
-when work completes; do not call wait_tasks again."
+agent jobs and bash tasks. wait_ms is accepted for compatibility but ignored — \
+the wait is event-driven with no timeout."
                 .into(),
             parameters: json!({
                 "type": "object",
@@ -250,7 +318,7 @@ when work completes; do not call wait_tasks again."
                     },
                     "wait_ms": {
                         "type": "integer",
-                        "description": "Optional cap in milliseconds. Omit or 0 = 30s default wait (Grok). Pass a large value to wait longer."
+                        "description": "Accepted for compatibility; ignored. The wait is event-driven with no timeout."
                     }
                 }
             }),
@@ -265,15 +333,15 @@ when work completes; do not call wait_tasks again."
             .and_then(JoinMode::parse)
             .unwrap_or(JoinMode::All);
 
-        let wait_ms = parse_wait_ms(&call.arguments, WaitMsMode::BlockUntilDone);
-
+        // wait_ms is accepted for compatibility but ignored: the wait is
+        // event-driven with no timeout (ReAct parks on the WaitInterest).
         let explicit = parse_id_list(call, &["job_ids", "task_ids"]);
         let report = unified_join(
             self.jobs.clone(),
             self.bash.clone(),
             explicit,
             mode,
-            wait_ms,
+            &self.wait_interest,
         )
         .await
         .map_err(|e| tool_error("wait_tasks", e))?;
@@ -282,13 +350,17 @@ when work completes; do not call wait_tasks again."
             .finals
             .iter()
             .any(|f| f.get("running").and_then(|v| v.as_bool()).unwrap_or(false));
+
+        // unified_join has already installed (or cleared) the WaitInterest for
+        // still-running targets; the ReAct loop parks on it after this batch.
+
         Ok(ToolOutput::text_with_details(
             report.message,
             json!({
                 "ok": report.ok,
                 "running": still_running,
                 "mode": mode.as_str(),
-                "timed_out": report.timed_out,
+                "parked": still_running,
                 "completed_events": report.events.len(),
                 "events": report.events,
                 "finals": report.finals,
@@ -414,16 +486,10 @@ fn looks_like_bash_id(id: &str) -> bool {
     id.starts_with("bg_") || id.starts_with("mon_")
 }
 
-/// Grok Build `wait_tasks` default when `timeout_ms` is omitted or 0.
-/// (`get_task_output` / `job_output` still treat 0 as a snapshot.)
-const DEFAULT_WAIT_TIMEOUT_MS: u64 = 30_000;
-
 #[derive(Clone, Copy)]
 enum WaitMsMode {
     /// `job_output`: 0 / omit = snapshot; any positive value waits.
     SnapshotOrBlock,
-    /// `wait_tasks`: omit or 0 = 30s default wait (Grok).
-    BlockUntilDone,
 }
 
 fn parse_wait_ms(args: &serde_json::Value, mode: WaitMsMode) -> Option<u64> {
@@ -434,9 +500,6 @@ fn parse_wait_ms(args: &serde_json::Value, mode: WaitMsMode) -> Option<u64> {
     match (mode, raw) {
         (WaitMsMode::SnapshotOrBlock, None) => None,
         (WaitMsMode::SnapshotOrBlock, Some(0)) => Some(0),
-        // Grok `wait_tasks`: omit and 0 both mean the 30s default wait.
-        (WaitMsMode::BlockUntilDone, None) => Some(DEFAULT_WAIT_TIMEOUT_MS),
-        (WaitMsMode::BlockUntilDone, Some(0)) => Some(DEFAULT_WAIT_TIMEOUT_MS),
         (_, Some(ms)) => Some(ms),
     }
 }
@@ -474,18 +537,24 @@ fn parse_id_list(call: &ToolCall, keys: &[&str]) -> Option<Vec<String>> {
 #[derive(Debug)]
 struct UnifiedJoinReport {
     ok: bool,
-    timed_out: bool,
+    /// True when still-running targets caused a WaitInterest registration;
+    /// the ReAct loop parks after this tool batch and wakes on completion.
+    parked: bool,
     message: String,
     events: Vec<serde_json::Value>,
     finals: Vec<serde_json::Value>,
 }
 
+/// Event-wait declaration: check current state once, then either return
+/// immediately (target condition already satisfied) or install a
+/// [`WaitInterest`] so the ReAct loop parks until completion notifications
+/// fire. No polling, no default timeout.
 async fn unified_join(
     jobs: Arc<AgentJobRegistry>,
     bash: Arc<BackgroundTaskRegistry>,
     ids: Option<Vec<String>>,
     mode: JoinMode,
-    wait_ms: Option<u64>,
+    wait_interest: &Arc<Mutex<Option<WaitInterest>>>,
 ) -> std::result::Result<UnifiedJoinReport, String> {
     let mut targets: Vec<String> = match ids {
         Some(list) if !list.is_empty() => list,
@@ -510,7 +579,7 @@ async fn unified_join(
     if targets.is_empty() {
         return Ok(UnifiedJoinReport {
             ok: true,
-            timed_out: false,
+            parked: false,
             message: "No background tasks or agent jobs to wait on.\n".into(),
             events: vec![],
             finals: vec![],
@@ -525,25 +594,17 @@ async fn unified_join(
         }
     }
 
-    let deadline = wait_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+    // Single state pass: targets already terminal become report events and
+    // their queued completion notifications are absorbed (report is the
+    // delivery channel for these — no double-notify on the next turn).
     let mut seen_terminal: std::collections::HashSet<String> = std::collections::HashSet::new();
     let mut events: Vec<serde_json::Value> = Vec::new();
     let mut event_ids: Vec<String> = Vec::new();
 
-    fn collect_terminal(
-        id: &str,
-        jobs: &AgentJobRegistry,
-        bash: &BackgroundTaskRegistry,
-        seen: &mut std::collections::HashSet<String>,
-        events: &mut Vec<serde_json::Value>,
-        event_ids: &mut Vec<String>,
-    ) -> bool {
-        if seen.contains(id) {
-            return false;
-        }
+    for id in &targets {
         if let Some(j) = jobs.get(id) {
             if j.state.is_terminal() {
-                seen.insert(id.to_string());
+                seen_terminal.insert(id.to_string());
                 event_ids.push(id.to_string());
                 events.push(json!({
                     "id": j.id,
@@ -553,11 +614,10 @@ async fn unified_join(
                     "status": j.status.map(|s| s.as_str()),
                     "ok": j.ok,
                 }));
-                return true;
             }
         } else if let Some(t) = bash.get(id) {
             if t.state.is_terminal() {
-                seen.insert(id.to_string());
+                seen_terminal.insert(id.to_string());
                 event_ids.push(id.to_string());
                 events.push(json!({
                     "id": t.id,
@@ -566,92 +626,62 @@ async fn unified_join(
                     "exitCode": t.exit_code,
                     "ok": t.state != TaskState::Failed,
                 }));
-                return true;
             }
         }
-        false
+    }
+    if !event_ids.is_empty() {
+        jobs.absorb_notifications_for(&event_ids);
+        if let Ok(mut guard) = bash.notification_queue().lock() {
+            guard.retain(|text| !event_ids.iter().any(|id| text.contains(id.as_str())));
+        }
     }
 
-    for id in &targets {
-        let _ = collect_terminal(
-            id,
-            &jobs,
-            &bash,
-            &mut seen_terminal,
-            &mut events,
-            &mut event_ids,
-        );
-    }
-    jobs.absorb_notifications_for(&event_ids);
-    if let Ok(mut guard) = bash.notification_queue().lock() {
-        guard.retain(|text| !event_ids.iter().any(|id| text.contains(id.as_str())));
-    }
+    let still_running: Vec<String> = targets
+        .iter()
+        .filter(|id| !seen_terminal.contains(*id))
+        .cloned()
+        .collect();
 
-    if targets.iter().all(|id| seen_terminal.contains(id)) {
-        let finals = snapshot_finals(&jobs, &bash, &targets);
-        let message = format_unified_report(mode, false, wait_ms, &events, &finals);
+    // Satisfied right now? Nothing still running → return immediately
+    // (mode=any still waits for the next *running* completion, per its
+    // documented semantics; already-terminal targets are events, not
+    // satisfaction).
+    let satisfied = still_running.is_empty();
+
+    let finals = snapshot_finals(&jobs, &bash, &targets);
+
+    if satisfied {
+        // Fresh declaration superseded any stale interest.
+        if let Ok(mut g) = wait_interest.lock() {
+            *g = None;
+        }
+        let message = format_unified_report(mode, false, &events, &finals);
         return Ok(UnifiedJoinReport {
             ok: true,
-            timed_out: false,
+            parked: false,
             message,
             events,
             finals,
         });
     }
 
-    let mut timed_out = false;
-
-    loop {
-        let mut newly = 0u32;
-        for id in &targets {
-            if collect_terminal(
-                id,
-                &jobs,
-                &bash,
-                &mut seen_terminal,
-                &mut events,
-                &mut event_ids,
-            ) {
-                newly += 1;
-            }
-        }
-        if newly > 0 {
-            jobs.absorb_notifications_for(&event_ids);
-            if let Ok(mut guard) = bash.notification_queue().lock() {
-                guard.retain(|text| !event_ids.iter().any(|id| text.contains(id.as_str())));
-            }
-        }
-
-        let still_pending = targets.iter().any(|id| !seen_terminal.contains(id));
-        let done = match mode {
-            JoinMode::All => !still_pending,
-            JoinMode::Any => newly > 0 || !still_pending,
-        };
-        if done {
-            break;
-        }
-
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl {
-                timed_out = true;
-                break;
-            }
-            let remaining = dl.saturating_duration_since(Instant::now());
-            let slice = remaining.min(Duration::from_millis(200));
-            tokio::time::sleep(slice).await;
-        } else {
-            tokio::time::sleep(Duration::from_millis(200)).await;
-        }
+    // Declare the wait: park the ReAct loop on these still-running ids.
+    // Completion notifications (done_notifier) wake it; steer/followup/abort
+    // interrupt the park as usual.
+    let interest_mode = match mode {
+        JoinMode::All => WaitInterestMode::All,
+        JoinMode::Any => WaitInterestMode::Any,
+    };
+    let waiter = Arc::new(CombinedTaskWaiter::new(jobs.clone(), bash.clone()));
+    let interest = WaitInterest::new(still_running, interest_mode, waiter);
+    if let Ok(mut g) = wait_interest.lock() {
+        *g = Some(interest);
     }
 
-    let finals = snapshot_finals(&jobs, &bash, &targets);
-    // Timeout while still running is a successful wait (Grok Build): the
-    // completion notice will arrive later. Marking ok=false makes the TUI
-    // show ✗ and the model retries wait_tasks in a doom loop.
-    let message = format_unified_report(mode, timed_out, wait_ms, &events, &finals);
+    let message = format_unified_report(mode, true, &events, &finals);
     Ok(UnifiedJoinReport {
         ok: true,
-        timed_out,
+        parked: true,
         message,
         events,
         finals,
@@ -674,7 +704,7 @@ fn snapshot_finals(
                     "state": j.state.as_str(),
                     "status": j.status.map(|s| s.as_str()),
                     "ok": j.ok,
-                    "running": j.state == JobState::Running,
+                    "running": !j.state.is_terminal(),
                 }))
             } else {
                 bash.get(id).map(|t| {
@@ -684,7 +714,7 @@ fn snapshot_finals(
                         "state": t.state.as_str(),
                         "exitCode": t.exit_code,
                         "ok": t.state != TaskState::Failed,
-                        "running": t.state == TaskState::Running,
+                        "running": !t.state.is_terminal(),
                     })
                 })
             }
@@ -694,14 +724,13 @@ fn snapshot_finals(
 
 fn format_unified_report(
     mode: JoinMode,
-    timed_out: bool,
-    wait_ms: Option<u64>,
+    parked: bool,
     events: &[serde_json::Value],
     finals: &[serde_json::Value],
 ) -> String {
     let mut out = format!("[wait_tasks · mode={}]\n", mode.as_str());
-    if timed_out {
-        out.push_str("timed_out: true\n");
+    if parked {
+        out.push_str("waiting: true (parked on completion notifications)\n");
     }
     out.push_str(&format!("completed_events: {}\n", events.len()));
     for e in events {
@@ -723,14 +752,11 @@ fn format_unified_report(
             if running { " (running)" } else { "" }
         ));
     }
-    if timed_out && any_running {
-        let waited = wait_ms
-            .map(|ms| format!("{}s", ms / 1000))
-            .unwrap_or_else(|| "the allotted time".to_string());
-        out.push_str(&format!(
-            "\nWaited {waited}; still running. You will be notified when it completes. \
-             Do not call wait_tasks again.\n"
-        ));
+    if parked && any_running {
+        out.push_str(
+            "\nParked until the running targets complete — a completion notice will be \
+             injected automatically. Do not call wait_tasks again.\n",
+        );
     }
     out
 }
@@ -738,6 +764,7 @@ fn format_unified_report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use one_core::{CompletionRequest, CompletionResponse, LlmProvider};
     use serde_json::json;
 
     #[test]
@@ -758,31 +785,10 @@ mod tests {
     }
 
     #[test]
-    fn wait_ms_block_omit_and_zero_are_default_thirty_seconds() {
-        assert_eq!(
-            parse_wait_ms(&json!({}), WaitMsMode::BlockUntilDone),
-            Some(DEFAULT_WAIT_TIMEOUT_MS)
-        );
-        assert_eq!(
-            parse_wait_ms(&json!({"wait_ms": 0}), WaitMsMode::BlockUntilDone),
-            Some(DEFAULT_WAIT_TIMEOUT_MS)
-        );
-        assert_eq!(
-            parse_wait_ms(&json!({"wait_ms": 1000}), WaitMsMode::BlockUntilDone),
-            Some(1000)
-        );
-        assert_eq!(
-            parse_wait_ms(&json!({"timeout_ms": 0}), WaitMsMode::BlockUntilDone),
-            Some(DEFAULT_WAIT_TIMEOUT_MS)
-        );
-    }
-
-    #[test]
-    fn wait_tasks_timeout_is_success_with_notify_hint() {
+    fn wait_tasks_report_parks_with_notify_hint() {
         let msg = format_unified_report(
             JoinMode::All,
             true,
-            Some(15_000),
             &[],
             &[json!({
                 "id": "job_1",
@@ -791,10 +797,9 @@ mod tests {
                 "running": true,
             })],
         );
-        assert!(msg.contains("timed_out: true"), "{msg}");
-        assert!(msg.contains("still running"), "{msg}");
+        assert!(msg.contains("waiting: true"), "{msg}");
+        assert!(msg.contains("Parked until"), "{msg}");
         assert!(msg.contains("Do not call wait_tasks again"), "{msg}");
-        assert!(msg.contains("15s"), "{msg}");
     }
 
     #[test]
@@ -815,5 +820,876 @@ mod tests {
             !props.contains_key("task_id"),
             "do not advertise task_id alias: {props:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn wait_tasks_registers_wait_interest_immediately_when_running() {
+        let jobs = AgentJobRegistry::new(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let bash = Arc::new(BackgroundTaskRegistry::new());
+        let wait_interest = Arc::new(Mutex::new(None));
+        let tool = WaitTasksTool::with_interest(
+            jobs.clone(),
+            bash.clone(),
+            "wait_tasks",
+            wait_interest.clone(),
+        );
+
+        // Spawn a background bash task that sleeps
+        let task_id = bash
+            .spawn("sleep 5".into(), std::path::PathBuf::from("."), None)
+            .await
+            .expect("spawn");
+
+        // wait_tasks must return immediately (no blocking wait) and register
+        // the interest — wait_ms is ignored now.
+        let started = std::time::Instant::now();
+        let out = tool
+            .execute(&ToolCall {
+                id: "call_1".into(),
+                name: "wait_tasks".into(),
+                arguments: json!({
+                    "task_ids": [task_id.clone()],
+                }),
+            })
+            .await
+            .expect("execute");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "wait_tasks must not block; took {:?}",
+            started.elapsed()
+        );
+
+        let out_text = out
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                one_core::message::TextOrImage::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(out_text.contains("waiting: true"), "{out_text}");
+
+        let interest = wait_interest.lock().unwrap().clone();
+        assert!(
+            interest.is_some(),
+            "WaitInterest must be registered while still running"
+        );
+        let interest = interest.unwrap();
+        assert_eq!(interest.ids, vec![task_id.clone()]);
+        assert_eq!(interest.mode, WaitInterestMode::All);
+        assert!(!interest.is_satisfied());
+
+        // Now kill the task — the interest must become satisfiable.
+        let _ = bash.kill(&task_id).await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(interest.is_satisfied());
+    }
+
+    #[tokio::test]
+    async fn wait_tasks_clears_wait_interest_on_completion() {
+        let jobs = AgentJobRegistry::new(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())));
+        let bash = Arc::new(BackgroundTaskRegistry::new());
+        let wait_interest = Arc::new(Mutex::new(None));
+        let tool = WaitTasksTool::with_interest(
+            jobs.clone(),
+            bash.clone(),
+            "wait_tasks",
+            wait_interest.clone(),
+        );
+
+        // Spawn a quick task and let it finish.
+        let task_id = bash
+            .spawn("echo done".into(), std::path::PathBuf::from("."), None)
+            .await
+            .expect("spawn");
+        let _ = bash
+            .wait(&task_id, Some(5))
+            .await
+            .expect("task must finish");
+
+        // Already-satisfied target: wait_tasks returns immediately and must
+        // NOT register an interest (it also clears any stale one).
+        let out = tool
+            .execute(&ToolCall {
+                id: "call_2".into(),
+                name: "wait_tasks".into(),
+                arguments: json!({
+                    "task_ids": [task_id.clone()],
+                }),
+            })
+            .await
+            .expect("execute");
+
+        let out_text = out
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                one_core::message::TextOrImage::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!out_text.contains("waiting: true"), "{out_text}");
+        assert!(out_text.contains("completed"), "{out_text}");
+        let interest = wait_interest.lock().unwrap().clone();
+        assert!(
+            interest.is_none(),
+            "WaitInterest must be None on completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_with_wait_tasks_parks_and_resumes_on_bash_completion() {
+        use one_core::message::{AgentMessage, ContentBlock, StopReason};
+        use one_core::{
+            Agent, AgentConfig, CompletionRequest, CompletionResponse, LlmProvider, TokenUsage,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        let notif_queue = agent.notification_queue_handle();
+        let jobs = AgentJobRegistry::new(notif_queue.clone());
+        let bash = Arc::new(BackgroundTaskRegistry::with_notification_queue(
+            notif_queue.clone(),
+        ));
+        let wait_interest = agent.wait_interest_handle();
+
+        // Spawn a background bash task that takes ~120ms
+        let task_id = bash
+            .spawn(
+                "sleep 0.12 && echo 'finished_work'".into(),
+                std::path::PathBuf::from("."),
+                None,
+            )
+            .await
+            .expect("spawn");
+
+        let wait_tool = Arc::new(WaitTasksTool::with_interest(
+            jobs.clone(),
+            bash.clone(),
+            "wait_tasks",
+            wait_interest.clone(),
+        ));
+        agent.set_tools(vec![wait_tool]);
+
+        struct E2eProvider {
+            turns: AtomicUsize,
+            task_id: String,
+        }
+
+        #[async_trait]
+        impl LlmProvider for E2eProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> one_core::error::Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                match turn {
+                    0 => Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::ToolCall {
+                            id: "tc_wait".into(),
+                            name: "wait_tasks".into(),
+                            arguments: json!({
+                                "task_ids": [self.task_id],
+                            }),
+                        }],
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    }),
+                    _ => {
+                        let has_completion = request.messages.iter().any(|m| match m {
+                            AgentMessage::User(u) => {
+                                let txt = u.content.as_plain_text();
+                                txt.contains(&self.task_id) && txt.contains("completed")
+                            }
+                            _ => false,
+                        });
+                        assert!(
+                            has_completion,
+                            "woken turn must receive background task completion notification"
+                        );
+                        Ok(CompletionResponse {
+                            provider: self.name().into(),
+                            model: self.model().into(),
+                            content: vec![ContentBlock::text("Task completed and verified!")],
+                            stop_reason: StopReason::Stop,
+                            usage: TokenUsage::default(),
+                            citations: Vec::new(),
+                        })
+                    }
+                }
+            }
+        }
+
+        let provider = E2eProvider {
+            turns: AtomicUsize::new(0),
+            task_id,
+        };
+        let final_answer = agent
+            .prompt(&provider, "run and wait")
+            .await
+            .expect("prompt");
+        assert_eq!(final_answer, "Task completed and verified!");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn job_output_on_200kb_subagent_result_is_capped() {
+        use crate::protocol::RunResult;
+        use crate::runtime::harness::HarnessOptions;
+        use crate::runtime::jobs::SpawnOptions;
+
+        // Isolate the spill dir: the default (~/.one/agent/jobs) may be
+        // read-only in sandboxed test environments. ENV_LOCK serializes with
+        // other suites that mutate the same process-global env vars.
+        let _guard = super::super::jobs::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let spill_dir = std::env::temp_dir().join(format!(
+            "one-job-output-spill-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&spill_dir).expect("create spill dir");
+        std::env::set_var("ONE_JOB_RESULT_DIR", &spill_dir);
+
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let jobs = AgentJobRegistry::new(queue);
+        let bash = Arc::new(BackgroundTaskRegistry::new());
+        let (id, _ctrl, _abort) = jobs.register_job(
+            "explore",
+            Some("heavy task"),
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+
+        let prefix = "OUTPUT_PREFIX_200K_";
+        let tail = "_OUTPUT_TAIL_200K_MARKER";
+        let heavy = format!("{prefix}{}{tail}", "M".repeat(200_000));
+        jobs.finalize(&id, RunResult::success(heavy.clone(), 120));
+
+        let tool = JobOutputTool::with_bash(jobs.clone(), bash);
+        let output = tool
+            .execute(&ToolCall {
+                id: "c_job_out".into(),
+                name: "job_output".into(),
+                arguments: json!({
+                    "job_id": id,
+                    "wait_ms": 0,
+                }),
+            })
+            .await
+            .expect("job_output execute");
+
+        let text = output
+            .content
+            .first()
+            .map(|c| c.as_display_text())
+            .unwrap_or_default();
+        assert!(
+            text.len() < 16 * 1024,
+            "job_output text must be bounded (got {} bytes)",
+            text.len()
+        );
+        assert!(text.contains(prefix));
+        assert!(
+            !text.contains(tail),
+            "job_output must NOT dump full 200KB tail"
+        );
+        assert!(text.contains("result_ref:"));
+        assert!(text.contains("result_truncated: true"));
+
+        let details = output.details.expect("details json");
+        assert_eq!(details["kind"], "agent");
+        assert_eq!(details["result_chars"], heavy.chars().count());
+        assert_eq!(details["result_bytes"], heavy.len());
+        assert_eq!(details["result_truncated"], true);
+        let result_ref_str = details["result_ref"].as_str().expect("result_ref string");
+        let path = std::path::PathBuf::from(result_ref_str);
+        assert!(path.exists());
+        let disk_text = std::fs::read_to_string(&path).expect("read result_ref");
+        assert_eq!(disk_text, heavy);
+        let _ = std::fs::remove_file(path);
+        std::env::remove_var("ONE_JOB_RESULT_DIR");
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+
+    #[tokio::test]
+    async fn agent_with_subagent_200kb_result_parks_and_resumes_without_full_result_in_request() {
+        use crate::protocol::RunResult;
+        use crate::runtime::harness::HarnessOptions;
+        use crate::runtime::jobs::SpawnOptions;
+        use one_core::message::{AgentMessage, ContentBlock, StopReason};
+        use one_core::{
+            Agent, AgentConfig, CompletionRequest, CompletionResponse, LlmProvider, TokenUsage,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // Isolate the spill dir (read-only HOME in sandboxed test runs would
+        // make the spill fail and drop result_ref from the notification).
+        let _guard = super::super::jobs::test_env::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let spill_dir = std::env::temp_dir().join(format!(
+            "one-job-parks-spill-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&spill_dir).expect("create spill dir");
+        std::env::set_var("ONE_JOB_RESULT_DIR", &spill_dir);
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        let notif_queue = agent.notification_queue_handle();
+        let jobs = AgentJobRegistry::new(notif_queue.clone());
+        let bash = Arc::new(BackgroundTaskRegistry::with_notification_queue(
+            notif_queue.clone(),
+        ));
+        let wait_interest = agent.wait_interest_handle();
+
+        let (job_id, _ctrl, _abort) = jobs.register_job(
+            "explore",
+            Some("async 200kb worker"),
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: true,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+
+        let wait_tool = Arc::new(WaitTasksTool::with_interest(
+            jobs.clone(),
+            bash.clone(),
+            "wait_tasks",
+            wait_interest.clone(),
+        ));
+        agent.set_tools(vec![wait_tool]);
+
+        let prefix = "REACT_200K_START_";
+        let tail = "_REACT_200K_TAIL_MARKER_NEVER_IN_PROMPT";
+        let big_body = format!("{prefix}{}{tail}", "K".repeat(200_000));
+        let big_body_clone = big_body.clone();
+
+        // Simulate async completion after 50ms
+        let jobs_clone = jobs.clone();
+        let jid = job_id.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            jobs_clone.finalize(&jid, RunResult::success(big_body_clone, 88));
+        });
+
+        struct Subagent200kProvider {
+            turns: AtomicUsize,
+            job_id: String,
+            tail_marker: String,
+        }
+
+        #[async_trait]
+        impl LlmProvider for Subagent200kProvider {
+            fn name(&self) -> &str {
+                "test-subagent-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(
+                &self,
+                request: CompletionRequest,
+            ) -> one_core::error::Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                match turn {
+                    0 => Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::ToolCall {
+                            id: "tc_wait".into(),
+                            name: "wait_tasks".into(),
+                            arguments: json!({
+                                "job_id": self.job_id,
+                            }),
+                        }],
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    }),
+                    _ => {
+                        // Resumed turn: inspect all messages in request
+                        let mut found_notification = false;
+                        for m in &request.messages {
+                            let text = match m {
+                                AgentMessage::User(u) => u.content.as_plain_text(),
+                                AgentMessage::Assistant(a) => a
+                                    .content
+                                    .iter()
+                                    .filter_map(|c| match c {
+                                        ContentBlock::Text { text } => Some(text.as_str()),
+                                        _ => None,
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                                _ => String::new(),
+                            };
+                            if text.contains(&self.job_id) && text.contains("[job completed]") {
+                                found_notification = true;
+                                assert!(
+                                    text.contains("result_ref:"),
+                                    "completion notification must include result_ref"
+                                );
+                                assert!(
+                                    text.contains("result_truncated: true"),
+                                    "completion notification must indicate result_truncated"
+                                );
+                            }
+                            assert!(
+                                !text.contains(&self.tail_marker),
+                                "CRITICAL: LLM request must NOT contain the full 200KB body or tail marker!"
+                            );
+                        }
+                        assert!(
+                            found_notification,
+                            "woken turn must receive subagent job completion notification"
+                        );
+
+                        Ok(CompletionResponse {
+                            provider: self.name().into(),
+                            model: self.model().into(),
+                            content: vec![ContentBlock::text("Subagent finished and verified!")],
+                            stop_reason: StopReason::Stop,
+                            usage: TokenUsage::default(),
+                            citations: Vec::new(),
+                        })
+                    }
+                }
+            }
+        }
+
+        let provider = Subagent200kProvider {
+            turns: AtomicUsize::new(0),
+            job_id: job_id.clone(),
+            tail_marker: tail.to_string(),
+        };
+
+        let final_answer = agent
+            .prompt(&provider, "wait for subagent")
+            .await
+            .expect("agent prompt");
+
+        assert_eq!(final_answer, "Subagent finished and verified!");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 2);
+
+        // Verify result_ref file exists and has full 200KB content
+        let snap = jobs.get(&job_id).expect("snapshot");
+        let path = snap.result_ref.expect("result_ref");
+        assert!(path.exists());
+        let disk_text = std::fs::read_to_string(&path).expect("read spill file");
+        assert_eq!(disk_text, big_body);
+        let _ = std::fs::remove_file(path);
+        std::env::remove_var("ONE_JOB_RESULT_DIR");
+        let _ = std::fs::remove_dir_all(&spill_dir);
+    }
+
+    // ---- Acceptance: event-driven wait_tasks (no 30s default / 200ms poll) ----
+
+    /// Shared fake provider:
+    /// - turn 0: issues `first_calls[0]` (e.g. bash with auto-bg)
+    /// - turn 1: issues `first_calls[1]` (wait_tasks) if present, else asserts
+    /// - final turn: asserts the conversation contains `expected_snippet`
+    struct AcceptanceProvider {
+        turns: std::sync::atomic::AtomicUsize,
+        first_calls: Vec<one_core::message::ContentBlock>,
+        expected_snippet: String,
+        final_text: &'static str,
+    }
+
+    #[async_trait]
+    impl LlmProvider for AcceptanceProvider {
+        fn name(&self) -> &str {
+            "acceptance"
+        }
+        fn model(&self) -> &str {
+            "test"
+        }
+        async fn complete(
+            &self,
+            request: CompletionRequest,
+        ) -> one_core::error::Result<CompletionResponse> {
+            use one_core::message::{AgentMessage, ContentBlock};
+            use std::sync::atomic::Ordering;
+            let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+            if let Some(call) = self.first_calls.get(turn) {
+                return Ok(CompletionResponse {
+                    provider: self.name().into(),
+                    model: self.model().into(),
+                    content: vec![call.clone()],
+                    stop_reason: one_core::message::StopReason::ToolUse,
+                    usage: Default::default(),
+                    citations: Vec::new(),
+                });
+            }
+            let conversation = request
+                .messages
+                .iter()
+                .map(|m| match m {
+                    AgentMessage::User(u) => u.content.as_plain_text(),
+                    AgentMessage::Assistant(a) => a
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            ContentBlock::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                    AgentMessage::ToolResult(t) => t
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            one_core::message::TextOrImage::Text { text } => Some(text.as_str()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(
+                conversation.contains(&self.expected_snippet),
+                "woken turn must see completion ({:?}); got:\n{conversation}",
+                self.expected_snippet
+            );
+            Ok(CompletionResponse {
+                provider: self.name().into(),
+                model: self.model().into(),
+                content: vec![ContentBlock::text(self.final_text)],
+                stop_reason: one_core::message::StopReason::Stop,
+                usage: Default::default(),
+                citations: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn acceptance_bash_auto_bg_then_wait_tasks_parks_until_done() {
+        use one_core::message::{ContentBlock, StopReason};
+        use one_core::{Agent, AgentConfig, LlmProvider};
+        use one_tools::BashTool;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        let notif_queue = agent.notification_queue_handle();
+        let jobs = AgentJobRegistry::new(notif_queue.clone());
+        let bash = Arc::new(BackgroundTaskRegistry::with_notification_queue(
+            notif_queue.clone(),
+        ));
+        let wait_interest = agent.wait_interest_handle();
+
+        // Auto-bg after 300ms (shortened 15s budget) — sleep 3 outlives it.
+        let bash_tool: Arc<dyn one_core::Tool> = Arc::new(
+            BashTool::with_policy(
+                one_tools::PathPolicy::workspace(std::path::PathBuf::from(".")),
+                true,
+                bash.clone(),
+            )
+            .with_auto_background(true)
+            .with_foreground_budget_ms(300),
+        );
+
+        let wait_tool = Arc::new(WaitTasksTool::with_interest(
+            jobs.clone(),
+            bash.clone(),
+            "wait_tasks",
+            wait_interest.clone(),
+        ));
+        agent.set_tools(vec![bash_tool, wait_tool]);
+
+        let provider = AcceptanceProvider {
+            turns: AtomicUsize::new(0),
+            first_calls: vec![
+                ContentBlock::ToolCall {
+                    id: "tc_bash".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "sleep 3; echo done_long", "timeout_secs": 30}),
+                },
+                // Omitted ids = all currently running (the auto-bg'd task).
+                ContentBlock::ToolCall {
+                    id: "tc_wait".into(),
+                    name: "wait_tasks".into(),
+                    arguments: json!({}),
+                },
+            ],
+            expected_snippet: "[Background task completed]".into(),
+            final_text: "bash done",
+        };
+
+        let started = std::time::Instant::now();
+        let answer = agent.prompt(&provider, "run long sleep then wait").await;
+        let answer = answer.expect("agent prompt");
+        assert_eq!(answer, "bash done");
+        // Auto-bg (300ms) + park + completion (3s). Assert the park was
+        // event-driven: total >= sleep duration (did not return early).
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(2_800),
+            "agent must park until bash completion; returned after {:?}",
+            started.elapsed()
+        );
+        assert_eq!(provider.turns.load(std::sync::atomic::Ordering::SeqCst), 3);
+        assert!(
+            wait_interest.lock().unwrap().is_none(),
+            "interest must be cleared after satisfaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_bash_hard_timeout_wakes_park() {
+        use one_core::message::{ContentBlock, StopReason};
+        use one_core::{Agent, AgentConfig, LlmProvider};
+        use one_tools::BashTool;
+        use std::sync::atomic::AtomicUsize;
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        let notif_queue = agent.notification_queue_handle();
+        let jobs = AgentJobRegistry::new(notif_queue.clone());
+        let bash = Arc::new(BackgroundTaskRegistry::with_notification_queue(
+            notif_queue.clone(),
+        ));
+        let wait_interest = agent.wait_interest_handle();
+
+        let bash_tool: Arc<dyn one_core::Tool> = Arc::new(
+            BashTool::with_policy(
+                one_tools::PathPolicy::workspace(std::path::PathBuf::from(".")),
+                true,
+                bash.clone(),
+            )
+            .with_auto_background(true)
+            .with_foreground_budget_ms(300),
+        );
+
+        let wait_tool = Arc::new(WaitTasksTool::with_interest(
+            jobs.clone(),
+            bash.clone(),
+            "wait_tasks",
+            wait_interest.clone(),
+        ));
+        agent.set_tools(vec![bash_tool, wait_tool]);
+
+        // Hard timeout 1s: auto-bg at 300ms, then TimedOut at 1s → kill → wake.
+        let provider = AcceptanceProvider {
+            turns: AtomicUsize::new(0),
+            first_calls: vec![
+                ContentBlock::ToolCall {
+                    id: "tc_bash".into(),
+                    name: "bash".into(),
+                    arguments: json!({"command": "sleep 60", "timeout_secs": 1}),
+                },
+                ContentBlock::ToolCall {
+                    id: "tc_wait".into(),
+                    name: "wait_tasks".into(),
+                    arguments: json!({}),
+                },
+            ],
+            expected_snippet: "timed_out".into(),
+            final_text: "bash timed out",
+        };
+
+        let started = std::time::Instant::now();
+        let answer = agent.prompt(&provider, "run then wait").await;
+        assert_eq!(answer.expect("agent prompt"), "bash timed out");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "park must wake on timeout notification"
+        );
+        assert!(
+            wait_interest.lock().unwrap().is_none(),
+            "interest must be cleared after satisfaction"
+        );
+    }
+
+    #[tokio::test]
+    async fn acceptance_agent_jobs_all_and_any() {
+        use crate::protocol::RunResult;
+        use crate::runtime::harness::HarnessOptions;
+        use crate::runtime::jobs::SpawnOptions;
+
+        // --- mode=all: two jobs finalized at different times; park until both.
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let jobs = AgentJobRegistry::new(queue);
+        let bash = Arc::new(BackgroundTaskRegistry::new());
+        let wait_interest: Arc<Mutex<Option<WaitInterest>>> = Arc::new(Mutex::new(None));
+        let tool = WaitTasksTool::with_interest(
+            jobs.clone(),
+            bash.clone(),
+            "wait_tasks",
+            wait_interest.clone(),
+        );
+
+        let (id_fast, _ctrl, _abort) = jobs.register_job(
+            "explore",
+            Some("fast"),
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+        let (id_slow, _ctrl, _abort) = jobs.register_job(
+            "explore",
+            Some("slow"),
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+
+        let jobs_slow = jobs.clone();
+        let slow_id = id_slow.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            jobs_slow.finalize(&slow_id, RunResult::success("slow done", 2));
+        });
+
+        // wait_tasks while both running → must park (not return terminal).
+        let out = tool
+            .execute(&ToolCall {
+                id: "c_all".into(),
+                name: "wait_tasks".into(),
+                arguments: json!({"task_ids": [id_fast.clone(), id_slow.clone()], "mode": "all"}),
+            })
+            .await
+            .expect("execute all");
+        let details = out.details.expect("details");
+        assert_eq!(details["parked"], true, "{details}");
+        let interest = wait_interest.lock().unwrap().clone().expect("interest");
+        assert_eq!(interest.mode, WaitInterestMode::All);
+        assert_eq!(interest.ids.len(), 2);
+
+        // Finalize the fast one; still not satisfied (mode=all).
+        jobs.finalize(&id_fast, RunResult::success("fast done", 1));
+        assert!(!interest.is_satisfied(), "all-mode must need both");
+
+        // Wait for slow finalize then satisfied + a second call returns immediately.
+        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        assert!(interest.is_satisfied(), "all-mode satisfied after both");
+
+        let started = std::time::Instant::now();
+        let out2 = tool
+            .execute(&ToolCall {
+                id: "c_all2".into(),
+                name: "wait_tasks".into(),
+                arguments: json!({"task_ids": [id_fast.clone(), id_slow.clone()], "mode": "all"}),
+            })
+            .await
+            .expect("execute all again");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        let details2 = out2.details.expect("details");
+        assert_eq!(details2["parked"], false, "{details2}");
+        assert_eq!(details2["completed_events"], 2, "{details2}");
+        assert!(wait_interest.lock().unwrap().is_none());
+
+        // --- mode=any: interest satisfied by the first completion.
+        let (id_a, _c, _a) = jobs.register_job(
+            "explore",
+            Some("any a"),
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+        let (id_b, _c, _b) = jobs.register_job(
+            "explore",
+            Some("any b"),
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+        let out_any = tool
+            .execute(&ToolCall {
+                id: "c_any".into(),
+                name: "wait_tasks".into(),
+                arguments: json!({"task_ids": [id_a.clone(), id_b.clone()], "mode": "any"}),
+            })
+            .await
+            .expect("execute any");
+        let details_any = out_any.details.expect("details");
+        assert_eq!(details_any["parked"], true, "{details_any}");
+        let interest_any = wait_interest.lock().unwrap().clone().expect("any interest");
+        assert_eq!(interest_any.mode, WaitInterestMode::Any);
+
+        jobs.finalize(&id_a, RunResult::success("a done", 1));
+        assert!(interest_any.is_satisfied(), "any-mode satisfied by one");
+        assert!(!interest_any.waiter.is_terminal(&id_b));
+
+        // job_output stays snapshot-only: no wait_ms → immediate, running state.
+        let out_snap = JobOutputTool::with_bash(jobs.clone(), bash.clone())
+            .execute(&ToolCall {
+                id: "c_snap".into(),
+                name: "job_output".into(),
+                arguments: json!({"job_id": id_b.clone()}),
+            })
+            .await
+            .expect("snapshot");
+        let details_snap = out_snap.details.expect("snap details");
+        assert_eq!(details_snap["running"], true, "{details_snap}");
+        let text_snap = out_snap
+            .content
+            .iter()
+            .filter_map(|c| match c {
+                one_core::message::TextOrImage::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!text_snap.contains("Waited"), "snapshot must not block");
     }
 }

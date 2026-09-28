@@ -97,34 +97,33 @@ struct PackedSpawn {
     abort: Arc<AtomicBool>,
 }
 
-/// Reply to `task` after admission (and after the child ends, if foreground).
+/// Admission outcome. Foreground callers wait on [`Self::wait`], not on spawn.
 #[derive(Debug)]
-pub struct SpawnReply {
+pub struct SpawnHandle {
     pub job_id: String,
-    pub backgrounded: bool,
     pub queued: bool,
     pub rejected: bool,
     pub result: Option<RunResult>,
+    wait: Option<oneshot::Receiver<SpawnWait>>,
 }
 
-impl SpawnReply {
-    fn started(job_id: String, queued: bool, backgrounded: bool) -> Self {
+/// How a foreground spawn ended.
+#[derive(Debug)]
+pub enum SpawnWait {
+    /// Child finished (success or failure).
+    Finished(RunResult),
+    /// Still queued when the foreground budget expired — handed off.
+    Backgrounded,
+}
+
+impl SpawnHandle {
+    fn started(job_id: String, queued: bool, wait: Option<oneshot::Receiver<SpawnWait>>) -> Self {
         Self {
             job_id,
-            backgrounded,
             queued,
             rejected: false,
             result: None,
-        }
-    }
-
-    fn finished(job_id: String, result: RunResult) -> Self {
-        Self {
-            job_id,
-            backgrounded: false,
-            queued: false,
-            rejected: false,
-            result: Some(result),
+            wait,
         }
     }
 
@@ -135,10 +134,21 @@ impl SpawnReply {
         rr.stop_reason = Some("admission_rejected".into());
         Self {
             job_id: String::new(),
-            backgrounded: false,
             queued: false,
             rejected: true,
             result: Some(rr),
+            wait: None,
+        }
+    }
+
+    pub fn should_wait(&self) -> bool {
+        self.wait.is_some()
+    }
+
+    pub async fn wait(self) -> Option<SpawnWait> {
+        match self.wait {
+            Some(rx) => rx.await.ok(),
+            None => None,
         }
     }
 }
@@ -152,7 +162,7 @@ pub struct CoordinatorCounts {
 enum Event {
     Spawn {
         spec: SpawnSpec,
-        reply: oneshot::Sender<SpawnReply>,
+        reply: oneshot::Sender<SpawnHandle>,
     },
     Resize {
         max_concurrent: usize,
@@ -165,7 +175,7 @@ enum Event {
 
 enum QueuedCaller {
     Awaiting {
-        reply: oneshot::Sender<SpawnReply>,
+        wait: oneshot::Sender<SpawnWait>,
         deadline: Option<Instant>,
     },
     Backgrounded,
@@ -216,11 +226,11 @@ impl SubagentCoordinator {
         Ok(tx)
     }
 
-    pub async fn spawn(&self, spec: SpawnSpec) -> SpawnReply {
+    pub async fn spawn(&self, spec: SpawnSpec) -> SpawnHandle {
         let (reply_tx, reply_rx) = oneshot::channel();
         let tx = match self.sender() {
             Ok(tx) => tx,
-            Err(e) => return SpawnReply::rejected(e),
+            Err(e) => return SpawnHandle::rejected(e),
         };
         if tx
             .send(Event::Spawn {
@@ -229,11 +239,11 @@ impl SubagentCoordinator {
             })
             .is_err()
         {
-            return SpawnReply::rejected("subagent coordinator is shut down");
+            return SpawnHandle::rejected("subagent coordinator is shut down");
         }
         reply_rx
             .await
-            .unwrap_or_else(|_| SpawnReply::rejected("subagent coordinator dropped the spawn"))
+            .unwrap_or_else(|_| SpawnHandle::rejected("subagent coordinator dropped the spawn"))
     }
 
     pub fn resize(&self, max_concurrent: usize) {
@@ -273,7 +283,7 @@ struct Actor {
     config: CoordinatorConfig,
     active: HashSet<String>,
     queued: VecDeque<QueuedSpawn>,
-    awaiting_finish: HashMap<String, oneshot::Sender<SpawnReply>>,
+    awaiting_finish: HashMap<String, oneshot::Sender<SpawnWait>>,
 }
 
 impl Actor {
@@ -313,7 +323,7 @@ impl Actor {
         }
     }
 
-    fn handle_spawn(&mut self, spec: SpawnSpec, reply: oneshot::Sender<SpawnReply>) {
+    fn handle_spawn(&mut self, spec: SpawnSpec, reply: oneshot::Sender<SpawnHandle>) {
         let max_turns = spec.req.agent.max_turns.unwrap_or(16) as u64;
         let background = spec.background;
         let (job_id, control, abort) = self.jobs.register_job(
@@ -337,14 +347,14 @@ impl Actor {
         };
 
         if self.active.len() < self.config.max_concurrent {
-            self.start_child(job_id, packed, Some(reply));
+            self.start_child(job_id, packed, Some(reply), background);
             return;
         }
 
         match self.config.behavior {
             LimitBehavior::Fail => {
                 let _ = self.jobs.kill_with_reason(&job_id, KillReason::JobKill);
-                let _ = reply.send(SpawnReply::rejected(format!(
+                let _ = reply.send(SpawnHandle::rejected(format!(
                     "admission rejected: {} live subagents (max_concurrent={})",
                     self.active.len(),
                     self.config.max_concurrent
@@ -357,10 +367,15 @@ impl Actor {
                     None
                 };
                 let caller = if background {
-                    let _ = reply.send(SpawnReply::started(job_id.clone(), true, false));
+                    let _ = reply.send(SpawnHandle::started(job_id.clone(), true, None));
                     QueuedCaller::Backgrounded
                 } else {
-                    QueuedCaller::Awaiting { reply, deadline }
+                    let (wait_tx, wait_rx) = oneshot::channel();
+                    let _ = reply.send(SpawnHandle::started(job_id.clone(), true, Some(wait_rx)));
+                    QueuedCaller::Awaiting {
+                        wait: wait_tx,
+                        deadline,
+                    }
                 };
                 self.queued.push_back(QueuedSpawn {
                     packed,
@@ -375,9 +390,9 @@ impl Actor {
         &mut self,
         job_id: String,
         packed: PackedSpawn,
-        reply: Option<oneshot::Sender<SpawnReply>>,
+        reply: Option<oneshot::Sender<SpawnHandle>>,
+        background: bool,
     ) {
-        let background = packed.spec.background;
         self.jobs.launch_registered(
             job_id.clone(),
             packed.spec.req,
@@ -388,14 +403,15 @@ impl Actor {
             packed.spec.spawn_opts,
         );
         self.active.insert(job_id.clone());
-        match (background, reply) {
-            (true, Some(reply)) => {
-                let _ = reply.send(SpawnReply::started(job_id, false, false));
-            }
-            (false, Some(reply)) => {
-                self.awaiting_finish.insert(job_id, reply);
-            }
-            (_, None) => {}
+        if let Some(reply) = reply {
+            let wait = if background {
+                None
+            } else {
+                let (wait_tx, wait_rx) = oneshot::channel();
+                self.awaiting_finish.insert(job_id.clone(), wait_tx);
+                Some(wait_rx)
+            };
+            let _ = reply.send(SpawnHandle::started(job_id, false, wait));
         }
     }
 
@@ -403,13 +419,13 @@ impl Actor {
         self.active.remove(job_id);
         if let Some(idx) = self.queued.iter().position(|q| q.job_id == job_id) {
             if let Some(q) = self.queued.remove(idx) {
-                if let QueuedCaller::Awaiting { reply, .. } = q.caller {
-                    send_finish(&self.jobs, job_id, reply);
+                if let QueuedCaller::Awaiting { wait, .. } = q.caller {
+                    send_finish(&self.jobs, job_id, wait);
                 }
             }
         }
-        if let Some(reply) = self.awaiting_finish.remove(job_id) {
-            send_finish(&self.jobs, job_id, reply);
+        if let Some(wait) = self.awaiting_finish.remove(job_id) {
+            send_finish(&self.jobs, job_id, wait);
         }
         self.start_queued_within_capacity();
     }
@@ -427,7 +443,7 @@ impl Actor {
             if !expired {
                 continue;
             }
-            if let QueuedCaller::Awaiting { reply, .. } =
+            if let QueuedCaller::Awaiting { wait, .. } =
                 std::mem::replace(&mut q.caller, QueuedCaller::Backgrounded)
             {
                 self.jobs.set_notify_completion(&q.job_id, true);
@@ -435,7 +451,7 @@ impl Actor {
                     &q.job_id,
                     "▸ queued · handed off to background (admission wait)",
                 );
-                let _ = reply.send(SpawnReply::started(q.job_id.clone(), true, true));
+                let _ = wait.send(SpawnWait::Backgrounded);
             }
         }
     }
@@ -450,28 +466,35 @@ impl Actor {
                 .get(&q.job_id)
                 .is_some_and(|s| matches!(s.state, JobState::Queued));
             if !live {
-                if let QueuedCaller::Awaiting { reply, .. } = q.caller {
-                    send_finish(&self.jobs, &q.job_id, reply);
+                if let QueuedCaller::Awaiting { wait, .. } = q.caller {
+                    send_finish(&self.jobs, &q.job_id, wait);
                 }
                 continue;
             }
             match q.caller {
-                QueuedCaller::Awaiting { reply, .. } => {
-                    self.start_child(q.job_id, q.packed, Some(reply));
+                QueuedCaller::Awaiting { wait, .. } => {
+                    self.awaiting_finish.insert(q.job_id.clone(), wait);
+                    self.start_child(q.job_id, q.packed, None, false);
                 }
                 QueuedCaller::Backgrounded => {
-                    self.start_child(q.job_id, q.packed, None);
+                    self.start_child(q.job_id, q.packed, None, true);
                 }
             }
         }
     }
 }
 
-fn send_finish(jobs: &AgentJobRegistry, job_id: &str, reply: oneshot::Sender<SpawnReply>) {
+fn send_finish(jobs: &AgentJobRegistry, job_id: &str, wait: oneshot::Sender<SpawnWait>) {
     let result = jobs.take_result_clone(job_id);
-    let _ = reply.send(match result {
-        Some(r) => SpawnReply::finished(job_id.to_string(), r),
-        None => SpawnReply::rejected("job ended without a result"),
+    let _ = wait.send(match result {
+        Some(r) => SpawnWait::Finished(r),
+        None => SpawnWait::Finished(
+            RunResult::failure(
+                ProtocolError::new(error_code::INTERNAL, "job ended without a result"),
+                0,
+            )
+            .with_status(TaskExitStatus::RuntimeError),
+        ),
     });
 }
 
@@ -530,6 +553,7 @@ mod tests {
                 trace: None,
                 trace_meta: None,
                 acquire_slot: None,
+                backend: None,
             },
             session_id: None,
             prompt: prompt.into(),
@@ -574,7 +598,7 @@ mod tests {
             second.queued, true,
             "second must park, not block the caller"
         );
-        assert_eq!(second.backgrounded, false);
+        assert!(!second.should_wait());
         assert_eq!(jobs.get(&second.job_id).unwrap().state, JobState::Queued);
 
         let counts = c.counts().await;
@@ -603,31 +627,39 @@ mod tests {
 
         let second = c.spawn(spec("waiter", false, p2)).await;
         assert!(
-            second.backgrounded && second.queued && second.result.is_none(),
-            "queued foreground must auto-bg: job={} bg={} queued={} result={:?}",
+            second.queued && second.result.is_none() && second.should_wait(),
+            "queued foreground must return a handle immediately: job={} queued={} result={:?}",
             second.job_id,
-            second.backgrounded,
             second.queued,
             second.result.as_ref().map(|r| r.status)
         );
-        assert_eq!(jobs.get(&second.job_id).unwrap().state, JobState::Queued);
+        let second_id = second.job_id.clone();
+        let wait = second.wait().await;
+        assert!(
+            matches!(wait, Some(SpawnWait::Backgrounded)),
+            "queued foreground must auto-bg: {wait:?}"
+        );
+        assert_eq!(jobs.get(&second_id).unwrap().state, JobState::Queued);
         assert_eq!(jobs.get(&first.job_id).unwrap().state, JobState::Running);
 
         hold.notify_one();
         let _ = jobs.wait_until_done(&first.job_id).await;
-        let _ = jobs.wait_until_done(&second.job_id).await;
-        assert!(jobs.get(&second.job_id).unwrap().state.is_terminal());
+        let _ = jobs.wait_until_done(&second_id).await;
+        assert!(jobs.get(&second_id).unwrap().state.is_terminal());
     }
 
     #[tokio::test]
     async fn foreground_with_free_slot_waits_for_result() {
         let (c, _) = coord(2, 40, LimitBehavior::Queue);
-        let reply = c
+        let handle = c
             .spawn(spec("sync", false, Arc::new(one_ai::MockProvider::new())))
             .await;
-        assert!(!reply.backgrounded);
-        assert!(!reply.queued);
-        let result = reply.result.expect("foreground result");
+        assert!(!handle.queued);
+        assert!(handle.should_wait());
+        let result = match handle.wait().await {
+            Some(SpawnWait::Finished(r)) => r,
+            other => panic!("expected finished result, got {other:?}"),
+        };
         assert!(
             result.ok || result.status == Some(TaskExitStatus::IncompleteInfo),
             "{:?}",

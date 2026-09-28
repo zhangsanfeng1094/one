@@ -6,7 +6,7 @@ use one_core::events::AgentEvent;
 use one_core::message::AgentMessage;
 use one_tui::{
     AlertLevel, App, ApprovalAnswer, ApprovalPrompt, ConfigOp, FloatKind, FloatMenu, ForceQuit,
-    ModelChoice, RunOutcome, SelectKind, TerminalSession,
+    ModelChoice, RunOutcome, SelectKind, TerminalSession, WorkItem, WorkKind, WorkState,
 };
 
 use crate::approval::{ApprovalChoice, PermissionGate, PermissionMode};
@@ -99,8 +99,14 @@ async fn apply_switch_model(
     model: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let previous_context_window = runtime.context_window();
-    match providers.switch_named(provider_name, model) {
-        Ok(()) => {
+    match providers.prepare_switch(provider_name, model) {
+        Ok(candidate) => {
+            if let Err(error) = runtime.refresh_web_search_backend(&candidate).await {
+                app.set_notice(format!("model unchanged: {error}"));
+                return Ok(());
+            }
+            *providers = candidate;
+            providers.persist_selection();
             app.set_mode_label(format_mode_label(providers));
             app.set_current_model(&providers.provider_id, providers.as_llm().model());
             if let Some(session) = &mut runtime.session {
@@ -113,10 +119,7 @@ async fn apply_switch_model(
             runtime.set_context_window(ctx);
             // Keep nested task harness on the same provider after model switch.
             runtime.bind_task_provider(providers.as_arc()).await;
-            // Rebind hosted search inject for the new model (Pi agentic style).
-            if let Err(e) = runtime.refresh_web_search_backend(providers).await {
-                tracing::warn!(error = %e, "hosted search refresh after model switch failed");
-            }
+
             if ctx < previous_context_window {
                 if let Some(applied) = runtime
                     .maybe_compact_with(
@@ -373,6 +376,69 @@ fn refresh_task_chip(app: &mut App, runtime: &AppRuntime) {
     let kind = if failed { 3 } else { 1 };
     // Distinct from bash `bg:N` — purple-adjacent wording via "task".
     app.set_task_chip(format!("◆ {running} · {label}"), kind);
+}
+
+/// One view model for Dock and Overview. The two registries stay independent.
+fn refresh_work(app: &mut App, runtime: &AppRuntime) {
+    let mut items = Vec::new();
+    if let Some(jobs) = runtime.agent_jobs() {
+        for (index, job) in jobs.list().into_iter().enumerate() {
+            let state = match job_status_key(&job) {
+                "queue" => WorkState::Queued,
+                "run" => WorkState::Running,
+                "fail" | "time" => WorkState::Failed,
+                "stop" => WorkState::Stopped,
+                _ => WorkState::Completed,
+            };
+            let progress = match (job.turns, job.max_turns) {
+                (Some(turn), Some(max)) => format!("turn {turn}/{max}"),
+                (Some(turn), None) => format!("turn {turn}"),
+                _ => String::new(),
+            };
+            items.push(WorkItem {
+                id: job.id,
+                kind: WorkKind::Agent,
+                state,
+                title: job
+                    .description
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(job.agent),
+                activity: job.activity,
+                elapsed_ms: job.duration_ms,
+                progress,
+                order: index as u64,
+            });
+        }
+    }
+    for task in runtime.bg_registry().list_meta() {
+        let state = match task.state {
+            one_tools::TaskState::Running => WorkState::Running,
+            one_tools::TaskState::Completed if task.exit_code.unwrap_or(0) == 0 => {
+                WorkState::Completed
+            }
+            one_tools::TaskState::Killed => WorkState::Stopped,
+            _ => WorkState::Failed,
+        };
+        items.push(WorkItem {
+            id: task.id,
+            kind: WorkKind::Bash,
+            state,
+            title: task.command,
+            activity: String::new(),
+            elapsed_ms: task.elapsed_ms,
+            progress: task
+                .exit_code
+                .map(|code| format!("exit {code}"))
+                .unwrap_or_default(),
+            order: task.seq,
+        });
+    }
+    app.set_work_items(items);
+}
+
+fn open_work_panel(app: &mut App, runtime: &AppRuntime) {
+    refresh_work(app, runtime);
+    app.open_work_float();
 }
 
 /// Selectable `/ps` list rows — **bash processes only**.
@@ -734,6 +800,7 @@ fn refresh_subagent_detail_if_open(app: &mut App, runtime: &AppRuntime) {
 /// Avoids anything that needs `agent.lock()` — the streaming task already holds it.
 fn apply_busy_ui_outcome(app: &mut App, runtime: &AppRuntime, outcome: RunOutcome) {
     match outcome {
+        RunOutcome::OpenWork => open_work_panel(app, runtime),
         RunOutcome::OpenBackgroundList => {
             open_background_list_panel(app, runtime);
         }
@@ -764,6 +831,7 @@ fn apply_busy_ui_outcome(app: &mut App, runtime: &AppRuntime, outcome: RunOutcom
             // Safe mid-turn subset — no agent.lock / no nested prompt turn.
             let cmd = text.split_whitespace().next().unwrap_or(text.as_str());
             match cmd {
+                "/work" => open_work_panel(app, runtime),
                 "/ps" => {
                     let id = text.split_whitespace().nth(1);
                     if let Some(id) = id {
@@ -843,6 +911,11 @@ async fn kill_subagent(app: &mut App, runtime: &AppRuntime, id: &str) {
 
 /// Sync bash kill + list refresh (safe from busy TUI tick).
 fn kill_background_task_sync(app: &mut App, runtime: &AppRuntime, id: &str) {
+    let from_work = app
+        .float
+        .as_ref()
+        .is_some_and(|f| f.kind == FloatKind::Work)
+        || app.work_detail_origin;
     let bash = runtime.bg_registry();
     if bash.get(id).is_some() {
         match bash.kill_sync(id) {
@@ -853,14 +926,27 @@ fn kill_background_task_sync(app: &mut App, runtime: &AppRuntime, id: &str) {
                 app.set_notice(format!("kill failed: {e}"));
             }
         }
-        open_background_list_panel(app, runtime);
+        if from_work {
+            open_work_panel(app, runtime);
+        } else {
+            open_background_list_panel(app, runtime);
+        }
         return;
     }
     app.set_notice(format!("not a bash task `{id}` · use /tasks for subagents"));
-    open_background_list_panel(app, runtime);
+    if from_work {
+        open_work_panel(app, runtime);
+    } else {
+        open_background_list_panel(app, runtime);
+    }
 }
 
 fn kill_subagent_sync(app: &mut App, runtime: &AppRuntime, id: &str) {
+    let from_work = app
+        .float
+        .as_ref()
+        .is_some_and(|f| f.kind == FloatKind::Work)
+        || app.work_detail_origin;
     if let Some(jobs) = runtime.agent_jobs() {
         match jobs.kill(id) {
             Ok(snap) => {
@@ -874,11 +960,19 @@ fn kill_subagent_sync(app: &mut App, runtime: &AppRuntime, id: &str) {
                 app.set_notice(format!("kill subagent failed: {e}"));
             }
         }
-        open_subagent_list_panel(app, runtime);
+        if from_work {
+            open_work_panel(app, runtime);
+        } else {
+            open_subagent_list_panel(app, runtime);
+        }
         return;
     }
     app.set_notice(format!("unknown subagent `{id}` · bash lives under /ps"));
-    open_subagent_list_panel(app, runtime);
+    if from_work {
+        open_work_panel(app, runtime);
+    } else {
+        open_subagent_list_panel(app, runtime);
+    }
 }
 
 fn bash_meta_status_label(t: &one_tools::TaskMeta) -> String {
@@ -1384,6 +1478,7 @@ pub async fn run_interactive(
     runtime: &mut AppRuntime,
     providers: &mut ProviderSet,
     initial: Option<String>,
+    mut control_rx: Option<crate::runtime::control::ControlPromptReceiver>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut app = App::new("one");
     app.set_agent_label(runtime.mode().label());
@@ -1469,9 +1564,7 @@ pub async fn run_interactive(
     if runtime.open_session_picker {
         let sessions = runtime.list_sessions().await.unwrap_or_default();
         if sessions.is_empty() {
-            // No past sessions — create one so interactive works.
-            runtime.new_session().await?;
-            app.set_notice("no past sessions · started new");
+            app.set_notice("no past sessions · start typing");
         } else {
             // `list` is already newest-first — do not reverse.
             let rows: Vec<(String, String, String, String)> = sessions
@@ -1497,7 +1590,10 @@ pub async fn run_interactive(
     }
 
     if let Some(text) = initial {
+        // Match the normal Enter-submit path: the first prompt must be visible
+        // in the transcript before the assistant starts streaming.
         app.push_prompt_history(&text);
+        app.push_user(&text);
         match run_turn_streaming(
             runtime,
             providers.as_arc(),
@@ -1513,20 +1609,33 @@ pub async fn run_interactive(
                 terminal
                     .leave()
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-                print_resume_hint(runtime);
+                if let Some(session) = &runtime.session {
+                    if session.is_empty() {
+                        let _ = session.delete_from_disk().await;
+                    } else {
+                        print_resume_hint(runtime);
+                    }
+                }
                 return Ok(());
             }
         }
     }
 
+    enum NextInteractiveInput {
+        Ui(RunOutcome),
+        Native(crate::runtime::control::ControlPrompt),
+        ControlClosed,
+    }
+
     loop {
-        match terminal
-            .wait_action_with(&mut app, |app| {
+        let next = tokio::select! {
+            ui = terminal.wait_action_with(&mut app, |app| {
                 // Live MCP 4/5 chip while servers connect in the background.
                 refresh_mcp_chip(app, runtime);
                 // Separate chips: bash `/ps` vs subagent `/tasks`.
                 refresh_bg_chip(app, runtime);
                 refresh_task_chip(app, runtime);
+                refresh_work(app, runtime);
                 // Live task tool activity + click-to-open subagent detail.
                 refresh_task_tools_live(app, runtime);
                 refresh_background_list_if_open(app, runtime);
@@ -1536,10 +1645,51 @@ pub async fn run_interactive(
                 while let Some(outcome) = app.take_busy_ui() {
                     apply_busy_ui_outcome(app, runtime, outcome);
                 }
-            })
-            .await
-            .map_err(|e| -> Box<dyn std::error::Error> { e })?
-        {
+            }) => {
+                NextInteractiveInput::Ui(ui.map_err(|e| -> Box<dyn std::error::Error> { e })?)
+            }
+            native = async {
+                match control_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match native {
+                    Some(prompt) => NextInteractiveInput::Native(prompt),
+                    None => NextInteractiveInput::ControlClosed,
+                }
+            }
+        };
+
+        if matches!(next, NextInteractiveInput::ControlClosed) {
+            control_rx = None;
+            continue;
+        }
+        if let NextInteractiveInput::Native(native) = next {
+            let text = native.text;
+            app.push_prompt_history(&text);
+            app.push_user(&text);
+            let _ = native.accepted.send(());
+            match run_turn_streaming(
+                runtime,
+                providers.as_arc(),
+                &mut terminal,
+                &mut app,
+                &text,
+                Vec::new(),
+            )
+            .await?
+            {
+                TurnEnd::Continue => {}
+                TurnEnd::ForceQuit => break,
+            }
+            continue;
+        }
+
+        let NextInteractiveInput::Ui(outcome) = next else {
+            unreachable!()
+        };
+        match outcome {
             RunOutcome::Quit => break,
             RunOutcome::Prompt(text) => {
                 match handle_slash(runtime, providers, &mut app, &text).await? {
@@ -1621,8 +1771,9 @@ pub async fn run_interactive(
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
             RunOutcome::Steer(text) => {
-                runtime.steer(text.clone());
-                app.set_notice(format!("queued steer  {text}"));
+                runtime.steer(text);
+                // Display lives in the compact `#N` rows; do not toast or re-queue.
+                let _ = app.take_steers();
                 terminal
                     .draw(&mut app)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
@@ -1731,6 +1882,12 @@ pub async fn run_interactive(
                     .draw(&mut app)
                     .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
+            RunOutcome::OpenWork => {
+                open_work_panel(&mut app, runtime);
+                terminal
+                    .draw(&mut app)
+                    .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+            }
             RunOutcome::OpenBackgroundDetail { id } => {
                 open_background_detail_panel(&mut app, runtime, &id);
                 terminal
@@ -1781,7 +1938,13 @@ pub async fn run_interactive(
     terminal
         .leave()
         .map_err(|e| -> Box<dyn std::error::Error> { e })?;
-    print_resume_hint(runtime);
+    if let Some(session) = &runtime.session {
+        if session.is_empty() {
+            let _ = session.delete_from_disk().await;
+        } else {
+            print_resume_hint(runtime);
+        }
+    }
     Ok(())
 }
 
@@ -1790,6 +1953,9 @@ fn print_resume_hint(runtime: &AppRuntime) {
     let Some(session) = runtime.session.as_ref() else {
         return;
     };
+    if session.is_empty() {
+        return;
+    }
     let id = session.header().id.as_str();
     if id.is_empty() {
         return;
@@ -1860,7 +2026,7 @@ fn sync_compaction_settings(app: &mut App, s: &crate::settings::Settings) {
         c.ratio.unwrap_or(one_core::DEFAULT_COMPACT_RATIO),
         c.threshold,
         c.keep_recent.unwrap_or(one_core::DEFAULT_KEEP_RECENT_TURNS),
-        c.prune.unwrap_or(true),
+        c.prune.unwrap_or(false),
         c.prune_keep_last_n_turns
             .unwrap_or(one_core::DEFAULT_PRUNE_KEEP_LAST_N_TURNS),
         c.two_pass.unwrap_or(false),
@@ -1940,6 +2106,13 @@ async fn run_turn_streaming(
     text: &str,
     images: Vec<(String, String)>,
 ) -> Result<TurnEnd, Box<dyn std::error::Error>> {
+    // Unified runtime status owns the turn lifecycle; `app.busy` below is a
+    // UI-only render cache driven from this frame (spinner, stream buffers).
+    let turn_outcome = Arc::new(Mutex::new(crate::runtime::status::TurnOutcome::Completed));
+    let _control_busy = runtime.status_store().turn_guard({
+        let turn_outcome = turn_outcome.clone();
+        move || *turn_outcome.lock().expect("turn outcome")
+    });
     // After `-r` picker dismiss without pick, create a session on first turn.
     if runtime.session.is_none() {
         runtime.new_session().await?;
@@ -1970,6 +2143,9 @@ async fn run_turn_streaming(
 
     let events: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
     runtime.subscribe_collector(events.clone()).await;
+    // Unified status: subscribe_collector clears listeners — re-bridge the
+    // runtime status store after it so native control observes this turn.
+    runtime.bridge_status_events().await;
 
     let agent = runtime.agent.clone();
     let resolved = runtime.resources.resolve_input(text);
@@ -2014,10 +2190,18 @@ async fn run_turn_streaming(
             return Ok(TurnEnd::ForceQuit);
         }
     }
-    let _ = runtime
-        .extensions
-        .emit(&one_ext::ExtensionEvent::UserPromptSubmit { text: text.clone() })
-        .await;
+    match runtime.extensions.notify_user_prompt_submit(&text).await {
+        one_ext::hooks::PromptHookOutcome::Allow => {}
+        one_ext::hooks::PromptHookOutcome::Block { reason } => {
+            app.end_busy();
+            app.finish_stream_with_interrupted(false);
+            app.push_alert(
+                one_tui::AlertLevel::Warn,
+                format!("🚫 UserPromptSubmit hook blocked this prompt:\n{reason}"),
+            );
+            return Ok(TurnEnd::Continue);
+        }
+    }
 
     let mut before = agent.lock().await.messages.len();
     runtime.begin_run_meta();
@@ -2055,6 +2239,7 @@ async fn run_turn_streaming(
                 refresh_mcp_chip(app, runtime);
                 refresh_bg_chip(app, runtime);
                 refresh_task_chip(app, runtime);
+                refresh_work(app, runtime);
                 refresh_task_tools_live(app, runtime);
                 refresh_background_list_if_open(app, runtime);
                 refresh_background_detail_if_open(app, runtime);
@@ -2076,14 +2261,16 @@ async fn run_turn_streaming(
                         app.set_notice("no foreground command to background");
                     }
                 }
-                if let Some(text) = app.take_steer() {
-                    one_core::agent::Agent::push_queue(&steering, text.clone());
-                    app.set_notice(format!("queued steer  {text}"));
+                for text in app.take_steers() {
+                    one_core::agent::Agent::push_queue(&steering, text);
                 }
-                if let Some(text) = app.take_followup() {
-                    one_core::agent::Agent::push_queue(&followup, text.clone());
-                    app.set_notice(format!("queued follow-up  {text}"));
+                let remaining = steering.lock().map(|q| q.len()).unwrap_or(0);
+                app.sync_queued_steers(remaining);
+                for text in app.take_followups() {
+                    one_core::agent::Agent::push_queue(&followup, text);
                 }
+                let remaining = followup.lock().map(|q| q.len()).unwrap_or(0);
+                app.sync_queued_followups(remaining);
             },
             prompt_handle,
         )
@@ -2131,6 +2318,7 @@ async fn run_turn_streaming(
             };
             let events2: Arc<Mutex<Vec<AgentEvent>>> = Arc::new(Mutex::new(Vec::new()));
             runtime.subscribe_collector(events2.clone()).await;
+            runtime.bridge_status_events().await;
             let agent2 = agent.clone();
             let provider2 = provider.clone();
             let text2 = text.clone();
@@ -2223,6 +2411,8 @@ async fn run_turn_streaming(
 
     match prompt_result {
         Ok(reply) => {
+            *turn_outcome.lock().expect("turn outcome") =
+                crate::runtime::status::TurnOutcome::Completed;
             runtime.note_sampling_success();
             if app.stream_buffer.is_empty() {
                 let reply = format!("{reply}{sources}");
@@ -2246,6 +2436,8 @@ async fn run_turn_streaming(
             }
         }
         Err(OneError::Aborted) => {
+            *turn_outcome.lock().expect("turn outcome") =
+                crate::runtime::status::TurnOutcome::Aborted;
             // Grok Build: turn_ended outcome cancelled/error — durable, not model history.
             runtime.persist_run_error_one(&OneError::Aborted).await;
             app.finish_stream_with_interrupted(true);
@@ -2253,6 +2445,8 @@ async fn run_turn_streaming(
             let _ = runtime.take_plan_exit_request();
         }
         Err(err) => {
+            *turn_outcome.lock().expect("turn outcome") =
+                crate::runtime::status::TurnOutcome::Failed;
             // Persist for resume/debug (one.error Custom; not LLM context). UI still
             // shows an alert like Grok SessionEvent::TurnFailed.
             // Discard partial stream first so seal_stream_segment (from the
@@ -2407,6 +2601,17 @@ fn drain_events(
                 app.busy_activity = "compacting".into();
                 app.push_compacting_marker();
                 app.set_notice("context full · compacting…");
+            }
+            AgentEvent::SteerApplied { text } => {
+                // Steer moved from the pending busy strip into the transcript
+                // timeline at its real chronological position.
+                app.push_steer_applied(text);
+            }
+            AgentEvent::WaitParkStart { mode, ids } => {
+                app.begin_wait_park(mode.as_str(), ids.len());
+            }
+            AgentEvent::WaitParkEnd => {
+                app.clear_wait_park();
             }
             AgentEvent::CompactionEnd {
                 tokens_before,
@@ -2652,6 +2857,10 @@ async fn handle_slash(
             }
             Ok(SlashAction::Consumed)
         }
+        Some("/work") => {
+            open_work_panel(app, runtime);
+            Ok(SlashAction::Consumed)
+        }
         // Subagent list / live log (higher level than `/ps`).
         Some("/tasks") | Some("/jobs") | Some("/subagents") => {
             if let Some(id) = parts.get(1).copied() {
@@ -2677,7 +2886,7 @@ async fn handle_slash(
             Ok(SlashAction::Consumed)
         }
         Some("/new") => {
-            runtime.new_session().await?;
+            runtime.close_session_for_new().await?;
             // New session defaults to Build; leave plan mode if active.
             if runtime.mode() == AgentMode::Plan {
                 let _ = runtime.leave_plan_mode().await;
@@ -3561,6 +3770,7 @@ async fn load_session_into_app(
         let context = session.build_session_context();
         context.provider.zip(context.model_id)
     });
+    let previous_provider = providers.clone();
     let model_notice = match session_model {
         Some((provider, model)) => match providers.restore_session_model(&provider, &model) {
             Ok(()) => format!("model → {provider} / {model}"),
@@ -3577,15 +3787,17 @@ async fn load_session_into_app(
             }
         },
     };
+    if let Err(error) = runtime.refresh_web_search_backend(providers).await {
+        *providers = previous_provider;
+        return Err(error);
+    }
     app.set_mode_label(format_mode_label(providers));
     app.set_current_model(&providers.provider_id, providers.as_llm().model());
     let ctx = providers.context_window();
     app.set_context_window(ctx);
     runtime.set_context_window(ctx);
     runtime.bind_task_provider(providers.as_arc()).await;
-    if let Err(err) = runtime.refresh_web_search_backend(providers).await {
-        tracing::warn!(error = %err, "hosted search refresh after session resume failed");
-    }
+
     if ctx < previous_context_window {
         let _ = runtime
             .maybe_compact_with(
@@ -3841,7 +4053,11 @@ fn rebuild_tui_from_entries(
     let mut batch: Vec<AgentMessage> = Vec::new();
     for entry in entries {
         match entry {
-            one_session::SessionEntry::Message { message, .. } => batch.push(message.clone()),
+            one_session::SessionEntry::Message { base, message } => {
+                let mut message = message.clone();
+                fill_missing_timestamp(&mut message, base.timestamp);
+                batch.push(message);
+            }
             one_session::SessionEntry::Compaction {
                 tokens_before,
                 details,
@@ -3867,13 +4083,16 @@ fn rebuild_tui_from_entries(
                 app.push_system(format!("[Branch summary] {summary}"));
             }
             one_session::SessionEntry::CustomMessage {
-                content, display, ..
+                base,
+                content,
+                display,
+                ..
             } if *display => {
                 if let Some(text) = content.as_str() {
                     if !text.is_empty() {
                         paint_agent_messages(app, &batch, tool_durations);
                         batch.clear();
-                        app.push_user(text);
+                        app.push_user_at(text, system_time_from_utc(base.timestamp));
                     }
                 }
             }
@@ -3913,7 +4132,16 @@ fn paint_agent_messages(
     for m in messages {
         match m {
             AgentMessage::User(u) => {
-                app.push_user(u.content.as_display_text());
+                if u.is_steer() {
+                    // Mid-run injection: keep steer identity on reload —
+                    // never collapses into a user bubble / turn boundary.
+                    app.push_steer_row(u.content.as_display_text(), true);
+                } else {
+                    app.push_user_at(
+                        u.content.as_display_text(),
+                        system_time_from_unix_ms(u.timestamp),
+                    );
+                }
             }
             AgentMessage::Assistant(a) => {
                 let is_compaction = a.provider == "system" && a.model == "compaction";
@@ -3925,6 +4153,7 @@ fn paint_agent_messages(
                             if !thinking.is_empty() {
                                 let mut msg = one_tui::message::Message::thinking(thinking.clone());
                                 msg.thinking_expanded = app.show_thinking && !redacted;
+                                msg.created_at = system_time_from_unix_ms(a.timestamp);
                                 app.messages.push(msg);
                             }
                         }
@@ -3936,6 +4165,9 @@ fn paint_agent_messages(
                                     app.push_compact_marker(0, 0, 0);
                                 } else {
                                     app.push_assistant(text);
+                                    if let Some(msg) = app.messages.last_mut() {
+                                        msg.created_at = system_time_from_unix_ms(a.timestamp);
+                                    }
                                 }
                             }
                         }
@@ -4025,6 +4257,36 @@ fn session_tool_durations(runtime: &AppRuntime) -> std::collections::HashMap<Str
         .as_ref()
         .map(|s| s.tool_duration_by_call_id())
         .unwrap_or_default()
+}
+
+fn system_time_from_unix_ms(ms: u64) -> Option<std::time::SystemTime> {
+    if ms == 0 {
+        None
+    } else {
+        std::time::UNIX_EPOCH.checked_add(std::time::Duration::from_millis(ms))
+    }
+}
+
+fn system_time_from_utc(dt: chrono::DateTime<chrono::Utc>) -> Option<std::time::SystemTime> {
+    let ms = dt.timestamp_millis();
+    if ms <= 0 {
+        None
+    } else {
+        system_time_from_unix_ms(ms as u64)
+    }
+}
+
+fn fill_missing_timestamp(message: &mut AgentMessage, entry_ts: chrono::DateTime<chrono::Utc>) {
+    let ms = match entry_ts.timestamp_millis() {
+        n if n > 0 => n as u64,
+        _ => return,
+    };
+    match message {
+        AgentMessage::User(u) if u.timestamp == 0 => u.timestamp = ms,
+        AgentMessage::Assistant(a) if a.timestamp == 0 => a.timestamp = ms,
+        AgentMessage::ToolResult(t) if t.timestamp == 0 => t.timestamp = ms,
+        _ => {}
+    }
 }
 
 fn format_sources(citations: &[one_core::Citation]) -> String {

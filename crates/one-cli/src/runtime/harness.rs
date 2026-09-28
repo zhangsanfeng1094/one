@@ -118,6 +118,16 @@ pub async fn run_with_control(
     control: RunControl,
 ) -> RunResult {
     let t0 = Instant::now();
+    let selected_provider = match crate::provider::agent_provider(&req.agent.model, provider) {
+        Ok(provider) => provider,
+        Err(error) => {
+            return RunResult::failure(
+                crate::protocol::ProtocolError::new(error_code::INVALID_AGENT_SPEC, error),
+                0,
+            )
+        }
+    };
+    let provider = selected_provider.as_deref().unwrap_or(provider);
     let depth = req.parent.as_ref().map(|p| p.depth).unwrap_or(0);
     let agent_name = req.agent.display_name().to_string();
 
@@ -162,11 +172,31 @@ pub async fn run_with_control(
             None
         };
 
-    let system_prompt = resolve_system_prompt(&req.agent, &effective_opts);
+    let system_prompt = match resolve_system_prompt(
+        &req.agent,
+        &effective_opts,
+        provider.name(),
+        provider.model(),
+        tool_names.clone(),
+    )
+    .await
+    {
+        Ok(prompt) => prompt,
+        Err(e) => {
+            if let Some(ref h) = wt_handle {
+                let _ = super::worktree::WorktreeManager::remove(h, true);
+            }
+            return RunResult::failure(
+                crate::protocol::ProtocolError::new(error_code::INVALID_AGENT_SPEC, e.to_string()),
+                t0.elapsed().as_millis() as u64,
+            );
+        }
+    };
     let max_turns = req.agent.max_turns.unwrap_or(16);
     let thinking = resolve_thinking(&req.agent);
     // Inherit empty-response policy from user settings / env (same as main agent).
-    let empty_response_retries = crate::settings::load().empty_response_retries();
+    let user_settings = crate::settings::load();
+    let empty_response_retries = user_settings.empty_response_retries();
 
     let config = AgentConfig {
         system_prompt,
@@ -175,6 +205,8 @@ pub async fn run_with_control(
         server_search: false,
         empty_response_retries,
         compaction_config: None,
+        max_parallel_readonly_tools: one_core::max_parallel_readonly_tools_from_env(),
+        batch_exploration: user_settings.batch_exploration,
     };
 
     let mut agent = Agent::new(config, tools);
@@ -383,13 +415,13 @@ fn apply_isolation(
         handle.path.display(),
         handle.branch
     );
-    match &mut req.agent.append_system_prompt {
-        Some(a) if !a.is_empty() => {
-            a.push_str("\n\n");
-            a.push_str(&note);
-        }
-        _ => req.agent.append_system_prompt = Some(note),
-    }
+    req.agent
+        .prompt
+        .operations
+        .push(one_prompt::SlotOperation::append(
+            "extra",
+            format!("\n\n{note}"),
+        ));
     Ok(Some(handle))
 }
 
@@ -454,38 +486,86 @@ fn last_assistant_citations(agent: &Agent) -> Vec<one_core::Citation> {
         .unwrap_or_default()
 }
 
-fn resolve_system_prompt(spec: &AgentSpec, opts: &HarnessOptions) -> String {
-    let mut base = spec
-        .system_prompt
-        .clone()
-        .unwrap_or_else(|| one_core::agent::DEFAULT_SYSTEM_PROMPT.to_string());
-    // M4: only inject L2 when AgentSpec.resources.memory = index (subagents default off)
-    // and feature `memory` package is on.
-    if spec.resources.memory.is_index() {
-        let settings = crate::settings::load();
-        let features = crate::runtime::features::FeatureState::from_settings(&settings)
-            .with_process_overrides(false, crate::runtime::features::env_no_memory());
-        if features.memory_enabled() {
-            let agent_dir = one_session::agent_dir();
-            let cwd = resolve_cwd(spec, opts);
-            let load = crate::runtime::features::effective_memory_options(&features, &settings);
-            if load.enabled {
-                if let Some(cat) = load_memory_catalog_sync(&agent_dir, &cwd, &load) {
-                    if !cat.prompt_section.trim().is_empty() {
-                        base.push_str("\n\n");
-                        base.push_str(&cat.prompt_section);
+fn resolve_system_prompt<'a>(
+    spec: &'a AgentSpec,
+    opts: &'a HarnessOptions,
+    provider: &'a str,
+    model: &'a str,
+    tool_names: Vec<String>,
+) -> futures::future::BoxFuture<'a, Result<String, one_prompt::PromptError>> {
+    Box::pin(async move {
+        let mut memory_catalog = None;
+        // M4: only inject L2 when AgentSpec.resources.memory = index (subagents default off)
+        // and feature `memory` package is on.
+        if spec.resources.memory.is_index() {
+            let settings = crate::settings::load();
+            let features = crate::runtime::features::FeatureState::from_settings(&settings)
+                .with_process_overrides(false, crate::runtime::features::env_no_memory());
+            if features.memory_enabled() {
+                let agent_dir = one_session::agent_dir();
+                let cwd = resolve_cwd(spec, opts);
+                let load = crate::runtime::features::effective_memory_options(&features, &settings);
+                if load.enabled {
+                    if let Some(cat) = load_memory_catalog_sync(&agent_dir, &cwd, &load) {
+                        if !cat.prompt_section.trim().is_empty() {
+                            memory_catalog = Some(cat.prompt_section);
+                        }
                     }
                 }
             }
         }
-    }
-    if let Some(append) = &spec.append_system_prompt {
-        if !append.is_empty() {
-            base.push_str("\n\n");
-            base.push_str(append);
-        }
-    }
-    base
+        let cwd = resolve_cwd(spec, opts);
+        let env = super::env_context::build_env_context(&cwd);
+        let resources = if spec.resources.agents_md
+            || spec.resources.claude_md
+            || (spec.skills.enabled && spec.skills.catalog)
+        {
+            let mut loader =
+                one_resources::ResourceLoader::discover(&cwd, one_session::agent_dir())
+                    .await
+                    .map_err(|e| one_prompt::PromptError {
+                        kind: one_prompt::ErrorKind::Io,
+                        source_location: format!("{}: resources", cwd.display()),
+                        message: e.to_string(),
+                    })?;
+            loader
+                .agents_files
+                .retain(|f| match f.path.file_name().and_then(|s| s.to_str()) {
+                    Some("AGENTS.md") => spec.resources.agents_md,
+                    Some("CLAUDE.md") => spec.resources.claude_md,
+                    _ => false,
+                });
+            if !(spec.skills.enabled && spec.skills.catalog) {
+                loader.clear_skills();
+            }
+            loader.build_system_prompt("")
+        } else {
+            String::new()
+        };
+        let quirks = crate::provider::load_config()
+            .0
+            .find_model(provider, model)
+            .map(|m| m.quirks.clone())
+            .unwrap_or_default();
+        super::prompt_compose::compile_host(super::prompt_compose::HostPromptInput {
+            prompt: &spec.prompt,
+            cwd: &cwd,
+            provider,
+            model,
+            mode: if spec.permission_mode.as_deref() == Some("plan") {
+                super::AgentMode::Plan
+            } else {
+                super::AgentMode::Act
+            },
+            plan_path: None,
+            tool_names,
+            resources: &resources,
+            env_context: Some(&env),
+            memory_catalog: memory_catalog.as_deref(),
+            quirks,
+        })
+        .map(|p| p.text)
+    })
 }
 
 fn resolve_thinking(spec: &AgentSpec) -> ThinkingLevel {
@@ -642,11 +722,13 @@ mod tests {
         assert!(names.contains(&"bash".to_string()));
     }
 
-    #[test]
-    fn resolve_explore_prompt_uses_spec() {
+    #[tokio::test]
+    async fn resolve_explore_prompt_uses_spec() {
         let s = AgentSpec::builtin_explore();
         let opts = HarnessOptions::from_cwd("/tmp");
-        let p = resolve_system_prompt(&s, &opts);
+        let p = resolve_system_prompt(&s, &opts, "test", "test", vec![])
+            .await
+            .unwrap();
         assert!(p.contains("read-only") || p.contains("sub-agent"));
         assert!(
             p.contains("No bash") || p.contains("no bash") || p.contains("No bash, no git"),
@@ -658,6 +740,28 @@ mod tests {
         );
         // M4: explore default memory off — no Memory L2 section forced in.
         assert_eq!(s.resources.memory, MemoryResourceMode::Off);
+    }
+
+    #[tokio::test]
+    async fn child_resource_flags_control_injected_context() {
+        let dir =
+            std::env::temp_dir().join(format!("one-child-resources-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(dir.join(".git")).unwrap();
+        std::fs::write(dir.join("AGENTS.md"), "CHILD_AGENTS_RESOURCE").unwrap();
+        std::fs::write(dir.join("CLAUDE.md"), "CHILD_CLAUDE_RESOURCE").unwrap();
+        let mut spec = AgentSpec::builtin_explore();
+        let opts = HarnessOptions::from_cwd(&dir);
+        let off = resolve_system_prompt(&spec, &opts, "test", "test", vec![])
+            .await
+            .unwrap();
+        assert!(!off.contains("CHILD_AGENTS_RESOURCE") && !off.contains("CHILD_CLAUDE_RESOURCE"));
+        assert!(off.contains(dir.to_str().unwrap()));
+        spec.resources.agents_md = true;
+        let on = resolve_system_prompt(&spec, &opts, "test", "test", vec![])
+            .await
+            .unwrap();
+        assert!(on.contains("CHILD_AGENTS_RESOURCE") && !on.contains("CHILD_CLAUDE_RESOURCE"));
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

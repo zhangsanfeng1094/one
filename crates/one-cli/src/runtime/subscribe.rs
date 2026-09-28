@@ -131,4 +131,20 @@ impl AppRuntime {
             }
         }));
     }
+
+    /// Bridge agent events into the unified runtime status store
+    /// (compaction / wait-park / tool activity overlays + AgentStart turn).
+    ///
+    /// Called at the start of every frontend turn frame (prompt /
+    /// prompt_with_images / interactive / rpc / acp) so the runtime-owned
+    /// status reflects in-turn activity without each frontend re-implementing it.
+    pub async fn bridge_status_events(&mut self) {
+        let status = self.status.clone();
+        let mut agent = self.agent.lock().await;
+        // Append, not replace: frontends may already have their collector
+        // subscribed (interactive drains its own UI events separately).
+        agent.subscribe(Box::new(move |event: &AgentEvent| {
+            status.observe_agent_event(event);
+        }));
+    }
 }

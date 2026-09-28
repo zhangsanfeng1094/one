@@ -14,7 +14,7 @@
 ```text
                     ┌─────────────────────────────────────┐
                     │           AgentSpec                 │
-                    │  name · system_prompt · tools ·     │
+                    │  name · prompt · tools ·     │
                     │  model · max_turns · permissions ·  │
                     │  skills · mcp · spawn_policy · …    │
                     └─────────────────┬───────────────────┘
@@ -73,8 +73,7 @@ spawn 路径（主模型调 Agent 工具 vs 宿主 `query`）不同，**规格�
 {
   "name": "explore",
   "description": "Read-only codebase research. Use for large exploration so the parent context stays small.",
-  "system_prompt": "You are a read-only research sub-agent of One.\n…",
-  "append_system_prompt": null,
+  "prompt": {"preset": "general", "operations": [{"slot": "role", "op": "replace", "body": {"text": "You are a read-only research sub-agent of One.\n…"}}]},
   "tools": {
     "profile": "read_only",
     "allow": ["read", "grep", "find", "ls", "web_search", "web_fetch"],
@@ -118,8 +117,7 @@ spawn 路径（主模型调 Agent 工具 vs 宿主 `query`）不同，**规格�
 |------|------|------|------|
 | `name` | string | ✅* | 角色 id（`explore`、`general`、自定义）。根会话可用 `"main"` / `"default"` |
 | `description` | string | | 给**父模型**看的委托说明（对齐 Claude frontmatter `description`） |
-| `system_prompt` | string\|null | | 完整替换默认 system；`null` 表示用 profile 默认模板 |
-| `append_system_prompt` | string\|null | | 追加在默认/主 prompt 后 |
+| `prompt` | object | `{"preset":"code"}` | 预设或 DSL 文件引用及具名插槽操作；详见 [提示词 DSL](prompt-dsl.md) |
 | `tools` | object | ✅ | 见 [§2.2](#22-tools工具约束) |
 | `model` | object | | 见 [§2.3](#23-model) |
 | `max_turns` | number | | 本 run 的 tool-loop 上限；子 agent 通常小于根 |
@@ -195,7 +193,7 @@ task：`isolation=worktree`；background + 可写工具默认升 worktree。
 | 路径 | 说明 |
 |------|------|
 | `.one/agents/<name>.json` | 完整 AgentSpec JSON |
-| `.one/agents/<name>.md` | YAML frontmatter + body→`system_prompt` |
+| `.one/agents/<name>.md` | YAML frontmatter + body→`prompt.operations` 的 `role` 替换 |
 | `~/.one/agent/agents/*` | 用户级；项目同名覆盖用户 |
 
 `main` / `default` 为父 agent 自身；其余文件自动进入 `spawn_policy.allow` + `agents` 表。
@@ -262,7 +260,7 @@ task：`isolation=worktree`；background + 可写工具默认升 worktree。
     "explore": {
       "name": "explore",
       "description": "…",
-      "system_prompt": "…",
+      "prompt": {"preset": "general", "operations": [{"slot": "role", "op": "replace", "body": {"text": "…"}}]},
       "tools": { "profile": "read_only", "mcp": false },
       "max_turns": 16,
       "permission_mode": "dont_ask",
@@ -400,7 +398,7 @@ harness 在 run 开始时根据 `AgentSpec.tools` **物化** 出列表，并应�
   "type": "run_request",
   "agent": {
     "name": "explore",
-    "system_prompt": "…",
+    "prompt": {"preset": "general", "operations": [{"slot": "role", "op": "replace", "body": {"text": "…"}}]},
     "tools": { "profile": "read_only", "mcp": false },
     "max_turns": 16,
     "permission_mode": "dont_ask",
@@ -588,7 +586,7 @@ harness 在 run 开始时根据 `AgentSpec.tools` **物化** 出列表，并应�
 {
   "name": "main",
   "description": "Default interactive coding agent",
-  "system_prompt": null,
+  "prompt": {"preset": "code"},
   "tools": {
     "profile": "coding",
     "allow": [],
@@ -612,7 +610,7 @@ harness 在 run 开始时根据 `AgentSpec.tools` **物化** 出列表，并应�
 }
 ```
 
-`system_prompt: null` = 使用 `DEFAULT_SYSTEM_PROMPT` + AGENTS.md + skills catalog（resources/skills 打开时）。
+省略 `prompt` 或使用 `prompt: {"preset":"code"}`，编译代码预设并注入宿主资源。旧 `system_prompt` / `append_system_prompt` 字段会报迁移错误，见 [迁移文档](prompt-dsl.md)。
 
 ### 7.2 `explore`（只读子 agent）
 
@@ -620,7 +618,7 @@ harness 在 run 开始时根据 `AgentSpec.tools` **物化** 出列表，并应�
 {
   "name": "explore",
   "description": "Fast read-only exploration. Prefer for multi-file research.",
-  "system_prompt": "You are a read-only sub-agent of One.\nComplete the research task, then stop.\n- Only use provided tools.\n- Do not ask the user questions.\n- Final answer: findings, paths/symbols, residual risks. Be concise.",
+  "prompt": {"preset": "general", "operations": [{"slot": "role", "op": "replace", "body": {"text": "You are a read-only sub-agent of One.\nComplete the research task, then stop.\n- Only use provided tools.\n- Do not ask the user questions.\n- Final answer: findings, paths/symbols, residual risks. Be concise."}}]},
   "tools": {
     "profile": "read_only",
     "mcp": false,

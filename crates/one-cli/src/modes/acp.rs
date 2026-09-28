@@ -95,7 +95,10 @@ struct SessionHandle {
     cancel: Arc<AtomicBool>,
     /// Runtime abort flag (shared with Agent loop).
     abort: Arc<AtomicBool>,
-    busy: AtomicBool,
+    /// Unified runtime lifecycle status (busy / waiting / abort / turn id).
+    /// Replaces the former local `busy: AtomicBool` — same store the runtime's
+    /// control plane reads, so ACP turns are observable like any frontend.
+    status: crate::runtime::status::RuntimeStatusStore,
     permission_gate: Arc<PermissionGate>,
     hitl: HitlChannel,
 }
@@ -221,6 +224,11 @@ impl OneAcpAgent {
         for msg in messages {
             match msg {
                 AgentMessage::User(u) => {
+                    // Steers are mid-run injections; replaying them as top-level
+                    // user-message chunks would fake a new user turn in the client.
+                    if u.is_steer() {
+                        continue;
+                    }
                     let text = user_content_text(&u.content);
                     if !text.is_empty() {
                         self.notify(
@@ -481,8 +489,10 @@ impl AcpAgentTrait for OneAcpAgent {
         let set = ProviderSet::build(&cli).map_err(|e| err_params(format!("model switch: {e}")))?;
         {
             let mut rt = handle.runtime.lock().await;
+            rt.refresh_web_search_backend(&set)
+                .await
+                .map_err(|e| err_params(format!("prompt compilation: {e}")))?;
             rt.set_context_window(set.context_window());
-            let _ = rt.refresh_web_search_backend(&set).await;
             rt.bind_task_provider(set.as_arc()).await;
         }
         *handle.provider.lock().await = set;
@@ -528,13 +538,15 @@ impl AcpAgentTrait for OneAcpAgent {
         }
 
         let handle = self.get_session(&session_id).await?;
-        if handle
-            .busy
-            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
-            .is_err()
-        {
+        // Admission + turn lifecycle on the unified status store. The store
+        // only reports busy while a turn is in flight, so double-prompt is
+        // still rejected the same way the old local AtomicBool did.
+        if handle.status.is_busy() {
             return Err(err_invalid("session already processing a prompt"));
         }
+        let _turn = handle
+            .status
+            .turn_guard_fixed(crate::runtime::status::TurnOutcome::Completed);
 
         handle.cancel.store(false, Ordering::SeqCst);
         handle.abort.store(false, Ordering::SeqCst);
@@ -553,6 +565,11 @@ impl AcpAgentTrait for OneAcpAgent {
             agent.clear_listeners();
             agent.subscribe(Box::new(move |ev: &AgentEvent| {
                 let _ = ev_tx.send(ev.clone());
+            }));
+            // Unified status bridge: compaction / wait-park / tool overlays.
+            let status = handle.status.clone();
+            agent.subscribe(Box::new(move |ev: &AgentEvent| {
+                status.observe_agent_event(ev);
             }));
         }
 
@@ -610,7 +627,14 @@ impl AcpAgentTrait for OneAcpAgent {
         approval_task.abort();
 
         let was_cancelled = handle.abort.load(Ordering::SeqCst);
-        handle.busy.store(false, Ordering::SeqCst);
+        let outcome = if was_cancelled {
+            crate::runtime::status::TurnOutcome::Aborted
+        } else if result.is_err() {
+            crate::runtime::status::TurnOutcome::Failed
+        } else {
+            crate::runtime::status::TurnOutcome::Completed
+        };
+        _turn.finish(outcome);
         handle.cancel.store(false, Ordering::SeqCst);
 
         match result {
@@ -641,6 +665,7 @@ impl AcpAgentTrait for OneAcpAgent {
         if let Ok(handle) = self.get_session(&args.session_id).await {
             handle.cancel.store(true, Ordering::SeqCst);
             handle.abort.store(true, Ordering::SeqCst);
+            handle.status.set_abort_requested();
             // Best-effort: also kill subagent jobs if we can take the lock quickly.
             if let Ok(rt) = handle.runtime.try_lock() {
                 rt.abort();
@@ -793,7 +818,10 @@ async fn build_session_components(
         }
     }
     runtime.set_context_window(providers.context_window());
-    let _ = runtime.refresh_web_search_backend(&providers).await;
+    runtime
+        .refresh_web_search_backend(&providers)
+        .await
+        .map_err(|e| format!("prompt compilation: {e}"))?;
     runtime.bind_task_provider(providers.as_arc()).await;
     runtime.sync_task_session().await;
 
@@ -806,6 +834,7 @@ async fn build_session_components(
     let abort = runtime.abort_handle();
     let permission_gate = runtime.permission_gate.clone();
     let hitl = runtime.hitl.clone();
+    let status = runtime.status_store().clone();
 
     let handle = Arc::new(SessionHandle {
         runtime: tokio::sync::Mutex::new(runtime),
@@ -813,7 +842,7 @@ async fn build_session_components(
         cwd,
         cancel: Arc::new(AtomicBool::new(false)),
         abort,
-        busy: AtomicBool::new(false),
+        status,
         permission_gate,
         hitl,
     });

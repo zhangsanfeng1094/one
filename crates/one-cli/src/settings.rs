@@ -94,7 +94,7 @@ impl CompactionSettings {
         if let Some(n) = self.keep_recent.filter(|n| *n > 0) {
             cfg.keep_recent_messages = n;
         }
-        cfg.prune = self.prune.unwrap_or(true);
+        cfg.prune = self.prune.unwrap_or(false);
         if let Some(n) = self.prune_protect_tokens {
             cfg.prune_protect_tokens = n;
         }
@@ -156,7 +156,7 @@ impl CompactionSettings {
         let keep = self
             .keep_recent
             .unwrap_or(one_core::DEFAULT_KEEP_RECENT_TURNS);
-        let prune = if self.prune.unwrap_or(true) {
+        let prune = if self.prune.unwrap_or(false) {
             "prune"
         } else {
             "no prune"
@@ -315,6 +315,28 @@ pub struct Settings {
         skip_serializing_if = "Option::is_none"
     )]
     pub enabled_models: Option<Vec<String>>,
+    /// Exact provider/model rules for one-time read-only exploration reminders.
+    ///
+    /// Omitted in JSON → [`default_batch_exploration`]. An explicit empty array turns the reminder off.
+    #[serde(
+        default = "default_batch_exploration",
+        rename = "batchExploration",
+        alias = "batch_exploration",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub batch_exploration: Vec<one_core::BatchExplorationRule>,
+}
+
+/// Built-in reminder for the model that issues one read-only tool per turn.
+///
+/// `gemini-3.8-flash-high(medium)` matches this id via the parenthetical suffix rule.
+pub fn default_batch_exploration() -> Vec<one_core::BatchExplorationRule> {
+    vec![one_core::BatchExplorationRule {
+        provider: "cpa".into(),
+        model: "gemini-3.8-flash-high".into(),
+        thinking_level: None,
+        after_single_reads: 4,
+    }]
 }
 
 impl Settings {
@@ -452,7 +474,8 @@ impl Settings {
     }
 }
 
-fn settings_path() -> PathBuf {
+/// Absolute path of `settings.json` (single source of truth for the studio too).
+pub fn settings_path() -> PathBuf {
     one_session::agent_dir().join("settings.json")
 }
 
@@ -465,15 +488,18 @@ pub fn load() -> Settings {
     }
     // Migrate legacy preferences.json once.
     if let Some(prefs) = preferences::load() {
-        let s = Settings {
+        let mut s = Settings {
             provider: Some(prefs.provider),
             model: Some(prefs.model),
             ..Default::default()
         };
+        s.batch_exploration = default_batch_exploration();
         let _ = save(&s);
         return s;
     }
-    Settings::default()
+    let mut fresh = Settings::default();
+    fresh.batch_exploration = default_batch_exploration();
+    fresh
 }
 
 pub fn save(settings: &Settings) -> std::io::Result<()> {
@@ -661,7 +687,7 @@ pub fn set_key(settings: &mut Settings, key: &str, value: &str) -> Result<(), St
             match v.as_str() {
                 "1" | "true" | "yes" | "on" => c.prune = Some(true),
                 "0" | "false" | "no" | "off" => c.prune = Some(false),
-                "toggle" => c.prune = Some(!c.prune.unwrap_or(true)),
+                "toggle" => c.prune = Some(!c.prune.unwrap_or(false)),
                 other => {
                     return Err(format!(
                         "compaction.prune must be on|off|toggle (got `{other}`)"
@@ -1131,11 +1157,25 @@ mod tests {
                 "openai:gpt-4o".into(),
                 "anthropic:claude-sonnet-4-20250514".into(),
             ]),
+            batch_exploration: vec![one_core::BatchExplorationRule {
+                provider: "cpa".into(),
+                model: "gemini-3.8-flash-high".into(),
+                thinking_level: Some(one_core::ThinkingLevel::Medium),
+                after_single_reads: 4,
+            }],
         };
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains("enabledModels"));
         let back: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, back);
+    }
+
+    #[test]
+    fn omitted_batch_exploration_uses_builtin_rule_and_empty_array_disables() {
+        let omitted: Settings = serde_json::from_str("{}").unwrap();
+        assert_eq!(omitted.batch_exploration, default_batch_exploration());
+        let off: Settings = serde_json::from_str(r#"{"batchExploration":[]}"#).unwrap();
+        assert!(off.batch_exploration.is_empty());
     }
 
     #[test]

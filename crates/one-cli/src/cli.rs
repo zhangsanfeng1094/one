@@ -83,7 +83,12 @@ impl RunMode {
 #[derive(Parser, Debug, Clone)]
 #[command(name = "one", about = "One coding agent", version)]
 pub struct Cli {
-    /// Prompt text.
+    /// First user prompt. By default this starts the interactive TUI, like Codex.
+    /// Use `one exec [PROMPT]` for non-interactive/headless execution.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: Option<String>,
+
+    /// Legacy prompt flag. Kept for compatibility: bare `-p` still selects print mode.
     ///
     /// - Bare `-p "…"` (no `--mode`) → **print** mode (scripts / CI).
     /// - `--mode interactive -p "…"` or `--tui -p "…"` → **TUI**, first user turn.
@@ -116,9 +121,18 @@ pub struct Cli {
     #[arg(long)]
     pub session: Option<PathBuf>,
 
+    /// Internal: exec --resume spec (resolved before build).
+    #[arg(skip)]
+    pub exec_resume: Option<String>,
+
     /// Do not persist a session file.
     #[arg(long, global = true)]
     pub no_session: bool,
+
+    /// Internal: `one exec` persists its session by default (unless --no-session).
+    /// Set by `normalize_cli_invocation`; legacy `-p` stays non-persisting.
+    #[arg(skip = false)]
+    pub exec_session: bool,
 
     /// Provider to use (defaults to last selection, or mock).
     #[arg(long, value_enum, global = true)]
@@ -185,9 +199,15 @@ pub struct Cli {
     #[arg(short = 'y', long = "yes", global = true)]
     pub auto_approve: bool,
 
-    /// Auto-approve all tool executions without interactive permission prompts (alias: `--yolo`).
-    #[arg(long = "always-approve", alias = "yolo", global = true)]
+    /// Auto-approve all tool executions without interactive permission prompts.
+    /// Keeps the workspace path boundary unless `--full-access` is also supplied.
+    #[arg(long = "always-approve", global = true)]
     pub always_approve: bool,
+
+    /// YOLO mode: auto-approve all tools and disable the workspace path boundary.
+    /// Equivalent to `--always-approve --full-access`.
+    #[arg(long = "yolo", global = true)]
+    pub yolo: bool,
 
     /// Permission mode: `default` (ask) | `acceptEdits` | `auto` | `dontAsk` | `bypassPermissions` (always-approve).
     #[arg(long = "permission-mode", value_name = "MODE", global = true)]
@@ -238,13 +258,19 @@ pub struct Cli {
     #[arg(long = "output-format", value_name = "FMT")]
     pub output_format: Option<String>,
 
-    /// Optional subcommands (`one mcp …` / `one bench` / `one agent` / `one run` / `one resume`).
+    /// Optional subcommands (`one exec …` / `one mcp …` / `one bench` / `one agent` / `one run` / `one resume`).
     #[command(subcommand)]
     pub command: Option<Commands>,
 }
 
 #[derive(Debug, Clone, Subcommand)]
 pub enum Commands {
+    /// Browse sessions and explicitly enter one in TUI or exec mode.
+    Session(SessionCli),
+    /// Inspect and control a live local One runtime.
+    Control(crate::control_cmd::ControlCli),
+    /// Run one prompt non-interactively and exit.
+    Exec(ExecCli),
     /// Manage MCP servers (list / add / remove / doctor)
     Mcp(McpCli),
     /// Subscription / OAuth login (Codex, xAI Grok, OpenCode Zen/Go, …)
@@ -257,7 +283,7 @@ pub enum Commands {
     Agent(AgentCli),
     /// Run harness with --preset or --spec (full AgentSpec JSON)
     Run(crate::agent_cmd::RunCli),
-    /// Resume a session after quitting (`one resume` / `one resume <id|name|path>`)
+    /// Quick resume picker or recent session (`one session` browses and selects explicitly).
     Resume(ResumeCli),
     /// Manually teach, list, or reset intent graph rules (`one learn`)
     Learn(LearnCli),
@@ -270,8 +296,88 @@ pub enum Commands {
     ///
     /// Open the web interface to interact with One via browser.
     Web(WebCli),
+    /// 本地配置控制台 (Config Studio) — 查看来源、编辑、校验、备份与恢复
+    ///
+    /// 只监听回环地址，启动时生成临时访问令牌。无需模型或认证配置成功即可使用。
+    Config(ConfigCli),
     /// Multi-channel Bot Gateway (Telegram / Discord / Feishu / Slack).
     Bot(BotCli),
+}
+
+#[derive(Debug, Clone, clap::Args)]
+pub struct SessionCli {
+    #[command(subcommand)]
+    pub action: SessionAction,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum SessionAction {
+    /// List sessions for this cwd, or across known workspaces with --all.
+    List {
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        query: Option<String>,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show one session and its current live runtime, if any.
+    Show {
+        spec: String,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Resume a dormant session in the interactive TUI.
+    Tui {
+        spec: String,
+        #[arg(long)]
+        all: bool,
+    },
+    /// Continue a dormant session, or prompt its idle live runtime.
+    Exec {
+        spec: String,
+        #[arg(value_name = "PROMPT", required = true, num_args = 1..)]
+        prompt: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+/// CLI: `one exec [PROMPT]` — non-interactive/headless agent execution.
+#[derive(Debug, Clone, clap::Args)]
+pub struct ExecCli {
+    /// Prompt to execute before exiting.
+    #[arg(value_name = "PROMPT")]
+    pub prompt: String,
+
+    /// Resume an existing session (id prefix, /name, substring, or file path)
+    /// and append this prompt to it. Same semantics as `one resume <spec>`.
+    #[arg(long = "resume", value_name = "SPEC", conflicts_with_all = &["continue_session"])]
+    pub resume: Option<String>,
+
+    /// Resume the most recent session for this cwd.
+    #[arg(long = "continue", short = 'c', conflicts_with_all = &["resume"])]
+    pub continue_session: bool,
+
+    /// Maximum agent turns for this headless run. `0` means unlimited.
+    #[arg(long = "max-turns")]
+    pub max_turns: Option<usize>,
+
+    /// Machine-readable result: `text` | `json` (RunResult envelope).
+    #[arg(long = "output-format", value_name = "FMT")]
+    pub output_format: Option<String>,
+
+    /// Export execution trace to Langfuse for this run.
+    #[arg(long = "trace", alias = "langfuse")]
+    pub trace: bool,
+
+    /// Include larger LLM / tool I/O previews in the Langfuse trace.
+    #[arg(long = "trace-full")]
+    pub trace_full: bool,
 }
 
 /// CLI: `one bot` action subcommands.
@@ -331,6 +437,32 @@ pub struct WebCli {
     /// Automatically open the Web UI in the default browser.
     #[arg(long)]
     pub open: bool,
+}
+
+/// CLI: `one config` — local Config Studio (read / edit / validate / backup).
+///
+/// ```text
+/// one config                 # 打开 http://127.0.0.1:3333/config?token=…
+/// one config --port 4000     # 换端口
+/// one config --open          # 自动打开浏览器
+/// ```
+#[derive(Debug, Clone, clap::Args)]
+pub struct ConfigCli {
+    /// Port to listen on (default: 3333).
+    #[arg(long, default_value_t = crate::config_studio::DEFAULT_PORT)]
+    pub port: u16,
+
+    /// Loopback host to bind (default: 127.0.0.1). Non-loopback is refused.
+    #[arg(long, default_value = "127.0.0.1")]
+    pub host: String,
+
+    /// Automatically open the Config Studio in the default browser.
+    #[arg(long)]
+    pub open: bool,
+
+    /// Print the catalog as JSON and exit (no server; useful for scripts).
+    #[arg(long)]
+    pub dump: bool,
 }
 
 /// CLI: `one learn [RULE]` — manually teach or manage intent graph rules.

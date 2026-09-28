@@ -471,11 +471,16 @@ pub struct AgentSpec {
     /// When the parent model should delegate (Claude-style description).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
-    /// Full system prompt; `None` = harness default template for this profile.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub system_prompt: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub append_system_prompt: Option<String>,
+    #[serde(default)]
+    pub prompt: crate::prompt_config::PromptConfig,
+    #[serde(
+        default,
+        rename = "system_prompt",
+        alias = "append_system_prompt",
+        deserialize_with = "crate::prompt_config::reject_legacy_prompt",
+        skip_serializing
+    )]
+    pub legacy_prompt: (),
     #[serde(default)]
     pub tools: ToolsSpec,
     #[serde(default)]
@@ -516,8 +521,8 @@ impl Default for AgentSpec {
         Self {
             name: Some("main".into()),
             description: None,
-            system_prompt: None,
-            append_system_prompt: None,
+            prompt: Default::default(),
+            legacy_prompt: (),
             tools: ToolsSpec::coding(),
             model: ModelSpec {
                 inherit: false,
@@ -570,7 +575,7 @@ impl AgentSpec {
 Not for git status/diff/commit, staging, or shell workflows; parent must use bash for those."
                     .into(),
             ),
-            system_prompt: Some(
+            prompt: crate::prompt_config::PromptConfig::role(
                 "You are a read-only research sub-agent of One.\n\
                  Complete the research task thoroughly, then stop.\n\
                  - Tools: read/grep/ls/find. **No bash, no git.**\n\
@@ -589,7 +594,7 @@ Not for git status/diff/commit, staging, or shell workflows; parent must use bas
                  - Do not restate the entire task prompt."
                     .into(),
             ),
-            append_system_prompt: None,
+            legacy_prompt: (),
             tools: {
                 let mut t = ToolsSpec::read_only();
                 t.deny = vec!["ask_user".into()];
@@ -633,7 +638,7 @@ Not for git status/diff/commit, staging, or shell workflows; parent must use bas
 Use for implementation that should stay out of the parent context."
                     .into(),
             ),
-            system_prompt: Some(
+            prompt: crate::prompt_config::PromptConfig::role(
                 "You are a general-purpose coding sub-agent of One.\n\
                  Complete the delegated implementation or mixed task, then stop.\n\
                  - Use the tools provided. Prefer surgical edits over full rewrites.\n\
@@ -651,7 +656,7 @@ Use for implementation that should stay out of the parent context."
                  - Do not restate the entire task prompt."
                     .into(),
             ),
-            append_system_prompt: None,
+            legacy_prompt: (),
             tools: {
                 let mut t = ToolsSpec::coding();
                 t.deny = vec!["ask_user".into(), "task".into()];
@@ -695,7 +700,7 @@ Use for implementation that should stay out of the parent context."
 implementation plan. Does not edit files."
                 .into(),
         );
-        spec.system_prompt = Some(
+        spec.prompt = crate::prompt_config::PromptConfig::role(
             "You are a planning sub-agent of One.\n\
              Explore the codebase and produce a structured implementation plan, then stop.\n\
              - Tools: only what you were given (typically read/grep/ls). **No edits.**\n\
@@ -1136,7 +1141,7 @@ mod tests {
         let j = serde_json::to_string(&explore).unwrap();
         let back: AgentSpec = serde_json::from_str(&j).unwrap();
         assert_eq!(back.name.as_deref(), Some("explore"));
-        assert!(back.system_prompt.is_some());
+        assert!(back.prompt.preset.is_some());
     }
 
     #[test]
@@ -1177,7 +1182,7 @@ mod tests {
         assert!(req.is_subagent());
         assert_eq!(req.agent.display_name(), "explore");
         assert!(matches!(req.session.mode, SessionMode::Ephemeral));
-        assert!(req.agent.system_prompt.is_some());
+        assert!(req.agent.prompt.preset.is_some());
         assert!(!req.agent.tools.mcp);
     }
 
@@ -1230,7 +1235,10 @@ mod tests {
     fn explore_json_roundtrip_preserves_prompt() {
         let spec = AgentSpec::builtin_explore();
         let raw = serde_json::to_value(&spec).unwrap();
-        assert!(raw["system_prompt"].as_str().unwrap().contains("read-only"));
+        assert!(raw["prompt"]["operations"][0]["body"]["text"]
+            .as_str()
+            .unwrap()
+            .contains("read-only"));
         assert_eq!(raw["tools"]["profile"], "read_only");
         assert_eq!(raw["skills"]["catalog"], false);
     }
@@ -1259,7 +1267,7 @@ mod tests {
     fn builtin_explore_is_exportable_harness_json() {
         let j = serde_json::to_value(AgentSpec::builtin_explore()).unwrap();
         assert_eq!(j["name"], "explore");
-        assert!(j.get("system_prompt").is_some());
+        assert!(j.get("prompt").is_some());
         assert!(j.get("tools").is_some());
         assert_eq!(j["spawn_policy"]["max_depth"], 0);
     }

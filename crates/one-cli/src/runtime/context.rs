@@ -24,7 +24,10 @@ impl AppRuntime {
         let turn_count = agent
             .messages
             .iter()
-            .filter(|m| matches!(m, AgentMessage::User(_)))
+            .filter(|m| match m {
+                AgentMessage::User(u) => !u.is_steer(),
+                _ => false,
+            })
             .count() as u64;
         let tool_call_count = agent.messages.iter().map(assistant_tool_calls).sum::<u64>();
 

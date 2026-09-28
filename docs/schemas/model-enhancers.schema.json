@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "One Model Enhancers",
+  "description": "Exact model behavior bindings. Global and project layers merge enabled and prompt independently; profile-specific bindings win within a layer. Duplicate provider/model/preset tuples are rejected by the runtime.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["version"],
+  "properties": {
+    "version": { "const": 1 },
+    "definitions": {
+      "type": "array",
+      "description": "Custom enhancer metadata. Built-in quirk ids are not stored here. Existing files without this field remain valid.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "name", "prompt"],
+        "properties": {
+          "id": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_]{1,63}$" },
+          "name": { "type": "string", "pattern": "\\S" },
+          "description": { "type": "string" },
+          "prompt": { "type": "string", "pattern": "\\S" }
+        }
+      }
+    },
+    "bindings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["provider", "model", "enhancers"],
+        "properties": {
+          "provider": { "type": "string", "pattern": "\\S", "description": "Exact registry provider id" },
+          "model": { "type": "string", "pattern": "\\S", "description": "Exact registry model id" },
+          "preset": { "type": ["string", "null"], "pattern": "\\S", "description": "Optional profile name; omitted/null applies to all profiles" },
+          "enhancers": {
+            "type": "object",
+            "additionalProperties": { "$ref": "#/$defs/override" },
+            "properties": {
+              "over_planning": { "$ref": "#/$defs/override" },
+              "stops_early": { "$ref": "#/$defs/override" },
+              "reluctant_to_use_tools": { "$ref": "#/$defs/override" },
+              "weak_verification": { "$ref": "#/$defs/override" }
+            }
+          }
+        }
+      }
+    }
+  },
+  "$defs": {
+    "override": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": ["boolean", "null"], "description": "Omitted/null inherits; false disables this enhancer only" },
+        "prompt": { "type": ["string", "null"], "pattern": "\\S", "description": "User prompt text; omitted/null inherits built-in or lower-layer text" }
+      }
+    }
+  }
+}

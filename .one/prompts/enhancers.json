@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "bindings": [
+    {
+      "provider": "cpa",
+      "model": "gemini*",
+      "enhancers": {
+        "over_planning": {
+          "enabled": true,
+          "prompt": "\n<model_behavior_guidance>\n- Execution over speculation: Do not output lengthy, multi-paragraph plans or speculative analysis when direct action is required. Execute the necessary tool calls immediately.\n- Action over investigation: Do not continuously read files without editing. Stop reading as soon as the target location is identified (max 3 read/grep rounds) and proceed to edit or ask directly.\n- Keep intermediate explanations concise; verify outcomes directly using tools.\n</model_behavior_guidance>\n"
+        }
+      }
+    },
+    {
+      "provider": "anthropic",
+      "model": "claude*",
+      "enhancers": {
+        "over_planning": {
+          "enabled": true,
+          "prompt": "\n<model_behavior_guidance>\n- Execution over speculation: Do not output lengthy, multi-paragraph plans or speculative analysis when direct action is required. Execute the necessary tool calls immediately.\n- Action over investigation: Do not continuously read files without editing. Stop reading as soon as the target location is identified (max 3 read/grep rounds) and proceed to edit or ask directly.\n- Keep intermediate explanations concise; verify outcomes directly using tools.\n</model_behavior_guidance>\n"
+        }
+      }
+    }
+  ]
+}

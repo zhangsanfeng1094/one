@@ -9,8 +9,10 @@
 //! - [`reload`] — `/reload` resources + extensions
 //! - [`subscribe`] — agent event fans-out
 
+pub mod agent_backend;
 mod build;
 mod context;
+pub mod control;
 pub mod coordinator;
 pub mod effective_config;
 pub mod env_context;
@@ -27,11 +29,15 @@ mod plan;
 mod policy;
 pub mod presets;
 mod prompt;
-mod prompt_compose;
+pub mod prompt_compose;
+pub mod prompt_enhancer;
+#[cfg(test)]
+mod prompt_tests;
 pub mod provider_limit;
 mod reload;
 mod session;
 mod session_meta;
+pub mod status;
 mod subscribe;
 pub mod task_tool;
 pub mod tool_materialize;
@@ -64,6 +70,11 @@ pub struct AppRuntime {
     abort_flag: Arc<AtomicBool>,
     steering_queue: Arc<std::sync::Mutex<Vec<String>>>,
     followup_queue: Arc<std::sync::Mutex<Vec<String>>>,
+    input_waker: Arc<tokio::sync::Notify>,
+    /// Unified runtime lifecycle status — single source of truth for
+    /// busy / waiting / abort / turn identity (see [`status`]).
+    pub(crate) status: status::RuntimeStatusStore,
+    pub(crate) control_session: Arc<std::sync::RwLock<control::ControlSessionInfo>>,
     pub session: Option<SessionManager>,
     /// Shared extension runtime (tools, hooks, lifecycle).
     pub extensions: Arc<ExtensionRuntime>,
@@ -83,6 +94,8 @@ pub struct AppRuntime {
     plan_exit: Arc<Mutex<PlanExitState>>,
     /// Shared background bash registry (reused when leaving plan mode).
     bg_registry: Arc<BackgroundTaskRegistry>,
+    /// Shared active wait interest for ReAct background task parking.
+    wait_interest: Arc<std::sync::Mutex<Option<one_core::WaitInterest>>>,
     /// Session todo list for `todo_write` (survives plan/act rebuilds).
     todo_state: TodoListState,
     /// Per-turn memory read/grep budget (M3; reset each user prompt).
@@ -91,8 +104,11 @@ pub struct AppRuntime {
     env_context: String,
     /// Frozen memory L2 catalog section (None when disabled).
     memory_catalog: Option<String>,
-    /// Base system prompt without plan-mode overlay.
-    base_system_prompt: String,
+    /// Last successfully compiled prompt and the actual context used to produce it.
+    compiled_prompt: one_prompt::CompiledPrompt,
+    prompt_tool_names: Vec<String>,
+    prompt_provider: String,
+    prompt_model: String,
     /// Shared permission gate (interactive ask / fail-closed / auto).
     pub permission_gate: Arc<PermissionGate>,
     /// Human-in-the-loop channel for `ask_user` select prompts.
@@ -167,9 +183,23 @@ impl AppRuntime {
         &mut self,
         providers: &crate::provider::ProviderSet,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        // Truth source = what the live LlmProvider would attach via server_tools().
+        let previous = (
+            self.prompt_provider.clone(),
+            self.prompt_model.clone(),
+            self.hosted_search_capable,
+        );
+        self.prompt_provider = providers.as_llm().name().to_string();
+        self.prompt_model = providers.as_llm().model().into();
         self.hosted_search_capable = !providers.as_llm().server_tools().is_empty();
-        self.rebuild_mode_tools_and_prompt().await
+        if let Err(error) = self.rebuild_mode_tools_and_prompt().await {
+            (
+                self.prompt_provider,
+                self.prompt_model,
+                self.hosted_search_capable,
+            ) = previous;
+            return Err(error);
+        }
+        Ok(())
     }
 
     /// True when we should **inject** hosted search on the main request
@@ -196,23 +226,33 @@ impl AppRuntime {
 
     /// Live system prompt: base (+ plan overlay) + optional deferred MCP announcement.
     pub(super) fn effective_system_prompt(&self) -> String {
-        let base = if self.mode == AgentMode::Plan {
-            if let Some(path) = &self.plan_path {
-                format!(
-                    "{}{}",
-                    self.base_system_prompt,
-                    one_tools::plan_mode_system_overlay(path)
-                )
-            } else {
-                self.base_system_prompt.clone()
-            }
-        } else {
-            self.base_system_prompt.clone()
-        };
-        // Plan mode never exposes MCP tools. MCP runtime state is injected as
-        // per-turn `<system-reminder>` notices instead of being appended here,
-        // so the cached base system prompt stays stable while servers connect.
-        base
+        self.compiled_prompt.text.clone()
+    }
+
+    pub(super) fn compile_prompt_for_tools(
+        &self,
+        tools: &[String],
+        mode: AgentMode,
+        path: Option<&std::path::Path>,
+    ) -> Result<one_prompt::CompiledPrompt, one_prompt::PromptError> {
+        let quirks = crate::provider::load_config()
+            .0
+            .find_model(&self.prompt_provider, &self.prompt_model)
+            .map(|m| m.quirks.clone())
+            .unwrap_or_default();
+        prompt_compose::compile_host(prompt_compose::HostPromptInput {
+            prompt: &self.main_agent.prompt,
+            cwd: &self.cwd,
+            provider: &self.prompt_provider,
+            model: &self.prompt_model,
+            mode,
+            plan_path: path,
+            tool_names: tools.to_vec(),
+            resources: &self.resources.build_system_prompt(""),
+            env_context: Some(&self.env_context),
+            memory_catalog: self.memory_catalog.as_deref(),
+            quirks,
+        })
     }
 
     /// Refresh session id on the task host (after session open / resume).
@@ -269,32 +309,24 @@ impl AppRuntime {
             .map(|p| format!("features pending ({}) · /new to apply", p.fingerprint()))
     }
 
-    fn can_spawn_policy(&self) -> bool {
-        self.task_host
-            .as_ref()
-            .map(|h| h.can_spawn())
-            .unwrap_or(false)
-    }
-
-    /// Recompose base + mode system prompt from applied features + resources.
+    /// Recompile the full prompt from the original spec and last materialized tools.
     ///
     /// Keeps frozen `env_context` / `memory_catalog` (session-stable for prompt cache).
-    pub(super) fn recompose_base_prompt(&mut self) {
-        self.base_system_prompt =
-            prompt_compose::compose_base_system_prompt(prompt_compose::ComposeBaseInput {
-                features: &self.applied_features,
-                resources: &self.resources,
-                can_spawn: self.can_spawn_policy(),
-                env_context: Some(self.env_context.as_str()),
-                memory_catalog: self.memory_catalog.as_deref(),
-            });
+    pub(super) fn recompile_prompt(&mut self) -> Result<(), one_prompt::PromptError> {
+        let compiled = self.compile_prompt_for_tools(
+            &self.prompt_tool_names,
+            self.mode,
+            self.plan_path.as_deref(),
+        )?;
+        self.compiled_prompt = compiled;
+        Ok(())
     }
 
     /// Refresh env + memory L2 snapshots and recompose (cold start, `/new`, `/reload`).
     pub(super) async fn refresh_context_snapshots(
         &mut self,
         memory_opts: &one_resources::MemoryLoadOptions,
-    ) {
+    ) -> Result<(), one_prompt::PromptError> {
         self.memory_lookups
             .set_max(memory_opts.max_lookups_per_turn);
         self.env_context = env_context::build_env_context(&self.cwd);
@@ -305,7 +337,7 @@ impl AppRuntime {
         } else {
             None
         };
-        self.recompose_base_prompt();
+        Ok(())
     }
 
     /// Whether the agent currently has conversation messages (context-bound).
@@ -380,7 +412,7 @@ impl AppRuntime {
         // Feature memory toggles L2 catalog + tools (path policy is cold-start; `/new` refreshes).
         if store_id == FEATURE_MEMORY {
             let mem_opts = features::effective_memory_options(&self.applied_features, &s);
-            self.refresh_context_snapshots(&mem_opts).await;
+            self.refresh_context_snapshots(&mem_opts).await?;
         }
         self.rebuild_mode_tools_and_prompt().await?;
         Ok((enabled, true))
@@ -396,8 +428,7 @@ impl AppRuntime {
         );
         self.pending_features = None;
         let mem_opts = features::effective_memory_options(&self.applied_features, &s);
-        self.refresh_context_snapshots(&mem_opts).await;
-        self.recompose_base_prompt();
+        self.refresh_context_snapshots(&mem_opts).await?;
         self.rebuild_mode_tools_and_prompt().await
     }
 
@@ -525,12 +556,31 @@ impl AppRuntime {
         }
     }
 
+    /// Compatibility: begin an in-flight turn on the unified status store.
+    /// Prefer [`Self::status`] / `status::TurnGuard` in new code.
+    pub fn control_busy_guard(&self) -> status::TurnGuard {
+        self.status.turn_guard_fixed(status::TurnOutcome::Completed)
+    }
+
+    /// Unified runtime status (busy / waiting / abort / turn identity).
+    pub fn status_store(&self) -> &status::RuntimeStatusStore {
+        &self.status
+    }
+
+    pub fn refresh_control_session(&self) {
+        if let Ok(mut slot) = self.control_session.write() {
+            *slot = control::ControlSessionInfo::from_runtime(self);
+        }
+    }
+
     pub fn steer(&self, text: impl Into<String>) {
         Agent::push_queue(&self.steering_queue, text);
+        self.input_waker.notify_one();
     }
 
     pub fn follow_up(&self, text: impl Into<String>) {
         Agent::push_queue(&self.followup_queue, text);
+        self.input_waker.notify_one();
     }
 
     pub fn steering_queue(&self) -> Arc<std::sync::Mutex<Vec<String>>> {
@@ -556,6 +606,8 @@ impl AppRuntime {
 
     pub fn abort(&self) {
         self.abort_flag.store(true, Ordering::Relaxed);
+        self.status.set_abort_requested();
+        self.input_waker.notify_one();
         // Cancel background subagent jobs (signals child abort_flag + notifies).
         // Background bash is intentionally left running (dev servers, watches).
         if let Some(host) = &self.task_host {

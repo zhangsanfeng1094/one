@@ -15,9 +15,15 @@ impl AppRuntime {
             // Background bash/jobs are session-owned — do not leak across /new.
             self.shutdown_owned_tasks();
             self.extensions.notify_session_end().await;
+            if let Some(old) = &self.session {
+                if old.is_empty() {
+                    let _ = old.delete_from_disk().await;
+                }
+            }
         }
         // New conversation only — MCP connection pool is process-scoped (Grok-style).
         self.session = Some(SessionManager::create(&self.cwd).await?);
+        self.refresh_control_session();
         {
             let mut agent = self.agent.lock().await;
             agent.messages.clear();
@@ -34,7 +40,8 @@ impl AppRuntime {
         // settings.memory.* changed without feature fingerprint change.
         let settings = crate::settings::load();
         let mem_opts = super::features::effective_memory_options(&self.applied_features, &settings);
-        self.refresh_context_snapshots(&mem_opts).await;
+        self.refresh_context_snapshots(&mem_opts).await?;
+        self.recompile_prompt()?;
         {
             let prompt = self.effective_system_prompt();
             let mut agent = self.agent.lock().await;
@@ -55,6 +62,46 @@ impl AppRuntime {
         Ok(())
     }
 
+    /// Reset to an empty conversation state without creating a session file on disk.
+    /// A durable session will be created on the first user prompt turn.
+    pub async fn close_session_for_new(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        if self.session.is_some() {
+            self.shutdown_owned_tasks();
+            self.extensions.notify_session_end().await;
+            if let Some(old) = &self.session {
+                if old.is_empty() {
+                    let _ = old.delete_from_disk().await;
+                }
+            }
+        }
+        self.session = None;
+        self.refresh_control_session();
+        {
+            let mut agent = self.agent.lock().await;
+            agent.messages.clear();
+            agent.last_prompt_tokens = 0;
+            agent.token_usage = Default::default();
+            agent.set_trace_session_id(None);
+        }
+        self.apply_features_from_settings().await?;
+        let settings = crate::settings::load();
+        let mem_opts = super::features::effective_memory_options(&self.applied_features, &settings);
+        self.refresh_context_snapshots(&mem_opts).await?;
+        self.recompile_prompt()?;
+        {
+            let prompt = self.effective_system_prompt();
+            let mut agent = self.agent.lock().await;
+            agent.config.system_prompt = prompt;
+        }
+        self.sync_mcp_tools().await?;
+        self.mcp_reminder_state.reset();
+        self.prompt_index = 0;
+        self.tool_audit.clear();
+        self.tool_starts.clear();
+        self.sync_task_session().await;
+        Ok(())
+    }
+
     pub async fn open_session_path(
         &mut self,
         path: impl AsRef<std::path::Path>,
@@ -64,6 +111,11 @@ impl AppRuntime {
             // Background bash/jobs are session-owned — do not leak across /resume.
             self.shutdown_owned_tasks();
             self.extensions.notify_session_end().await;
+            if let Some(old) = &self.session {
+                if old.is_empty() {
+                    let _ = old.delete_from_disk().await;
+                }
+            }
         }
         let session = SessionManager::open(path).await?;
         {
@@ -86,6 +138,7 @@ impl AppRuntime {
         load_extension_state(self.extensions.as_ref(), &session);
         self.mcp_reminder_state.reset();
         self.session = Some(session);
+        self.refresh_control_session();
         if switching {
             self.extensions.notify_session_start().await;
         }
@@ -97,11 +150,11 @@ impl AppRuntime {
             }
             match self.restore_mode_from_session().unwrap_or(AgentMode::Act) {
                 AgentMode::Plan => {
-                    let _ = self.enter_plan_mode().await;
+                    self.enter_plan_mode().await?;
                 }
                 AgentMode::Act => {
                     if self.mode == AgentMode::Plan {
-                        let _ = self.leave_plan_mode().await;
+                        self.leave_plan_mode().await?;
                     }
                 }
             }

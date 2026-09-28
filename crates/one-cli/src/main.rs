@@ -5,6 +5,8 @@ mod approval;
 mod auth_cmd;
 mod bench_cmd;
 mod cli;
+mod config_studio;
+mod control_cmd;
 mod governance;
 mod hitl;
 mod langfuse;
@@ -12,9 +14,11 @@ mod learn_cmd;
 mod mcp_cmd;
 mod modes;
 mod preferences;
+mod prompt_config;
 mod protocol;
 mod provider;
 mod runtime;
+mod session_cmd;
 mod settings;
 
 use clap::parser::ValueSource;
@@ -111,7 +115,9 @@ async fn apply_resume_cli(
 /// | invocation | mode |
 /// |------------|------|
 /// | `one` | Interactive |
-/// | `one -p "…"` | Print (compat) |
+/// | `one "…"` | Interactive, first turn = positional prompt |
+/// | `one exec "…"` | Print/headless |
+/// | `one -p "…"` | Print (legacy compat) |
 /// | `one --mode interactive -p "…"` | Interactive, first turn = prompt |
 /// | `one --tui -p "…"` | Interactive, first turn = prompt |
 /// | `one --mode print -p "…"` | Print |
@@ -128,6 +134,51 @@ fn resolve_run_mode(cli: &Cli, matches: &clap::ArgMatches) -> RunMode {
         return RunMode::Print;
     }
     cli.mode.clone()
+}
+
+/// Normalize convenience CLI forms without changing the legacy `-p` contract.
+///
+/// - `one exec PROMPT` becomes explicit print/headless mode.
+/// - `--yolo` is the Codex-style convenience for always-approve + full-access.
+fn normalize_cli_invocation(cli: &mut Cli) -> Option<RunMode> {
+    if cli.yolo {
+        cli.always_approve = true;
+        cli.auto_approve = true;
+        cli.full_access = true;
+    }
+
+    if matches!(&cli.command, Some(Commands::Exec(_))) {
+        let Some(Commands::Exec(exec)) = cli.command.take() else {
+            unreachable!();
+        };
+        cli.print = Some(exec.prompt);
+        if let Some(max_turns) = exec.max_turns {
+            cli.max_turns = max_turns;
+        }
+        if exec.output_format.is_some() {
+            cli.output_format = exec.output_format;
+        }
+        cli.trace |= exec.trace;
+        cli.trace_full |= exec.trace_full;
+        // `one exec` persists its session by default so exec/TUI can resume it
+        // (`one resume <id>` / `one exec --resume <id> ...`). Explicit
+        // `--no-session` still wins. Legacy bare `-p` keeps its old
+        // non-persisting behavior.
+        cli.exec_session = !cli.no_session;
+        if let Some(spec) = exec.resume {
+            cli.exec_resume = Some(spec);
+        }
+        if exec.continue_session {
+            cli.exec_resume = Some(String::new());
+        }
+        cli.mode = RunMode::Print;
+        return Some(RunMode::Print);
+    }
+    None
+}
+
+fn initial_prompt(cli: &Cli) -> Option<String> {
+    cli.prompt.clone().or_else(|| cli.print.clone())
 }
 
 fn init_tracing(interactive_tui: bool) {
@@ -281,17 +332,49 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     install_panic_hook();
     let matches = Cli::command().get_matches();
     let mut cli = Cli::from_arg_matches(&matches).unwrap_or_else(|e| e.exit());
-    let run_mode = resolve_run_mode(&cli, &matches);
+    let forced_mode = normalize_cli_invocation(&mut cli);
+    let mut run_mode = forced_mode.unwrap_or_else(|| resolve_run_mode(&cli, &matches));
     cli.mode = run_mode.clone();
 
     // Interactive TUI owns the terminal — never print tracing to stderr
     // (MCP background connect would otherwise corrupt the alternate screen).
     // ACP reserves stdout for JSON-RPC; keep tracing on stderr.
-    let interactive_tui = matches!(run_mode, RunMode::Interactive)
-        && cli.command.is_none()
-        && !cli.list_models
-        && !cli.list_providers;
+    let session_tui = matches!(
+        &cli.command,
+        Some(Commands::Session(crate::cli::SessionCli {
+            action: crate::cli::SessionAction::Tui { .. }
+        }))
+    );
+    let interactive_tui = session_tui
+        || (matches!(run_mode, RunMode::Interactive)
+            && cli.command.is_none()
+            && !cli.list_models
+            && !cli.list_providers);
     init_tracing(interactive_tui);
+
+    if matches!(&cli.command, Some(Commands::Control(_))) {
+        if let Some(Commands::Control(control)) = cli.command.take() {
+            return Ok(control_cmd::run_control(control).await);
+        }
+    }
+
+    let mut _session_entry_lock = None;
+    if matches!(&cli.command, Some(Commands::Session(_))) {
+        let Some(Commands::Session(session)) = cli.command.take() else {
+            unreachable!()
+        };
+        match session_cmd::apply(&mut cli, session).await {
+            Ok(session_cmd::SessionDisposition::Complete(code)) => return Ok(code),
+            Ok(session_cmd::SessionDisposition::Enter(lock)) => {
+                _session_entry_lock = Some(lock);
+                run_mode = cli.mode;
+            }
+            Err(message) => {
+                eprintln!("one session: {message}");
+                return Ok(ExitCode::FAILURE);
+            }
+        }
+    }
 
     // `one acp` — Agent Client Protocol over stdio (IDE embedding).
     if matches!(&cli.command, Some(Commands::Acp(_))) {
@@ -304,6 +387,13 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
     if matches!(&cli.command, Some(Commands::Web(_))) {
         if let Some(Commands::Web(web)) = cli.command.take() {
             return run_web_command(cli, web).await;
+        }
+    }
+
+    // `one config` — 本地配置控制台（不依赖模型/认证可用）。
+    if matches!(&cli.command, Some(Commands::Config(_))) {
+        if let Some(Commands::Config(config)) = cli.command.take() {
+            return run_config_command(cli, config).await;
         }
     }
 
@@ -341,6 +431,62 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         if let Some(Commands::Resume(resume)) = cli.command.take() {
             apply_resume_cli(&mut cli, resume).await?;
         }
+    }
+    // `one exec --resume <spec> PROMPT` / `one exec -c PROMPT`: resolve the spec
+    // onto the standard `--session` path so the runtime opens (not creates) the
+    // same session file — history stays continuous, id/path unchanged.
+    // Empty spec (from `exec -c`) resolves to the most recent session.
+    if let Some(spec) = cli.exec_resume.take() {
+        let cwd = cli.cwd.canonicalize().unwrap_or_else(|_| cli.cwd.clone());
+        if spec.trim().is_empty() {
+            match SessionManager::continue_recent(&cwd).await {
+                Ok(session) => {
+                    eprintln!(
+                        "exec resume: {}",
+                        session
+                            .session_file()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default()
+                    );
+                    cli.session = session.session_file().map(|p| p.to_path_buf());
+                    cli.r#continue = false;
+                    cli.resume = false;
+                }
+                Err(SessionError::NoSessions) => {
+                    // No prior session: fall through and create a fresh one.
+                }
+                Err(err) => return Err(err.into()),
+            }
+        } else {
+            match SessionManager::resolve(&cwd, &spec).await {
+                Ok(info) => {
+                    eprintln!(
+                        "exec resume: {} · {}",
+                        info.display_label(),
+                        info.path.display()
+                    );
+                    cli.session = Some(info.path);
+                    cli.r#continue = false;
+                    cli.resume = false;
+                }
+                Err(SessionError::Ambiguous { spec, candidates }) => {
+                    eprintln!("error: ambiguous session `{spec}` — refine the query:");
+                    for c in candidates {
+                        eprintln!("  · {c}");
+                    }
+                    std::process::exit(2);
+                }
+                Err(SessionError::NoSessions) => {
+                    return Err(format!("no sessions for {}", cwd.display()).into());
+                }
+                Err(SessionError::NotFound(msg)) => {
+                    return Err(msg.into());
+                }
+                Err(err) => return Err(err.into()),
+            }
+        }
+        // Resuming implies persistence even if defaults changed elsewhere.
+        cli.exec_session = !cli.no_session;
     }
     // Take subcommand first so remaining `cli` can be borrowed (Agent/Run need global flags).
     if matches!(
@@ -471,12 +617,52 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
         .map(|s| s.eq_ignore_ascii_case("json"))
         .unwrap_or(false);
 
+    // `one exec` with a durable session: surface the id on stderr (stdout stays
+    // clean for piping) so users/scripts can `one resume <id>` afterwards.
+    if cli.exec_session && matches!(run_mode, RunMode::Print | RunMode::Json) && !want_json_envelope
+    {
+        if let Some(session) = &runtime.session {
+            let sid = &session.header().id;
+            let prefix: String = sid.chars().take(8).collect();
+            eprintln!("[session] {sid} · resume: one resume {prefix}");
+        }
+    }
+
+    // Native control plane: one user-only Unix socket per live One process.
+    // It controls this exact AppRuntime (no sidecar runtime).
+    // Prompt capability is decided by the real transport wiring below —
+    // never by matching on the frontend label string.
+    let control_frontend = match run_mode {
+        RunMode::Interactive => Some("interactive"),
+        RunMode::Print => Some("print"),
+        RunMode::Json => Some("json"),
+        _ => None,
+    };
+    let mut native_control = if let Some(frontend) = control_frontend {
+        // Prompt capability = the real transport wiring: only the interactive
+        // TUI consumes native prompts (prompt_rx is taken by run_interactive).
+        // Print / json are one-shot runs — no live prompt consumer.
+        let transport = match run_mode {
+            RunMode::Interactive => {
+                crate::runtime::control::ControlPromptTransport::InteractiveChannel
+            }
+            _ => crate::runtime::control::ControlPromptTransport::None,
+        };
+        match crate::runtime::control::start_control_server(&runtime, frontend, transport).await {
+            Ok(server) => Some(server),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to start native control socket; continuing without it");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let exit = match run_mode {
         RunMode::Print => {
-            let prompt = cli
-                .print
-                .clone()
-                .ok_or("--mode print requires -p / --print <prompt>")?;
+            let prompt = initial_prompt(&cli)
+                .ok_or("print/exec mode requires a prompt (`one exec <prompt>` or legacy `-p`)")?;
             if want_json_envelope {
                 run_print_envelope(&mut runtime, providers.as_llm(), &prompt).await?
             } else {
@@ -485,10 +671,7 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             }
         }
         RunMode::Json => {
-            let prompt = cli
-                .print
-                .clone()
-                .unwrap_or_else(|| "Say hello.".to_string());
+            let prompt = initial_prompt(&cli).unwrap_or_else(|| "Say hello.".to_string());
             if want_json_envelope {
                 run_print_envelope(&mut runtime, providers.as_llm(), &prompt).await?
             } else {
@@ -513,8 +696,17 @@ async fn main() -> Result<ExitCode, Box<dyn std::error::Error>> {
             unreachable!("bot mode exits earlier");
         }
         RunMode::Interactive => {
-            // `-p` / `--tui -p` seeds the first user turn inside the TUI.
-            modes::run_interactive(&mut runtime, &mut providers, cli.print.clone()).await?;
+            // Positional PROMPT is the normal first TUI turn; legacy `--tui -p` still works.
+            let control_rx = native_control
+                .as_mut()
+                .and_then(|server| server.take_prompt_rx());
+            modes::run_interactive(
+                &mut runtime,
+                &mut providers,
+                initial_prompt(&cli),
+                control_rx,
+            )
+            .await?;
             ExitCode::SUCCESS
         }
     };
@@ -537,6 +729,38 @@ async fn run_web_command(
         cli.auto_approve = true;
     }
     modes::run_web_server(cli, &web.host, web.port, web.open).await?;
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `one config` — 本地配置控制台 (Config Studio)。
+///
+/// 刻意不构建 provider、不检查认证：配置坏掉时正是最需要打开它的时候。
+async fn run_config_command(
+    cli: Cli,
+    config: crate::cli::ConfigCli,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    if config.dump {
+        let studio = config_studio::ConfigStudio::new(cli.cwd.clone());
+        let catalog = studio.catalog();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "context": catalog.context,
+                "modules": catalog.modules,
+                "documents": catalog.documents,
+                "backup_root": catalog.backup_root,
+            }))?
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    let cfg = config_studio::StudioServerConfig {
+        host: config.host,
+        port: config.port,
+        open_browser: config.open,
+        cwd: cli.cwd.clone(),
+    };
+    config_studio::run(cfg).await?;
     Ok(ExitCode::SUCCESS)
 }
 
@@ -609,5 +833,109 @@ async fn run_print_envelope(
             println!("{}", rr.to_json_line());
             Ok(ExitCode::from(1))
         }
+    }
+}
+
+#[cfg(test)]
+mod cli_semantics_tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> (Cli, clap::ArgMatches) {
+        let matches = Cli::command()
+            .try_get_matches_from(args)
+            .expect("parse CLI");
+        let cli = Cli::from_arg_matches(&matches).expect("build CLI");
+        (cli, matches)
+    }
+
+    #[test]
+    fn positional_prompt_keeps_interactive_mode() {
+        let (cli, matches) = parse(&["one", "fix the bug"]);
+        assert_eq!(cli.prompt.as_deref(), Some("fix the bug"));
+        assert!(cli.command.is_none());
+        assert!(matches!(
+            resolve_run_mode(&cli, &matches),
+            RunMode::Interactive
+        ));
+    }
+
+    #[test]
+    fn legacy_p_still_selects_print_mode() {
+        let (cli, matches) = parse(&["one", "-p", "fix the bug"]);
+        assert_eq!(cli.print.as_deref(), Some("fix the bug"));
+        assert!(matches!(resolve_run_mode(&cli, &matches), RunMode::Print));
+    }
+
+    #[test]
+    fn exec_is_explicit_headless_mode() {
+        let (mut cli, _matches) = parse(&[
+            "one",
+            "exec",
+            "fix the bug",
+            "--max-turns",
+            "7",
+            "--output-format",
+            "json",
+        ]);
+        assert!(matches!(&cli.command, Some(Commands::Exec(_))));
+        let forced = normalize_cli_invocation(&mut cli);
+        assert!(matches!(forced, Some(RunMode::Print)));
+        assert!(cli.command.is_none());
+        assert_eq!(initial_prompt(&cli).as_deref(), Some("fix the bug"));
+        assert_eq!(cli.max_turns, 7);
+        assert_eq!(cli.output_format.as_deref(), Some("json"));
+        // exec persists its session by default.
+        assert!(cli.exec_session);
+        assert!(cli.exec_resume.is_none());
+    }
+
+    #[test]
+    fn exec_no_session_stays_ephemeral() {
+        let (mut cli, _matches) = parse(&["one", "exec", "hi", "--no-session"]);
+        normalize_cli_invocation(&mut cli);
+        assert!(cli.no_session);
+        assert!(!cli.exec_session);
+    }
+
+    #[test]
+    fn exec_resume_spec_maps_to_session_resume() {
+        let (mut cli, _matches) = parse(&["one", "exec", "--resume", "abc123", "continue"]);
+        normalize_cli_invocation(&mut cli);
+        assert_eq!(cli.exec_resume.as_deref(), Some("abc123"));
+        assert!(cli.exec_session);
+    }
+
+    #[test]
+    fn exec_continue_maps_to_most_recent() {
+        let (mut cli, _matches) = parse(&["one", "exec", "-c", "continue"]);
+        normalize_cli_invocation(&mut cli);
+        assert_eq!(cli.exec_resume.as_deref(), Some(""));
+        assert!(cli.exec_session);
+    }
+
+    #[test]
+    fn legacy_p_stays_ephemeral() {
+        let (mut cli, _matches) = parse(&["one", "-p", "fix the bug"]);
+        let forced = normalize_cli_invocation(&mut cli);
+        assert!(matches!(forced, None));
+        assert!(!cli.exec_session);
+    }
+
+    #[test]
+    fn yolo_means_always_approve_plus_full_access() {
+        let (mut cli, _matches) = parse(&["one", "--yolo"]);
+        normalize_cli_invocation(&mut cli);
+        assert!(cli.yolo);
+        assert!(cli.always_approve);
+        assert!(cli.auto_approve);
+        assert!(cli.full_access);
+    }
+
+    #[test]
+    fn always_approve_does_not_imply_full_access() {
+        let (mut cli, _matches) = parse(&["one", "--always-approve"]);
+        normalize_cli_invocation(&mut cli);
+        assert!(cli.always_approve);
+        assert!(!cli.full_access);
     }
 }

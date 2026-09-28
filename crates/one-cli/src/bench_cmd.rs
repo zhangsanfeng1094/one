@@ -326,6 +326,8 @@ async fn run_one_task(
             server_search: false,
             empty_response_retries: crate::settings::load().empty_response_retries(),
             compaction_config: None,
+            max_parallel_readonly_tools: one_core::max_parallel_readonly_tools_from_env(),
+            batch_exploration: crate::settings::load().batch_exploration,
         },
         tools,
     );

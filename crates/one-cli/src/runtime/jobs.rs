@@ -25,6 +25,10 @@ use serde_json::{json, Value};
 use tokio::sync::{mpsc, Notify, OwnedSemaphorePermit, Semaphore};
 use tokio::time::timeout;
 
+use super::agent_backend::{
+    backend_for, resolve_backend, AgentBackend, AgentEventSink, AgentHealth, BackendControl,
+    BackendKind, BackendSpawn, HealthEvaluation, HealthEvaluator, HealthInputs, TaskLifecycle,
+};
 use super::harness::{self, HarnessOptions, RunControl};
 use crate::protocol::{error_code, ProtocolError, RunRequest, RunResult, TaskExitStatus};
 
@@ -35,6 +39,40 @@ const DEFAULT_JOB_MAX_WALL_MS: u64 = 300_000;
 
 /// Cap live event lines retained per job (ring buffer).
 const EVENT_LOG_CAP: usize = 200;
+
+/// Character threshold above which a subagent result is spilled to disk and previewed.
+pub const JOB_RESULT_SPILL_THRESHOLD_CHARS: usize = 4_000;
+
+/// Max preview characters included in a `[job completed]` notification.
+pub const JOB_NOTIFICATION_PREVIEW_CHARS: usize = 4_000;
+
+/// Max preview characters included in `job_output(job_*)`.
+pub const JOB_OUTPUT_PREVIEW_CHARS: usize = 8_000;
+
+/// Default hard cap on the durable `.result.txt` file size (16 MiB).
+pub const DEFAULT_JOB_RESULT_FILE_MAX_BYTES: usize = 16 * 1024 * 1024;
+
+/// Effective hard cap on `.result.txt` bytes (`ONE_JOB_RESULT_MAX_BYTES`).
+pub fn job_result_file_max_bytes() -> usize {
+    std::env::var("ONE_JOB_RESULT_MAX_BYTES")
+        .ok()
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(DEFAULT_JOB_RESULT_FILE_MAX_BYTES)
+}
+
+/// Sanitize a `job_id` so it is safe to use as a file stem.
+pub fn safe_job_file_stem(job_id: &str) -> String {
+    let safe: String = job_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
+        .collect();
+    if safe.is_empty() {
+        "job_unknown".into()
+    } else {
+        safe
+    }
+}
 
 /// Directory for durable job JSONL logs.
 ///
@@ -47,6 +85,19 @@ pub fn job_log_dir() -> PathBuf {
         }
     }
     one_session::agent_dir().join("jobs")
+}
+
+/// Directory for durable subagent result artifacts.
+///
+/// Override with `ONE_JOB_RESULT_DIR`, falling back to `job_log_dir()`.
+pub fn job_result_dir() -> PathBuf {
+    if let Ok(p) = std::env::var("ONE_JOB_RESULT_DIR") {
+        let t = p.trim();
+        if !t.is_empty() {
+            return PathBuf::from(t);
+        }
+    }
+    job_log_dir()
 }
 
 /// Whether durable job logs are enabled (default: on).
@@ -62,16 +113,90 @@ pub fn job_log_enabled() -> bool {
 
 /// Path for a job's durable JSONL log (`…/jobs/<safe_id>.jsonl`).
 pub fn job_log_path(job_id: &str) -> PathBuf {
-    let safe: String = job_id
-        .chars()
-        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '-')
-        .collect();
-    let name = if safe.is_empty() {
-        "job_unknown".into()
-    } else {
-        safe
-    };
+    let name = safe_job_file_stem(job_id);
     job_log_dir().join(format!("{name}.jsonl"))
+}
+
+/// Path for a job's durable final result artifact (`…/jobs/<safe_id>.result.txt`).
+pub fn job_result_path(job_id: &str) -> PathBuf {
+    let name = safe_job_file_stem(job_id);
+    job_result_dir().join(format!("{name}.result.txt"))
+}
+
+fn slice_utf8_prefix_bytes<'a>(s: &'a str, max_bytes: usize) -> (&'a str, bool) {
+    if s.len() <= max_bytes {
+        return (s, false);
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    (&s[..end], true)
+}
+
+/// Persist full subagent result text when it exceeds [`JOB_RESULT_SPILL_THRESHOLD_CHARS`].
+/// Never panics or fails `finalize`; returns `(result_ref, file_capped, spill_error)`.
+fn persist_job_result_artifact(
+    job_id: &str,
+    result_text: &str,
+) -> (Option<PathBuf>, bool, Option<String>) {
+    if result_text.chars().count() <= JOB_RESULT_SPILL_THRESHOLD_CHARS {
+        return (None, false, None);
+    }
+    let path = job_result_path(job_id);
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            let msg = format!("failed to create result dir {}: {e}", parent.display());
+            tracing::warn!(job_id = %job_id, error = %msg, "subagent result spill failed");
+            return (None, false, Some(msg));
+        }
+    }
+    let max_bytes = job_result_file_max_bytes();
+    let (to_write, capped) = if result_text.len() > max_bytes {
+        let note = format!(
+            "\n…[result file capped at {max_bytes} bytes ({} bytes total)]",
+            result_text.len()
+        );
+        if max_bytes > note.len() {
+            let prefix_budget = max_bytes - note.len();
+            let (prefix, _) = slice_utf8_prefix_bytes(result_text, prefix_budget);
+            let mut s = prefix.to_string();
+            s.push_str(&note);
+            (s, true)
+        } else {
+            let (prefix, _) = slice_utf8_prefix_bytes(result_text, max_bytes);
+            (prefix.to_string(), true)
+        }
+    } else {
+        (result_text.to_string(), false)
+    };
+
+    match File::create(&path) {
+        Ok(mut f) => {
+            if let Err(e) = f.write_all(to_write.as_bytes()) {
+                let msg = format!("failed to write result file {}: {e}", path.display());
+                tracing::warn!(job_id = %job_id, error = %msg, "subagent result spill failed");
+                return (None, capped, Some(msg));
+            }
+            let _ = f.flush();
+            (Some(path), capped, None)
+        }
+        Err(e) => {
+            let msg = format!("failed to create result file {}: {e}", path.display());
+            tracing::warn!(job_id = %job_id, error = %msg, "subagent result spill failed");
+            (None, false, Some(msg))
+        }
+    }
+}
+
+/// Build a bounded preview of `text` up to `max_chars` characters.
+pub fn preview_job_result(text: &str, max_chars: usize) -> (String, bool) {
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
+        return (text.to_string(), false);
+    }
+    let head: String = text.chars().take(max_chars).collect();
+    (head, true)
 }
 
 fn now_rfc3339() -> String {
@@ -325,7 +450,20 @@ impl JobEventLog {
             AgentEvent::TurnEnd { turn, .. } => {
                 self.push_line(format!("◂ turn {} end", turn + 1));
             }
+            AgentEvent::SteerApplied { text } => {
+                let brief: String = text.chars().take(48).collect();
+                self.push_line(format!("↳ steer applied: {brief}"));
+            }
             AgentEvent::UsageUpdate { .. } => {}
+            AgentEvent::WaitParkStart { mode, ids } => {
+                let line = format!("⏸ waiting · {} task(s) ({})", ids.len(), mode.as_str());
+                self.set_activity(line.clone());
+                self.push_line(format!("▸ {line}"));
+            }
+            AgentEvent::WaitParkEnd => {
+                self.set_activity("resuming");
+                self.push_line("▸ wait ended");
+            }
             AgentEvent::CompactionStart => {
                 self.set_activity("compacting");
                 self.push_line("▸ compacting context");
@@ -402,6 +540,9 @@ pub struct SpawnOptions {
     /// If `slot` is `None`, acquire this semaphore inside the spawned task
     /// (admission timeout → auto-background while still queued).
     pub acquire_slot: Option<Arc<Semaphore>>,
+    /// Explicit backend override (`codex` / `grok` / `one`). Default: agent
+    /// name or OneInternal.
+    pub backend: Option<String>,
 }
 
 impl Default for SpawnOptions {
@@ -413,7 +554,15 @@ impl Default for SpawnOptions {
             trace: None,
             trace_meta: None,
             acquire_slot: None,
+            backend: None,
         }
+    }
+}
+
+impl SpawnOptions {
+    /// Resolve the backend for this spawn (explicit override wins).
+    pub fn resolve_backend_kind(&self, agent_name: &str) -> Result<BackendKind, String> {
+        resolve_backend(self.backend.as_deref(), agent_name)
     }
 }
 
@@ -546,8 +695,18 @@ pub struct JobSnapshot {
     pub agent: String,
     pub description: Option<String>,
     pub state: JobState,
+    /// Backend executing this job (`one-internal` / `codex-cli` / `grok-cli`).
+    pub backend: &'static str,
+    /// Anti-fake-death health (`healthy` / `suspicious` / `stalled`).
+    pub health: &'static str,
     pub status: Option<TaskExitStatus>,
     pub summary: String,
+    pub preview: String,
+    pub result_bytes: usize,
+    pub result_chars: usize,
+    pub result_truncated: bool,
+    pub result_ref: Option<PathBuf>,
+    pub spill_error: Option<String>,
     pub ok: bool,
     pub duration_ms: u64,
     pub turns: Option<u64>,
@@ -565,12 +724,214 @@ pub struct JobSnapshot {
     pub log_path: Option<PathBuf>,
 }
 
+/// Live per-job normalized-event tracker: updates the AgentTask counters and
+/// mirrors compact activity lines into the job's event log. Implements
+/// [`AgentEventSink`] so any backend (internal or CLI) feeds it uniformly.
+///
+/// Thought/reasoning policy: reasoning-shaped events only refresh
+/// `last_event_at` / activity — the body never reaches this tracker because
+/// normalizers never emit it.
+pub struct JobTracker {
+    task: std::sync::Mutex<super::agent_backend::AgentTask>,
+    log: Arc<JobEventLog>,
+}
+
+impl JobTracker {
+    fn new(id: &str, backend: BackendKind, agent: &str, log: Arc<JobEventLog>) -> Arc<Self> {
+        Arc::new(Self {
+            task: std::sync::Mutex::new(super::agent_backend::AgentTask {
+                id: id.to_string(),
+                backend,
+                agent: agent.to_string(),
+                lifecycle: super::agent_backend::TaskLifecycle::Starting,
+                health: AgentHealth::default(),
+                session_id: None,
+                process_id: None,
+                started_at: std::time::Instant::now(),
+                last_event_at: None,
+                last_progress_at: None,
+                turn_count: 0,
+                tool_call_count: 0,
+                current_activity: String::new(),
+                current_tool: None,
+                result_ref: None,
+            }),
+            log,
+        })
+    }
+
+    pub fn snapshot_task(&self) -> super::agent_backend::AgentTask {
+        self.task.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// External process id (CLI backends).
+    fn set_process(&self, pid: Option<u32>) {
+        let mut t = self.task.lock().unwrap_or_else(|e| e.into_inner());
+        t.process_id = pid;
+    }
+
+    /// Registry-side lifecycle fix-ups (kill/finalize).
+    pub(crate) fn set_lifecycle(&self, l: super::agent_backend::TaskLifecycle) {
+        let mut t = self.task.lock().unwrap_or_else(|e| e.into_inner());
+        t.lifecycle = l;
+    }
+
+    /// Compute health from the current tracker state (deterministic inputs).
+    pub fn evaluate_health(&self, process_alive: Option<bool>) -> HealthEvaluation {
+        let evaluator = HealthEvaluator::new(Default::default());
+        self.evaluate_health_with(&evaluator, process_alive)
+    }
+
+    /// Like [`Self::evaluate_health`] but with the job's configured evaluator
+    /// (env-tuned thresholds via [`HealthThresholds::from_env`]).
+    pub fn evaluate_health_with(
+        &self,
+        evaluator: &HealthEvaluator,
+        process_alive: Option<bool>,
+    ) -> HealthEvaluation {
+        let t = self.task.lock().unwrap_or_else(|e| e.into_inner());
+        let now = std::time::Instant::now();
+        evaluator.evaluate(&HealthInputs {
+            process_alive,
+            elapsed: now.duration_since(t.started_at),
+            since_event: t.last_event_at.map(|at| now.duration_since(at)),
+            since_progress: t.last_progress_at.map(|at| now.duration_since(at)),
+            tool_in_flight: t.current_tool.is_some(),
+            terminal: t.lifecycle.is_terminal(),
+        })
+    }
+}
+
+impl AgentEventSink for JobTracker {
+    fn on_event(&self, event: super::agent_backend::AgentTaskEvent) {
+        let now = std::time::Instant::now();
+        let mut t = self.task.lock().unwrap_or_else(|e| e.into_inner());
+        t.last_event_at = Some(now);
+        match &event {
+            super::agent_backend::AgentTaskEvent::Started {
+                session_id,
+                process_id,
+            } => {
+                t.lifecycle = TaskLifecycle::Running;
+                t.current_activity = "running".into();
+                if let Some(sid) = session_id.clone() {
+                    t.session_id = Some(sid);
+                }
+                if let Some(pid) = *process_id {
+                    t.process_id = Some(pid);
+                }
+                self.log.set_activity("running");
+                self.log.push_line("▸ backend started");
+            }
+            super::agent_backend::AgentTaskEvent::TurnStarted { turn } => {
+                t.lifecycle = TaskLifecycle::Running;
+                t.turn_count = (*turn).max(t.turn_count + 1);
+                t.last_progress_at = Some(now);
+                t.current_activity = format!("turn {turn}");
+                t.current_tool = None;
+                self.log.set_activity(format!("turn {turn}"));
+                self.log.push_line(format!("▸ turn {turn}"));
+            }
+            super::agent_backend::AgentTaskEvent::ToolStarted {
+                tool_call_id: _,
+                tool,
+                title,
+            } => {
+                t.tool_call_count += 1;
+                t.last_progress_at = Some(now);
+                t.current_tool = Some(tool.clone());
+                let line = match title {
+                    Some(ti) if !ti.is_empty() => format!("→ {tool} · {ti}"),
+                    _ => format!("→ {tool}"),
+                };
+                t.current_activity = line.clone();
+                self.log.set_activity(line.clone());
+                self.log.push_line(line);
+            }
+            super::agent_backend::AgentTaskEvent::ToolProgress { tool_call_id, note } => {
+                // Progress signal — refreshes the anti-stall clock.
+                t.last_progress_at = Some(now);
+                if let Some(id) = tool_call_id {
+                    if t.current_tool.is_none() {
+                        t.current_tool = Some(id.clone());
+                    }
+                }
+                if !note.is_empty() {
+                    let line = format!("… {note}");
+                    t.current_activity.clone_from(&line);
+                    self.log.set_activity(line);
+                }
+            }
+            super::agent_backend::AgentTaskEvent::OutputActivity { .. } => {
+                // Liveness evidence only: last_event_at already refreshed.
+            }
+            super::agent_backend::AgentTaskEvent::ToolCompleted {
+                tool,
+                is_error,
+                note,
+                ..
+            } => {
+                t.last_progress_at = Some(now);
+                t.current_tool = None;
+                let mark = if *is_error { "✗" } else { "✓" };
+                let line = if note.is_empty() {
+                    format!("{mark} {tool}")
+                } else {
+                    format!("{mark} {tool} · {note}")
+                };
+                t.current_activity = format!("{tool} done");
+                self.log.push_line(line);
+            }
+            super::agent_backend::AgentTaskEvent::TextActivity { .. } => {
+                t.current_activity = "writing".into();
+            }
+            super::agent_backend::AgentTaskEvent::TurnCompleted { turn } => {
+                t.turn_count = (*turn).max(t.turn_count);
+                t.last_progress_at = Some(now);
+                t.current_tool = None;
+                self.log.push_line(format!("◂ turn {turn} end"));
+            }
+            super::agent_backend::AgentTaskEvent::Completed { .. } => {
+                t.lifecycle = TaskLifecycle::Completed;
+                t.current_tool = None;
+            }
+            super::agent_backend::AgentTaskEvent::Failed { .. } => {
+                t.lifecycle = TaskLifecycle::Failed;
+                t.current_tool = None;
+            }
+        }
+    }
+}
+
+impl JobInner {
+    /// Snapshot-time health (deterministic inputs from the tracker).
+    fn health_now(&self) -> AgentHealth {
+        // Internal jobs have no external process; CLI process liveness is not
+        // polled per-snapshot (evaluator never treats None as dead).
+        self.tracker
+            .evaluate_health_with(&self.health_evaluator, None)
+            .health
+    }
+}
+
 struct JobInner {
     id: String,
     agent: String,
     description: Option<String>,
     state: JobState,
+    /// Which backend executes (or executed) this job.
+    backend: BackendKind,
+    /// Live task tracker (normalized events → lifecycle/health counters).
+    tracker: Arc<JobTracker>,
+    /// Deterministic health evaluator (env-tunable thresholds).
+    health_evaluator: HealthEvaluator,
     result: Option<RunResult>,
+    result_bytes: usize,
+    result_chars: usize,
+    result_truncated: bool,
+    result_ref: Option<PathBuf>,
+    preview: String,
+    spill_error: Option<String>,
     started: Instant,
     finished: Option<Instant>,
     notified: bool,
@@ -583,12 +944,24 @@ struct JobInner {
     resume: ResumeSource,
 }
 
+/// Terminal subagent stop event drained by the runtime to fire
+/// `SubagentStop` (extensions + hooks.json). Sent once per job.
+#[derive(Debug, Clone)]
+pub struct SubagentStopEvent {
+    pub id: String,
+    pub agent: String,
+    pub ok: bool,
+    pub summary: String,
+}
+
 /// Registry for background `task` jobs (one-cli only).
 pub struct AgentJobRegistry {
     jobs: Mutex<HashMap<String, JobInner>>,
     notifications: Arc<Mutex<Vec<String>>>,
     /// Coordinator finish hook (job id). Fired after `finalize` / `kill`.
     finish_sink: Mutex<Option<mpsc::UnboundedSender<String>>>,
+    /// SubagentStop hook drain (terminal snapshot per job).
+    stop_sink: Mutex<Option<mpsc::UnboundedSender<SubagentStopEvent>>>,
 }
 
 impl AgentJobRegistry {
@@ -597,7 +970,27 @@ impl AgentJobRegistry {
             jobs: Mutex::new(HashMap::new()),
             notifications,
             finish_sink: Mutex::new(None),
+            stop_sink: Mutex::new(None),
         })
+    }
+
+    /// Wire the SubagentStop drain (terminal job snapshots).
+    pub fn set_stop_sink(&self, tx: mpsc::UnboundedSender<SubagentStopEvent>) {
+        *self.stop_sink.lock().expect("stop_sink") = Some(tx);
+    }
+
+    /// Queue a SubagentStop event if a sink is wired.
+    fn notify_subagent_stop(&self, snap: &JobSnapshot) {
+        if let Ok(g) = self.stop_sink.lock() {
+            if let Some(tx) = g.as_ref() {
+                let _ = tx.send(SubagentStopEvent {
+                    id: snap.id.clone(),
+                    agent: snap.agent.clone(),
+                    ok: snap.ok,
+                    summary: snap.summary.clone(),
+                });
+            }
+        }
     }
 
     /// Wire the independent coordinator so it can dequeue when a child ends.
@@ -696,6 +1089,69 @@ impl AgentJobRegistry {
         ));
 
         {
+            let backend = match spawn_opts.resolve_backend_kind(agent_name) {
+                Ok(b) => b,
+                Err(e) => {
+                    // Reserved/unknown backend: register the row, then finalize
+                    // it as an immediate failure (keeps wait/notify semantics).
+                    tracing::warn!(agent = agent_name, error = %e, "job backend rejected");
+                    let tracker = JobTracker::new(
+                        &id,
+                        BackendKind::OneInternal,
+                        agent_name,
+                        event_log.clone(),
+                    );
+                    {
+                        let mut jobs = self.jobs.lock().expect("jobs lock");
+                        jobs.insert(
+                            id.clone(),
+                            JobInner {
+                                id: id.clone(),
+                                agent: agent_name.to_string(),
+                                description: description.map(|s| s.to_string()),
+                                state: JobState::Running,
+                                backend: BackendKind::OneInternal,
+                                tracker,
+                                health_evaluator: HealthEvaluator::new(Default::default()),
+                                result: None,
+                                result_bytes: 0,
+                                result_chars: 0,
+                                result_truncated: false,
+                                result_ref: None,
+                                preview: String::new(),
+                                spill_error: None,
+                                started: Instant::now(),
+                                finished: None,
+                                notified: false,
+                                abort: abort.clone(),
+                                turn_progress: turn_progress.clone(),
+                                max_turns,
+                                done: done.clone(),
+                                event_log: event_log.clone(),
+                                notify_completion: spawn_opts.notify_completion,
+                                resume: ResumeSource {
+                                    job_id: id.clone(),
+                                    agent: agent_name.to_string(),
+                                    ..ResumeSource::default()
+                                },
+                            },
+                        );
+                    }
+                    let rr =
+                        RunResult::failure(ProtocolError::new(error_code::INVALID_REQUEST, e), 0)
+                            .with_status(TaskExitStatus::RuntimeError);
+                    self.finalize(&id, rr);
+                    let control = RunControl {
+                        abort: Some(abort.clone()),
+                        turn_progress: Some(turn_progress),
+                        event_log: Some(event_log),
+                        trace: None,
+                        trace_meta: None,
+                    };
+                    return (id, control, abort);
+                }
+            };
+            let tracker = JobTracker::new(&id, backend, agent_name, event_log.clone());
             let mut jobs = self.jobs.lock().expect("jobs lock");
             jobs.insert(
                 id.clone(),
@@ -708,7 +1164,18 @@ impl AgentJobRegistry {
                     } else {
                         JobState::Running
                     },
+                    backend,
+                    tracker,
+                    health_evaluator: HealthEvaluator::new(
+                        super::agent_backend::HealthThresholds::from_env(),
+                    ),
                     result: None,
+                    result_bytes: 0,
+                    result_chars: 0,
+                    result_truncated: false,
+                    result_ref: None,
+                    preview: String::new(),
+                    spill_error: None,
                     started: Instant::now(),
                     finished: None,
                     notified: false,
@@ -916,16 +1383,24 @@ impl AgentJobRegistry {
         abort: Arc<AtomicBool>,
         spawn_opts: SpawnOptions,
     ) {
-        {
+        // Snapshot backend + agent + tracker before detaching.
+        let (backend, agent_name, tracker, event_log) = {
             let mut jobs = self.jobs.lock().expect("jobs lock");
-            if let Some(job) = jobs.get_mut(&id) {
-                if job.state == JobState::Queued {
-                    job.state = JobState::Running;
-                    job.event_log.set_activity("starting");
-                    job.event_log.push_line("▸ starting");
-                }
+            let Some(job) = jobs.get_mut(&id) else {
+                return;
+            };
+            if job.state == JobState::Queued {
+                job.state = JobState::Running;
+                job.event_log.set_activity("starting");
+                job.event_log.push_line("▸ starting");
             }
-        }
+            (
+                job.backend,
+                job.agent.clone(),
+                job.tracker.clone(),
+                job.event_log.clone(),
+            )
+        };
         let apply_wall = spawn_opts.apply_wall_timeout;
         let late_slot = spawn_opts.acquire_slot.clone();
         self.arm_wall_watchdog(&id, apply_wall);
@@ -936,8 +1411,50 @@ impl AgentJobRegistry {
             } else {
                 None
             };
-            let result =
-                Self::run_harness_with_wall(req, provider, opts, control, abort, apply_wall).await;
+            let result = match backend {
+                BackendKind::OneInternal => {
+                    // Legacy path, unchanged: harness + soft wall timeout.
+                    Self::run_harness_with_wall(req, provider, opts, control, abort, apply_wall)
+                        .await
+                }
+                BackendKind::CodexCli | BackendKind::GrokCli => {
+                    // External CLI backend: normalized events feed the tracker;
+                    // wall timeout handled by the runner; abort kills the tree.
+                    let backend_impl: Arc<dyn AgentBackend> = backend_for(backend);
+                    let child_spec = req.agent.clone();
+                    let spawn = BackendSpawn {
+                        req,
+                        opts,
+                        agent_name,
+                        description: None,
+                        child_spec,
+                        provider: Some(provider),
+                    };
+                    let control = BackendControl {
+                        abort,
+                        event_log: event_log.clone(),
+                        wall_timeout: if apply_wall {
+                            job_max_wall_ms().map(Duration::from_millis)
+                        } else {
+                            None
+                        },
+                    };
+                    let sink: Arc<dyn AgentEventSink> = tracker;
+                    backend_impl.run(spawn, control, sink).await
+                }
+                // Reserved stubs never reach launch (rejected at register).
+                BackendKind::ClaudeCli | BackendKind::PiCli => RunResult::failure(
+                    ProtocolError::new(
+                        error_code::INVALID_REQUEST,
+                        format!(
+                            "backend `{}` is reserved but NOT implemented",
+                            backend.as_str()
+                        ),
+                    ),
+                    0,
+                )
+                .with_status(TaskExitStatus::RuntimeError),
+            };
             registry.finalize(&id, result);
         });
     }
@@ -1064,6 +1581,11 @@ impl AgentJobRegistry {
         job.state = state;
         job.finished = Some(Instant::now());
         job.event_log.set_activity(activity);
+        {
+            // Lifecycle fix-up: cancellation, not backend failure.
+            job.tracker
+                .set_lifecycle(super::agent_backend::TaskLifecycle::Cancelled);
+        }
         job.event_log
             .push_line(format!("▸ {activity} · {}", reason.as_str()));
         job.event_log.write_end(
@@ -1082,6 +1604,12 @@ impl AgentJobRegistry {
             rr.stop_reason = Some(reason.as_str().into());
         }
         rr.ok = false;
+        job.result_bytes = 0;
+        job.result_chars = 0;
+        job.result_truncated = false;
+        job.result_ref = None;
+        job.preview = String::new();
+        job.spill_error = None;
         job.result = Some(rr);
         let should_notify = job.notify_completion && !job.notified;
         if should_notify {
@@ -1092,12 +1620,15 @@ impl AgentJobRegistry {
             drop(jobs);
             self.push_notification(text);
             self.notify_finish(id);
+            self.notify_subagent_stop(&snap);
             return Ok(snap);
         }
         job.notified = true;
         job.done.notify_waiters();
+        let snap = snapshot_of(job);
         drop(jobs);
         self.notify_finish(id);
+        self.notify_subagent_stop(&snap);
         Ok(self.get(id).expect("just killed"))
     }
 
@@ -1128,7 +1659,7 @@ impl AgentJobRegistry {
             .push(text);
     }
 
-    fn finalize(&self, id: &str, result: RunResult) {
+    pub(crate) fn finalize(&self, id: &str, result: RunResult) {
         let mut jobs = self.jobs.lock().expect("jobs lock");
         let Some(job) = jobs.get_mut(id) else {
             return;
@@ -1162,6 +1693,42 @@ impl AgentJobRegistry {
             .unwrap_or_else(|| job.turn_progress.load(Ordering::Relaxed));
         let stop_reason = result.stop_reason.clone();
         let err_s = result.error.as_ref().map(|e| e.to_string());
+
+        // Process subagent final result: spill when exceeding threshold, build bounded preview.
+        let raw_result = &result.result;
+        let result_bytes = raw_result.len();
+        let result_chars = raw_result.chars().count();
+        let (result_ref, file_capped, spill_error) =
+            if result_chars > JOB_RESULT_SPILL_THRESHOLD_CHARS {
+                persist_job_result_artifact(id, raw_result)
+            } else {
+                (None, false, None)
+            };
+        let (preview, preview_truncated) = preview_job_result(raw_result, JOB_OUTPUT_PREVIEW_CHARS);
+        let result_truncated = preview_truncated || file_capped;
+
+        job.result_bytes = result_bytes;
+        job.result_chars = result_chars;
+        job.result_truncated = result_truncated;
+        job.result_ref = result_ref;
+        // Mirror terminal state + spill ref into the unified task tracker.
+        {
+            let l = match job.state {
+                JobState::Completed => TaskLifecycle::Completed,
+                _ => TaskLifecycle::Failed,
+            };
+            job.tracker.set_lifecycle(l);
+            if let Ok(mut t) = job.tracker.task.lock() {
+                t.result_ref = job.result_ref.clone();
+            }
+        }
+        job.preview = preview.clone();
+        job.spill_error = spill_error;
+
+        if job.resume.summary.is_empty() {
+            job.resume.summary = preview;
+        }
+
         job.result = Some(result);
         let st = job.state.as_str();
         job.event_log.set_activity(st);
@@ -1174,6 +1741,10 @@ impl AgentJobRegistry {
                 "status": status.as_str(),
                 "stop_reason": stop_reason,
                 "error": err_s,
+                "result_bytes": result_bytes,
+                "result_chars": result_chars,
+                "result_truncated": result_truncated,
+                "result_ref": job.result_ref.as_ref().map(|p| p.display().to_string()),
             }),
         );
         let should_notify = job.notify_completion && !job.notified;
@@ -1185,6 +1756,7 @@ impl AgentJobRegistry {
             drop(jobs);
             self.push_notification(text);
             self.notify_finish(id);
+            self.notify_subagent_stop(&snap);
             return;
         }
         // Sync jobs: mark notified so kill/finalize do not double-fire later.
@@ -1192,8 +1764,10 @@ impl AgentJobRegistry {
             job.notified = true;
         }
         job.done.notify_waiters();
+        let snap = snapshot_of(job);
         drop(jobs);
         self.notify_finish(id);
+        self.notify_subagent_stop(&snap);
     }
 
     pub async fn wait(&self, id: &str, wait_ms: Option<u64>) -> Result<JobSnapshot, String> {
@@ -1279,6 +1853,18 @@ impl AgentJobRegistry {
             .filter(|(_, j)| !j.state.is_terminal())
             .map(|(id, _)| id.clone())
             .collect()
+    }
+
+    /// Check whether a job is terminal (or unknown/removed).
+    pub fn is_terminal(&self, id: &str) -> bool {
+        let jobs = self.jobs.lock().expect("jobs lock");
+        jobs.get(id).map_or(true, |j| j.state.is_terminal())
+    }
+
+    /// Completion notifier for a job if present.
+    pub fn done_notifier(&self, id: &str) -> Option<Arc<Notify>> {
+        let jobs = self.jobs.lock().expect("jobs lock");
+        jobs.get(id).map(|j| j.done.clone())
     }
 
     /// Drop queued `[job completed]` notices that mention these job ids (avoid double delivery after join).
@@ -1534,9 +2120,18 @@ fn format_join_report(
                 }
             }
             if !e.summary.is_empty() {
-                out.push_str(&e.summary);
-                if !e.summary.ends_with('\n') {
+                let (prev, _) = preview_job_result(&e.summary, JOB_OUTPUT_PREVIEW_CHARS);
+                out.push_str(&prev);
+                if !prev.ends_with('\n') {
                     out.push('\n');
+                }
+                if e.result_truncated {
+                    if let Some(ref path) = e.result_ref {
+                        out.push_str(&format!(
+                            "[result truncated · full output: {}]\n",
+                            path.display()
+                        ));
+                    }
                 }
             } else {
                 out.push_str("(no summary)\n");
@@ -1581,10 +2176,9 @@ fn snapshot_of(job: &JobInner) -> JobSnapshot {
         .duration_since(job.started)
         .as_millis() as u64;
     let live_turns = job.turn_progress.load(Ordering::Relaxed);
-    let (status, summary, ok, turns, error) = if let Some(r) = &job.result {
+    let (status, ok, turns, error) = if let Some(r) = &job.result {
         (
             r.status,
-            r.result.clone(),
             r.ok && r.status.map(|s| s.is_ok()).unwrap_or(r.ok),
             r.turns.or(if live_turns > 0 {
                 Some(live_turns)
@@ -1596,7 +2190,6 @@ fn snapshot_of(job: &JobInner) -> JobSnapshot {
     } else {
         (
             None,
-            String::new(),
             false,
             if live_turns > 0 {
                 Some(live_turns)
@@ -1613,14 +2206,23 @@ fn snapshot_of(job: &JobInner) -> JobSnapshot {
     };
     let event_lines = job.event_log.lines();
     let log_path = job.event_log.log_path();
+
     JobSnapshot {
         id: job.id.clone(),
         kind: "task",
         agent: job.agent.clone(),
         description: job.description.clone(),
         state: job.state,
+        backend: job.backend.as_str(),
+        health: job.health_now().as_str(),
         status,
-        summary,
+        summary: job.preview.clone(),
+        preview: job.preview.clone(),
+        result_bytes: job.result_bytes,
+        result_chars: job.result_chars,
+        result_truncated: job.result_truncated,
+        result_ref: job.result_ref.clone(),
+        spill_error: job.spill_error.clone(),
         ok,
         duration_ms,
         turns,
@@ -1660,16 +2262,56 @@ pub fn format_job_completed_notification(snap: &JobSnapshot) -> String {
     if let Some(err) = &snap.error {
         out.push_str(&format!("error: {err}\n"));
     }
+    if let Some(ref path) = snap.result_ref {
+        out.push_str(&format!("result_ref: {}\n", path.display()));
+    }
+    out.push_str(&format!("result_bytes: {}\n", snap.result_bytes));
+    out.push_str(&format!("result_chars: {}\n", snap.result_chars));
+    if snap.result_truncated {
+        out.push_str("result_truncated: true\n");
+    }
+    if let Some(ref err) = snap.spill_error {
+        out.push_str(&format!("spill_error: {err}\n"));
+    }
     if let Some(p) = &snap.log_path {
         out.push_str(&format!("log_path: {}\n", p.display()));
     }
     out.push('\n');
-    if snap.summary.is_empty() {
+
+    let base_text = if !snap.preview.is_empty() {
+        &snap.preview
+    } else if !snap.summary.is_empty() {
+        &snap.summary
+    } else {
+        ""
+    };
+
+    if base_text.is_empty() {
         out.push_str("(no summary)\n");
     } else {
-        out.push_str(&snap.summary);
-        if !snap.summary.ends_with('\n') {
+        let (bounded_preview, preview_capped) =
+            preview_job_result(base_text, JOB_NOTIFICATION_PREVIEW_CHARS);
+        out.push_str(&bounded_preview);
+        if !bounded_preview.ends_with('\n') {
             out.push('\n');
+        }
+        if snap.result_truncated || preview_capped {
+            if let Some(ref path) = snap.result_ref {
+                out.push_str(&format!(
+                    "\n[Result preview capped ({}/{} chars, {} bytes). Full output saved to {}. Use read/grep to inspect on demand; do not load entire file if unnecessary.]\n",
+                    bounded_preview.chars().count(),
+                    snap.result_chars,
+                    snap.result_bytes,
+                    path.display()
+                ));
+            } else {
+                out.push_str(&format!(
+                    "\n[Result preview capped ({}/{} chars, {} bytes).]\n",
+                    bounded_preview.chars().count(),
+                    snap.result_chars,
+                    snap.result_bytes,
+                ));
+            }
         }
     }
     one_core::system_reminder(out)
@@ -1724,6 +2366,17 @@ pub fn format_job_snapshot(snap: &JobSnapshot) -> String {
     if let Some(err) = &snap.error {
         out.push_str(&format!("error: {err}\n"));
     }
+    if let Some(ref path) = snap.result_ref {
+        out.push_str(&format!("result_ref: {}\n", path.display()));
+    }
+    out.push_str(&format!("result_bytes: {}\n", snap.result_bytes));
+    out.push_str(&format!("result_chars: {}\n", snap.result_chars));
+    if snap.result_truncated {
+        out.push_str("result_truncated: true\n");
+    }
+    if let Some(ref err) = snap.spill_error {
+        out.push_str(&format!("spill_error: {err}\n"));
+    }
     if let Some(p) = &snap.log_path {
         out.push_str(&format!("log_path: {}\n", p.display()));
     }
@@ -1739,16 +2392,53 @@ pub fn format_job_snapshot(snap: &JobSnapshot) -> String {
     }
     if snap.state == JobState::Running {
         out.push_str("(still running)\n");
-    } else if snap.summary.is_empty() {
-        out.push_str("(no summary)\n");
     } else {
-        out.push_str("--- summary ---\n");
-        out.push_str(&snap.summary);
-        if !snap.summary.ends_with('\n') {
-            out.push('\n');
+        let base_text = if !snap.preview.is_empty() {
+            &snap.preview
+        } else if !snap.summary.is_empty() {
+            &snap.summary
+        } else {
+            ""
+        };
+        if base_text.is_empty() {
+            out.push_str("(no summary)\n");
+        } else {
+            let (bounded_preview, preview_capped) =
+                preview_job_result(base_text, JOB_OUTPUT_PREVIEW_CHARS);
+            out.push_str("--- summary ---\n");
+            out.push_str(&bounded_preview);
+            if !bounded_preview.ends_with('\n') {
+                out.push('\n');
+            }
+            if snap.result_truncated || preview_capped {
+                if let Some(ref path) = snap.result_ref {
+                    out.push_str(&format!(
+                        "\n[Output preview capped ({}/{} chars, {} bytes). Full result in {}. Use read/grep to inspect on demand.]\n",
+                        bounded_preview.chars().count(),
+                        snap.result_chars,
+                        snap.result_bytes,
+                        path.display()
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "\n[Output preview capped ({}/{} chars, {} bytes).]\n",
+                        bounded_preview.chars().count(),
+                        snap.result_chars,
+                        snap.result_bytes,
+                    ));
+                }
+            }
         }
     }
     out
+}
+
+/// Shared lock for tests that mutate process-global env vars
+/// (`ONE_JOB_RESULT_DIR`, `ONE_JOB_RESULT_MAX_BYTES`, …) so suites in
+/// different modules (jobs, job_tools) cannot interleave.
+#[cfg(test)]
+pub(crate) mod test_env {
+    pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }
 
 #[cfg(test)]
@@ -1763,8 +2453,16 @@ mod tests {
             agent: "explore".into(),
             description: Some("auth".into()),
             state: JobState::Completed,
+            backend: "one-internal",
+            health: "healthy",
             status: Some(TaskExitStatus::Success),
             summary: "found login".into(),
+            preview: "found login".into(),
+            result_bytes: 11,
+            result_chars: 11,
+            result_truncated: false,
+            result_ref: None,
+            spill_error: None,
             ok: true,
             duration_ms: 10,
             turns: Some(2),
@@ -1872,6 +2570,7 @@ mod tests {
                 trace: None,
                 trace_meta: None,
                 acquire_slot: None,
+                backend: None,
             },
             |_| flag.store(true, Ordering::Relaxed),
         );
@@ -2055,13 +2754,13 @@ mod tests {
         assert_eq!(parse_job_max_wall_ms("0"), None);
     }
 
-    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    use super::test_env::ENV_LOCK;
 
     /// Independent watchdog must terminalize even when the harness future is
     /// stuck in non-cooperative work (the soft `timeout()` cannot cancel that).
     #[tokio::test]
     async fn wall_watchdog_kills_stuck_job_row() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let prev = set_job_max_wall_ms_override(Some(Some(50)));
         let queue = Arc::new(Mutex::new(Vec::new()));
         let reg = AgentJobRegistry::new(queue);
@@ -2076,6 +2775,7 @@ mod tests {
                 trace: None,
                 trace_meta: None,
                 acquire_slot: None,
+                backend: None,
             },
             false,
         );
@@ -2159,5 +2859,617 @@ mod tests {
             .expect("join any");
         assert!(!report.events.is_empty());
         assert!(report.message.contains("mode=any"));
+    }
+
+    #[tokio::test]
+    async fn test_subagent_spill_200kb_result() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue.clone());
+        let (id, _ctrl, _abort) = reg.register_job(
+            "explore",
+            Some("deep scan"),
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: true,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+
+        let prefix = "START_200KB_OUTPUT_";
+        let tail = "_TAIL_200KB_MARKER";
+        let middle = "X".repeat(200_000);
+        let large_result = format!("{prefix}{middle}{tail}");
+        let expected_chars = large_result.chars().count();
+        let expected_bytes = large_result.len();
+
+        let rr = RunResult::success(large_result.clone(), 150);
+        reg.finalize(&id, rr);
+
+        let snap = reg.get(&id).expect("job snapshot exists");
+        assert_eq!(snap.state, JobState::Completed);
+        assert_eq!(snap.status, Some(TaskExitStatus::Success));
+        assert_eq!(snap.result_chars, expected_chars);
+        assert_eq!(snap.result_bytes, expected_bytes);
+        assert!(snap.result_truncated);
+        assert!(snap.spill_error.is_none());
+
+        let result_file = snap.result_ref.clone().expect("result_ref must be set");
+        assert!(result_file.exists(), "spill file must exist on disk");
+        let disk_content = std::fs::read_to_string(&result_file).expect("read spill file");
+        assert_eq!(
+            disk_content, large_result,
+            "spill file must contain full 200KB text"
+        );
+
+        // Verify completion notification size & contents
+        let notes = queue.lock().unwrap().clone();
+        assert_eq!(
+            notes.len(),
+            1,
+            "must have exactly one completion notification"
+        );
+        let notif = &notes[0];
+        assert!(
+            notif.len() < 16 * 1024,
+            "notification must be < 16KB (got {} bytes)",
+            notif.len()
+        );
+        assert!(notif.contains("[job completed]"));
+        assert!(notif.contains(&format!("id: {id}")));
+        assert!(notif.contains(&format!("result_bytes: {expected_bytes}")));
+        assert!(notif.contains(&format!("result_chars: {expected_chars}")));
+        assert!(notif.contains("result_truncated: true"));
+        assert!(notif.contains(&result_file.display().to_string()));
+        assert!(
+            notif.contains(prefix),
+            "notification preview contains prefix"
+        );
+        assert!(
+            !notif.contains(tail),
+            "notification preview must NOT contain 200KB tail"
+        );
+        assert!(
+            notif.contains("Full output saved to"),
+            "notification includes read/grep guidance"
+        );
+
+        // Verify format_job_snapshot is also bounded
+        let snap_text = format_job_snapshot(&snap);
+        assert!(snap_text.len() < 16 * 1024, "job snapshot must be bounded");
+        assert!(snap_text.contains(&result_file.display().to_string()));
+        assert!(snap_text.contains(prefix));
+        assert!(!snap_text.contains(tail));
+
+        let _ = std::fs::remove_file(&result_file);
+    }
+
+    #[tokio::test]
+    async fn test_subagent_small_result_no_spill() {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue.clone());
+        let (id, _ctrl, _abort) = reg.register_job(
+            "explore",
+            Some("quick scan"),
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: true,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+
+        let small_result = "SUBAGENT_DONE: all 5 files inspected cleanly.";
+        let rr = RunResult::success(small_result, 42);
+        reg.finalize(&id, rr);
+
+        let snap = reg.get(&id).expect("snapshot");
+        assert_eq!(snap.result_chars, small_result.chars().count());
+        assert_eq!(snap.result_bytes, small_result.len());
+        assert!(!snap.result_truncated);
+        assert!(snap.result_ref.is_none());
+
+        let notes = queue.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1);
+        let notif = &notes[0];
+        assert!(notif.contains(small_result));
+        assert!(!notif.contains("result_truncated: true"));
+        assert!(!notif.contains("Full output saved to"));
+    }
+
+    #[test]
+    fn test_subagent_result_file_hard_cap() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        std::env::set_var("ONE_JOB_RESULT_MAX_BYTES", "2048");
+        let text = "ABCDE".repeat(2000); // 10,000 bytes
+        let (result_ref, file_capped, spill_error) =
+            persist_job_result_artifact("test_hard_cap_job", &text);
+        std::env::remove_var("ONE_JOB_RESULT_MAX_BYTES");
+
+        assert!(file_capped, "must report file capped at 2048 bytes");
+        assert!(spill_error.is_none());
+        let path = result_ref.expect("file written");
+        let metadata = std::fs::metadata(&path).expect("file metadata");
+        assert_eq!(
+            metadata.len(),
+            2048,
+            "disk file must be capped exactly at 2048 bytes"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn test_subagent_spill_write_failure_resilience() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Point result dir to a non-existent path that cannot be created (a file path as parent)
+        let dummy_file = std::env::temp_dir().join(format!("dummy_file_{}", std::process::id()));
+        std::fs::write(&dummy_file, "blocking file").expect("write dummy");
+        let uncreatable_dir = dummy_file.join("sub_dir_impossible");
+        std::env::set_var("ONE_JOB_RESULT_DIR", &uncreatable_dir);
+
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue.clone());
+        let (id, _ctrl, _abort) = reg.register_job(
+            "explore",
+            None,
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: true,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+
+        let large_result = "Y".repeat(10_000);
+        let rr = RunResult::success(large_result, 50);
+        // Finalize must NOT panic or fail when spill write fails
+        reg.finalize(&id, rr);
+
+        std::env::remove_var("ONE_JOB_RESULT_DIR");
+        let _ = std::fs::remove_file(&dummy_file);
+
+        let snap = reg.get(&id).expect("snapshot exists");
+        assert!(snap.spill_error.is_some(), "spill_error should be recorded");
+        assert!(
+            snap.result_ref.is_none(),
+            "result_ref is None when disk write fails"
+        );
+        assert!(snap.result_truncated, "result_truncated is true");
+
+        let notes = queue.lock().unwrap().clone();
+        assert_eq!(notes.len(), 1);
+        let notif = &notes[0];
+        assert!(notif.contains("spill_error:"));
+        assert!(notif.contains("[Result preview capped"));
+    }
+
+    #[tokio::test]
+    async fn test_subagent_failed_status_preserves_error() {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue.clone());
+        let (id, _ctrl, _abort) = reg.register_job(
+            "explore",
+            None,
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: true,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+
+        let rr = RunResult::failure(
+            ProtocolError::new(error_code::INTERNAL, "subagent failed with panic"),
+            100,
+        );
+        reg.finalize(&id, rr);
+
+        let snap = reg.get(&id).expect("snapshot");
+        assert_eq!(snap.state, JobState::Failed);
+        assert!(snap
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("subagent failed with panic"));
+
+        let notes = queue.lock().unwrap().clone();
+        let notif = &notes[0];
+        assert!(notif.contains("subagent failed with panic"));
+        assert!(notif.contains("status: failed") || notif.contains("status: runtime_error"));
+    }
+
+    #[tokio::test]
+    async fn test_resume_source_preserves_semantics_after_spill() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue);
+        let (id, _ctrl, _abort) = reg.register_job(
+            "explore",
+            None,
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+
+        let large_result = format!("START_RESUME_{}_END_RESUME", "Z".repeat(100_000));
+        let rr = RunResult::success(large_result, 60);
+        reg.finalize(&id, rr);
+
+        let src = reg
+            .resume_source(&id)
+            .expect("resume_source must be available");
+        assert_eq!(src.job_id, id);
+        assert_eq!(src.agent, "explore");
+        // resume summary should be bounded to avoid injecting 100KB into child seed messages
+        assert!(src.summary.len() <= JOB_OUTPUT_PREVIEW_CHARS + 100);
+        assert!(src.summary.contains("START_RESUME_"));
+        assert!(!src.summary.contains("_END_RESUME"));
+
+        if let Some(snap) = reg.get(&id) {
+            if let Some(path) = snap.result_ref {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+    }
+
+    // ---- Registry-level CLI-backend integration tests ----
+    //
+    // These drive the *full* registry path: register_job (backend resolution)
+    // → launch_registered (backend dispatch) → tracker (normalized events)
+    // → finalize (result + lifecycle). The codex/grok binaries are faked via
+    // `ONE_CODEX_BIN` / `ONE_GROK_BIN` env overrides, so no real CLI or auth
+    // is needed.
+    use crate::protocol::AgentSpec;
+    use crate::runtime::agent_backend::AgentTaskEvent;
+
+    /// Write a fake `codex`/`grok` script printing the given NDJSON stream and
+    /// return its path.
+    fn write_fake_cli(dir: &std::path::Path, name: &str, stream: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\ncat <<'EOF'\n{stream}\nEOF\n"))
+            .expect("write fake cli");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake cli");
+        path
+    }
+
+    fn fake_cli_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "one-cli-backend-e2e-{}-{}",
+            tag,
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("mkdir fake cli dir");
+        dir
+    }
+
+    fn cli_spawn_opts(dir: &std::path::Path) -> HarnessOptions {
+        HarnessOptions::from_cwd(dir.to_path_buf())
+    }
+
+    async fn run_cli_backend_job(
+        reg: &Arc<AgentJobRegistry>,
+        dir: &std::path::Path,
+        agent_name: &str,
+        opts: &SpawnOptions,
+    ) -> JobSnapshot {
+        let provider: Arc<dyn LlmProvider> = Arc::new(one_ai::MockProvider::new());
+        let mut req = RunRequest::new(AgentSpec::builtin_explore(), "probe the repo");
+        req.agent.cwd = Some(dir.display().to_string());
+        let id = reg.spawn_with(
+            req,
+            provider,
+            cli_spawn_opts(dir),
+            agent_name.to_string(),
+            Some("fake cli probe".to_string()),
+            None,
+            opts.clone(),
+        );
+        let snap = reg.wait_until_done(&id).await.expect("job must terminate");
+        reg.take_result_clone(&id);
+        snap
+    }
+
+    #[tokio::test]
+    async fn registry_codex_backend_job_end_to_end() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = fake_cli_dir("codex");
+        let stream = concat!(
+            r#"{"type":"thread.started","thread_id":"th_fake_1"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.started","item":{"id":"i1","type":"reasoning","text":"SECRET REASONING"}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"CODEX_E2E_DONE"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{}}"#,
+            "\n",
+        );
+        let fake = write_fake_cli(&dir, "codex", stream);
+        std::env::set_var("ONE_CODEX_BIN", fake.display().to_string());
+
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue);
+        let snap = run_cli_backend_job(
+            &reg,
+            &dir,
+            "codex:explore",
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+        )
+        .await;
+
+        // Backend resolution: agent-name prefix selected codex-cli.
+        assert_eq!(snap.backend, "codex-cli");
+        assert_eq!(snap.state, JobState::Completed, "{snap:?}");
+        assert!(snap.ok, "{snap:?}");
+        assert_eq!(snap.summary, "CODEX_E2E_DONE");
+        // Normalized events fed the tracker: session + one turn recorded.
+        let task = {
+            let jobs = reg.jobs.lock().expect("jobs lock");
+            jobs.get(&snap.id).unwrap().tracker.snapshot_task()
+        };
+        assert_eq!(task.session_id.as_deref(), Some("th_fake_1"));
+        assert_eq!(task.turn_count, 1, "{task:?}");
+        assert_eq!(task.tool_call_count, 0);
+        assert!(matches!(task.lifecycle, TaskLifecycle::Completed));
+        // Reasoning body never reaches the tracker or the event log.
+        for line in &snap.event_lines {
+            assert!(!line.contains("SECRET"), "reasoning leaked: {line}");
+        }
+
+        std::env::remove_var("ONE_CODEX_BIN");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn registry_grok_backend_job_end_to_end() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = fake_cli_dir("grok");
+        let stream = concat!(
+            r#"{"type":"session_configured","sessionId":"s_fake_2"}"#,
+            "\n",
+            r#"{"type":"turn_started"}"#,
+            "\n",
+            r#"{"sessionUpdate":"agent_thought_chunk","content":{"type":"text","text":"HIDDEN"}}"#,
+            "\n",
+            r#"{"sessionUpdate":"tool_call","toolCallId":"tc_9","title":"grep auth","kind":"grep"}"#,
+            "\n",
+            r#"{"sessionUpdate":"tool_call_update","toolCallId":"tc_9","status":"completed"}"#,
+            "\n",
+            r#"{"type":"turn_completed"}"#,
+            "\n",
+            r#"{"type":"result","subtype":"success","result":"GROK_E2E_DONE","isError":false}"#,
+            "\n",
+        );
+        let fake = write_fake_cli(&dir, "grok", stream);
+        std::env::set_var("ONE_GROK_BIN", fake.display().to_string());
+
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue);
+        let snap = run_cli_backend_job(
+            &reg,
+            &dir,
+            "grok:explore",
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+        )
+        .await;
+
+        assert_eq!(snap.backend, "grok-cli");
+        assert_eq!(snap.state, JobState::Completed, "{snap:?}");
+        assert!(snap.ok, "{snap:?}");
+        assert_eq!(snap.summary, "GROK_E2E_DONE");
+        let task = {
+            let jobs = reg.jobs.lock().expect("jobs lock");
+            jobs.get(&snap.id).unwrap().tracker.snapshot_task()
+        };
+        assert_eq!(task.session_id.as_deref(), Some("s_fake_2"));
+        assert_eq!(task.turn_count, 1);
+        assert_eq!(task.tool_call_count, 1);
+        for line in &snap.event_lines {
+            assert!(!line.contains("HIDDEN"), "thought leaked: {line}");
+        }
+
+        std::env::remove_var("ONE_GROK_BIN");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn registry_cli_backend_failure_is_terminal_failed() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = fake_cli_dir("codex-fail");
+        // turn.failed terminal: job must land Failed, not hang.
+        let stream = concat!(
+            r#"{"type":"thread.started","thread_id":"th_fail"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"turn.failed","error":{"message":"401 Unauthorized"}}"#,
+            "\n",
+        );
+        let fake = write_fake_cli(&dir, "codex", stream);
+        std::env::set_var("ONE_CODEX_BIN", fake.display().to_string());
+
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue);
+        let snap = run_cli_backend_job(
+            &reg,
+            &dir,
+            "codex:explore",
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: Some("codex".into()),
+            },
+        )
+        .await;
+
+        assert_eq!(snap.backend, "codex-cli");
+        assert_eq!(snap.state, JobState::Failed, "{snap:?}");
+        assert!(!snap.ok);
+        assert!(
+            snap.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("401 Unauthorized"),
+            "{snap:?}"
+        );
+        let task = {
+            let jobs = reg.jobs.lock().expect("jobs lock");
+            jobs.get(&snap.id).unwrap().tracker.snapshot_task()
+        };
+        assert!(matches!(task.lifecycle, TaskLifecycle::Failed));
+
+        std::env::remove_var("ONE_CODEX_BIN");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn registry_reserved_backend_registers_then_fails() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let reg = AgentJobRegistry::new(queue);
+        let (id, _ctrl, _abort) = reg.register_job(
+            "claude:explore",
+            None,
+            &HarnessOptions::from_cwd(std::env::temp_dir()),
+            16,
+            &SpawnOptions {
+                notify_completion: false,
+                apply_wall_timeout: false,
+                trace: None,
+                trace_meta: None,
+                acquire_slot: None,
+                backend: None,
+            },
+            false,
+        );
+        // Row exists and is already terminal-failed; wait semantics intact.
+        let snap = reg
+            .wait_until_done(&id)
+            .await
+            .expect("reserved backend must finalize, not hang");
+        assert_eq!(snap.state, JobState::Failed);
+        assert!(
+            snap.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("NOT implemented"),
+            "{snap:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn tracker_distinguishes_event_vs_progress_clocks() {
+        // OutputActivity refreshes last_event_at only; ToolStarted/
+        // ToolProgress/ToolCompleted refresh last_progress_at too. Drive the
+        // tracker directly (deterministic, no process needed).
+        let log = JobEventLog::new();
+        let tracker = JobTracker::new("job_t1", BackendKind::OneInternal, "explore", log);
+        tracker.on_event(AgentTaskEvent::Started {
+            session_id: None,
+            process_id: None,
+        });
+        tracker.on_event(AgentTaskEvent::OutputActivity { bytes: 120 });
+        {
+            let t = tracker.snapshot_task();
+            assert!(t.last_event_at.is_some());
+            assert!(
+                t.last_progress_at.is_none(),
+                "OutputActivity must not touch the progress clock: {t:?}"
+            );
+        }
+        tracker.on_event(AgentTaskEvent::ToolStarted {
+            tool_call_id: "tc".into(),
+            tool: "grep".into(),
+            title: Some("auth".into()),
+        });
+        {
+            let t = tracker.snapshot_task();
+            assert!(t.last_progress_at.is_some());
+            assert_eq!(t.current_tool.as_deref(), Some("grep"));
+        }
+        tracker.on_event(AgentTaskEvent::ToolProgress {
+            tool_call_id: Some("tc".into()),
+            note: "streaming".into(),
+        });
+        tracker.on_event(AgentTaskEvent::ToolCompleted {
+            tool_call_id: "tc".into(),
+            tool: "grep".into(),
+            is_error: false,
+            note: "3 hits".into(),
+        });
+        {
+            let t = tracker.snapshot_task();
+            assert_eq!(t.tool_call_count, 1);
+            assert!(t.current_tool.is_none(), "completed clears in-flight");
+            assert!(matches!(t.lifecycle, TaskLifecycle::Running));
+        }
+    }
+
+    #[test]
+    fn snapshot_exposes_health_via_tracker() {
+        // Terminal jobs snapshot healthy; a tracker mid-run with no events at
+        // all still evaluates (warmup → healthy).
+        let log = JobEventLog::new();
+        let tracker = JobTracker::new("job_h1", BackendKind::CodexCli, "codex:explore", log);
+        let h = tracker.evaluate_health(None);
+        assert_eq!(h.health, AgentHealth::Healthy, "{h:?}");
+        assert_eq!(h.reason, "warmup", "{h:?}");
+        // Terminal overrides everything.
+        tracker.on_event(AgentTaskEvent::Completed {
+            result_text: "x".into(),
+            turns: None,
+        });
+        let h = tracker.evaluate_health(None);
+        assert_eq!(h.health, AgentHealth::Healthy);
+        assert_eq!(h.reason, "terminal");
     }
 }

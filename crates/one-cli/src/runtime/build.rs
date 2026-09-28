@@ -10,16 +10,17 @@ use one_mcp::{McpManager, McpReminderState};
 use one_resources::ResourceLoader;
 use one_session::{agent_dir, SessionManager};
 use one_tools::{
-    coding_tools_with_options, plan_mode_system_overlay, plan_mode_tools_with_policy,
-    read_only_tools_with_ask, AskUserHandler, BackgroundTaskRegistry, OsSandbox, PermissionMode,
-    PermissionRules, PlanExitState, ToolBuildOptions,
+    coding_tools_with_options, plan_mode_tools_with_policy, read_only_tools_with_ask,
+    AskUserHandler, BackgroundTaskRegistry, OsSandbox, PermissionMode, PermissionRules,
+    PlanExitState, ToolBuildOptions,
 };
+use tokio::sync::mpsc;
 
 use super::features::{env_no_subagent, FeatureState};
 use super::helpers::{load_extension_state, new_plan_path};
 use super::job_tools::{JobKillTool, JobOutputTool, WaitTasksTool};
 use super::policy::build_path_policy;
-use super::prompt_compose::compose_base_system_prompt;
+
 use super::task_tool::{
     harness_opts_from_policy, main_parent_agent_spec_for_cwd, TaskTool, TaskToolHost,
 };
@@ -171,7 +172,7 @@ impl AppRuntime {
         )));
 
         // Main AgentSpec drives Act tool face + task spawn table.
-        let main_agent = main_parent_agent_spec_for_cwd(&cwd);
+        let main_agent = main_parent_agent_spec_for_cwd(&cwd)?;
 
         // Task meta-tool host (same harness as `one agent run`). Enabled for
         // main agents that can spawn (not pure --read-only research shells).
@@ -213,13 +214,19 @@ impl AppRuntime {
                 tool_gate: Some(permission_gate.clone()),
             })
         };
+        let wait_interest = Arc::new(std::sync::Mutex::new(None));
         // Register `task` + job poll/kill when feature + spawn policy allow.
         let can_spawn = task_host.as_ref().map(|h| h.can_spawn()).unwrap_or(false);
         if applied_features.subagent_enabled() && can_spawn {
             if let Some(host) = &task_host {
                 tools.push(Arc::new(TaskTool::new(host.clone())));
                 tools.push(Arc::new(JobOutputTool::new(host.jobs())));
-                tools.push(Arc::new(WaitTasksTool::new(host.jobs())));
+                tools.push(Arc::new(WaitTasksTool::with_interest(
+                    host.jobs(),
+                    bg_registry.clone(),
+                    "wait_tasks",
+                    wait_interest.clone(),
+                )));
                 tools.push(Arc::new(JobKillTool::new(host.jobs())));
             }
         }
@@ -272,20 +279,20 @@ impl AppRuntime {
             None
         };
 
-        let base_system_prompt =
-            compose_base_system_prompt(super::prompt_compose::ComposeBaseInput {
-                features: &applied_features,
-                resources: &resources,
-                can_spawn,
-                env_context: Some(env_context.as_str()),
-                memory_catalog: memory_catalog.as_deref(),
-            });
-        let system_prompt = if start_plan {
-            let p = plan_path.as_ref().expect("plan path");
-            format!("{base_system_prompt}{}", plan_mode_system_overlay(p))
-        } else {
-            base_system_prompt.clone()
+        let initial_provider = crate::provider::ProviderSet::build(cli)?;
+        let prompt_provider = initial_provider.as_llm().name().to_string();
+        let prompt_model = initial_provider.as_llm().model().to_string();
+        let prompt_tool_names = tools
+            .iter()
+            .map(|t| t.definition().name)
+            .collect::<Vec<_>>();
+        // Final compilation happens after ToolsSpec materialization below.
+        let compiled_prompt = one_prompt::CompiledPrompt {
+            text: String::new(),
+            slots: vec![],
+            matched_rules: vec![],
         };
+        let system_prompt = compiled_prompt.text.clone();
         let max_turns = if cli.max_turns > 0 {
             cli.max_turns
         } else {
@@ -301,9 +308,12 @@ impl AppRuntime {
                 server_search: false,
                 empty_response_retries,
                 compaction_config: Some(user_settings.compaction_config(0)),
+                max_parallel_readonly_tools: one_core::max_parallel_readonly_tools_from_env(),
+                batch_exploration: user_settings.batch_exploration.clone(),
             },
             tools,
         );
+        agent.set_wait_interest_handle(wait_interest.clone());
         // Extension PreToolUse → PermissionGate → after_tool (Codex-style pipeline).
         agent.set_tool_gate(Some(extensions.tool_gate(permission_gate.clone())));
         agent.set_hooks(Some(extensions.agent_hooks()));
@@ -378,20 +388,14 @@ impl AppRuntime {
             // `-c` always most-recent; non-interactive `-r` same.
             match SessionManager::continue_recent(&cwd).await {
                 Ok(session) => Some(session),
-                Err(_) => {
-                    if matches!(cli.mode, crate::cli::RunMode::Interactive) {
-                        Some(SessionManager::create(&cwd).await?)
-                    } else {
-                        None
-                    }
-                }
+                Err(_) => None,
             }
-        } else if matches!(
-            cli.mode,
-            crate::cli::RunMode::Interactive | crate::cli::RunMode::Acp
-        ) {
-            // Interactive TUI and ACP both get a durable session by default
-            // (ACP `session/load` / `session/list` need real session files).
+        } else if cli.exec_session && matches!(cli.mode, crate::cli::RunMode::Print) {
+            // `one exec` persists by default so `one resume <id>` /
+            // `one exec --resume <id>` can continue the same conversation.
+            Some(SessionManager::create(&cwd).await?)
+        } else if matches!(cli.mode, crate::cli::RunMode::Acp) {
+            // ACP RPC builds session handles.
             Some(SessionManager::create(&cwd).await?)
         } else {
             None
@@ -432,6 +436,15 @@ impl AppRuntime {
         let steering_queue = agent.steering_queue_handle();
         let followup_queue = agent.followup_queue_handle();
         let abort_flag = agent.abort_handle();
+        let input_waker = agent.input_waker_handle();
+        let status = super::status::RuntimeStatusStore::new();
+        let control_session =
+            Arc::new(std::sync::RwLock::new(super::control::ControlSessionInfo {
+                id: session.as_ref().map(|s| s.header().id.clone()),
+                path: session
+                    .as_ref()
+                    .and_then(|s| s.session_file().map(|p| p.display().to_string())),
+            }));
 
         let intent_graph = Arc::new(tokio::sync::RwLock::new(
             one_resources::IntentGraph::load_merged(&cwd, &agent_dir),
@@ -442,6 +455,9 @@ impl AppRuntime {
             abort_flag,
             steering_queue,
             followup_queue,
+            input_waker,
+            status,
+            control_session,
             session,
             extensions,
             resources,
@@ -458,11 +474,15 @@ impl AppRuntime {
             plan_path,
             plan_exit,
             bg_registry,
+            wait_interest,
             todo_state: one_tools::TodoListState::new(),
             memory_lookups: one_tools::MemoryLookupBudget::new(memory_opts.max_lookups_per_turn),
             env_context,
             memory_catalog,
-            base_system_prompt,
+            compiled_prompt,
+            prompt_tool_names,
+            prompt_provider,
+            prompt_model,
             permission_gate,
             hitl,
             ask_user_handler,
@@ -490,15 +510,44 @@ impl AppRuntime {
 
         // Seed session id for task parent metadata.
         runtime.sync_task_session().await;
-        // Audit system prompt once for new/resumed sessions (Custom, not LLM context).
-        runtime.maybe_persist_prompt_snapshot("boot").await;
+
+        // Project interactive-wait states onto the unified status store:
+        // a pending approval / ask_user flips the runtime lifecycle to
+        // `waiting_input` for native-control + session-browser observers.
+        // Event-driven (no polling): the gate/channel fire on set↔clear.
+        runtime.permission_gate.set_pending_observer({
+            let status = runtime.status.clone();
+            Box::new(move |pending| status.set_gate_pending(pending))
+        });
+        runtime.hitl.set_pending_observer({
+            let status = runtime.status.clone();
+            Box::new(move |pending| status.set_hitl_pending(pending))
+        });
+
+        // SubagentStop (extensions + hooks.json) drain: every terminal job
+        // snapshot from AgentJobRegistry fires the observe hooks off the lock.
+        if let Some(jobs) = runtime.agent_jobs() {
+            let (stop_tx, mut stop_rx) =
+                mpsc::unbounded_channel::<super::jobs::SubagentStopEvent>();
+            jobs.set_stop_sink(stop_tx);
+            let extensions = runtime.extensions.clone();
+            tokio::spawn(async move {
+                while let Some(ev) = stop_rx.recv().await {
+                    extensions
+                        .notify_subagent_stop(&ev.id, &ev.agent, ev.ok, &ev.summary)
+                        .await;
+                }
+            });
+        }
+
         // MCP/extension tools for child harness (tools.mcp / allow MCP names).
         runtime.refresh_task_dynamic_tools().await;
         // Materialize Act tools from main AgentSpec.tools (not a fixed coding bag).
-        if !start_plan {
-            if let Err(e) = runtime.rebuild_act_tools().await {
-                tracing::warn!(error = %e, "main ToolsSpec materialize failed; using bootstrap tools");
-            }
+        if start_plan {
+            let path = runtime.plan_path.clone().expect("plan path");
+            runtime.apply_plan_tools_and_prompt(&path).await?;
+        } else {
+            runtime.rebuild_act_tools().await?;
         }
 
         // Restore plan path + mode from session custom entry if present.
@@ -509,7 +558,7 @@ impl AppRuntime {
             if !start_plan {
                 if let Some(restored) = runtime.restore_mode_from_session() {
                     if restored == AgentMode::Plan {
-                        let _ = runtime.enter_plan_mode().await;
+                        runtime.enter_plan_mode().await?;
                     }
                 }
             }
@@ -518,6 +567,7 @@ impl AppRuntime {
             let _ = runtime.persist_mode().await;
         }
 
+        runtime.maybe_persist_prompt_snapshot("boot").await;
         Ok(runtime)
     }
 }

@@ -1,0 +1,24 @@
+{
+  "version": 1,
+  "bindings": [
+    {
+      "provider": "gemini",
+      "model": "gemini-2.5-pro",
+      "enhancers": {
+        "stops_early": {
+          "enabled": true,
+          "prompt": "继续执行任务所需的操作和检查；所有要求得到验证后再报告结果。"
+        },
+        "over_planning": { "enabled": true }
+      }
+    },
+    {
+      "provider": "gemini",
+      "model": "gemini-2.5-pro",
+      "preset": "general",
+      "enhancers": {
+        "weak_verification": { "enabled": true }
+      }
+    }
+  ]
+}

@@ -2,10 +2,14 @@
 
 ## 基本用法
 
+One 采用统一的 ReAct 执行模型。后台 bash 或 subagent 等异步操作通过 `wait_tasks` 配合完成事件通知机制在 ReAct 循环内部进行 park 与 resume：当工具批处理执行完成后若存在未就绪的异步任务依赖（`WaitInterest`），Agent 在当前轮次工具结果入流后立即挂起等待，挂起期间不会触发中间模型调用或过早完成；任务终端状态到达唤醒后继续执行下一轮模型采样。
+
 ```bash
 one                          # 交互模式（自动创建 session）
-one -p "explain this repo"   # print 模式（裸 -p；脚本/CI）
-one --tui -p "fix the bug"  # TUI + 首条消息自动发出（监督/评测）
+one "explain this repo"      # 交互模式 + 首条消息（推荐的新入口）
+one exec "explain this repo" # 非交互/headless，完成后退出
+one -p "explain this repo"   # 旧兼容入口：print 模式（脚本/CI）
+one --tui -p "fix the bug"  # 旧兼容：TUI + 首条消息自动发出
 one --mode interactive -p "…"  # 同上（显式 mode）
 one acp                      # Agent Client Protocol（IDE 嵌入；JSON-RPC stdio）
 one acp --cwd /proj --provider xai -y
@@ -22,6 +26,12 @@ one --resume / -r            # 交互：打开 session 选择器；非交互：�
 one resume                   # 退出后恢复：同 `one -r`（TUI 选择器）
 one resume <id|name|path>    # 退出后恢复：按 id 前缀 / 名称 / 预览 / 路径匹配
 one resume --list            # 列出本项目近期 session
+one session list              # 浏览当前 cwd 的 session（含 live/history 状态）
+one session list --all --query auth --limit 40 --json  # 跨已知项目搜索
+one --cwd /proj session show <SPEC> --json             # 查看 session 与 live runtime
+one session show <SPEC> --all                          # 跨项目确定性解析
+one session tui <SPEC>                                 # dormant session 进入 TUI
+one session exec <SPEC> "continue work"                # dormant 继续；live idle 发给原 runtime
 # TUI 正常退出后会在终端打印一行可复制命令，例如：
 #   resume:  one resume 6f5cad03-12a
 one --session PATH           # 打开指定 session 文件
@@ -86,8 +96,8 @@ one --provider xai -p "hello"
 one --provider opencode-go --model deepseek-v4-flash -p "hello"
 
 # 其它常用 flags
-one --always-approve         # 开启 Always-Approve / YOLO 模式（自动批准所有工具调用）
-one --yolo                   # --always-approve 的别名
+one --always-approve         # 自动批准所有工具调用，但仍保留 workspace 路径边界
+one --yolo                   # Codex 风格 YOLO：--always-approve + --full-access
 one --permission-mode <MODE> # 权限模式：default | acceptEdits | auto | dontAsk | bypassPermissions
 one --no-mcp                 # 本 session 不连 MCP
 one --no-skills              # 不注入 skills catalog（评测隔离）
@@ -276,10 +286,10 @@ one --full-access
 | 模式 | `require_escalated` / 失败提权 |
 |------|--------------------------------|
 | Interactive | 弹窗询问 |
-| `-y` / always-approve | 直接允许（危险，等同 yolo） |
+| `-y` / `--always-approve` | 直接允许审批，但仍保留 workspace 路径边界 |
 | print / RPC（非 interactive） | **拒绝**（fail-closed），除非 `-y` |
 
-整会话关闭沙箱仍用：`one --full-access` 或 `/settings sandbox full-access`。
+整会话关闭路径边界仍用：`one --full-access`；若同时希望跳过审批，可直接用 `one --yolo`。
 
 
 ## Provider 与模型配置
@@ -367,6 +377,23 @@ one --list-models
 **空回复重试**（`empty_response_retries`）：模型结束 turn 时既无正文也无 tool call（仅 thinking 也算空）时，自动再采样的次数。默认 **2**（共最多 3 次请求）；`0` 表示不重试、首次空即报错。环境变量 `ONE_EMPTY_RESPONSE_RETRIES` 可覆盖 settings。
 
 **单轮最大 Turns**（`max_turns`）：每条用户 Prompt 允许 Agent 执行工具循环的最大轮数。默认 **0**（无限制）；可设置正整数限制循环深度。环境变量 `ONE_MAX_TURNS` 或 CLI `--max-turns <N>` 可覆盖 settings。
+
+**批量探索提醒**（`batchExploration`）：省略该字段时内置一条规则，provider `cpa`、model `gemini-3.8-flash-high`（实际 id 多一个括号后缀也算，例如 `gemini-3.8-flash-high(medium)`）、不限 thinkingLevel、连续 4 次单调用只读后提醒一次。显式列表替换内置规则；`[]` 关闭。按精确 provider 匹配。多调用批次或写入工具会重置计数；配置在新会话生效。例如只对试验模型启用：
+
+```json
+{
+  "batchExploration": [
+    {
+      "provider": "cpa",
+      "model": "gemini-3.8-flash-high",
+      "thinkingLevel": "medium",
+      "afterSingleReads": 4
+    }
+  ]
+}
+```
+
+将这个字段合并到 `~/.one/agent/settings.json`；删除规则或设为空数组即可关闭。省略 `thinkingLevel` 时匹配该模型的所有思考等级。
 
 交互内：
 
@@ -752,8 +779,8 @@ cargo run -p one-cli --features http-providers -- --provider openai -m gpt-4o
 
 - `Enter`：发送消息
 - `Ctrl+J` / `Shift+Enter`：多行换行
-- `Alt+Enter`：follow-up
-- `Ctrl+S`：steer（运行中）
+- `Alt+Enter`：运行中 follow-up（本轮结束后追加）；空闲时等同 `Enter` 发送
+- `Ctrl+S`：steer（运行中插队）
 - `Shift+Tab`：切换 **Plan / Build** 模式
 - Thinking 深度：`/settings thinking <off|low|medium|high>` 或 `/thinking`（无快捷键）
 - `Ctrl+T`：展开/折叠全部 thinking 正文（**默认折叠**为 `▸ thinking · N chars`；流式输出时仍显示末 3 行 tail；点击或 ↵ 可单独展开/折叠一块）
@@ -946,10 +973,11 @@ description: Structured code review. Use when reviewing PRs or diffs.
 
 Prompt 模板：`/templatename` 展开 `prompts/*.md`
 
-### Print
+### 非交互执行（Exec）
 
 ```bash
-one -p "summarize src/"
+one exec "summarize src/"
+# 旧脚本仍可继续使用：one -p "summarize src/"
 ```
 
 ### JSON

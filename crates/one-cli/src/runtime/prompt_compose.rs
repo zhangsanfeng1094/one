@@ -1,54 +1,128 @@
-//! Single entry point for system-prompt assembly (features + resources + mode).
-
-use std::path::Path;
-
-use one_resources::ResourceLoader;
-use one_tools::plan_mode_system_overlay;
-
+//! One host adapter for the standalone prompt compiler.
+#[cfg(test)]
 use super::features::FeatureState;
-use super::task_tool::TASK_TOOL_PROMPT_HINT;
 use super::AgentMode;
 
-/// Short write policy when feature `memory` is on and L2 catalog is present.
-pub const MEMORY_WRITE_PROMPT_HINT: &str = "\
-## Memory write (跨会话知识备忘录)
+use one_prompt::{CompileContext, CompiledPrompt, ComponentRegistry, PromptError};
+#[cfg(test)]
+use one_resources::ResourceLoader;
+use std::path::Path;
 
-Use `memory_write` to persist cross-session notes (atomic body + MEMORY.md index). \
-Default NO-OP — only when a future agent would clearly benefit from persistent project knowledge \
-(architecture decisions, conventions, environment details, domain facts). Prefer updating an \
-existing id after `memory_search`. Do not use raw `write` under memory dirs unless \
-`memory_write` is unavailable. New L2 index lines apply after `/reload` or a new session.
+pub struct HostPromptInput<'a> {
+    pub prompt: &'a crate::prompt_config::PromptConfig,
+    pub cwd: &'a Path,
+    pub provider: &'a str,
+    pub model: &'a str,
+    pub mode: AgentMode,
+    pub plan_path: Option<&'a Path>,
+    pub tool_names: Vec<String>,
+    pub resources: &'a str,
+    pub env_context: Option<&'a str>,
+    pub memory_catalog: Option<&'a str>,
+    pub quirks: Vec<one_ai::registry::ModelQuirk>,
+}
+pub fn compile_host(input: HostPromptInput<'_>) -> Result<CompiledPrompt, PromptError> {
+    compile_host_with_agent_dir(input, &one_session::agent_dir())
+}
 
-Intent recognition, tool preferences, safety guardrails, and dynamic reminders are managed by \
-the Intent Graph engine (LPG). Custom rules can be taught via `/learn <rule>` or `one learn \"<rule>\"`.
-";
+/// Explicit host paths for Config Studio and isolated runtime tests.
+pub fn compile_host_with_agent_dir(
+    input: HostPromptInput<'_>,
+    agent_dir: &Path,
+) -> Result<CompiledPrompt, PromptError> {
+    compile_host_resolved(input, agent_dir).map(|(compiled, _)| compiled)
+}
 
-/// One-style output guidance (always injected for high quality)
-pub const ONE_OUTPUT_GUIDE: &str = r#"
+/// Return the exact enhancer resolution used in this compilation for inspection.
+pub fn compile_host_resolved(
+    input: HostPromptInput<'_>,
+    agent_dir: &Path,
+) -> Result<
+    (
+        CompiledPrompt,
+        Vec<super::prompt_enhancer::config::ResolvedEnhancer>,
+    ),
+    PromptError,
+> {
+    compile_host_scoped(input, agent_dir, false)
+}
 
-## One Output Style (始终生效)
+pub fn compile_host_scoped(
+    input: HostPromptInput<'_>,
+    agent_dir: &Path,
+    global_only: bool,
+) -> Result<
+    (
+        CompiledPrompt,
+        Vec<super::prompt_enhancer::config::ResolvedEnhancer>,
+    ),
+    PromptError,
+> {
+    let mut spec = input.prompt.load(input.cwd)?;
+    let registry = ComponentRegistry::with_builtins();
 
-- 写完整、专业、结构化的技术文章风格
-- 使用 **bold**、`inline code`、`### 标题`、`表格` 自然且丰富
-- 解释为什么这样做（而非只给出结果）
-- 保持简洁但信息丰富
-- 最终输出用清晰的 Markdown 格式
-- 优先使用 bullet lists 和 numbered lists
-"#;
+    // Dynamically inject behavioral patches based on current model quirks.
+    let sources = if global_only {
+        vec![agent_dir.join(super::prompt_enhancer::config::RELATIVE_PATH)]
+    } else {
+        super::prompt_enhancer::config::paths(input.cwd, agent_dir)
+    };
+    let enhancers = super::prompt_enhancer::config::resolve_paths(
+        sources,
+        input.provider,
+        input.model,
+        &spec.preset,
+        &input.quirks,
+    )?;
+    super::prompt_enhancer::PromptEnhancer::apply_resolved(&mut spec, &registry, &enhancers);
 
-/// Inputs for composing the live system prompt.
+    let mut context = CompileContext {
+        provider: input.provider.into(),
+        model: input.model.into(),
+        mode: input.mode.as_str().into(),
+        capabilities: input.tool_names.into_iter().collect(),
+        ..CompileContext::default()
+    };
+    context
+        .variables
+        .insert("resources".into(), input.resources.into());
+    let section = |s: Option<&str>| {
+        s.map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| format!("\n\n{s}"))
+            .unwrap_or_default()
+    };
+    context
+        .variables
+        .insert("environment".into(), section(input.env_context));
+    context
+        .variables
+        .insert("memory_catalog".into(), section(input.memory_catalog));
+    if input.memory_catalog.is_some_and(|m| !m.trim().is_empty()) {
+        context.capabilities.insert("memory".into());
+    }
+    if let Some(path) = input.plan_path.filter(|_| input.mode == AgentMode::Plan) {
+        context.capabilities.insert("plan".into());
+        context
+            .variables
+            .insert("plan_path".into(), path.display().to_string());
+    }
+    one_prompt::compile(&spec, &registry, &context).map(|compiled| (compiled, enhancers))
+}
+
+// Legacy behavior assertions exercise this test-only adapter. Production callers
+// always pass the materialized tools and actual provider through compile_host.
+#[cfg(test)]
 pub struct PromptComposeInput<'a> {
     pub features: &'a FeatureState,
     pub resources: &'a ResourceLoader,
     pub mode: AgentMode,
     pub plan_path: Option<&'a Path>,
-    /// Whether spawn_policy allows children (independent of feature flag).
     pub can_spawn: bool,
     pub env_context: Option<&'a str>,
     pub memory_catalog: Option<&'a str>,
 }
-
-/// Shared pieces for base system prompt (no plan overlay).
+#[cfg(test)]
 pub struct ComposeBaseInput<'a> {
     pub features: &'a FeatureState,
     pub resources: &'a ResourceLoader,
@@ -56,66 +130,71 @@ pub struct ComposeBaseInput<'a> {
     pub env_context: Option<&'a str>,
     pub memory_catalog: Option<&'a str>,
 }
-
-/// Base system prompt **without** plan-mode overlay.
-///
-/// Order:
-/// 1. `DEFAULT_SYSTEM_PROMPT` (core role + tool policy; no feature packages)
-/// 2. AGENTS.md / skills catalog / plugin+ext append (`ResourceLoader`)
-/// 3. Environment snapshot (cwd / git / date) — session-frozen
-/// 4. Memory L2 catalog — session-frozen progressive disclosure
-/// 5. Feature sections (subagent when enabled + can_spawn)
+#[cfg(test)]
 pub fn compose_base_system_prompt(input: ComposeBaseInput<'_>) -> String {
-    let mut base = input
-        .resources
-        .build_system_prompt(one_core::agent::DEFAULT_SYSTEM_PROMPT);
-    if let Some(env) = input.env_context.map(str::trim).filter(|s| !s.is_empty()) {
-        base.push_str("\n\n");
-        base.push_str(env);
-    }
-    if let Some(mem) = input
-        .memory_catalog
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-    {
-        base.push_str("\n\n");
-        base.push_str(mem);
-    }
-    if input.features.subagent_enabled() && input.can_spawn {
-        base.push('\n');
-        base.push_str(TASK_TOOL_PROMPT_HINT);
-    }
-    // Feature `memory` on + L2 catalog present → write discipline for memory_write tool.
-    if input.features.memory_enabled()
-        && input
-            .memory_catalog
-            .map(str::trim)
-            .is_some_and(|s| !s.is_empty())
-    {
-        base.push('\n');
-        base.push_str(MEMORY_WRITE_PROMPT_HINT);
-    }
-
-    // One output style — always injected for high-quality responses
-    base.push_str(ONE_OUTPUT_GUIDE);
-    base
-}
-
-/// Full system prompt for the current mode (base + optional plan overlay).
-pub fn compose_system_prompt(input: PromptComposeInput<'_>) -> String {
-    let base = compose_base_system_prompt(ComposeBaseInput {
+    compose_system_prompt(PromptComposeInput {
         features: input.features,
         resources: input.resources,
+        mode: AgentMode::Act,
+        plan_path: None,
         can_spawn: input.can_spawn,
         env_context: input.env_context,
         memory_catalog: input.memory_catalog,
-    });
-    if input.mode == AgentMode::Plan {
-        if let Some(path) = input.plan_path {
-            return format!("{}{}", base, plan_mode_system_overlay(path));
-        }
+    })
+}
+#[cfg(test)]
+pub fn compose_system_prompt(input: PromptComposeInput<'_>) -> String {
+    let mut tools = vec!["monitor".into()];
+    if input.features.subagent_enabled() && input.can_spawn {
+        tools.push("task".into());
     }
-    base
+    if input.features.memory_enabled() {
+        tools.push("memory_write".into());
+    }
+    compile_host(HostPromptInput {
+        prompt: &Default::default(),
+        cwd: &input.resources.cwd,
+        provider: "test",
+        model: "test",
+        mode: input.mode,
+        plan_path: input.plan_path,
+        tool_names: tools,
+        resources: &input.resources.build_system_prompt(""),
+        env_context: input.env_context,
+        memory_catalog: input.memory_catalog,
+        quirks: vec![],
+    })
+    .unwrap()
+    .text
+}
+
+#[cfg(test)]
+pub fn compose_system_prompt_with_quirks(
+    input: PromptComposeInput<'_>,
+    quirks: Vec<one_ai::registry::ModelQuirk>,
+) -> String {
+    let mut tools = vec!["monitor".into()];
+    if input.features.subagent_enabled() && input.can_spawn {
+        tools.push("task".into());
+    }
+    if input.features.memory_enabled() {
+        tools.push("memory_write".into());
+    }
+    compile_host(HostPromptInput {
+        prompt: &Default::default(),
+        cwd: &input.resources.cwd,
+        provider: "test",
+        model: "test",
+        mode: input.mode,
+        plan_path: input.plan_path,
+        tool_names: tools,
+        resources: &input.resources.build_system_prompt(""),
+        env_context: input.env_context,
+        memory_catalog: input.memory_catalog,
+        quirks,
+    })
+    .unwrap()
+    .text
 }
 
 #[cfg(test)]

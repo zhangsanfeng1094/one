@@ -80,7 +80,7 @@ impl AppRuntime {
         // Refresh frozen env + memory L2 (user asked for /reload).
         let mem_opts =
             super::features::effective_memory_options(&self.applied_features, &user_settings);
-        self.refresh_context_snapshots(&mem_opts).await;
+        self.refresh_context_snapshots(&mem_opts).await?;
 
         // Rebuild tools + prompt for current mode (keeps applied features).
         match self.mode {
@@ -106,7 +106,7 @@ impl AppRuntime {
         let user_settings = crate::settings::load();
         self.resources
             .apply_skills_config(&user_settings.skills_config_entries());
-        self.recompose_base_prompt();
+        self.recompile_prompt()?;
         {
             let prompt = self.effective_system_prompt();
             let mut agent = self.agent.lock().await;

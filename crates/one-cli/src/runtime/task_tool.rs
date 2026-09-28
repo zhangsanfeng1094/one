@@ -24,7 +24,7 @@ use one_tools::DEFAULT_MAX_BYTES;
 use serde_json::{json, Value};
 use tokio::sync::RwLock;
 
-use super::coordinator::{CoordinatorConfig, SpawnSpec, SubagentCoordinator};
+use super::coordinator::{CoordinatorConfig, SpawnSpec, SpawnWait, SubagentCoordinator};
 use super::effective_config::EffectiveRuntimeConfig;
 use super::harness::{self, HarnessOptions, ParentReadGrants};
 use super::jobs::{AgentJobRegistry, SpawnOptions};
@@ -424,6 +424,10 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
                     "model": {
                         "type": "string",
                         "description": "Optional model id override for this child"
+                    },
+                    "backend": {
+                        "type": "string",
+                        "description": "Execution backend: one|internal (default), codex, grok. Claude/pi are reserved (not implemented). Agent names like codex:<name>/grok:<name> also select."
                     }
                 }
             }),
@@ -464,7 +468,35 @@ The sub-agent cannot ask the user questions; if it lacks info it ends with ERROR
             return Err(invalid_args(&self.name, "missing non-empty `prompt`"));
         }
 
-        let agent_name = config.agent_name.clone();
+        // Backend-prefixed agent names (`codex:implementer`, `grok:reviewer`)
+        // select a backend; the child agent is the suffix (policy-checked
+        // against the parent allow-list as usual). Bare `codex`/`grok` names
+        // select the backend with the default explore preset.
+        let (backend_prefix, agent_name) = match config.agent_name.split_once(':') {
+            Some((prefix, rest))
+                if !rest.is_empty()
+                    && crate::runtime::agent_backend::BackendKind::parse(prefix)
+                        .is_some_and(|b| !b.is_reserved_stub()) =>
+            {
+                (Some(prefix.to_string()), rest.to_string())
+            }
+            _ if crate::runtime::agent_backend::BackendKind::parse(&config.agent_name)
+                .is_some_and(|b| !b.is_reserved_stub())
+                && !matches!(
+                    config.agent_name.as_str(),
+                    "explore" | "plan" | "general" | "general-purpose" | "main"
+                ) =>
+            {
+                (Some(config.agent_name.clone()), "explore".to_string())
+            }
+            _ => (None, config.agent_name.clone()),
+        };
+        let backend_arg = call
+            .arguments
+            .get("backend")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or(backend_prefix);
         let description = config.description.clone();
         let background = config.run_in_background;
         let resume_from = config.resume_from.clone();
@@ -573,7 +605,9 @@ Do not re-delegate git workflows to explore.";
             let session_id = parent_meta.session_id.clone();
             let prompt_snap = req.prompt.text.clone();
             let cwd_snap = req.agent.cwd.clone();
-            let reply = self
+            // Backend selection: explicit `backend` argument, else agent-name
+            // prefix (`codex:impl` / `grok:writer`), else OneInternal.
+            let handle = self
                 .host
                 .coordinator
                 .spawn(SpawnSpec {
@@ -589,6 +623,7 @@ Do not re-delegate git workflows to explore.";
                         trace: child_trace,
                         trace_meta: child_trace_meta,
                         acquire_slot: None,
+                        backend: backend_arg.clone(),
                     },
                     session_id,
                     prompt: prompt_snap,
@@ -596,11 +631,11 @@ Do not re-delegate git workflows to explore.";
                 })
                 .await;
 
-            if reply.rejected {
+            if handle.rejected {
                 return Ok(format_task_output(
                     &agent_name,
                     description.as_deref(),
-                    &reply.result.unwrap_or_else(|| {
+                    &handle.result.unwrap_or_else(|| {
                         RunResult::failure(
                             ProtocolError::new(error_code::SPAWN_NOT_ALLOWED, "admission rejected"),
                             0,
@@ -610,37 +645,73 @@ Do not re-delegate git workflows to explore.";
                 ));
             }
 
-            if !reply.job_id.is_empty() {
-                self.host.bind_tool_job(&call.id, &reply.job_id);
+            let job_id = handle.job_id.clone();
+            let queued = handle.queued;
+            if !job_id.is_empty() {
+                self.host.bind_tool_job(&call.id, &job_id);
             }
 
-            if let Some(result) = reply.result {
-                self.host.unbind_tool_job(&call.id);
-                let log_path = self
-                    .host
-                    .jobs
-                    .get(&reply.job_id)
-                    .and_then(|s| s.log_path.map(|p| p.display().to_string()));
-                return Ok(stamp_job_output(
-                    format_task_output(&agent_name, description.as_deref(), &result),
-                    &reply.job_id,
-                    &result,
-                    log_path,
-                ));
+            if handle.should_wait() {
+                match handle.wait().await {
+                    Some(SpawnWait::Finished(result)) => {
+                        self.host.unbind_tool_job(&call.id);
+                        let log_path = self
+                            .host
+                            .jobs
+                            .get(&job_id)
+                            .and_then(|s| s.log_path.map(|p| p.display().to_string()));
+                        return Ok(stamp_job_output(
+                            format_task_output(&agent_name, description.as_deref(), &result),
+                            &job_id,
+                            &result,
+                            log_path,
+                        ));
+                    }
+                    Some(SpawnWait::Backgrounded) => {
+                        let log_path = self
+                            .host
+                            .jobs
+                            .get(&job_id)
+                            .and_then(|s| s.log_path.map(|p| p.display().to_string()));
+                        return Ok(format_task_started(
+                            &agent_name,
+                            description.as_deref(),
+                            &job_id,
+                            log_path.as_deref(),
+                            true,
+                            true,
+                        ));
+                    }
+                    None => {
+                        self.host.unbind_tool_job(&call.id);
+                        return Ok(format_task_output(
+                            &agent_name,
+                            description.as_deref(),
+                            &RunResult::failure(
+                                ProtocolError::new(
+                                    error_code::INTERNAL,
+                                    "subagent coordinator dropped the spawn wait",
+                                ),
+                                0,
+                            )
+                            .with_status(TaskExitStatus::RuntimeError),
+                        ));
+                    }
+                }
             }
 
             let log_path = self
                 .host
                 .jobs
-                .get(&reply.job_id)
+                .get(&job_id)
                 .and_then(|s| s.log_path.map(|p| p.display().to_string()));
             return Ok(format_task_started(
                 &agent_name,
                 description.as_deref(),
-                &reply.job_id,
+                &job_id,
                 log_path.as_deref(),
-                reply.backgrounded,
-                reply.queued,
+                false,
+                queued,
             ));
         }
 
@@ -1238,8 +1309,6 @@ pub fn format_task_output_from_job(snap: &super::jobs::JobSnapshot) -> (bool, St
 }
 
 /// One-liner for main agent system prompt.
-pub const TASK_TOOL_PROMPT_HINT: &str = "\
-- To delegate work to a sub-agent, use the `task` tool. `agent` / `subagent_type` / `mode` select the role (explore = read-only research; plan = read-only implementation plan; general / general-purpose = writable coding). Default agent is explore when allowed. Findings return as a summary so this conversation stays small. Do not use task for a trivial single-file read, and do not use task to implement code when you already have the design/context — edit/write yourself. **Never use explore/task for git workflows** — explore has no bash; run compact git via bash yourself. **background defaults to true** (returns status=started + job_id; completion is a [job completed] notice). Set background=false when you need the summary this turn — that **waits for the child to finish**. Auto-background only happens if all concurrent slots are busy for ~1s (admission), not because the child is slow. Use resume_from=<job_id> to continue a completed sibling. capability_mode=read-only|read-write|execute|all optionally filters tools. When you have spawned all background work and have nothing else to do, call wait_tasks (mode=all) with no wait_ms (blocks until done). wait_ms=0 on wait_tasks waits 30s, not a snapshot. job_output without wait_ms is a snapshot; a timeout while still running is success — a [job completed] notice will follow. job_output / job_kill accept both `job_*` and `bg_*` ids. For agents that write/edit/bash, prefer isolation=worktree (background writable children default to worktree).";
 
 /// Build parent AgentSpec for the interactive / -p main agent.
 ///
@@ -1250,22 +1319,18 @@ pub const TASK_TOOL_PROMPT_HINT: &str = "\
 ///
 /// Then merges every other `*.json` under project/user agents dirs into
 /// `agents` + `spawn_policy.allow` (so defining a new worker is drop-a-file).
-pub fn main_parent_agent_spec() -> AgentSpec {
+pub fn main_parent_agent_spec() -> std::result::Result<AgentSpec, crate::protocol::ProtocolError> {
     main_parent_agent_spec_for_cwd(&std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")))
 }
 
 /// Same as [`main_parent_agent_spec`] with an explicit project cwd.
-pub fn main_parent_agent_spec_for_cwd(cwd: &std::path::Path) -> AgentSpec {
-    let mut spec = if let Ok(s) = super::presets::load_preset("main", cwd) {
-        s
-    } else if let Ok(s) = super::presets::load_preset("default", cwd) {
-        s
-    } else {
-        AgentSpec::builtin_main()
-    };
+pub fn main_parent_agent_spec_for_cwd(
+    cwd: &std::path::Path,
+) -> std::result::Result<AgentSpec, crate::protocol::ProtocolError> {
+    let mut spec = super::presets::load_preset("main", cwd)?;
     merge_disk_main(&mut spec);
-    super::presets::merge_discovered_agents(&mut spec, cwd);
-    spec
+    super::presets::merge_discovered_agents(&mut spec, cwd)?;
+    Ok(spec)
 }
 
 fn merge_disk_main(spec: &mut AgentSpec) {
@@ -1371,8 +1436,16 @@ mod tests {
             agent: "explore".into(),
             description: Some("scan".into()),
             state: JobState::Failed,
+            backend: "one-internal",
+            health: "healthy",
             status: Some(TaskExitStatus::RuntimeError),
             summary: String::new(),
+            preview: String::new(),
+            result_bytes: 0,
+            result_chars: 0,
+            result_truncated: false,
+            result_ref: None,
+            spill_error: None,
             ok: false,
             duration_ms: 12,
             turns: Some(4),
@@ -1787,6 +1860,8 @@ mod tests {
                 server_search: false,
                 empty_response_retries: one_core::agent::DEFAULT_EMPTY_RESPONSE_RETRIES,
                 compaction_config: None,
+                max_parallel_readonly_tools: one_core::DEFAULT_MAX_PARALLEL_READONLY_TOOLS,
+                batch_exploration: Vec::new(),
             },
             vec![task],
         );
@@ -2005,6 +2080,84 @@ mod tests {
                 || text.contains("status=incomplete")
                 || text.contains("status=started"),
             "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_task_binds_job_before_provider_unblocks() {
+        use one_core::agent::{CompletionRequest, CompletionResponse, LlmProvider, TokenUsage};
+        use one_core::message::{ContentBlock, StopReason};
+        use tokio::sync::Notify;
+
+        struct HoldProvider {
+            hold: Arc<Notify>,
+            released: Arc<Notify>,
+        }
+
+        #[async_trait]
+        impl LlmProvider for HoldProvider {
+            fn name(&self) -> &str {
+                "hold"
+            }
+            fn model(&self) -> &str {
+                "hold-v1"
+            }
+            async fn complete(
+                &self,
+                _request: CompletionRequest,
+            ) -> one_core::error::Result<CompletionResponse> {
+                self.released.notify_one();
+                self.hold.notified().await;
+                Ok(CompletionResponse {
+                    provider: "hold".into(),
+                    model: "hold-v1".into(),
+                    content: vec![ContentBlock::Text {
+                        text: "held-done".into(),
+                    }],
+                    stop_reason: StopReason::Stop,
+                    usage: TokenUsage::default(),
+                    citations: Vec::new(),
+                })
+            }
+        }
+
+        let host = test_host();
+        let hold = Arc::new(Notify::new());
+        let released = Arc::new(Notify::new());
+        host.bind_provider(Arc::new(HoldProvider {
+            hold: hold.clone(),
+            released: released.clone(),
+        }))
+        .await;
+        let tool = TaskTool::new(host.clone());
+        let exec = tokio::spawn(async move {
+            tool.execute(&ToolCall {
+                id: "fg_bind".into(),
+                name: "task".into(),
+                arguments: json!({
+                    "prompt": "hold until released",
+                    "agent": "explore",
+                    "background": false
+                }),
+            })
+            .await
+        });
+        released.notified().await;
+        let mut job_id = None;
+        for _ in 0..50 {
+            if let Some(id) = host.job_for_tool("fg_bind") {
+                job_id = Some(id);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        let job_id = job_id.expect("foreground task must bind before the child finishes");
+        hold.notify_one();
+        let out = exec.await.unwrap().unwrap();
+        assert!(out.as_text().contains("status="), "{}", out.as_text());
+        assert!(
+            host.job_for_tool("fg_bind").is_none(),
+            "binding must clear after the foreground task ends ({job_id})"
         );
     }
 }

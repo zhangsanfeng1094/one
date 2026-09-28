@@ -25,6 +25,7 @@ pub fn models_json_path() -> PathBuf {
     one_session::agent_dir().join("models.json")
 }
 
+#[derive(Clone)]
 pub struct ProviderSet {
     inner: std::sync::Arc<dyn LlmProvider>,
     /// Built-in kind when known; custom providers use `Openai` wire under the hood.
@@ -73,6 +74,25 @@ impl ProviderSet {
         self.registry = models_config.registry.clone();
         self.models_config = models_config;
         self.config_warning = config_warning;
+    }
+
+    /// Construct a candidate without mutating the active provider or persisted defaults.
+    pub fn prepare_switch(&self, provider: &str, model: Option<String>) -> Result<Self, String> {
+        let mut candidate = self.clone();
+        candidate.switch_named_inner(provider, model, false)?;
+        Ok(candidate)
+    }
+
+    pub fn persist_selection(&self) {
+        let mut s = settings::load();
+        s.provider = Some(self.provider_id.clone());
+        s.model = Some(self.as_llm().model().to_string());
+        if let Err(err) = settings::save(&s) {
+            tracing::warn!("failed to save settings: {err}");
+        }
+        if let Err(err) = preferences::save(&self.provider_id, self.as_llm().model()) {
+            tracing::warn!("failed to save model preferences: {err}");
+        }
     }
 
     /// Switch by free-form provider name + optional model.
@@ -146,6 +166,7 @@ impl ProviderSet {
         };
 
         let cli = Cli {
+            prompt: None,
             print: None,
             mode: crate::cli::RunMode::Interactive,
             tui: false,
@@ -153,6 +174,8 @@ impl ProviderSet {
             resume: false,
             session: None,
             no_session: true,
+            exec_session: false,
+            exec_resume: None,
             provider: Some(kind.clone()),
             model,
             openai_api: None, // re-resolve from config for this provider/model
@@ -169,6 +192,7 @@ impl ProviderSet {
             list_providers: false,
             auto_approve: false,
             always_approve: false,
+            yolo: false,
             permission_mode: None,
             share: false,
             no_mcp: false,
@@ -601,6 +625,7 @@ impl ProviderSet {
             reasoning: None,
             thinking_level_map: None,
             compat: p.compat.clone(),
+            quirks: vec![],
         });
         apply_model_kv(&mut entry, kv)?;
         // If model sets base/api and provider lacks them, lift.
@@ -684,6 +709,7 @@ impl ProviderSet {
                     reasoning: None,
                     thinking_level_map: None,
                     compat: p.compat.clone(),
+                    quirks: vec![],
                 });
                 added += 1;
             }
@@ -1445,6 +1471,7 @@ mod tests {
             reasoning: None,
             thinking_level_map: None,
             compat: None,
+            quirks: vec![],
         });
         let mut cfg = ModelsConfig {
             registry: registry.clone(),
@@ -1609,7 +1636,7 @@ mod tests {
     }
 }
 
-fn load_config() -> (ModelsConfig, Option<String>) {
+pub fn load_config() -> (ModelsConfig, Option<String>) {
     let path = models_json_path();
     if !path.exists() {
         return (ModelsConfig::with_defaults(), None);
@@ -1624,6 +1651,31 @@ fn load_config() -> (ModelsConfig, Option<String>) {
             )),
         ),
     }
+}
+
+/// Resolve explicit child model selection before both prompt compilation and requests.
+pub fn agent_provider(
+    spec: &crate::protocol::ModelSpec,
+    parent: &dyn LlmProvider,
+) -> Result<Option<std::sync::Arc<dyn LlmProvider>>, String> {
+    if spec.provider.is_none() && spec.id.is_none() {
+        return Ok(None);
+    }
+    let provider = spec.provider.as_deref().unwrap_or(parent.name());
+    let model = spec
+        .id
+        .clone()
+        .or_else(|| (provider == parent.name()).then(|| parent.model().to_string()));
+    if provider == parent.name() && model.as_deref() == Some(parent.model()) {
+        return Ok(None);
+    }
+    let (config, _) = load_config();
+    let mut cli = Cli::try_parse_from(["one"]).map_err(|e| e.to_string())?;
+    cli.model = model;
+    let resolved = resolve_settings(&cli, &config, provider);
+    build_provider_llm(provider, &resolved)
+        .map(Some)
+        .map_err(|e| e.to_string())
 }
 
 fn build_provider_llm(
@@ -1868,7 +1920,8 @@ pub(crate) fn heuristic_context_window(model: &str) -> usize {
     } else if lower.contains("llama-3") || lower.contains("llama3") {
         128_000
     } else {
-        0
+        // Unknown model families: assume a common 200k window instead of 0 (unknown).
+        200_000
     }
 }
 
@@ -1900,6 +1953,8 @@ mod heuristic_context_window_tests {
         assert_eq!(heuristic_context_window("claude-sonnet-4.6"), 200_000);
         assert_eq!(heuristic_context_window("gemini-3-flash"), 1_000_000);
         assert_eq!(heuristic_context_window("grok-4.5"), 256_000);
-        assert_eq!(heuristic_context_window("glm-5.3"), 0);
+        // Unknown families now fall back to 200k instead of 0 (unknown).
+        assert_eq!(heuristic_context_window("glm-5.3"), 200_000);
+        assert_eq!(heuristic_context_window("some-random-model"), 200_000);
     }
 }

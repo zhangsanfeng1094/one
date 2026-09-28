@@ -13,12 +13,14 @@
 //! Methods: `ping`, `prompt`, `abort`, `steer`, `follow_up`, `session`, `status`,
 //! `thinking`, `compact`, `spawn`.
 
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Write};
 
 use one_core::agent::{LlmProvider, ThinkingLevel};
 use serde::Deserialize;
 use serde_json::json;
+use tokio::sync::mpsc;
 
+use crate::runtime::control::RuntimeControlHandle;
 use crate::runtime::AppRuntime;
 use one_core::tool::{Tool, ToolCall};
 
@@ -75,9 +77,20 @@ pub async fn run_rpc(
     runtime: &mut AppRuntime,
     provider: &dyn LlmProvider,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    runtime.subscribe_printer(true).await;
-    let stdin = io::stdin();
-    for line in stdin.lock().lines() {
+    // RPC stdout is exclusively request responses. Agent events must not add
+    // unsolicited JSON lines or race the serialized response writer.
+    let control = RuntimeControlHandle::for_rpc(runtime);
+    let (tx, mut rx) = mpsc::unbounded_channel::<Result<String, io::Error>>();
+    std::thread::spawn(move || {
+        for line in io::stdin().lock().lines() {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let stdout = io::stdout();
+    let mut out = stdout.lock();
+    while let Some(line) = rx.recv().await {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -85,26 +98,138 @@ pub async fn run_rpc(
         let request: RpcRequest = match serde_json::from_str(&line) {
             Ok(r) => r,
             Err(e) => {
-                println!(
-                    "{}",
-                    serde_json::to_string(&json!({
-                        "id": null,
-                        "ok": false,
-                        "error": format!("invalid request json: {e}"),
-                    }))?
-                );
+                write_response(
+                    &mut out,
+                    &json!({"id": null, "ok": false, "error": format!("invalid request json: {e}")}),
+                )?;
                 continue;
             }
         };
-        let response = handle(runtime, provider, &request).await;
-        println!("{}", serde_json::to_string(&response)?);
+        if request.method != "prompt" {
+            let response = handle(runtime, provider, &control, &request).await;
+            write_response(&mut out, &response)?;
+            continue;
+        }
+        let prompt = request
+            .params
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        let id = request.id;
+        let status_request = RpcRequest {
+            id: None,
+            method: "status".into(),
+            params: json!({}),
+        };
+        let status_snapshot =
+            handle(runtime, provider, &control, &status_request).await["result"].clone();
+        let session_snapshot = json!({"path": runtime.session_path().map(|p| p.display().to_string()), "summary": runtime.session_summary_line()});
+        runtime.clear_abort();
+        let _busy = control.busy_guard();
+        // Unified status: bridge agent events (compaction / wait-park / tool)
+        // so native control + session browser observe in-turn activity.
+        runtime.bridge_status_events().await;
+        let mut prompt_future = Box::pin(runtime.prompt(provider, &prompt));
+        loop {
+            tokio::select! {
+                result = &mut prompt_future => {
+                    let response = match result {
+                        Ok(text) => json!({"id": id, "ok": true, "result": {"text": text}}),
+                        Err(err) => json!({"id": id, "ok": false, "error": err.to_string()}),
+                    };
+                    write_response(&mut out, &response)?;
+                    break;
+                }
+                incoming = rx.recv() => {
+                    let Some(line) = incoming else {
+                        let result = prompt_future.await;
+                        let response = match result {
+                            Ok(text) => json!({"id": id, "ok": true, "result": {"text": text}}),
+                            Err(err) => json!({"id": id, "ok": false, "error": err.to_string()}),
+                        };
+                        write_response(&mut out, &response)?;
+                        return Ok(());
+                    };
+                    let line = line?;
+                    if line.trim().is_empty() { continue; }
+                    let response = match serde_json::from_str::<RpcRequest>(&line) {
+                        Ok(request) => handle_busy(&control, &status_snapshot, &session_snapshot, &request),
+                        Err(e) => json!({"id": null, "ok": false, "error": format!("invalid request json: {e}")}),
+                    };
+                    write_response(&mut out, &response)?;
+                }
+            }
+        }
     }
     Ok(())
+}
+
+fn write_response(out: &mut impl Write, response: &serde_json::Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *out, response)?;
+    out.write_all(b"\n")?;
+    out.flush()
+}
+
+fn handle_busy(
+    control: &RuntimeControlHandle,
+    status_snapshot: &serde_json::Value,
+    session_snapshot: &serde_json::Value,
+    request: &RpcRequest,
+) -> serde_json::Value {
+    let id = &request.id;
+    match request.method.as_str() {
+        "ping" => json!({"id": id, "ok": true, "result": "pong"}),
+        "status" => {
+            // Live projection from the unified status store — the pre-turn
+            // snapshot only supplies usage/context fields.
+            let mut result = status_snapshot.clone();
+            result["busy"] = json!(control.is_busy());
+            result["state"] = json!(control.status()["state"]);
+            result["control"] = control.status();
+            json!({"id": id, "ok": true, "result": result})
+        }
+        "session" => json!({"id": id, "ok": true, "result": session_snapshot}),
+        "steer" | "follow_up" | "followup" | "abort" => handle_control(control, request),
+        "prompt" | "thinking" | "compact" | "spawn" => {
+            json!({"id": id, "ok": false, "error": "runtime is busy; choose steer, follow_up, or abort explicitly", "code": "busy"})
+        }
+        other => json!({"id": id, "ok": false, "error": format!("unknown method: {other}")}),
+    }
+}
+
+fn handle_control(control: &RuntimeControlHandle, request: &RpcRequest) -> serde_json::Value {
+    let id = &request.id;
+    match request.method.as_str() {
+        "abort" => {
+            control.abort();
+            json!({"id": id, "ok": true, "result": {"aborted": true}})
+        }
+        "steer" | "follow_up" | "followup" => {
+            let text = request
+                .params
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if text.trim().is_empty() {
+                return json!({"id": id, "ok": false, "error": "params.text required"});
+            }
+            if request.method == "steer" {
+                control.steer(text.to_string());
+                json!({"id": id, "ok": true, "result": {"queued": "steer"}})
+            } else {
+                control.follow_up(text.to_string());
+                json!({"id": id, "ok": true, "result": {"queued": "follow_up"}})
+            }
+        }
+        _ => unreachable!(),
+    }
 }
 
 async fn handle(
     runtime: &mut AppRuntime,
     provider: &dyn LlmProvider,
+    control: &RuntimeControlHandle,
     request: &RpcRequest,
 ) -> serde_json::Value {
     let id = &request.id;
@@ -124,40 +249,7 @@ async fn handle(
             }
         }
 
-        "abort" => {
-            runtime.abort();
-            json!({"id": id, "ok": true, "result": {"aborted": true}})
-        }
-
-        "steer" => {
-            let text = request
-                .params
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if text.is_empty() {
-                json!({"id": id, "ok": false, "error": "params.text required"})
-            } else {
-                runtime.steer(text);
-                json!({"id": id, "ok": true, "result": {"queued": "steer"}})
-            }
-        }
-
-        "follow_up" | "followup" => {
-            let text = request
-                .params
-                .get("text")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            if text.is_empty() {
-                json!({"id": id, "ok": false, "error": "params.text required"})
-            } else {
-                runtime.follow_up(text);
-                json!({"id": id, "ok": true, "result": {"queued": "follow_up"}})
-            }
-        }
+        "abort" | "steer" | "follow_up" | "followup" => handle_control(control, request),
 
         "session" => json!({
             "id": id,
@@ -173,11 +265,22 @@ async fn handle(
             let thinking = runtime.thinking_level().await;
             let (context_tokens, context_estimated) = runtime.context_tokens().await;
             let last_prompt = runtime.last_prompt_tokens().await;
+            let control_status = control.status();
             json!({
                 "id": id,
                 "ok": true,
                 "result": {
                     "provider": provider.name(),
+                    // Unified runtime status (same store native control reads).
+                    "state": control_status["state"],
+                    "busy": control.is_busy(),
+                    "activity": control_status["activity"],
+                    "control": control_status.clone(),
+                    "pid": control_status["pid"],
+                    "process_start": control_status["process_start"],
+                    "capabilities": control_status["capabilities"],
+                    "session_id": control_status["session_id"],
+                    "session_path": control_status["session_path"],
                     "model": provider.model(),
                     "mode": format!("{:?}", runtime.mode()),
                     "thinking": thinking.as_str(),

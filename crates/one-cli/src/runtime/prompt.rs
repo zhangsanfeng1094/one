@@ -1,24 +1,36 @@
 //! User prompt path and context compaction.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use one_core::agent::{CompletionRequest, LlmProvider, ThinkingLevel};
+use super::status;
+
+use one_core::agent::{CompletionRequest, LlmProvider, ServerTool, ThinkingLevel};
 use one_core::compaction::{
-    attach_compaction_reminder, compact_messages_forced, compacted_live_messages,
-    edited_paths_from_messages, estimate_tokens, messages_fingerprint, prefix_fingerprint,
-    prune_old_tool_outputs, should_compact_tokens, should_prefire_two_pass, split_for_compaction,
-    split_for_compaction_forced, split_two_pass, summarization_prompt, tokens_for_compaction,
-    two_pass_pass1_prompt, two_pass_pass2_prompt, user_turn_count, CompactApplied, CompactRequest,
-    CompactionConfig, CompactionStateContext, CompactionSuppression, PrefireCandidate,
+    attach_compaction_reminder, can_fork_summarize_prefix, compact_messages_forced,
+    compacted_live_messages, compaction_request_messages, edited_paths_from_messages,
+    estimate_tokens, messages_fingerprint, prefix_fingerprint, should_compact_tokens,
+    should_prefire_two_pass, split_for_compaction, split_for_compaction_forced, split_two_pass,
+    summarization_prompt, tokens_for_compaction, two_pass_pass1_prompt, two_pass_pass2_prompt,
+    user_turn_count, CompactApplied, CompactRequest, CompactionConfig, CompactionStateContext,
+    CompactionSuppression, PrefireCandidate,
 };
 use one_core::error::OneError;
 use one_core::message::AgentMessage;
-use one_ext::ExtensionEvent;
-
+use one_core::tool::ToolDefinition;
 use one_session::meta::{ContextProjectionMeta, ProjectionToolResultProvenance};
 
 use super::helpers::is_overflow_err;
 use super::AppRuntime;
+
+/// Render a UserPromptSubmit hook block into the error text shown to callers.
+fn prompt_blocked_message(outcome: &one_ext::hooks::PromptHookOutcome) -> String {
+    match outcome {
+        one_ext::hooks::PromptHookOutcome::Block { reason } => {
+            format!("prompt blocked by UserPromptSubmit hook: {reason}")
+        }
+        one_ext::hooks::PromptHookOutcome::Allow => String::new(),
+    }
+}
 
 impl AppRuntime {
     pub async fn prompt(
@@ -26,6 +38,14 @@ impl AppRuntime {
         provider: &dyn LlmProvider,
         text: &str,
     ) -> Result<String, Box<dyn std::error::Error>> {
+        // Unified runtime status: one turn frame per user prompt. The guard
+        // projects lifecycle (running → idle) for native control + RPC.
+        let turn_outcome = Arc::new(Mutex::new(status::TurnOutcome::Completed));
+        let _turn = self.status.turn_guard({
+            let turn_outcome = turn_outcome.clone();
+            move || *turn_outcome.lock().expect("turn outcome")
+        });
+        self.bridge_status_events().await;
         // MCP async load (Grok-style):
         // - If still loading and no tools yet, wait up to 45s for the *first*
         //   server so `-p` / cold start don't race empty tool lists.
@@ -50,10 +70,15 @@ impl AppRuntime {
         // M3: memory read/grep budget is per user turn.
         self.memory_lookups.reset_turn();
 
-        let _ = self
-            .extensions
-            .emit(&ExtensionEvent::UserPromptSubmit { text: text.clone() })
-            .await;
+        match self.extensions.notify_user_prompt_submit(&text).await {
+            hooks_outcome @ one_ext::hooks::PromptHookOutcome::Block { .. } => {
+                return Err(
+                    Box::new(OneError::Provider(prompt_blocked_message(&hooks_outcome)))
+                        as Box<dyn std::error::Error>,
+                );
+            }
+            one_ext::hooks::PromptHookOutcome::Allow => {}
+        }
 
         let mut before = {
             let agent = self.agent.lock().await;
@@ -128,6 +153,13 @@ impl AppRuntime {
             self.persist_run_error_one(err).await;
         }
 
+        // Unified status: record terminal outcome for the turn guard.
+        *turn_outcome.lock().expect("turn outcome") = match &result {
+            Ok(_) => status::TurnOutcome::Completed,
+            Err(one_core::error::OneError::Aborted) => status::TurnOutcome::Aborted,
+            Err(_) => status::TurnOutcome::Failed,
+        };
+
         if result.is_ok() {
             self.note_sampling_success();
         }
@@ -143,6 +175,12 @@ impl AppRuntime {
         if images.is_empty() {
             return self.prompt(provider, text).await;
         }
+        let turn_outcome = Arc::new(Mutex::new(status::TurnOutcome::Completed));
+        let _turn = self.status.turn_guard({
+            let turn_outcome = turn_outcome.clone();
+            move || *turn_outcome.lock().expect("turn outcome")
+        });
+        self.bridge_status_events().await;
 
         if self.mcp.is_loading() && self.mcp.tool_count() == 0 {
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(45);
@@ -162,10 +200,15 @@ impl AppRuntime {
 
         self.memory_lookups.reset_turn();
 
-        let _ = self
-            .extensions
-            .emit(&ExtensionEvent::UserPromptSubmit { text: text.clone() })
-            .await;
+        match self.extensions.notify_user_prompt_submit(&text).await {
+            hooks_outcome @ one_ext::hooks::PromptHookOutcome::Block { .. } => {
+                return Err(
+                    Box::new(OneError::Provider(prompt_blocked_message(&hooks_outcome)))
+                        as Box<dyn std::error::Error>,
+                );
+            }
+            one_ext::hooks::PromptHookOutcome::Allow => {}
+        }
 
         let before = {
             let agent = self.agent.lock().await;
@@ -200,6 +243,13 @@ impl AppRuntime {
         if let Err(ref err) = result {
             self.persist_run_error_one(err).await;
         }
+
+        // Unified status: record terminal outcome for the turn guard.
+        *turn_outcome.lock().expect("turn outcome") = match &result {
+            Ok(_) => status::TurnOutcome::Completed,
+            Err(one_core::error::OneError::Aborted) => status::TurnOutcome::Aborted,
+            Err(_) => status::TurnOutcome::Failed,
+        };
 
         if result.is_ok() {
             self.note_sampling_success();
@@ -399,7 +449,7 @@ impl AppRuntime {
         }
         let force = request.force();
 
-        let (mut messages, last_prompt) = {
+        let (messages, last_prompt) = {
             let agent = self.agent.lock().await;
             (agent.messages.clone(), agent.last_prompt_tokens)
         };
@@ -408,20 +458,11 @@ impl AppRuntime {
         } else {
             None
         };
-        let mut tokens = tokens_for_compaction(&messages, observed);
-
-        // 1) Prune old tool outputs every check (independent of auto-compact).
-        if config.prune {
-            let outcome = prune_old_tool_outputs(&mut messages, &config);
-            if !outcome.is_empty() {
-                tokens = tokens_for_compaction(&messages, None);
-                let mut agent = self.agent.lock().await;
-                agent.messages = messages.clone();
-                agent.last_prompt_tokens = 0;
-            }
-        }
+        let tokens = tokens_for_compaction(&messages, observed);
 
         // Manual / overflow always proceed; auto respects `enabled`.
+        // Note: live history is kept strictly append-only across normal turns
+        // (no per-turn in-place tool output pruning) so prompt caches stay valid.
         if !force && !config.enabled {
             return Ok(None);
         }
@@ -654,6 +695,20 @@ impl AppRuntime {
             return None;
         }
 
+        let (system_prompt, tools, server_tools) = {
+            let agent = self.agent.lock().await;
+            let server_tools = if agent.config.server_search {
+                provider.server_tools()
+            } else {
+                Vec::new()
+            };
+            (
+                agent.config.system_prompt.clone(),
+                agent.tool_definitions(),
+                server_tools,
+            )
+        };
+
         if config.two_pass {
             if let Some((prefix, suffix)) = split_two_pass(older) {
                 // Wait for in-flight Pass-1 if it is the matching prefix.
@@ -689,6 +744,21 @@ impl AppRuntime {
             }
         }
 
+        if can_fork_summarize_prefix(older) {
+            if let Some(summary) = sample_forked_summary(
+                provider,
+                system_prompt,
+                tools,
+                server_tools,
+                older,
+                instructions,
+            )
+            .await
+            {
+                return Some(summary);
+            }
+        }
+
         let prompt = summarization_prompt(older, instructions);
         sample_summary(provider, prompt).await
     }
@@ -701,6 +771,50 @@ impl AppRuntime {
             }
         }
         Ok(())
+    }
+}
+
+/// Cache-sharing forked summarization: reuses the live `system_prompt`, `tools`,
+/// and `older` message prefix so providers hit the existing KV cache.
+async fn sample_forked_summary(
+    provider: &dyn LlmProvider,
+    system_prompt: String,
+    tools: Vec<ToolDefinition>,
+    server_tools: Vec<ServerTool>,
+    older: &[AgentMessage],
+    instructions: Option<&str>,
+) -> Option<String> {
+    let request = CompletionRequest {
+        system_prompt,
+        messages: compaction_request_messages(older, instructions),
+        tools,
+        server_tools,
+        thinking_level: ThinkingLevel::Off,
+    };
+    match provider.complete(request).await {
+        Ok(response) => {
+            let text = one_core::agent::extract_text(&response.content)
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                tracing::warn!("forked compaction summarizer returned empty text; falling back");
+                None
+            } else {
+                tracing::info!(
+                    length = text.len(),
+                    cache_read_tokens = response.usage.cache_read_tokens,
+                    "forked compaction summarizer generated summary"
+                );
+                Some(text)
+            }
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "forked compaction summarizer failed; falling back to standalone summary"
+            );
+            None
+        }
     }
 }
 

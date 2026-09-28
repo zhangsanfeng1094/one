@@ -106,12 +106,7 @@ pub async fn run_agent_command(
                 let kids: Vec<_> = spec.agents.keys().cloned().collect();
                 println!("agents: {kids:?}");
             }
-            if let Some(sys) = &spec.system_prompt {
-                let preview: String = sys.chars().take(200).collect();
-                println!("system_prompt (preview): {preview}…");
-            } else {
-                println!("system_prompt: (default template)");
-            }
+            println!("prompt: {}", serde_json::to_string(&spec.prompt)?);
             Ok(ExitCode::SUCCESS)
         }
         AgentCommands::Run(args) => {
