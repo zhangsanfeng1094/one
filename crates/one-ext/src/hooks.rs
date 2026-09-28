@@ -438,11 +438,18 @@ pub async fn run_pre_tool_use(
             return Ok(PreToolDecision::Deny { message: msg });
         }
         if let Some(dec) = resp.permission_decision.as_deref() {
-            if dec.eq_ignore_ascii_case("deny") {
+            let dec_lc = dec.to_ascii_lowercase();
+            if dec_lc == "deny" {
                 let msg = resp
                     .system_message
                     .unwrap_or_else(|| "denied by PreToolUse hook".into());
                 return Ok(PreToolDecision::Deny { message: msg });
+            }
+            if dec_lc == "ask" {
+                let msg = resp
+                    .system_message
+                    .unwrap_or_else(|| "PreToolUse hook requests user confirmation".into());
+                return Ok(PreToolDecision::Ask { message: msg });
             }
         }
         if let Some(updated) = resp
@@ -559,6 +566,84 @@ pub async fn run_stop_hooks(
     StopDecision::Allow
 }
 
+/// Run UserPromptSubmit hooks. Grok `Prompt` gate: first `block`/`deny` (exit 2,
+/// `continue:false`, or `decision:"block"`) blocks the prompt with its reason;
+/// other outcomes fall through. Fail-open on hook errors.
+pub async fn run_user_prompt_hooks(
+    hooks: &[HookHandler],
+    text: &str,
+    cwd: &Path,
+) -> PromptHookOutcome {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Req {
+        hook_event_name: &'static str,
+        prompt: String,
+        cwd: String,
+    }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Resp {
+        #[serde(default, alias = "decision")]
+        permission_decision: Option<String>,
+        #[serde(default)]
+        reason: Option<String>,
+        #[serde(default, rename = "continue")]
+        continue_flag: Option<bool>,
+    }
+    let req = Req {
+        hook_event_name: "UserPromptSubmit",
+        prompt: text.to_string(),
+        cwd: cwd.display().to_string(),
+    };
+    for handler in hooks {
+        let res = match run_handler_raw(handler, &req, "UserPromptSubmit", cwd).await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(
+                    hook = %handler.name.as_deref().unwrap_or("user_prompt_submit"),
+                    error = %e,
+                    "user_prompt_submit hook failed"
+                );
+                continue;
+            }
+        };
+        // Exit code 2 explicitly blocks with stderr feedback.
+        if res.exit_code == Some(2) {
+            let reason = if !res.stderr.trim().is_empty() {
+                res.stderr.trim().to_string()
+            } else {
+                "prompt blocked by UserPromptSubmit hook (exit 2)".into()
+            };
+            return PromptHookOutcome::Block { reason };
+        }
+        if res.stdout.trim().is_empty() {
+            continue;
+        }
+        let Ok(resp) = serde_json::from_str::<Resp>(&res.stdout) else {
+            continue;
+        };
+        let blocked = resp.continue_flag == Some(false)
+            || resp
+                .permission_decision
+                .as_deref()
+                .is_some_and(|d| d.eq_ignore_ascii_case("block") || d.eq_ignore_ascii_case("deny"));
+        if blocked {
+            let reason = resp
+                .reason
+                .unwrap_or_else(|| "prompt blocked by UserPromptSubmit hook".into());
+            return PromptHookOutcome::Block { reason };
+        }
+    }
+    PromptHookOutcome::Allow
+}
+
+#[derive(Debug, Clone)]
+pub enum PromptHookOutcome {
+    Allow,
+    Block { reason: String },
+}
+
 /// Fire PreCompact / PostCompact hooks. Matcher tests `manual` or `auto`.
 /// Fail-open: hook errors are logged, compaction is never blocked.
 pub async fn run_compact_hooks(hooks: &[HookHandler], event: &str, trigger: &str, cwd: &Path) {
@@ -606,6 +691,48 @@ pub async fn run_session_hooks(hooks: &[HookHandler], event: &str, cwd: &Path) {
                 hook = %handler.name.as_deref().unwrap_or(event),
                 error = %e,
                 "session hook failed"
+            );
+        }
+    }
+}
+
+/// Fire SubagentStop hooks when a `task` subagent job reaches a terminal state.
+/// Observational only (fail-open); matcher tests the job agent name.
+pub async fn run_subagent_stop_hooks(
+    hooks: &[HookHandler],
+    job_id: &str,
+    agent: &str,
+    ok: bool,
+    summary: &str,
+    cwd: &Path,
+) {
+    #[derive(Serialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Req {
+        hook_event_name: &'static str,
+        job_id: String,
+        agent: String,
+        ok: bool,
+        summary: String,
+        cwd: String,
+    }
+    let req = Req {
+        hook_event_name: "SubagentStop",
+        job_id: job_id.to_string(),
+        agent: agent.to_string(),
+        ok,
+        summary: summary.to_string(),
+        cwd: cwd.display().to_string(),
+    };
+    for handler in hooks {
+        if !matcher_hits(handler.matcher.as_deref(), agent) {
+            continue;
+        }
+        if let Err(e) = run_handler_raw(handler, &req, "SubagentStop", cwd).await {
+            tracing::warn!(
+                hook = %handler.name.as_deref().unwrap_or("subagent_stop"),
+                error = %e,
+                "subagent_stop hook failed"
             );
         }
     }
@@ -837,5 +964,91 @@ mod tests {
         assert_eq!(cfg.post_compact.len(), 1);
         assert!(matcher_hits(Some("manual"), "manual"));
         assert!(!matcher_hits(Some("manual"), "auto"));
+    }
+
+    fn tmp_cwd() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("one-ext-hooks-test-{}", std::process::id()));
+        // Command::current_dir requires the dir to exist or spawn fails (fail-open).
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    }
+
+    #[tokio::test]
+    async fn user_prompt_hook_exit_2_blocks() {
+        let cfg: HooksConfig = serde_json::from_str(
+            r#"{ "userPromptSubmit": [
+                { "command": "echo 'no secrets allowed' >&2; exit 2" }
+            ] }"#,
+        )
+        .unwrap();
+        let cwd = tmp_cwd();
+        match run_user_prompt_hooks(&cfg.user_prompt_submit, "deploy prod", &cwd).await {
+            PromptHookOutcome::Block { reason } => {
+                assert!(reason.contains("no secrets allowed"))
+            }
+            PromptHookOutcome::Allow => panic!("expected block"),
+        }
+    }
+
+    #[tokio::test]
+    async fn user_prompt_hook_json_block_and_allow() {
+        let cfg: HooksConfig = serde_json::from_str(
+            r#"{ "userPromptSubmit": [
+                { "command": "echo '{\"decision\":\"block\",\"reason\":\"off-topic\"}'" }
+            ] }"#,
+        )
+        .unwrap();
+        let cwd = tmp_cwd();
+        match run_user_prompt_hooks(&cfg.user_prompt_submit, "hello", &cwd).await {
+            PromptHookOutcome::Block { reason } => assert_eq!(reason, "off-topic"),
+            PromptHookOutcome::Allow => panic!("expected block"),
+        }
+
+        // continue: true / allow decisions pass through.
+        let cfg2: HooksConfig = serde_json::from_str(
+            r#"{ "userPromptSubmit": [
+                { "command": "echo '{\"decision\":\"allow\"}'" },
+                { "command": "true" }
+            ] }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            run_user_prompt_hooks(&cfg2.user_prompt_submit, "hello", &cwd).await,
+            PromptHookOutcome::Allow
+        ));
+    }
+
+    #[tokio::test]
+    async fn pre_tool_use_ask_decision() {
+        let cfg: HooksConfig = serde_json::from_str(
+            r#"{ "preToolUse": [
+                { "matcher": "bash",
+                  "command": "echo '{\"permissionDecision\":\"ask\",\"systemMessage\":\"confirm rm\"}'" }
+            ] }"#,
+        )
+        .unwrap();
+        let call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "rm -rf /tmp/x"}),
+        };
+        let cwd = tmp_cwd();
+        match run_pre_tool_use(&cfg, &call, &cwd).await.unwrap() {
+            PreToolDecision::Ask { message } => assert_eq!(message, "confirm rm"),
+            other => panic!("expected Ask, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_stop_hooks_run_and_match_agent() {
+        let cfg: HooksConfig = serde_json::from_str(
+            r#"{ "subagentStop": [
+                { "matcher": "explore", "command": "true" }
+            ] }"#,
+        )
+        .unwrap();
+        let cwd = tmp_cwd();
+        // Matcher passes (agent = explore) — fail-open so just assert no panic.
+        run_subagent_stop_hooks(&cfg.subagent_stop, "job_1", "explore", true, "done", &cwd).await;
     }
 }

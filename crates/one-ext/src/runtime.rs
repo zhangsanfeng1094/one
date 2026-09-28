@@ -126,6 +126,38 @@ impl ExtensionRuntime {
         hooks::run_compact_hooks(&self.hooks.post_compact, "PostCompact", trigger, &self.cwd).await;
     }
 
+    /// Fire UserPromptSubmit (extensions + hooks.json). Returns `Block` when a
+    /// hook blocks the prompt (Grok Prompt gate); `Allow` otherwise.
+    pub async fn notify_user_prompt_submit(&self, text: &str) -> hooks::PromptHookOutcome {
+        let _ = self
+            .emit(&ExtensionEvent::UserPromptSubmit {
+                text: text.to_string(),
+            })
+            .await;
+        hooks::run_user_prompt_hooks(&self.hooks.user_prompt_submit, text, &self.cwd).await
+    }
+
+    /// Fire SubagentStop (extensions + hooks.json) when a subagent job ends.
+    pub async fn notify_subagent_stop(&self, job_id: &str, agent: &str, ok: bool, summary: &str) {
+        let _ = self
+            .emit(&ExtensionEvent::SubagentStop {
+                job_id: job_id.to_string(),
+                agent: agent.to_string(),
+                ok,
+                summary: summary.to_string(),
+            })
+            .await;
+        hooks::run_subagent_stop_hooks(
+            &self.hooks.subagent_stop,
+            job_id,
+            agent,
+            ok,
+            summary,
+            &self.cwd,
+        )
+        .await;
+    }
+
     pub fn make_context<'a>(
         &'a self,
         cwd: &'a Path,
@@ -220,6 +252,9 @@ impl ExtensionRuntime {
                 Ok(PreToolDecision::Deny { message }) => {
                     return PreToolDecision::Deny { message };
                 }
+                Ok(PreToolDecision::Ask { message }) => {
+                    return PreToolDecision::Ask { message };
+                }
                 Err(e) => {
                     tracing::warn!(
                         extension = %extension.name(),
@@ -240,6 +275,9 @@ impl ExtensionRuntime {
             }
             Ok(PreToolDecision::Deny { message }) => {
                 return PreToolDecision::Deny { message };
+            }
+            Ok(PreToolDecision::Ask { message }) => {
+                return PreToolDecision::Ask { message };
             }
             Err(e) => {
                 tracing::warn!(error = %e, "pre_tool_use hooks failed");
@@ -345,6 +383,19 @@ impl ToolGate for ExtensionToolGate {
             PreToolDecision::Deny { message } => {
                 return ToolGateDecision::Deny { message };
             }
+            PreToolDecision::Ask { message } => {
+                // 2) Hook asked: route through the permission UI / approval flow
+                //    before the regular rule check (Grok `ask` decision).
+                let reason = if message.trim().is_empty() {
+                    "PreToolUse hook requests user confirmation".to_string()
+                } else {
+                    message
+                };
+                match self.inner.confirm(&effective, &reason).await {
+                    ToolGateDecision::Allow => {}
+                    other => return other,
+                }
+            }
         }
 
         // 2) Permission / approval gate on (possibly rewritten) call
@@ -368,6 +419,14 @@ impl ToolGate for ExtensionToolGate {
         self.runtime.after_tool(call, output, is_error).await;
         self.inner.after_tool(call, output, is_error).await;
     }
+
+    async fn confirm(&self, call: &ToolCall, reason: &str) -> ToolGateDecision {
+        self.inner.confirm(call, reason).await
+    }
+
+    fn release_permission_lease(&self, call: &ToolCall) {
+        self.inner.release_permission_lease(call);
+    }
 }
 
 #[cfg(test)]
@@ -376,6 +435,30 @@ mod tests {
     use crate::registry::ExtensionRegistryBuilder;
     use one_core::tool_gate::AllowAllGate;
     use serde_json::json;
+
+    /// Inner gate that records `confirm` calls and returns a canned decision.
+    struct AskRecordingGate {
+        confirmed: std::sync::Mutex<Vec<String>>,
+        allow: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl ToolGate for AskRecordingGate {
+        async fn check(&self, _call: &ToolCall) -> ToolGateDecision {
+            ToolGateDecision::Allow
+        }
+
+        async fn confirm(&self, _call: &ToolCall, reason: &str) -> ToolGateDecision {
+            self.confirmed.lock().unwrap().push(reason.to_string());
+            if self.allow.load(std::sync::atomic::Ordering::Relaxed) {
+                ToolGateDecision::Allow
+            } else {
+                ToolGateDecision::Deny {
+                    message: "user said no".into(),
+                }
+            }
+        }
+    }
 
     struct DenyBash;
 
@@ -457,6 +540,64 @@ mod tests {
             }
             other => panic!("expected rewrite, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn pre_tool_ask_routes_to_inner_confirm() {
+        // Hook asks → inner.confirm() decides.
+        let hooks_raw = r#"{
+            "pre_tool_use": [{
+                "matcher": "bash",
+                "command": "echo '{\"permissionDecision\":\"ask\",\"systemMessage\":\"check this\"}'"
+            }]
+        }"#;
+        let cfg: HooksConfig = serde_json::from_str(hooks_raw).unwrap();
+        let rt = Arc::new(ExtensionRuntime::from_registry(
+            ExtensionRegistryBuilder::new().build(),
+            cfg,
+            PathBuf::from("/tmp"),
+        ));
+        let inner = Arc::new(AskRecordingGate {
+            confirmed: std::sync::Mutex::new(Vec::new()),
+            allow: std::sync::atomic::AtomicBool::new(true),
+        });
+        let gate = rt.tool_gate(inner.clone() as Arc<dyn ToolGate>);
+        let call = ToolCall {
+            id: "1".into(),
+            name: "bash".into(),
+            arguments: json!({"command": "ls"}),
+        };
+        assert!(matches!(gate.check(&call).await, ToolGateDecision::Allow));
+        assert_eq!(
+            inner.confirmed.lock().unwrap().as_slice(),
+            ["check this".to_string()]
+        );
+
+        // User denies → Deny flows back to the agent.
+        let inner2 = Arc::new(AskRecordingGate {
+            confirmed: std::sync::Mutex::new(Vec::new()),
+            allow: std::sync::atomic::AtomicBool::new(false),
+        });
+        let gate2 = rt.tool_gate(inner2.clone() as Arc<dyn ToolGate>);
+        match gate2.check(&call).await {
+            ToolGateDecision::Deny { message } => assert_eq!(message, "user said no"),
+            other => panic!("expected deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn subagent_stop_hook_runs_on_notify() {
+        let hooks_raw = r#"{
+            "subagent_stop": [{ "command": "true" }]
+        }"#;
+        let cfg: HooksConfig = serde_json::from_str(hooks_raw).unwrap();
+        let rt = ExtensionRuntime::from_registry(
+            ExtensionRegistryBuilder::new().build(),
+            cfg,
+            PathBuf::from("/tmp"),
+        );
+        rt.notify_subagent_stop("job_1", "explore", true, "done")
+            .await;
     }
 
     #[tokio::test]

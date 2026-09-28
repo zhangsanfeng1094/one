@@ -31,6 +31,13 @@ pub enum ExtensionEvent {
     PreCompact { trigger: String },
     /// Compaction finished. `trigger` is `manual` or `auto`.
     PostCompact { trigger: String },
+    /// A `task` subagent job reached a terminal state (observe only).
+    SubagentStop {
+        job_id: String,
+        agent: String,
+        ok: bool,
+        summary: String,
+    },
     /// User submitted a prompt (before model).
     UserPromptSubmit { text: String },
 }
@@ -68,6 +75,9 @@ pub enum PreToolDecision {
     Rewrite { arguments: Value },
     /// Block the tool; message is returned to the model.
     Deny { message: String },
+    /// Defer to the human: surface the permission prompt (Grok `ask`).
+    /// `message` is shown as the approval reason; empty → generic reason.
+    Ask { message: String },
 }
 
 impl Default for PreToolDecision {

@@ -83,7 +83,7 @@ impl Extension for MyExtension {
         call: &one_core::ToolCall,
     ) -> one_ext::Result<PreToolDecision> {
         if call.name == "bash" {
-            // Allow | Rewrite { arguments } | Deny { message }
+            // Allow | Rewrite { arguments } | Deny { message } | Ask { message }
         }
         Ok(PreToolDecision::Allow)
     }

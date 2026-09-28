@@ -65,44 +65,48 @@ pub async fn discover_skills(dirs: &[PathBuf]) -> Result<Vec<Skill>> {
 
 const MAX_DEPTH: u32 = 5;
 
-async fn collect_skills_under(
-    dir: &Path,
-    skills: &mut Vec<Skill>,
-    seen: &mut std::collections::HashSet<String>,
+fn collect_skills_under<'a>(
+    dir: &'a Path,
+    skills: &'a mut Vec<Skill>,
+    seen: &'a mut std::collections::HashSet<String>,
     depth: u32,
-) -> Result<()> {
-    if depth > MAX_DEPTH {
-        return Ok(());
-    }
-    let skill_file = dir.join("SKILL.md");
-    if skill_file.is_file() {
-        if let Some(skill) = load_skill_file(&skill_file).await? {
-            // First-found wins (caller should pass roots in precedence order).
-            if seen.insert(skill.name.clone()) {
-                skills.push(skill);
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'a>> {
+    // Erase the recursive future at this boundary so discovery can also run
+    // inside Send subagent tasks without recursively proving its own Send type.
+    Box::pin(async move {
+        if depth > MAX_DEPTH {
+            return Ok(());
+        }
+        let skill_file = dir.join("SKILL.md");
+        if skill_file.is_file() {
+            if let Some(skill) = load_skill_file(&skill_file).await? {
+                // First-found wins (caller should pass roots in precedence order).
+                if seen.insert(skill.name.clone()) {
+                    skills.push(skill);
+                }
             }
+            // Directory with SKILL.md is a skill package — don't recurse into scripts/refs as skills.
+            return Ok(());
         }
-        // Directory with SKILL.md is a skill package — don't recurse into scripts/refs as skills.
-        return Ok(());
-    }
 
-    let mut entries = match fs::read_dir(dir).await {
-        Ok(e) => e,
-        Err(_) => return Ok(()),
-    };
-    while let Some(entry) = entries.next_entry().await? {
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
+        let mut entries = match fs::read_dir(dir).await {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with('.') || name == "node_modules" || name == "target" {
+                continue;
+            }
+            collect_skills_under(&path, skills, seen, depth + 1).await?;
         }
-        let name = entry.file_name();
-        let name = name.to_string_lossy();
-        if name.starts_with('.') || name == "node_modules" || name == "target" {
-            continue;
-        }
-        Box::pin(collect_skills_under(&path, skills, seen, depth + 1)).await?;
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 async fn load_skill_file(path: &Path) -> Result<Option<Skill>> {
@@ -468,6 +472,33 @@ pub fn force_load_message(skill: &Skill, user_args: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn nested_discovery_can_run_in_a_send_task() {
+        let dir = std::env::temp_dir().join(format!(
+            "one-skills-send-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let package = dir.join("group/nested");
+        std::fs::create_dir_all(&package).unwrap();
+        std::fs::write(
+            package.join("SKILL.md"),
+            "---\nname: nested\ndescription: Nested discovery regression\n---\nBody\n",
+        )
+        .unwrap();
+        let root = dir.clone();
+        let skills = tokio::spawn(async move { discover_skills(&[root]).await })
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "nested");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn parses_standard_frontmatter() {
