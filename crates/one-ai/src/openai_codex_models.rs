@@ -93,6 +93,7 @@ pub fn openai_codex_model_entries() -> Vec<ModelEntry> {
             reasoning: Some(true),
             thinking_level_map: thinking_map(m.thinking_level_map),
             compat: None,
+            quirks: vec![],
         })
         .collect()
 }

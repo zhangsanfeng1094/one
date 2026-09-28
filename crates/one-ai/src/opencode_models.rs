@@ -233,6 +233,7 @@ fn model_entries(provider: &str, defs: &[OpencodeModelDef]) -> Vec<ModelEntry> {
             reasoning: Some(m.reasoning),
             thinking_level_map: None,
             compat: None,
+            quirks: vec![],
         })
         .collect()
 }

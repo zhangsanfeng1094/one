@@ -1278,25 +1278,90 @@ mod inner {
         }
 
         let mut last_role: Option<String> = None;
-        for message in &request.messages {
-            // Some proxies reject user messages immediately after tool results.
-            if compat.requires_assistant_after_tool_result
-                && last_role.as_deref() == Some("tool")
-                && matches!(message, one_core::AgentMessage::User(_))
-            {
-                messages.push(json!({
-                    "role": "assistant",
-                    "content": "I have processed the tool results.",
-                }));
+        let mut idx = 0;
+        while idx < request.messages.len() {
+            match &request.messages[idx] {
+                one_core::AgentMessage::ToolResult(_) => {
+                    // Gather all consecutive ToolResult messages. OpenAI requires all
+                    // tool responses for an assistant's tool_calls to be consecutive.
+                    let mut tool_images = Vec::new();
+                    while idx < request.messages.len() {
+                        if let one_core::AgentMessage::ToolResult(result) = &request.messages[idx] {
+                            let mut tool_msg = json!({
+                                "role": "tool",
+                                "tool_call_id": result.tool_call_id,
+                                "content": crate::media::tool_result_plain(&result.content),
+                            });
+                            if compat.requires_tool_result_name {
+                                tool_msg["name"] = json!(result.tool_name);
+                            }
+                            messages.push(tool_msg);
+                            let images = crate::media::collect_images(&result.content);
+                            if !images.is_empty() {
+                                tool_images.push((result.tool_name.clone(), images));
+                            }
+                            idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    last_role = Some("tool".to_string());
+
+                    // If any tool results contained images, attach them in a follow-up user message
+                    // strictly AFTER all consecutive tool responses to avoid interrupting the tool block.
+                    if !tool_images.is_empty() {
+                        if compat.requires_assistant_after_tool_result {
+                            messages.push(json!({
+                                "role": "assistant",
+                                "content": "I have processed the tool results.",
+                            }));
+                        }
+                        let mut parts = Vec::new();
+                        for (tool_name, images) in tool_images {
+                            parts.push(json!({
+                                "type": "text",
+                                "text": format!(
+                                    "[images from tool `{tool_name}` — see attached]"
+                                ),
+                            }));
+                            for (mime, data) in images {
+                                parts.push(json!({
+                                    "type": "image_url",
+                                    "image_url": {
+                                        "url": format!("data:{mime};base64,{data}")
+                                    }
+                                }));
+                            }
+                        }
+                        messages.push(json!({
+                            "role": "user",
+                            "content": parts,
+                        }));
+                        last_role = Some("user".to_string());
+                    }
+                }
+                msg => {
+                    // Some proxies reject user messages immediately after tool results.
+                    if compat.requires_assistant_after_tool_result
+                        && last_role.as_deref() == Some("tool")
+                        && matches!(msg, one_core::AgentMessage::User(_))
+                    {
+                        messages.push(json!({
+                            "role": "assistant",
+                            "content": "I have processed the tool results.",
+                        }));
+                    }
+                    let mapped = map_chat_messages(msg, compat, reasoning_model);
+                    if let Some(last) = mapped.last() {
+                        last_role = last
+                            .get("role")
+                            .and_then(|r| r.as_str())
+                            .map(|s| s.to_string());
+                    }
+                    messages.extend(mapped);
+                    idx += 1;
+                }
             }
-            let mapped = map_chat_messages(message, compat, reasoning_model);
-            if let Some(last) = mapped.last() {
-                last_role = last
-                    .get("role")
-                    .and_then(|r| r.as_str())
-                    .map(|s| s.to_string());
-            }
-            messages.extend(mapped);
         }
 
         // OpenRouter Anthropic cache: stabilize *all* non-tool message shapes first
@@ -1695,14 +1760,16 @@ mod inner {
     /// Convert agent history into Responses `input` items.
     fn map_responses_input(messages: &[one_core::AgentMessage]) -> Vec<Value> {
         let mut input = Vec::new();
-        for message in messages {
-            match message {
+        let mut idx = 0;
+        while idx < messages.len() {
+            match &messages[idx] {
                 one_core::AgentMessage::User(user) => {
                     input.push(json!({
                         "type": "message",
                         "role": "user",
                         "content": crate::media::openai_responses_user_content(user),
                     }));
+                    idx += 1;
                 }
                 one_core::AgentMessage::Assistant(assistant) => {
                     // Prefer replaying signed reasoning items when we have an id.
@@ -1767,33 +1834,48 @@ mod inner {
                             }));
                         }
                     }
+                    idx += 1;
                 }
-                one_core::AgentMessage::ToolResult(result) => {
-                    let call_id = result
-                        .tool_call_id
-                        .split('|')
-                        .next()
-                        .unwrap_or(&result.tool_call_id);
-                    input.push(json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": crate::media::tool_result_plain(&result.content),
-                    }));
-                    // Responses: function_call_output is text-only — attach images as user input.
-                    let images = crate::media::collect_images(&result.content);
-                    if !images.is_empty() {
-                        let mut parts = vec![json!({
-                            "type": "input_text",
-                            "text": format!(
-                                "[images from tool `{}` — see attached]",
-                                result.tool_name
-                            ),
-                        })];
-                        for (mime, data) in images {
-                            parts.push(json!({
-                                "type": "input_image",
-                                "image_url": format!("data:{mime};base64,{data}"),
+                one_core::AgentMessage::ToolResult(_) => {
+                    let mut tool_images = Vec::new();
+                    while idx < messages.len() {
+                        if let one_core::AgentMessage::ToolResult(result) = &messages[idx] {
+                            let call_id = result
+                                .tool_call_id
+                                .split('|')
+                                .next()
+                                .unwrap_or(&result.tool_call_id);
+                            input.push(json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": crate::media::tool_result_plain(&result.content),
                             }));
+                            let images = crate::media::collect_images(&result.content);
+                            if !images.is_empty() {
+                                tool_images.push((result.tool_name.clone(), images));
+                            }
+                            idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    // Responses: function_call_output is text-only — attach images as user input
+                    // AFTER all consecutive function_call_output items.
+                    if !tool_images.is_empty() {
+                        let mut parts = Vec::new();
+                        for (tool_name, images) in tool_images {
+                            parts.push(json!({
+                                "type": "input_text",
+                                "text": format!(
+                                    "[images from tool `{tool_name}` — see attached]"
+                                ),
+                            }));
+                            for (mime, data) in images {
+                                parts.push(json!({
+                                    "type": "input_image",
+                                    "image_url": format!("data:{mime};base64,{data}"),
+                                }));
+                            }
                         }
                         input.push(json!({
                             "type": "message",
@@ -2170,6 +2252,117 @@ mod inner {
                 "error message should appear once: {msg}"
             );
             server.await.unwrap();
+        }
+
+        #[test]
+        fn parallel_tool_results_with_images_keep_tool_messages_consecutive() {
+            let dir = std::env::temp_dir().join(format!(
+                "test_img_{}",
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let img_path1 = dir.join("img1.png");
+            let img_path2 = dir.join("img2.png");
+            let png_bytes = [
+                0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+                0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
+                0x00, 0x1f, 0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0a, 0x49, 0x44, 0x41, 0x54, 0x78,
+                0x9c, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00,
+                0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+            ];
+            std::fs::write(&img_path1, &png_bytes).unwrap();
+            std::fs::write(&img_path2, &png_bytes).unwrap();
+
+            let req = CompletionRequest {
+                system_prompt: "".into(),
+                messages: vec![
+                    one_core::AgentMessage::Assistant(one_core::message::AssistantMessage {
+                        content: vec![
+                            ContentBlock::ToolCall {
+                                id: "call_00".into(),
+                                name: "read".into(),
+                                arguments: json!({"path": img_path1.display().to_string()}),
+                            },
+                            ContentBlock::ToolCall {
+                                id: "call_01".into(),
+                                name: "read".into(),
+                                arguments: json!({"path": img_path2.display().to_string()}),
+                            },
+                        ],
+                        provider: "openai".into(),
+                        model: "gpt-4o".into(),
+                        stop_reason: StopReason::ToolUse,
+                        citations: Vec::new(),
+                        timestamp: 0,
+                    }),
+                    one_core::AgentMessage::ToolResult(one_core::message::ToolResultMessage {
+                        tool_call_id: "call_00".into(),
+                        tool_name: "read".into(),
+                        content: vec![one_core::message::TextOrImage::Image {
+                            mime_type: "image/png".into(),
+                            path: img_path1.display().to_string(),
+                        }],
+                        is_error: false,
+                        timestamp: 0,
+                    }),
+                    one_core::AgentMessage::ToolResult(one_core::message::ToolResultMessage {
+                        tool_call_id: "call_01".into(),
+                        tool_name: "read".into(),
+                        content: vec![one_core::message::TextOrImage::Image {
+                            mime_type: "image/png".into(),
+                            path: img_path2.display().to_string(),
+                        }],
+                        is_error: false,
+                        timestamp: 0,
+                    }),
+                ],
+                tools: Vec::new(),
+                server_tools: Vec::new(),
+                thinking_level: ThinkingLevel::Off,
+            };
+
+            let compat = crate::compat::ResolvedOpenAiCompat::default();
+            let body = build_chat_body(
+                &req,
+                "gpt-4o",
+                false,
+                &compat,
+                false,
+                crate::thinking::ThinkingWire::Off,
+                "https://api.openai.com/v1",
+            );
+
+            let msgs = body["messages"].as_array().unwrap();
+            assert_eq!(
+                msgs.len(),
+                4,
+                "expected assistant, tool, tool, user: {msgs:?}"
+            );
+            assert_eq!(msgs[0]["role"], "assistant");
+            assert_eq!(msgs[1]["role"], "tool");
+            assert_eq!(msgs[1]["tool_call_id"], "call_00");
+            assert_eq!(msgs[2]["role"], "tool");
+            assert_eq!(msgs[2]["tool_call_id"], "call_01");
+            assert_eq!(msgs[3]["role"], "user");
+            let user_content = msgs[3]["content"].as_array().unwrap();
+            assert!(user_content.iter().any(|p| p["type"] == "image_url"));
+
+            // map_responses_input test
+            let resp_input = map_responses_input(&req.messages);
+            assert_eq!(resp_input.len(), 5, "expected 2 function_calls, 2 function_call_outputs, 1 user message: {resp_input:?}");
+            assert_eq!(resp_input[0]["type"], "function_call");
+            assert_eq!(resp_input[1]["type"], "function_call");
+            assert_eq!(resp_input[2]["type"], "function_call_output");
+            assert_eq!(resp_input[2]["call_id"], "call_00");
+            assert_eq!(resp_input[3]["type"], "function_call_output");
+            assert_eq!(resp_input[3]["call_id"], "call_01");
+            assert_eq!(resp_input[4]["type"], "message");
+            assert_eq!(resp_input[4]["role"], "user");
+
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 }

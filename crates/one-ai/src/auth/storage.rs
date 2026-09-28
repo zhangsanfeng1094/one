@@ -401,7 +401,19 @@ async fn refresh_oauth(provider: &str, oauth: &OAuthCredential) -> AuthResult<OA
 }
 
 fn agent_dir() -> PathBuf {
-    // Mirror one-session without adding a crate dependency.
+    // Mirror one-session without adding a crate dependency. The env checks must
+    // stay in sync with `one_session::paths::agent_dir`, otherwise `auth.json`
+    // would be read from a different directory than the rest of One.
+    if let Ok(dir) = std::env::var("ONE_AGENT_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir.trim());
+        }
+    }
+    if let Ok(dir) = std::env::var("ONE_DATA_DIR") {
+        if !dir.trim().is_empty() {
+            return PathBuf::from(dir.trim()).join("agent");
+        }
+    }
     let home = std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."));

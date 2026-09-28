@@ -75,6 +75,7 @@ pub fn xai_model_entries() -> Vec<ModelEntry> {
             reasoning: Some(m.reasoning),
             thinking_level_map: None,
             compat: None,
+            quirks: vec![],
         })
         .collect()
 }

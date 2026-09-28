@@ -520,6 +520,7 @@ mod inner {
                 messages: vec![one_core::AgentMessage::User(UserMessage {
                     content: UserContent::Text("hi".into()),
                     timestamp: 0,
+                    kind: None,
                 })],
                 tools: vec![ToolDefinition {
                     name: "read".into(),
@@ -565,6 +566,7 @@ mod inner {
                 one_core::AgentMessage::User(UserMessage {
                     content: UserContent::Text("do it".into()),
                     timestamp: 0,
+                    kind: None,
                 }),
                 one_core::AgentMessage::Assistant(AssistantMessage {
                     content: vec![ContentBlock::ToolCall {

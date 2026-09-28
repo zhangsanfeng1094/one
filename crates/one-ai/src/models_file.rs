@@ -126,6 +126,9 @@ struct ProviderModelEntry {
     /// Per-model `compat` overrides (merged over provider-level).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     compat: Option<CompatConfig>,
+    /// Model behavior quirks for dynamic Prompt Enhancement.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    quirks: Vec<crate::registry::ModelQuirk>,
 }
 
 /// On-disk snapshot written by CRUD.
@@ -229,8 +232,16 @@ pub fn load_models_file(path: &Path) -> ModelsConfig {
 /// Load models.json, returning a parse error instead of silently falling back.
 pub fn try_load_models_file(path: &Path) -> Result<ModelsConfig, String> {
     let content = std::fs::read_to_string(path).map_err(|e| format!("read failed: {e}"))?;
+    try_parse_models_file(&content)
+}
+
+/// Parse models.json content without touching the filesystem.
+///
+/// Shared by the runtime loader and the Config Studio so a draft is judged by
+/// exactly the same rules the runtime will apply.
+pub fn try_parse_models_file(content: &str) -> Result<ModelsConfig, String> {
     // Tolerate trailing commas (common hand-edit mistake) before strict JSON parse.
-    let cleaned = strip_json_trailing_commas(&content);
+    let cleaned = strip_json_trailing_commas(content);
     let file: ModelsFile = serde_json::from_str(&cleaned).map_err(|e| {
         format!("invalid JSON: {e}. Tip: remove trailing commas after the last array/object item.")
     })?;
@@ -272,6 +283,7 @@ pub fn try_load_models_file(path: &Path) -> Result<ModelsConfig, String> {
                 reasoning: m.reasoning,
                 thinking_level_map: m.thinking_level_map.clone(),
                 compat,
+                quirks: m.quirks.clone(),
             });
         }
 
@@ -314,6 +326,7 @@ pub fn try_load_models_file(path: &Path) -> Result<ModelsConfig, String> {
             reasoning: None,
             thinking_level_map: None,
             compat: None,
+            quirks: vec![],
         });
 
         // Ensure a provider config exists for flat entries that carry baseUrl.
@@ -444,6 +457,7 @@ fn build_file_out(cfg: &ModelsConfig) -> ModelsFileOut {
             reasoning: m.reasoning,
             thinking_level_map: m.thinking_level_map.clone().filter(|map| !map.is_empty()),
             compat: model_compat,
+            quirks: m.quirks.clone(),
         });
     }
 
@@ -723,6 +737,7 @@ mod tests {
             reasoning: None,
             thinking_level_map: None,
             compat: None,
+            quirks: vec![],
         });
         if let Some(p) = cfg.provider_mut("myproxy") {
             p.api_key = Some("sk-test".into());

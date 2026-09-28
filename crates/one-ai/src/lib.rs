@@ -39,7 +39,8 @@ pub use compat::{
 pub use gemini::GeminiProvider;
 pub use mock::MockProvider;
 pub use models_file::{
-    load_models_file, resolve_secret, save_models_file, try_load_models_file, ModelsConfig,
+    load_models_file, resolve_secret, save_models_file, try_load_models_file,
+    try_parse_models_file, ModelsConfig,
 };
 #[cfg(feature = "network")]
 pub use ollama::OllamaProvider;

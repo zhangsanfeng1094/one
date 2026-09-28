@@ -675,6 +675,7 @@ mod inner {
                 messages: vec![one_core::AgentMessage::User(UserMessage {
                     content: UserContent::Text("hi".into()),
                     timestamp: 0,
+                    kind: None,
                 })],
                 tools: vec![
                     ToolDefinition {
@@ -722,6 +723,7 @@ mod inner {
                 messages: vec![one_core::AgentMessage::User(UserMessage {
                     content: UserContent::Text("hi".into()),
                     timestamp: 0,
+                    kind: None,
                 })],
                 tools: vec![],
                 server_tools: Vec::new(),
@@ -735,6 +737,7 @@ mod inner {
                     one_core::AgentMessage::User(UserMessage {
                         content: UserContent::Text("hi".into()),
                         timestamp: 0,
+                        kind: None,
                     }),
                     one_core::AgentMessage::Assistant(one_core::message::AssistantMessage {
                         content: vec![ContentBlock::Text { text: "yo".into() }],

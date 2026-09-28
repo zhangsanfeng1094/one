@@ -119,15 +119,31 @@ pub fn attach_cache_control_to_message(message: &mut Value, cache: &Value) -> bo
     attach_cache_control_to_content(content, cache)
 }
 
-/// Walk messages from the end; place one conversation breakpoint on the first
-/// message that has an eligible content block (skips empty / thinking-only).
+/// Walk messages from the end; place up to two conversation breakpoints:
+/// - Always on the last message with an eligible content block (skips empty / thinking-only).
+/// - When there are at least 3 non-system messages, also on the second-to-last
+///   eligible message so the previous turn/step boundary stays anchored for
+///   Anthropic cache lookups and cache-sharing forked compaction.
 pub fn attach_cache_control_to_messages_suffix(messages: &mut [Value], cache: &Value) -> bool {
-    for message in messages.iter_mut().rev() {
+    let conv_start = messages
+        .iter()
+        .position(|m| {
+            let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+            role != "system" && role != "developer"
+        })
+        .unwrap_or(messages.len());
+    let conv = &mut messages[conv_start..];
+    let max_markers = if conv.len() >= 3 { 2 } else { 1 };
+    let mut placed = 0usize;
+    for message in conv.iter_mut().rev() {
         if attach_cache_control_to_message(message, cache) {
-            return true;
+            placed += 1;
+            if placed >= max_markers {
+                break;
+            }
         }
     }
-    false
+    placed > 0
 }
 
 /// System prompt as Anthropic content-block array with a trailing cache breakpoint.
@@ -581,6 +597,18 @@ mod tests {
         // Breakpoint moved to the new last message.
         assert!(turn2[1]["content"][0].get("cache_control").is_some());
         assert!(turn2[0]["content"][0].get("cache_control").is_none());
+
+        // Turn 3 (or forked compaction): 3+ messages anchor both the previous
+        // turn boundary and the new trailing message (2 message breakpoints).
+        let mut turn3 = vec![
+            json!({ "role": "user", "content": "hi" }),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "hello" }] }),
+            json!({ "role": "user", "content": "summarize" }),
+        ];
+        apply_anthropic_message_cache(&mut turn3, &mut [], &cache, false);
+        assert!(turn3[0]["content"][0].get("cache_control").is_none());
+        assert!(turn3[1]["content"][0].get("cache_control").is_some());
+        assert!(turn3[2]["content"][0].get("cache_control").is_some());
     }
 
     #[test]

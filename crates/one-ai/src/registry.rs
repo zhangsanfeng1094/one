@@ -3,6 +3,49 @@ use serde::{Deserialize, Serialize};
 use crate::compat::{CompatConfig, ThinkingLevelMap};
 use crate::openai::OpenaiWireApi;
 
+/// Known model post-training / inference behavior quirks that benefit from Prompt Enhancement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelQuirk {
+    /// Over-plans or produces long speculative lists before acting; benefits from "act immediately" instruction.
+    OverPlanning,
+    /// Concludes after 1 tool call or gives up early; benefits from "keep executing until verified" instruction.
+    StopsEarly,
+    /// Reluctant to invoke available tools, preferring text guess; benefits from "must use tools" instruction.
+    ReluctantToUseTools,
+    /// Fails to verify code edits or assumptions before declaring success; benefits from "verify before done".
+    WeakVerification,
+}
+
+impl ModelQuirk {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::OverPlanning => "over_planning",
+            Self::StopsEarly => "stops_early",
+            Self::ReluctantToUseTools => "reluctant_to_use_tools",
+            Self::WeakVerification => "weak_verification",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_lowercase().replace('-', "_").as_str() {
+            "over_planning" | "overplanning" => Some(Self::OverPlanning),
+            "stops_early" | "stopsearly" => Some(Self::StopsEarly),
+            "reluctant_to_use_tools" | "reluctanttousetools" => Some(Self::ReluctantToUseTools),
+            "weak_verification" | "weakverification" => Some(Self::WeakVerification),
+            _ => None,
+        }
+    }
+}
+
+/// Model behavior profile describing generation and agent tendencies.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelBehaviorProfile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quirks: Vec<ModelQuirk>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelEntry {
     pub provider: String,
@@ -33,6 +76,9 @@ pub struct ModelEntry {
     /// Pi-style `compat` overrides (merged with provider-level + auto-detect).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub compat: Option<CompatConfig>,
+    /// Behavioral quirks for Prompt Enhancement (e.g. over_planning, stops_early).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub quirks: Vec<ModelQuirk>,
 }
 
 /// Provider-level settings from `models.json` `providers` block.
@@ -71,6 +117,7 @@ impl ModelRegistry {
                     reasoning: None,
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
                 ModelEntry {
                     provider: "anthropic".into(),
@@ -83,6 +130,7 @@ impl ModelRegistry {
                     reasoning: Some(true),
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
                 ModelEntry {
                     provider: "openai".into(),
@@ -95,6 +143,7 @@ impl ModelRegistry {
                     reasoning: None,
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
                 ModelEntry {
                     provider: "openai".into(),
@@ -107,6 +156,7 @@ impl ModelRegistry {
                     reasoning: None,
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
                 ModelEntry {
                     provider: "ollama".into(),
@@ -119,6 +169,7 @@ impl ModelRegistry {
                     reasoning: None,
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
                 ModelEntry {
                     provider: "openrouter".into(),
@@ -131,6 +182,7 @@ impl ModelRegistry {
                     reasoning: Some(true),
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
                 ModelEntry {
                     provider: "deepseek".into(),
@@ -143,6 +195,7 @@ impl ModelRegistry {
                     reasoning: None,
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
                 ModelEntry {
                     provider: "deepseek".into(),
@@ -155,6 +208,7 @@ impl ModelRegistry {
                     reasoning: Some(true),
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
                 ModelEntry {
                     provider: "gemini".into(),
@@ -167,6 +221,7 @@ impl ModelRegistry {
                     reasoning: Some(true),
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
                 ModelEntry {
                     provider: "gemini".into(),
@@ -179,6 +234,7 @@ impl ModelRegistry {
                     reasoning: Some(true),
                     thinking_level_map: None,
                     compat: None,
+                    quirks: vec![],
                 },
             ]
             .into_iter()

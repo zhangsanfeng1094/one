@@ -564,14 +564,16 @@ mod inner {
 
     fn map_responses_input(messages: &[one_core::AgentMessage]) -> Vec<Value> {
         let mut input = Vec::new();
-        for message in messages {
-            match message {
+        let mut idx = 0;
+        while idx < messages.len() {
+            match &messages[idx] {
                 one_core::AgentMessage::User(user) => {
                     input.push(json!({
                         "type": "message",
                         "role": "user",
                         "content": crate::media::openai_responses_user_content(user),
                     }));
+                    idx += 1;
                 }
                 one_core::AgentMessage::Assistant(assistant) => {
                     for block in &assistant.content {
@@ -634,32 +636,46 @@ mod inner {
                             }));
                         }
                     }
+                    idx += 1;
                 }
-                one_core::AgentMessage::ToolResult(result) => {
-                    let call_id = result
-                        .tool_call_id
-                        .split('|')
-                        .next()
-                        .unwrap_or(&result.tool_call_id);
-                    input.push(json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": crate::media::tool_result_plain(&result.content),
-                    }));
-                    let images = crate::media::collect_images(&result.content);
-                    if !images.is_empty() {
-                        let mut parts = vec![json!({
-                            "type": "input_text",
-                            "text": format!(
-                                "[images from tool `{}` — see attached]",
-                                result.tool_name
-                            ),
-                        })];
-                        for (mime, data) in images {
-                            parts.push(json!({
-                                "type": "input_image",
-                                "image_url": format!("data:{mime};base64,{data}"),
+                one_core::AgentMessage::ToolResult(_) => {
+                    let mut tool_images = Vec::new();
+                    while idx < messages.len() {
+                        if let one_core::AgentMessage::ToolResult(result) = &messages[idx] {
+                            let call_id = result
+                                .tool_call_id
+                                .split('|')
+                                .next()
+                                .unwrap_or(&result.tool_call_id);
+                            input.push(json!({
+                                "type": "function_call_output",
+                                "call_id": call_id,
+                                "output": crate::media::tool_result_plain(&result.content),
                             }));
+                            let images = crate::media::collect_images(&result.content);
+                            if !images.is_empty() {
+                                tool_images.push((result.tool_name.clone(), images));
+                            }
+                            idx += 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    if !tool_images.is_empty() {
+                        let mut parts = Vec::new();
+                        for (tool_name, images) in tool_images {
+                            parts.push(json!({
+                                "type": "input_text",
+                                "text": format!(
+                                    "[images from tool `{tool_name}` — see attached]"
+                                ),
+                            }));
+                            for (mime, data) in images {
+                                parts.push(json!({
+                                    "type": "input_image",
+                                    "image_url": format!("data:{mime};base64,{data}"),
+                                }));
+                            }
                         }
                         input.push(json!({
                             "type": "message",

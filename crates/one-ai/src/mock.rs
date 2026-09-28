@@ -128,6 +128,30 @@ impl MockProvider {
             });
         }
 
+        // Opt-in deterministic TUI smoke scenario. Both tools return promptly,
+        // leaving a long-running bash process and child agent to inspect in Work.
+        if std::env::var_os("ONE_MOCK_WORK_DEMO").is_some() && lower.contains("work dock demo") {
+            return Ok(CompletionResponse {
+                provider: self.name().to_string(),
+                model: self.model.clone(),
+                content: vec![
+                    ContentBlock::ToolCall {
+                        id: "call_mock_work_bash".into(),
+                        name: "bash".into(),
+                        arguments: json!({"command": "sleep 45", "run_in_background": true}),
+                    },
+                    ContentBlock::ToolCall {
+                        id: "call_mock_work_agent".into(),
+                        name: "task".into(),
+                        arguments: json!({"prompt": "inspect mock work ".repeat(260), "description": "Inspect mock work", "background": true}),
+                    },
+                ],
+                stop_reason: StopReason::ToolUse,
+                usage: TokenUsage::default(),
+                citations: Vec::new(),
+            });
+        }
+
         if lower.contains("list") && (lower.contains("file") || lower.contains("dir")) {
             return Ok(CompletionResponse {
                 provider: self.name().to_string(),
