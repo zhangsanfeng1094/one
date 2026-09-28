@@ -148,7 +148,12 @@ async fn bash_background_start_poll_and_notify() {
     use serde_json::json;
 
     let registry = Arc::new(BackgroundTaskRegistry::new());
-    let bash = BashTool::with_registry(std::env::temp_dir(), true, registry.clone());
+    let policy = if one_tools::OsSandbox::bwrap_available() {
+        one_tools::PathPolicy::workspace(std::env::temp_dir())
+    } else {
+        one_tools::PathPolicy::full_access(std::env::temp_dir())
+    };
+    let bash = BashTool::with_policy(policy, true, registry.clone());
     let output = BashOutputTool::new(registry.clone());
     let kill = BashKillTool::new(registry.clone());
 

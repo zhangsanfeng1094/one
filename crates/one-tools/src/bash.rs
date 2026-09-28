@@ -1230,6 +1230,14 @@ mod tests {
     use one_core::tool::ToolCall;
     use serde_json::json;
 
+    fn test_policy(dir: PathBuf) -> PathPolicy {
+        if OsSandbox::bwrap_available() {
+            PathPolicy::workspace(dir)
+        } else {
+            PathPolicy::full_access(dir)
+        }
+    }
+
     #[test]
     fn schema_exposes_timeout_secs_and_ms() {
         let dir = std::env::temp_dir();
@@ -1335,7 +1343,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = BashTool::with_policy(
-            PathPolicy::workspace(dir.clone()),
+            test_policy(dir.clone()),
             true,
             Arc::new(BackgroundTaskRegistry::new()),
         );
@@ -1582,7 +1590,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = BashTool::with_policy(
-            PathPolicy::workspace(dir.clone()),
+            test_policy(dir.clone()),
             true,
             Arc::new(BackgroundTaskRegistry::new()),
         );
@@ -1628,7 +1636,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = BashTool::with_policy(
-            PathPolicy::workspace(dir.clone()),
+            test_policy(dir.clone()),
             true,
             Arc::new(BackgroundTaskRegistry::new()),
         )
@@ -1678,10 +1686,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
 
         let registry = Arc::new(BackgroundTaskRegistry::new());
-        let tool =
-            BashTool::with_policy(PathPolicy::workspace(dir.clone()), true, registry.clone())
-                .with_auto_background(true)
-                .with_foreground_budget_ms(500);
+        let tool = BashTool::with_policy(test_policy(dir.clone()), true, registry.clone())
+            .with_auto_background(true)
+            .with_foreground_budget_ms(500);
 
         let out = tool
             .execute(&ToolCall {
@@ -1737,8 +1744,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let registry = Arc::new(BackgroundTaskRegistry::new());
-        let tool =
-            BashTool::with_policy(PathPolicy::workspace(dir.clone()), true, registry.clone());
+        let tool = BashTool::with_policy(test_policy(dir.clone()), true, registry.clone());
         let out = tool
             .execute(&ToolCall {
                 id: "1".into(),
@@ -1778,10 +1784,9 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let registry = Arc::new(BackgroundTaskRegistry::new());
-        let tool =
-            BashTool::with_policy(PathPolicy::workspace(dir.clone()), true, registry.clone())
-                .with_auto_background(true)
-                .with_foreground_budget_ms(15_000);
+        let tool = BashTool::with_policy(test_policy(dir.clone()), true, registry.clone())
+            .with_auto_background(true)
+            .with_foreground_budget_ms(15_000);
         let out = tool
             .execute(&ToolCall {
                 id: "1".into(),
@@ -1822,7 +1827,7 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         let tool = BashTool::with_policy(
-            PathPolicy::workspace(dir.clone()),
+            test_policy(dir.clone()),
             true,
             Arc::new(BackgroundTaskRegistry::new()),
         )
@@ -1879,7 +1884,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let tool = BashTool::with_policy(
-            PathPolicy::workspace(dir.clone()),
+            test_policy(dir.clone()),
             true,
             Arc::new(BackgroundTaskRegistry::new()),
         )
@@ -1929,9 +1934,8 @@ mod tests {
         ));
         std::fs::create_dir_all(dir.join("sub")).unwrap();
         let registry = Arc::new(BackgroundTaskRegistry::new());
-        let tool =
-            BashTool::with_policy(PathPolicy::workspace(dir.clone()), true, registry.clone())
-                .with_auto_background(false);
+        let tool = BashTool::with_policy(test_policy(dir.clone()), true, registry.clone())
+            .with_auto_background(false);
 
         let out = tool
             .execute(&ToolCall {
@@ -2012,10 +2016,9 @@ __ONE_SHELL_STATE_END__\n";
         ));
         std::fs::create_dir_all(&dir).unwrap();
         let registry = Arc::new(BackgroundTaskRegistry::new());
-        let tool =
-            BashTool::with_policy(PathPolicy::workspace(dir.clone()), true, registry.clone())
-                .with_auto_background(true)
-                .with_foreground_budget_ms(30_000);
+        let tool = BashTool::with_policy(test_policy(dir.clone()), true, registry.clone())
+            .with_auto_background(true)
+            .with_foreground_budget_ms(30_000);
 
         let kick = registry.clone();
         tokio::spawn(async move {

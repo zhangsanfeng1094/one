@@ -1407,15 +1407,16 @@ mod tests {
         ));
         let wait_interest = agent.wait_interest_handle();
 
+        let policy = if one_tools::OsSandbox::bwrap_available() {
+            one_tools::PathPolicy::workspace(std::path::PathBuf::from("."))
+        } else {
+            one_tools::PathPolicy::full_access(std::path::PathBuf::from("."))
+        };
         // Auto-bg after 300ms (shortened 15s budget) — sleep 3 outlives it.
         let bash_tool: Arc<dyn one_core::Tool> = Arc::new(
-            BashTool::with_policy(
-                one_tools::PathPolicy::workspace(std::path::PathBuf::from(".")),
-                true,
-                bash.clone(),
-            )
-            .with_auto_background(true)
-            .with_foreground_budget_ms(300),
+            BashTool::with_policy(policy, true, bash.clone())
+                .with_auto_background(true)
+                .with_foreground_budget_ms(300),
         );
 
         let wait_tool = Arc::new(WaitTasksTool::with_interest(
@@ -1478,14 +1479,15 @@ mod tests {
         ));
         let wait_interest = agent.wait_interest_handle();
 
+        let policy = if one_tools::OsSandbox::bwrap_available() {
+            one_tools::PathPolicy::workspace(std::path::PathBuf::from("."))
+        } else {
+            one_tools::PathPolicy::full_access(std::path::PathBuf::from("."))
+        };
         let bash_tool: Arc<dyn one_core::Tool> = Arc::new(
-            BashTool::with_policy(
-                one_tools::PathPolicy::workspace(std::path::PathBuf::from(".")),
-                true,
-                bash.clone(),
-            )
-            .with_auto_background(true)
-            .with_foreground_budget_ms(300),
+            BashTool::with_policy(policy, true, bash.clone())
+                .with_auto_background(true)
+                .with_foreground_budget_ms(300),
         );
 
         let wait_tool = Arc::new(WaitTasksTool::with_interest(

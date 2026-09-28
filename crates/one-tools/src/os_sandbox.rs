@@ -166,6 +166,17 @@ impl OsSandbox {
 }
 
 fn which_bwrap() -> Option<String> {
+    if let Ok(override_bin) = std::env::var("ONE_TEST_BWRAP_BIN") {
+        let trimmed = override_bin.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        let candidate = Path::new(trimmed);
+        if candidate.is_file() {
+            return Some(candidate.display().to_string());
+        }
+        return None;
+    }
     if Path::new("/usr/bin/bwrap").is_file() {
         return Some("/usr/bin/bwrap".into());
     }
