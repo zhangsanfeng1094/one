@@ -127,6 +127,31 @@ fn enter_submits_prompt() {
 }
 
 #[test]
+fn idle_alt_enter_submits_prompt_not_followup() {
+    let mut app = App::new("test");
+    app.input = "hello".into();
+    match app.handle_key(key(KeyCode::Enter, KeyModifiers::ALT)) {
+        RunOutcome::Prompt(t) => assert_eq!(t, "hello"),
+        other => panic!("idle Alt+Enter must send Prompt, got {other:?}"),
+    }
+    assert!(app.input.is_empty());
+    assert!(app.take_followups().is_empty());
+    assert_eq!(app.messages.last().unwrap().content, "hello");
+}
+
+#[test]
+fn idle_ctrl_s_does_not_steer() {
+    let mut app = App::new("test");
+    app.input = "hello".into();
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL)),
+        RunOutcome::Noop
+    ));
+    assert_eq!(app.input, "hello");
+    assert!(app.take_steers().is_empty());
+}
+
+#[test]
 fn settings_tool_output_panel_opens() {
     let mut app = App::new("test");
     app.set_tool_output_limits(100, 4096);
@@ -1967,11 +1992,13 @@ fn followup_expands_text_chip() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    let shown = &app.messages.last().unwrap().content;
+    // Queued follow-up keeps the compact chip — no user bubble until it starts.
+    let shown = &app.queued_followups()[0];
     assert!(
         shown.contains("[文本") && (shown.contains("line") || shown.contains("lines")),
         "{shown}"
     );
+    assert!(app.messages.is_empty());
 }
 
 #[test]
@@ -2236,6 +2263,89 @@ fn ctrl_c_closes_settings_then_quits() {
 }
 
 #[test]
+fn ctrl_c_closes_deep_settings_dialog_at_any_depth() {
+    let mut app = App::new("test");
+    app.set_settings_catalog(
+        vec![("openai".into(), "2 models".into())],
+        vec![("openai:gpt-4o".into(), "gpt-4o".into())],
+        vec![],
+    );
+
+    // 1) 5 levels deep: Settings -> ProviderDetail -> Compat -> ThinkingFormat
+    app.open_settings_provider_detail("openai", "2 models");
+    app.open_settings_provider_compat("openai");
+    app.open_settings_thinking_format("openai", false);
+    assert_eq!(
+        app.float.as_ref().unwrap().kind,
+        FloatKind::SettingsThinkingFormat
+    );
+    let outcome = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(matches!(outcome, RunOutcome::Noop));
+    assert!(!app.float_open(), "float must be closed completely");
+    assert!(app.select.is_none(), "select must be none");
+
+    // 2) Inline edit inside Tool output
+    app.open_settings_tool_output();
+    app.start_settings_inline_edit("setting:tool_output.max_lines", "max lines", "2000");
+    assert!(app.settings_inline_op.is_some());
+    let outcome = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(matches!(outcome, RunOutcome::Noop));
+    assert!(!app.float_open());
+    assert!(app.settings_inline_op.is_none());
+
+    // 3) Form edit inside ModelAdd
+    app.open_settings_models_for_provider("openai");
+    app.open_settings_model_add();
+    app.settings_form_edit = Some("id".into());
+    let outcome = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(matches!(outcome, RunOutcome::Noop));
+    assert!(!app.float_open());
+    assert!(app.settings_form_edit.is_none());
+    assert!(app.model_draft.is_none());
+
+    // 4) Delete confirm dialog
+    app.open_settings_provider_detail("openai", "2 models");
+    app.confirm_settings_provider_detail("rm_provider");
+    assert_eq!(
+        app.float.as_ref().unwrap().kind,
+        FloatKind::SettingsDeleteConfirm
+    );
+    let outcome = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(matches!(outcome, RunOutcome::Noop));
+    assert!(!app.float_open());
+    assert!(app.settings_delete_target.is_none());
+
+    // 5) Cascaded model select from Settings (Switch active model -> choose provider -> choose model)
+    app.model_catalog = vec![crate::slash::ModelChoice {
+        provider: "openai".into(),
+        id: "gpt-4o".into(),
+        name: "gpt-4o".into(),
+    }];
+    app.open_model_select();
+    assert!(app.select.is_some());
+    // Select provider -> transitions to Model selection
+    let outcome = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+    assert!(matches!(outcome, RunOutcome::Noop));
+    assert!(matches!(
+        app.select_kind,
+        Some(crate::state::SelectKind::Model { .. })
+    ));
+    // Ctrl+C in model selection must close all popups completely, NOT reopen provider select!
+    let outcome = app.handle_key(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
+    assert!(matches!(outcome, RunOutcome::Noop));
+    assert!(!app.float_open());
+    assert!(app.select.is_none());
+    assert!(app.select_kind.is_none());
+
+    // 6) KeyCode::Char('\u{03}') (bare ETX byte sent by some terminals/SSH/PTYs)
+    app.open_settings_float();
+    assert!(app.float_open());
+    let outcome = app.handle_key(key(KeyCode::Char('\u{03}'), KeyModifiers::NONE));
+    assert!(matches!(outcome, RunOutcome::Noop));
+    assert!(!app.float_open());
+}
+
+#[test]
 fn ctrl_c_clears_input_then_quits() {
     let mut app = App::new("test");
     app.input = "draft text".into();
@@ -2425,6 +2535,111 @@ fn ctrl_t_toggles_thinking_visibility() {
     }
     assert!(!app.show_thinking);
     assert!(!app.messages[0].thinking_expanded);
+}
+
+fn work_item(
+    id: &str,
+    kind: crate::work::WorkKind,
+    state: crate::work::WorkState,
+) -> crate::work::WorkItem {
+    crate::work::WorkItem {
+        id: id.into(),
+        kind,
+        state,
+        title: id.into(),
+        activity: String::new(),
+        elapsed_ms: 1000,
+        progress: String::new(),
+        order: 1,
+    }
+}
+
+#[test]
+fn alt_t_opens_work_idle_and_busy_without_composer_side_effects() {
+    let mut app = App::new("test");
+    app.input = "draft".into();
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Char('t'), KeyModifiers::ALT)),
+        RunOutcome::OpenWork
+    ));
+    assert_eq!(app.input, "draft");
+    app.busy = true;
+    app.handle_busy_key(key(KeyCode::Char('t'), KeyModifiers::ALT));
+    assert!(matches!(app.take_busy_ui(), Some(RunOutcome::OpenWork)));
+    assert_eq!(app.input, "draft");
+    assert!(!app.show_thinking);
+}
+
+#[test]
+fn work_overview_routes_detail_stop_and_preserves_selection() {
+    use crate::work::{WorkKind, WorkState};
+    let mut app = App::new("test");
+    app.set_work_items(vec![
+        work_item("agent-1", WorkKind::Agent, WorkState::Running),
+        work_item("bash-1", WorkKind::Bash, WorkState::Running),
+    ]);
+    app.open_work_float();
+    assert_eq!(app.float.as_ref().unwrap().kind, FloatKind::Work);
+    assert!(
+        matches!(app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)), RunOutcome::OpenSubagentDetail { id } if id == "agent-1")
+    );
+    app.open_subagent_detail_float("agent-1", "agent", "running", &[]);
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+        RunOutcome::OpenWork
+    ));
+    app.open_work_float();
+    app.float.as_mut().unwrap().selected = 1;
+    assert!(
+        matches!(app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE)), RunOutcome::OpenBackgroundDetail { id } if id == "bash-1")
+    );
+    app.open_background_detail_float("bash-1", "bash", "running", &[]);
+    assert!(matches!(
+        app.handle_key(key(KeyCode::Esc, KeyModifiers::NONE)),
+        RunOutcome::OpenWork
+    ));
+    app.open_work_float();
+    assert_eq!(
+        app.float
+            .as_ref()
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .item
+            .id,
+        "BASH:bash-1"
+    );
+    app.set_work_items(vec![
+        work_item("agent-1", WorkKind::Agent, WorkState::Failed),
+        work_item("bash-1", WorkKind::Bash, WorkState::Running),
+    ]);
+    assert_eq!(
+        app.float
+            .as_ref()
+            .unwrap()
+            .selected_entry()
+            .unwrap()
+            .item
+            .id,
+        "BASH:bash-1"
+    );
+    assert!(
+        matches!(app.handle_key(key(KeyCode::Char('x'), KeyModifiers::NONE)), RunOutcome::KillBackground { id } if id == "bash-1")
+    );
+}
+
+#[test]
+fn work_slash_and_legacy_slashes_are_ui_commands() {
+    for cmd in ["/work", "/tasks", "/ps"] {
+        assert!(super::helpers::is_ui_slash(cmd));
+        let mut app = App::new("test");
+        app.input = cmd.into();
+        let outcome = app.handle_key(key(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(
+            matches!(outcome, RunOutcome::Prompt(text) if text == cmd),
+            "{cmd} should reach local slash dispatch"
+        );
+    }
 }
 
 #[test]
@@ -3066,5 +3281,156 @@ fn settings_subviews_back_restores_root_settings_selection() {
             .item
             .id,
         "compaction"
+    );
+}
+
+#[test]
+fn busy_steer_queues_compact_row_not_user_bubble() {
+    let mut app = App::new("test");
+    app.push_user("first question");
+    app.begin_busy();
+    app.input = "你哈喽".into();
+    app.input_cursor = app.input.chars().count();
+    app.handle_busy_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert!(app.input.is_empty());
+    assert_eq!(app.queued_steers(), &["你哈喽".to_string()]);
+    assert_eq!(
+        app.messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .count(),
+        1,
+        "steer must not insert a second user bubble"
+    );
+    app.input = "还有呢".into();
+    app.input_cursor = app.input.chars().count();
+    app.handle_busy_key(key(KeyCode::Char('s'), KeyModifiers::CONTROL));
+    assert_eq!(
+        app.queued_steers(),
+        &["你哈喽".to_string(), "还有呢".to_string()]
+    );
+    assert_eq!(
+        app.take_steers(),
+        vec!["你哈喽".to_string(), "还有呢".to_string()]
+    );
+    app.sync_queued_steers(2);
+    assert_eq!(
+        app.queued_steers(),
+        &["你哈喽".to_string(), "还有呢".to_string()]
+    );
+    app.sync_queued_steers(1);
+    assert_eq!(app.queued_steers(), &["还有呢".to_string()]);
+    app.sync_queued_steers(0);
+    assert!(app.queued_steers().is_empty());
+}
+
+#[test]
+fn busy_alt_enter_queues_followup() {
+    let mut app = App::new("test");
+    app.push_user("first question");
+    app.begin_busy();
+    app.input = "and then this".into();
+    app.input_cursor = app.input.chars().count();
+    app.handle_busy_key(key(KeyCode::Enter, KeyModifiers::ALT));
+    assert!(app.input.is_empty());
+    assert_eq!(app.queued_followups(), &["and then this".to_string()]);
+    assert_eq!(app.take_followups(), vec!["and then this".to_string()]);
+    assert_eq!(
+        app.messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .count(),
+        1,
+        "follow-up must not appear as a new user bubble before it starts"
+    );
+    // Agent drained the queue → the follow-up becomes a real user bubble.
+    app.sync_queued_followups(0);
+    assert!(app.queued_followups().is_empty());
+    assert_eq!(
+        app.messages
+            .iter()
+            .filter(|m| m.role == MessageRole::User)
+            .count(),
+        2,
+        "consumed follow-up should appear as a user bubble"
+    );
+    assert_eq!(app.messages.last().unwrap().content, "and then this");
+}
+
+#[test]
+fn steer_applied_paints_timeline_row_not_user_turn() {
+    let mut app = App::new("test");
+    app.push_user("fix the bug");
+    app.begin_busy();
+
+    // Two steers queued (busy strip pending rows)…
+    app.queue_steer("不要重构 shared package", "不要重构 shared package");
+    app.queue_steer("先跑测试", "先跑测试");
+    assert_eq!(app.queued_steers().len(), 2);
+
+    // …then applied in real order by live events.
+    app.push_steer_applied("不要重构 shared package");
+    app.push_steer_applied("先跑测试");
+    assert!(
+        app.queued_steers().is_empty(),
+        "applied rows leave the strip"
+    );
+
+    let user_turns = app
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::User)
+        .count();
+    assert_eq!(user_turns, 1, "steer must not create user turn rows");
+
+    let steer_rows: Vec<&crate::message::Message> = app
+        .messages
+        .iter()
+        .filter(|m| m.role == MessageRole::Steer)
+        .collect();
+    assert_eq!(steer_rows.len(), 2, "each steer keeps its own timeline row");
+    assert!(steer_rows.iter().all(|m| m.steer_applied));
+    assert_eq!(steer_rows[0].content, "不要重构 shared package");
+    assert_eq!(steer_rows[1].content, "先跑测试");
+
+    // Turn-boundary math must treat the transcript as a single user turn.
+    assert_eq!(
+        crate::user_fold::turn_end(&app.messages, 0),
+        app.messages.len()
+    );
+    assert!(crate::user_fold::is_real_user(&app.messages[0]));
+}
+
+#[test]
+fn steer_row_is_pending_until_applied() {
+    let mut app = App::new("test");
+    app.push_user("do the thing");
+    // Session reload path paints with explicit state; pending stays honest.
+    app.push_steer_row("还没被消费", false);
+    let row = app.messages.last().unwrap();
+    assert_eq!(row.role, MessageRole::Steer);
+    assert!(
+        !row.steer_applied,
+        "pending steer must not fake an applied chip"
+    );
+}
+
+#[test]
+fn steer_rows_survive_between_user_turns_in_order() {
+    let mut app = App::new("test");
+    app.push_user("turn one");
+    app.push_steer_row("mid steer A", true);
+    app.push_steer_row("mid steer B", true);
+    app.push_user("turn two");
+    let roles: Vec<MessageRole> = app.messages.iter().map(|m| m.role).collect();
+    assert_eq!(
+        roles,
+        vec![
+            MessageRole::User,
+            MessageRole::Steer,
+            MessageRole::Steer,
+            MessageRole::User,
+        ],
+        "steers stay at their real timeline position between turns"
     );
 }

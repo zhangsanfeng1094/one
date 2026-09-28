@@ -20,6 +20,12 @@ impl super::App {
         }
         self.last_ctrl_c_at = None;
 
+        if Self::is_work_key(key) {
+            let outcome = self.toggle_work_float();
+            self.route_busy_outcome(outcome);
+            return;
+        }
+
         // Help works while busy (same chord encodings as idle).
         if Self::is_help_key(key) {
             self.select = None;
@@ -202,17 +208,17 @@ impl super::App {
             // Mid-turn user text is follow-up, not a new Prompt turn.
             RunOutcome::Prompt(text) => {
                 if !text.is_empty() {
-                    self.followup_pending = Some(text);
+                    self.queue_followup(text.clone(), text);
                 }
             }
             RunOutcome::FollowUp(text) => {
                 if !text.is_empty() {
-                    self.followup_pending = Some(text);
+                    self.queue_followup(text.clone(), text);
                 }
             }
             RunOutcome::Steer(text) => {
                 if !text.is_empty() {
-                    self.steer_pending = Some(text);
+                    self.queue_steer(text.clone(), text);
                 }
             }
             other if other.is_actionable() => self.queue_busy_ui(other),
@@ -224,6 +230,7 @@ impl super::App {
     pub(crate) fn queue_busy_ui_from_slash(&mut self, text: &str) {
         let parts: Vec<&str> = text.split_whitespace().collect();
         match parts.first().copied() {
+            Some("/work") => self.queue_busy_ui(RunOutcome::OpenWork),
             Some("/ps") => {
                 if let Some(id) = parts.get(1).copied() {
                     self.queue_busy_ui(RunOutcome::OpenBackgroundDetail { id: id.to_string() });

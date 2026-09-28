@@ -6,6 +6,7 @@
 
 use crate::slash::ModelChoice;
 use crate::state::SettingsDeleteTarget;
+use crate::work::{WorkItem, WorkState};
 
 /// Visual role of a float row.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -105,6 +106,8 @@ pub enum FloatKind {
     Subagent,
     /// One subagent live log (turns/tools). Esc → subagent list.
     SubagentDetail,
+    /// Unified work overview across independent registries.
+    Work,
     /// Subscription / OAuth login provider picker (`/login`).
     Login,
     /// Logout provider picker (`/logout`).
@@ -139,6 +142,60 @@ pub struct FloatEntry {
 }
 
 impl FloatMenu {
+    pub fn work_picker(items: &[WorkItem]) -> Self {
+        let mut sections = Vec::new();
+        for section in ["ATTENTION", "RUNNING", "RECENT"] {
+            let rows: Vec<FloatItem> = items
+                .iter()
+                .filter(|item| item.state.section() == section)
+                .map(|item| {
+                    let state = match item.state {
+                        WorkState::NeedsAttention => "attention",
+                        WorkState::Failed => "failed",
+                        WorkState::Running => "running",
+                        WorkState::Queued => "queued",
+                        WorkState::Completed => "done",
+                        WorkState::Stopped => "stopped",
+                    };
+                    let mut hint = Vec::new();
+                    if !item.progress.is_empty() {
+                        hint.push(item.progress.clone());
+                    }
+                    if !item.activity.is_empty() && item.state.is_live() {
+                        hint.push(item.activity.clone());
+                    }
+                    hint.push(format!("{} · {}s", state, item.elapsed_ms / 1000));
+                    FloatItem {
+                        id: item.stable_id(),
+                        label: item.kind.label().into(),
+                        detail: item.title.clone(),
+                        hint: hint.join(" · "),
+                        style: FloatItemStyle::Normal,
+                    }
+                })
+                .collect();
+            if !rows.is_empty() {
+                sections.push(FloatSection {
+                    title: section.into(),
+                    items: rows,
+                });
+            }
+        }
+        if sections.is_empty() {
+            sections.push(FloatSection {
+                title: "IDLE".into(),
+                items: vec![FloatItem {
+                    id: "_empty".into(),
+                    label: "·".into(),
+                    detail: "No work yet".into(),
+                    hint: String::new(),
+                    style: FloatItemStyle::Normal,
+                }],
+            });
+        }
+        Self::with_sections(FloatKind::Work, "Work", sections)
+    }
+
     fn with_sections(
         kind: FloatKind,
         title: impl Into<String>,

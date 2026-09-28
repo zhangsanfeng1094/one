@@ -1,6 +1,6 @@
 //! Transcript mutations: user/assistant/tool rows, streaming, busy lifecycle.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::message::{
     summarize_tool_output, truncate_tool_output_for_ui, ChatLineTarget, Message, MessageRole,
@@ -14,7 +14,13 @@ use super::{RetryWait, STATUS_BUSY, STATUS_IDLE};
 
 impl super::App {
     pub fn push_user(&mut self, text: impl Into<String>) {
-        self.messages.push(Message::user(text));
+        self.push_user_at(text, Some(SystemTime::now()));
+    }
+
+    pub fn push_user_at(&mut self, text: impl Into<String>, created_at: Option<SystemTime>) {
+        let mut msg = Message::user(text);
+        msg.created_at = created_at;
+        self.messages.push(msg);
         self.scroll_to_bottom();
     }
 
@@ -565,6 +571,17 @@ impl super::App {
         }
     }
 
+    /// Toggle a long assistant answer at `msg_index` (click / enter).
+    pub fn toggle_assistant_at(&mut self, msg_index: usize) {
+        if let Some(msg) = self.messages.get_mut(msg_index) {
+            if msg.role == MessageRole::Assistant && !msg.streaming {
+                let currently = msg.assistant_expanded.unwrap_or(false);
+                msg.assistant_expanded = Some(!currently);
+            }
+        }
+        self.chat_focus = Some(msg_index);
+    }
+
     /// Toggle a thinking block at `msg_index` (click / enter).
     pub fn toggle_thinking_at(&mut self, msg_index: usize) {
         if let Some(msg) = self.messages.get_mut(msg_index) {
@@ -587,6 +604,7 @@ impl super::App {
                 match m.role {
                     MessageRole::Tool => true,
                     MessageRole::Thinking if !m.streaming => true,
+                    MessageRole::Assistant if !m.streaming => true,
                     MessageRole::User => crate::user_fold::is_real_user(m),
                     _ => false,
                 }
@@ -657,6 +675,10 @@ impl super::App {
                 }
                 Some(MessageRole::User) => {
                     self.toggle_user_or_turn_fold_at(idx);
+                    return true;
+                }
+                Some(MessageRole::Assistant) => {
+                    self.toggle_assistant_at(idx);
                     return true;
                 }
                 _ => {}
@@ -994,6 +1016,7 @@ impl super::App {
         self.turn_started = Some(Instant::now());
         self.spinner_frame = 0;
         self.clear_retry_wait();
+        self.clear_wait_park();
         self.scroll_to_bottom();
     }
 
@@ -1002,6 +1025,7 @@ impl super::App {
         self.busy_activity.clear();
         self.status = STATUS_IDLE.into();
         self.clear_retry_wait();
+        self.clear_wait_park();
     }
 
     /// Show a live retry countdown while the agent waits before re-sampling.
@@ -1017,6 +1041,16 @@ impl super::App {
         self.retry_wait = None;
     }
 
+    /// Mark the agent as parked on `wait_tasks` (mode all/any, n awaited ids).
+    pub fn begin_wait_park(&mut self, mode: &'static str, count: usize) {
+        self.wait_park = Some((mode, count));
+    }
+
+    /// Leave the parked state (satisfied / new input / abort).
+    pub fn clear_wait_park(&mut self) {
+        self.wait_park = None;
+    }
+
     /// `(retry, max_retries, seconds_remaining)` for the animated status chip.
     pub fn retry_wait_status(&self) -> Option<(usize, usize, u64)> {
         let retry = self.retry_wait.as_ref()?;
@@ -1025,12 +1059,117 @@ impl super::App {
         Some((retry.retry, retry.max_retries, seconds))
     }
 
-    pub fn take_followup(&mut self) -> Option<String> {
-        self.followup_pending.take()
+    /// Queue a follow-up without rendering it as a new user question yet.
+    pub(crate) fn queue_followup(
+        &mut self,
+        display: impl Into<String>,
+        expanded: impl Into<String>,
+    ) {
+        let display = display.into();
+        let expanded = expanded.into();
+        if display.is_empty() && expanded.is_empty() {
+            return;
+        }
+        self.followup_pending.push(if expanded.is_empty() {
+            display.clone()
+        } else {
+            expanded
+        });
+        self.followup_queued.push(display);
+        self.scroll_to_bottom();
     }
 
-    pub fn take_steer(&mut self) -> Option<String> {
-        self.steer_pending.take()
+    /// Drain follow-ups that have not been copied onto the agent queue yet.
+    pub fn take_followups(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.followup_pending)
+    }
+
+    /// Keep compact follow-up rows in sync with pending + agent-queued items.
+    /// Rows that drop out were drained by the agent — paint them as real user
+    /// bubbles now that their turn actually starts.
+    pub fn sync_queued_followups(&mut self, agent_remaining: usize) {
+        let keep = self.followup_pending.len() + agent_remaining;
+        if self.followup_queued.len() > keep {
+            let drop_n = self.followup_queued.len() - keep;
+            let consumed: Vec<String> = self.followup_queued.drain(..drop_n).collect();
+            for text in consumed {
+                self.push_user(text);
+            }
+        }
+    }
+
+    pub fn queued_followups(&self) -> &[String] {
+        &self.followup_queued
+    }
+
+    /// Queue a mid-turn steer: agent text + compact transcript row.
+    pub(crate) fn queue_steer(&mut self, display: impl Into<String>, expanded: impl Into<String>) {
+        let display = display.into();
+        let expanded = expanded.into();
+        if display.is_empty() && expanded.is_empty() {
+            return;
+        }
+        let shown = if display.is_empty() {
+            expanded.clone()
+        } else {
+            display
+        };
+        let payload = if expanded.is_empty() {
+            shown.clone()
+        } else {
+            expanded
+        };
+        self.steer_pending.push(payload);
+        self.steer_queued.push(shown);
+        self.scroll_to_bottom();
+    }
+
+    /// Drain steers that have not been copied onto the agent queue yet.
+    pub fn take_steers(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.steer_pending)
+    }
+
+    /// Keep `#N` rows in sync with pending + still-queued agent items (FIFO).
+    pub fn sync_queued_steers(&mut self, agent_remaining: usize) {
+        let keep = self.steer_pending.len() + agent_remaining;
+        if self.steer_queued.len() > keep {
+            let drop_n = self.steer_queued.len() - keep;
+            self.steer_queued.drain(..drop_n);
+        }
+    }
+
+    pub fn queued_steers(&self) -> &[String] {
+        &self.steer_queued
+    }
+
+    /// Append a steer row into the transcript timeline (lightweight, in-order).
+    ///
+    /// Used by the live `SteerApplied` event and by session reload so both
+    /// paths paint the identical row at the real chronological position.
+    pub fn push_steer_row(&mut self, text: impl Into<String>, applied: bool) {
+        let text = text.into();
+        if text.trim().is_empty() {
+            return;
+        }
+        self.messages.push(Message::steer(text, applied));
+        self.scroll_to_bottom();
+    }
+
+    /// Live event: the agent drained a steer into model context.
+    ///
+    /// Drops the oldest matching `#N` busy-strip row (FIFO) and paints a
+    /// steer row at the current timeline position with the applied state.
+    /// Text match is a soft key: when the exact text is missing (e.g. the
+    /// queue was already synced), the oldest row is still consumed so counts
+    /// stay consistent.
+    pub fn push_steer_applied(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        if let Some(pos) = self.steer_queued.iter().position(|s| *s == text) {
+            self.steer_queued.remove(pos);
+        } else if !self.steer_queued.is_empty() {
+            self.steer_queued.remove(0);
+        }
+        self.push_steer_row(text, true);
     }
 
     /// Queue a UI action while the agent is streaming (CLI drains via [`take_busy_ui`]).

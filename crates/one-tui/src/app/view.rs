@@ -101,6 +101,7 @@ impl super::App {
                 }
                 ChatLineTarget::Message(msg_i) => match self.messages.get(msg_i).map(|m| m.role) {
                     Some(MessageRole::Thinking) => self.toggle_thinking_at(msg_i),
+                    Some(MessageRole::Assistant) => self.toggle_assistant_at(msg_i),
                     Some(MessageRole::Tool) => self.toggle_tool_at(msg_i),
                     Some(MessageRole::User) => {
                         if let Some(msg) = self.messages.get_mut(msg_i) {
@@ -450,17 +451,15 @@ impl super::App {
         }
     }
 
-    /// Click handler for the sticky bar. If `mouse_row` matches the rendered
-    /// sticky bar row, jump directly to that user message start.
+    /// Click handler for the one-line sticky turn prompt.
     pub fn click_sticky(&mut self, mouse_row: u16) -> bool {
-        if self.chat_sticky_y == Some(mouse_row) {
-            self.scroll_to_sticky()
-        } else {
-            false
+        match self.chat_sticky_y {
+            Some(y) if mouse_row == y => self.scroll_to_sticky(),
+            _ => false,
         }
     }
 
-    /// Click handler for the floating "Jump to bottom" badge.
+    /// Click handler for the one-line "Jump to bottom" hint.
     pub fn click_jump_to_bottom(&mut self, mouse_col: u16, mouse_row: u16) -> bool {
         if let Some(rect) = self.chat_jump_to_bottom_rect {
             if mouse_col >= rect.x

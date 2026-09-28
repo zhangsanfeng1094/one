@@ -31,8 +31,12 @@ impl Theme {
     pub const CODE: Color = Color::Rgb(0x56, 0xb6, 0xc2);
     /// Soft wash behind inline `code` and tool-name chips.
     pub const CODE_BG: Color = Color::Rgb(0x22, 0x28, 0x2a);
+    /// Pi-style user / prompt box — cool blue outline.
+    pub const BOX_BORDER: Color = Color::Rgb(0x3d, 0x7e, 0xc0);
+    /// Folder glyph on the top path strip.
+    pub const FOLDER: Color = Color::Rgb(0xe5, 0xc0, 0x7b);
     /// Full-row user bubble — navy wash, heavier than info / assistant (no fill).
-    pub const USER_BG: Color = Color::Rgb(0x1c, 0x23, 0x33);
+    pub const USER_BG: Color = Color::Rgb(0x12, 0x1a, 0x28);
     /// Fenced code inside a user bubble — ~10% darker than [`USER_BG`].
     pub const USER_CODE_BG: Color = Color::Rgb(0x15, 0x1b, 0x28);
 
@@ -142,43 +146,79 @@ impl Theme {
 
     /// Footer strip — slightly elevated so it separates from the transcript.
     pub fn footer_bg() -> Style {
-        Style::default().bg(Self::PANEL).fg(Self::MUTED)
+        Style::default().bg(Self::BG).fg(Self::MUTED)
     }
 
     pub fn status_faint() -> Style {
         Style::default().fg(Self::BORDER_ACTIVE)
     }
 
+    /// Pi-style rounded box border (user turn + composer).
+    pub fn box_border() -> Style {
+        Style::default().fg(Self::BOX_BORDER).bg(Self::BG)
+    }
+
+    pub fn box_border_focused() -> Style {
+        Style::default()
+            .fg(Self::SECONDARY)
+            .bg(Self::BG)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn box_fill() -> Style {
+        Style::default().fg(Self::FG).bg(Self::USER_BG)
+    }
+
+    pub fn box_meta() -> Style {
+        Style::default().fg(Self::MUTED).bg(Self::USER_BG)
+    }
+
+    pub fn box_prompt() -> Style {
+        Style::default().fg(Self::SECONDARY).bg(Self::USER_BG)
+    }
+
     /// Top bar elevated strip background + default text style.
     pub fn top_bar_bg() -> Style {
-        Style::default().bg(Self::PANEL).fg(Self::FG)
+        Style::default().bg(Self::BG).fg(Self::FG)
     }
 
     /// Grok-build style Top Header Strip base style.
     pub fn top_bar() -> Style {
-        Style::default().bg(Self::PANEL).fg(Self::MUTED)
+        Style::default().bg(Self::BG).fg(Self::MUTED)
     }
 
     /// Top bar path separator slash `/`.
     pub fn top_bar_sep() -> Style {
-        Style::default().bg(Self::PANEL).fg(Self::BORDER_ACTIVE)
+        Style::default().bg(Self::BG).fg(Self::BORDER_ACTIVE)
     }
 
     /// Current workspace / project folder name in top header (bold / highlighted).
     pub fn top_bar_folder() -> Style {
         Style::default()
-            .bg(Self::PANEL)
+            .bg(Self::BG)
             .fg(Self::FG)
             .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn top_bar_folder_icon() -> Style {
+        Style::default().bg(Self::BG).fg(Self::FOLDER)
     }
 
     /// Status dot on top bar: ready / idle green, busy amber.
     pub fn top_bar_status(busy: bool) -> Style {
         if busy {
-            Style::default().bg(Self::PANEL).fg(Self::WARNING)
+            Style::default().bg(Self::BG).fg(Self::WARNING)
         } else {
-            Style::default().bg(Self::PANEL).fg(Self::SUCCESS)
+            Style::default().bg(Self::BG).fg(Self::SUCCESS)
         }
+    }
+
+    pub fn top_bar_model() -> Style {
+        Style::default().bg(Self::BG).fg(Self::MUTED)
+    }
+
+    pub fn top_bar_clock() -> Style {
+        Style::default().bg(Self::BG).fg(Self::MUTED)
     }
 
     /// Context Pill capsule background and container style.
@@ -225,14 +265,14 @@ impl Theme {
 
     /// Base style for the prompt panel (applied via Paragraph::style).
     pub fn input() -> Style {
-        Style::default().fg(Self::FG).bg(Self::ELEMENT)
+        Style::default().fg(Self::FG).bg(Self::USER_BG)
     }
 
     /// Explicit text style for typed characters (never muted).
     pub fn input_text() -> Style {
         Style::default()
             .fg(Self::FG)
-            .bg(Self::ELEMENT)
+            .bg(Self::USER_BG)
             .add_modifier(Modifier::BOLD)
     }
 
@@ -273,7 +313,7 @@ impl Theme {
     }
 
     pub fn input_placeholder() -> Style {
-        Style::default().fg(Self::MUTED).bg(Self::ELEMENT)
+        Style::default().fg(Self::MUTED).bg(Self::USER_BG)
     }
 
     /// Slash popup panel background.
@@ -574,16 +614,18 @@ impl Theme {
         Style::default().fg(Self::FG)
     }
 
-    /// Warm dark orange wash for the sticky query bar background.
-    pub const STICKY_BG: Color = Color::Rgb(0x28, 0x1c, 0x12);
-    /// Vivid orange accent for the sticky bar rail, pin icon (`⇡ Pinned`), and highlights.
-    pub const STICKY_ACCENT: Color = Color::Rgb(0xf5, 0xa7, 0x42);
-    /// Warm muted orange for the sticky query timestamp.
-    pub const STICKY_TIME: Color = Color::Rgb(0xb8, 0x88, 0x68);
+    /// Active-turn / sticky prompt wash (cool blue, not a rounded panel).
+    pub const STICKY_BG: Color = Color::Rgb(0x10, 0x1c, 0x2c);
+    pub const STICKY_ACCENT: Color = Color::Rgb(0x3d, 0x7e, 0xc0);
+    pub const STICKY_TIME: Color = Color::Rgb(0x7a, 0x9c, 0xbe);
 
     /// Sticky query bar at the top of transcript when user message scrolled off-screen.
     pub fn sticky_query_bg() -> Style {
         Style::default().bg(Self::STICKY_BG).fg(Self::FG)
+    }
+
+    pub fn sticky_query_border() -> Style {
+        Style::default().bg(Self::BG).fg(Self::STICKY_ACCENT)
     }
 
     pub fn sticky_query_accent() -> Style {
@@ -606,14 +648,50 @@ impl Theme {
     }
 
     pub fn sticky_query_body() -> Style {
-        Style::default().bg(Self::STICKY_BG).fg(Self::FG)
+        Style::default()
+            .bg(Self::STICKY_BG)
+            .fg(Self::FG)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn sticky_query_hint() -> Style {
+        Style::default().bg(Self::STICKY_BG).fg(Self::MUTED)
+    }
+
+    pub fn sticky_query_meta() -> Style {
+        Style::default().bg(Self::STICKY_BG).fg(Self::MUTED)
+    }
+
+    /// Current expanded turn header (same wash as sticky; full-width text row).
+    pub fn turn_active_bg() -> Style {
+        Style::default().bg(Self::STICKY_BG).fg(Self::FG)
+    }
+
+    pub fn turn_active_title() -> Style {
         Style::default()
             .bg(Self::STICKY_BG)
-            .fg(Self::STICKY_ACCENT)
+            .fg(Self::FG)
             .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn turn_active_time() -> Style {
+        Style::default().bg(Self::STICKY_BG).fg(Self::STICKY_TIME)
+    }
+
+    pub fn turn_active_meta() -> Style {
+        Style::default().bg(Self::STICKY_BG).fg(Self::MUTED)
+    }
+
+    pub fn turn_row_time() -> Style {
+        Style::default().fg(Self::MUTED)
+    }
+
+    pub fn turn_row_meta() -> Style {
+        Style::default().fg(Self::MUTED)
+    }
+
+    pub fn turn_row_dim() -> Style {
+        Style::default().fg(Self::MUTED).add_modifier(Modifier::DIM)
     }
 
     /// System reminder card border — subtle purple/accent outline.
@@ -645,6 +723,13 @@ impl Theme {
 
     pub fn assistant_body() -> Style {
         Style::default().fg(Self::FG)
+    }
+
+    /// Answer section glyph (`✦ 回答`).
+    pub fn answer_glyph() -> Style {
+        Style::default()
+            .fg(Self::ACCENT)
+            .add_modifier(Modifier::BOLD)
     }
 
     /// Thinking block chevron / accent.
@@ -751,6 +836,12 @@ impl Theme {
 
     pub fn meta() -> Style {
         Style::default().fg(Self::MUTED)
+    }
+
+    /// Steer row body — readable normal text (must stay visible/traceable),
+    /// styled between meta and a full user bubble.
+    pub fn user_steer() -> Style {
+        Style::default().fg(Self::FG).add_modifier(Modifier::DIM)
     }
 
     pub fn tool_icon() -> Style {

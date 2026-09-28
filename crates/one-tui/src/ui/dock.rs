@@ -12,6 +12,24 @@ use crate::theme::Theme;
 
 use super::text::truncate_mid;
 
+pub(super) fn draw_work_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+    frame.render_widget(Block::default().style(Theme::slash_panel()), area);
+    let right = "Alt+T";
+    let available = (area.width as usize).saturating_sub(right.len() + 5);
+    let left = truncate_mid(&format!(" Work  {}", app.work_summary.label()), available);
+    let gap = (area.width as usize)
+        .saturating_sub(unicode_width::UnicodeWidthStr::width(left.as_str()) + right.len() + 1);
+    let line = Line::from(vec![
+        Span::styled(left, Theme::title()),
+        Span::raw(" ".repeat(gap)),
+        Span::styled(right, Theme::status_key()),
+    ]);
+    frame.render_widget(Paragraph::new(line), area);
+}
+
 pub(super) fn draw_slash_dock(frame: &mut Frame<'_>, area: Rect, app: &App) {
     use crate::slash::PopupRow;
 

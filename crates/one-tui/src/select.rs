@@ -565,6 +565,15 @@ impl SelectPrompt {
     }
 
     fn handle_typing_key(&mut self, key: KeyEvent) -> Option<SelectResult> {
+        if (!key.modifiers.contains(KeyModifiers::SHIFT)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && (matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+                && key.modifiers.contains(KeyModifiers::CONTROL)))
+            || key.code == KeyCode::Char('\u{03}')
+        {
+            return Some(SelectResult::Cancelled);
+        }
+
         match key.code {
             KeyCode::Esc => {
                 self.phase = SelectPhase::List;
@@ -591,6 +600,10 @@ impl SelectPrompt {
     }
 
     fn handle_list_key(&mut self, key: KeyEvent) -> Option<SelectResult> {
+        if key.code == KeyCode::Char('\u{03}') {
+            return Some(SelectResult::Cancelled);
+        }
+
         // Ctrl+O → always-approve shortcut when configured.
         if key.modifiers.contains(KeyModifiers::CONTROL) {
             match key.code {

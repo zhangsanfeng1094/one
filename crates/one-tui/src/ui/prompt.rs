@@ -3,7 +3,7 @@
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -11,7 +11,7 @@ use crate::theme::Theme;
 
 use super::text::{display_width, take_prefix_cols, tokenize_input_chips, InputChipKind};
 
-const INDENT: &str = "  ";
+const INDENT: &str = " > ";
 
 #[derive(Clone, Debug)]
 struct PromptVisualRow {
@@ -21,8 +21,8 @@ struct PromptVisualRow {
 }
 
 impl PromptVisualRow {
-    fn to_line(&self) -> Line<'static> {
-        let mut spans = vec![Span::raw(INDENT)];
+    fn to_line_with_indent(&self, indent: &str) -> Line<'static> {
+        let mut spans = vec![Span::styled(indent.to_string(), Theme::box_prompt())];
         spans.extend(self.spans.clone());
         Line::from(spans)
     }
@@ -198,7 +198,7 @@ fn wrap_prompt_line(
 /// - Meta left  → session identity (agent / model / provider)
 /// - Meta right → live ops chips only (MCP / bg / running)
 /// - Status left → contextual keybindings
-/// - Status right → session stats (think level / token usage)
+/// - Status right → MCP chip only (context fill lives on the header)
 ///
 /// The terminal owns the caret shape and blink phase. The prompt only reports
 /// its desired screen position to Ratatui while it has interaction focus; the
@@ -206,50 +206,43 @@ fn wrap_prompt_line(
 pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     let box_area = area;
 
-    // Left rail + caret track real interaction focus (not just "no modal").
-    // Busy always keeps the busy rail; otherwise dim when float/select/j/k browse
-    // owns focus so a blinking peach caret cannot fake "prompt focused".
+    // Rounded Pi-style box. Busy / unfocused only change the outline color.
     let prompt_focused = app.prompt_focused();
     let bar_style = if app.busy {
         Theme::prompt_bar_busy()
     } else if prompt_focused {
-        Theme::prompt_bar()
+        Theme::box_border_focused()
     } else {
-        Theme::prompt_bar_unfocused()
+        Theme::box_border()
     };
 
-    // Keep placeholder quiet — keybindings live on the sparse status strip / Alt+H help.
-    // Busy: light steer hint only; Esc/Ctrl+C live on the status row (avoid wall-of-text).
     let placeholder = if app.busy && app.busy_activity == "compacting" {
         "compacting context…"
     } else if app.busy {
         "steer or follow-up…"
     } else if app.transcript_browse_focused() {
-        // Short: keys live on the status strip; avoid a long dual-hint soup.
         "type to edit…"
     } else {
-        "Message…"
+        "继续提问或输入指令…"
     };
 
-    let usable_width = (box_area.width.saturating_sub(4) as usize).max(1);
+    // Inner width: left border + ` > ` + text + right border.
+    let usable_width = (box_area.width.saturating_sub(2 + INDENT.len() as u16) as usize).max(1);
+    let indent_w = display_width(INDENT) as u16;
 
-    // Multi-line input: visual lines wrapped to terminal width; the native caret follows
-    // `input_cursor`. Long paste / images render as solid chips (`[文本 · 12
-    // lines · 3KB]` / `[图片.img]`), not as the raw body fanned across the
-    // composer.
-    let mut content: Vec<Line> = vec![Line::from("")]; // top padding
+    let mut content: Vec<Line> = Vec::new();
     let mut cursor_pos: Option<(u16, u16)> = None;
-    app.prompt_content_x = box_area.x + 3;
+    app.prompt_content_x = box_area.x + 1 + indent_w;
     app.prompt_content_y = box_area.y + 1;
     app.prompt_visible_line_starts.clear();
     if app.input.is_empty() {
         app.prompt_visible_line_starts.push(0);
         content.push(Line::from(vec![
-            Span::raw(INDENT),
+            Span::styled(INDENT, Theme::box_prompt()),
             Span::styled(placeholder, Theme::input_placeholder()),
         ]));
         if prompt_focused {
-            cursor_pos = Some((box_area.x + 3, box_area.y + 1));
+            cursor_pos = Some((box_area.x + 1 + indent_w, box_area.y + 1));
         }
     } else {
         let lines: Vec<&str> = app.input.split('\n').collect();
@@ -305,7 +298,7 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
         }
 
         let max_visible = box_area.height.saturating_sub(2) as usize;
-        let max_visible = max_visible.max(1);
+        let max_visible = max_visible.max(1); // inner rows between rounded borders
         let total_rows = all_visual_rows.len();
         let (caret_row_idx, caret_col_w) = caret_pos.unwrap_or((0, 0));
 
@@ -321,19 +314,23 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             let abs_i = start + vis_i;
             let caret_here = abs_i == caret_row_idx;
             app.prompt_visible_line_starts.push(row.char_start);
-            content.push(row.to_line());
+            let indent = if abs_i == 0 { INDENT } else { "   " };
+            content.push(row.to_line_with_indent(indent));
             if caret_here && prompt_focused {
-                cursor_pos = Some((box_area.x + 3 + caret_col_w, box_area.y + 1 + vis_i as u16));
+                cursor_pos = Some((
+                    box_area.x + 1 + indent_w + caret_col_w,
+                    box_area.y + 1 + vis_i as u16,
+                ));
             }
         }
     }
-    content.push(Line::from("")); // bottom padding
 
     let paragraph = Paragraph::new(content).style(Theme::input()).block(
         Block::default()
-            .borders(Borders::LEFT)
+            .borders(Borders::ALL)
+            .border_type(BorderType::Plain)
             .border_style(bar_style)
-            .style(Style::default().bg(Theme::ELEMENT)),
+            .style(Style::default().bg(Theme::USER_BG)),
     );
 
     frame.render_widget(paragraph, box_area);
@@ -344,81 +341,6 @@ pub(super) fn draw_prompt(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 }
 
-pub(super) fn identity_spans(app: &App) -> Vec<Span<'static>> {
-    let agent = if app.agent_label.is_empty() {
-        "Build".to_string()
-    } else {
-        app.agent_label.clone()
-    };
-    let model = if !app.current_model.is_empty() {
-        app.current_model.clone()
-    } else if !app.mode_label.is_empty() {
-        app.mode_label.clone()
-    } else {
-        String::new()
-    };
-    let provider = app.current_provider.clone();
-
-    let sep = || Span::styled(" · ", Theme::status_faint().bg(Theme::PANEL));
-    let mut left = vec![
-        Span::styled("  ", Theme::footer_bg()),
-        Span::styled(agent, Theme::mode_label().bg(Theme::PANEL)),
-    ];
-    if !model.is_empty() {
-        left.push(sep());
-        left.push(Span::styled(model, Theme::meta().bg(Theme::PANEL)));
-    }
-    if !provider.is_empty() {
-        left.push(sep());
-        left.push(Span::styled(
-            provider,
-            Theme::status_faint().bg(Theme::PANEL),
-        ));
-    }
-    left
-}
-
-pub(super) fn ops_spans(app: &App) -> Vec<Span<'static>> {
-    let mut right: Vec<Span<'static>> = Vec::new();
-    if !app.mcp_chip_text.is_empty() {
-        right.push(Span::styled(
-            app.mcp_chip_text.clone(),
-            mcp_chip_style(app.mcp_chip_kind).bg(Theme::PANEL),
-        ));
-    }
-    if !app.bg_chip_text.is_empty() {
-        if !right.is_empty() {
-            right.push(Span::styled("  ", Theme::footer_bg()));
-        }
-        right.push(Span::styled(
-            app.bg_chip_text.clone(),
-            bg_chip_style(app.bg_chip_kind).bg(Theme::PANEL),
-        ));
-    }
-    if !app.task_chip_text.is_empty() {
-        if !right.is_empty() {
-            right.push(Span::styled("  ", Theme::footer_bg()));
-        }
-        right.push(Span::styled(
-            app.task_chip_text.clone(),
-            bg_chip_style(app.task_chip_kind).bg(Theme::PANEL),
-        ));
-    }
-    if app.busy {
-        if !right.is_empty() {
-            right.push(Span::styled("  ", Theme::footer_bg()));
-        }
-        right.push(Span::styled(
-            "running",
-            Theme::status_faint().bg(Theme::PANEL),
-        ));
-    }
-    if !right.is_empty() {
-        right.push(Span::raw("  "));
-    }
-    right
-}
-
 /// Paint a single-row strip with left content + right-aligned trailing content.
 /// Right width is measured from content (not a fixed column count) so chips
 /// never collide with identity/key labels.
@@ -426,7 +348,7 @@ pub(super) fn render_split_row(
     frame: &mut Frame<'_>,
     area: Rect,
     left: Vec<Span<'static>>,
-    right: Vec<Span<'static>>,
+    mut right: Vec<Span<'static>>,
 ) {
     if right.is_empty() {
         frame.render_widget(
@@ -437,7 +359,11 @@ pub(super) fn render_split_row(
     }
 
     let right_text: String = right.iter().map(|s| s.content.as_ref()).collect();
-    let right_cols = display_width(&right_text) as u16;
+    if !right_text.starts_with("  ") {
+        right.insert(0, Span::styled("  ", Theme::footer_bg()));
+    }
+    let right_cols =
+        display_width(&right_text) as u16 + if right_text.starts_with("  ") { 0 } else { 2 };
     // Leave at least ~12 cols for left identity/keys; clamp right if terminal is tight.
     let max_right = area.width.saturating_sub(12);
     let right_w = right_cols.min(max_right).max(1);
@@ -457,26 +383,4 @@ pub(super) fn render_split_row(
             .style(Theme::footer_bg()),
         row[1],
     );
-}
-
-fn mcp_chip_style(kind: u8) -> Style {
-    match kind {
-        1 => Theme::status().fg(Theme::INFO),
-        2 => Style::default()
-            .fg(Theme::SUCCESS)
-            .add_modifier(ratatui::style::Modifier::DIM),
-        3 => Theme::status().fg(Theme::WARNING),
-        4 => Theme::status().fg(Theme::ERROR),
-        _ => Theme::status_faint(),
-    }
-}
-
-fn bg_chip_style(kind: u8) -> Style {
-    match kind {
-        1 => Theme::status().fg(Theme::INFO),    // running
-        2 => Theme::status_faint(),              // recent done
-        3 => Theme::status().fg(Theme::WARNING), // mixed
-        4 => Theme::status().fg(Theme::ERROR),   // failed
-        _ => Theme::status_faint(),
-    }
 }

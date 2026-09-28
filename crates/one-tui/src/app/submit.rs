@@ -99,8 +99,9 @@ impl super::App {
         self.input.clear();
         self.input_cursor = 0;
         self.clear_input_selection();
-        self.push_user(&text);
-        self.followup_pending = Some(expanded.clone());
+        // Keep a follow-up distinct from a new user question until the agent
+        // actually starts its next turn.
+        self.queue_followup(text, expanded.clone());
         RunOutcome::FollowUp(expanded)
     }
 
@@ -114,8 +115,8 @@ impl super::App {
         self.input.clear();
         self.input_cursor = 0;
         self.clear_input_selection();
-        self.push_user(&text);
-        self.steer_pending = Some(expanded.clone());
+        // Compact `#N` above Waiting — not a user bubble or sticky prompt.
+        self.queue_steer(text, expanded.clone());
         RunOutcome::Steer(expanded)
     }
 

@@ -34,6 +34,7 @@ use crate::state::{
     ApprovalAnswer, ApprovalPrompt, ModelDraft, PendingImage, PendingText, RunOutcome, SelectKind,
     SelectPos, SettingsDeleteTarget, Toast,
 };
+use crate::work::{WorkItem, WorkSummary};
 
 pub use helpers::expand_at_files;
 
@@ -122,7 +123,7 @@ pub struct App {
     pub chat_sticky_line: Option<usize>,
     /// Terminal row where the sticky bar is rendered (`None` when not visible).
     pub chat_sticky_y: Option<u16>,
-    /// Terminal Rect where the "Jump to bottom" badge is rendered (`None` when hidden).
+    /// Terminal Rect of the one-line "Jump to bottom" hint (`None` when hidden).
     pub chat_jump_to_bottom_rect: Option<Rect>,
     /// In-app transcript selection (character carets on absolute display lines).
     /// App-owned select + OSC 52 copy — does not need native terminal drag-select.
@@ -153,6 +154,8 @@ pub struct App {
     pub spinner_frame: usize,
     /// Pending provider retry, rendered as a countdown while the backoff runs.
     retry_wait: Option<RetryWait>,
+    /// Active `wait_tasks` park: (mode label, awaited id count). Cleared on wake.
+    pub(crate) wait_park: Option<(&'static str, usize)>,
     /// Selected **row** index in the popup (may point at a header — navigation skips those).
     pub slash_selected: usize,
     /// Models from registry / models.json for `/model` picker.
@@ -210,6 +213,12 @@ pub struct App {
     pub task_chip_text: String,
     /// Same kind codes as `bg_chip_kind`.
     pub task_chip_kind: u8,
+    /// Unified UI projection; registries remain independent in one-cli.
+    pub work_items: Vec<WorkItem>,
+    pub work_summary: WorkSummary,
+    /// Stable row to restore after detail or a live refresh.
+    pub work_selected_id: Option<String>,
+    pub work_detail_origin: bool,
     /// Cached `/ps` bash list rows for Esc-back from detail.
     pub bg_ps_list: Vec<(String, String, String, String)>,
     /// Bash task id currently shown in BackgroundDetail.
@@ -267,8 +276,14 @@ pub struct App {
     /// Optional context window for % display (0 = unknown).
     pub context_window: usize,
     turn_started: Option<Instant>,
-    followup_pending: Option<String>,
-    steer_pending: Option<String>,
+    /// Follow-ups not yet copied onto the agent queue.
+    followup_pending: Vec<String>,
+    /// Compact follow-up rows shown while the current turn is still running.
+    followup_queued: Vec<String>,
+    /// Steers not yet copied onto the agent queue.
+    steer_pending: Vec<String>,
+    /// Compact `#N` rows shown above Waiting until the agent drains them.
+    steer_queued: Vec<String>,
     abort_pending: bool,
     /// Ctrl+B: send the in-flight foreground bash to the background (does not abort).
     background_now_pending: bool,
@@ -377,6 +392,7 @@ impl App {
             agent_label: "Build".into(),
             spinner_frame: 0,
             retry_wait: None,
+            wait_park: None,
             slash_selected: 0,
             model_catalog: Vec::new(),
             enabled_models: None,
@@ -397,7 +413,7 @@ impl App {
             compaction_ratio: 0.85,
             compaction_threshold: None,
             compaction_keep_recent: one_core::DEFAULT_KEEP_RECENT_TURNS,
-            compaction_prune: true,
+            compaction_prune: false,
             compaction_prune_keep_last_n_turns: 3,
             compaction_two_pass: false,
             compaction_prefire_lead_ratio: 0.10,
@@ -410,6 +426,10 @@ impl App {
             bg_chip_kind: 0,
             task_chip_text: String::new(),
             task_chip_kind: 0,
+            work_items: Vec::new(),
+            work_summary: WorkSummary::default(),
+            work_selected_id: None,
+            work_detail_origin: false,
             bg_ps_list: Vec::new(),
             bg_ps_detail_id: None,
             task_list: Vec::new(),
@@ -438,8 +458,10 @@ impl App {
             usage_cost_usd: 0.0,
             context_window: 0,
             turn_started: None,
-            followup_pending: None,
-            steer_pending: None,
+            followup_pending: Vec::new(),
+            followup_queued: Vec::new(),
+            steer_pending: Vec::new(),
+            steer_queued: Vec::new(),
             abort_pending: false,
             background_now_pending: false,
             busy_ui_queue: VecDeque::new(),

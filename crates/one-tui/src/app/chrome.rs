@@ -6,11 +6,68 @@ use std::time::Instant;
 use crate::float::FloatMenu;
 use crate::message::{AlertLevel, Message, MessageRole};
 use crate::slash::{self, ModelChoice, PopupKind, PopupRow};
-use crate::state::{PendingImage, RunOutcome, Toast};
+use crate::state::{ApprovalAnswer, PendingImage, RunOutcome, SelectKind, Toast};
+use crate::work::{overview_items, WorkItem, WorkSummary};
 
 use super::classify_toast_level;
 
 impl super::App {
+    pub fn set_work_items(&mut self, items: Vec<WorkItem>) {
+        self.work_summary = WorkSummary::from_items(&items);
+        self.work_items = overview_items(items);
+        if self
+            .float
+            .as_ref()
+            .is_some_and(|f| f.kind == crate::float::FloatKind::Work)
+        {
+            self.open_work_float();
+        }
+    }
+
+    pub fn open_work_float(&mut self) {
+        let filter = self
+            .float
+            .as_ref()
+            .filter(|f| f.kind == crate::float::FloatKind::Work)
+            .map(|f| (f.search.clone(), f.search_cursor));
+        let selected = self
+            .float
+            .as_ref()
+            .filter(|f| f.kind == crate::float::FloatKind::Work)
+            .and_then(|f| f.selected_entry())
+            .map(|entry| entry.item.id)
+            .or_else(|| self.work_selected_id.clone());
+        let mut menu = FloatMenu::work_picker(&self.work_items);
+        if let Some((search, cursor)) = filter {
+            menu.search = search;
+            menu.search_cursor = cursor;
+        }
+        if let Some(id) = selected {
+            if let Some(index) = menu
+                .filtered_entries()
+                .iter()
+                .position(|entry| entry.item.id == id)
+            {
+                menu.selected = index;
+            }
+        }
+        self.float = Some(menu);
+        self.work_detail_origin = false;
+    }
+
+    pub fn toggle_work_float(&mut self) -> RunOutcome {
+        if self
+            .float
+            .as_ref()
+            .is_some_and(|f| f.kind == crate::float::FloatKind::Work)
+        {
+            self.close_float();
+            RunOutcome::Noop
+        } else {
+            RunOutcome::OpenWork
+        }
+    }
+
     pub fn set_thinking_level(&mut self, level: impl Into<String>) {
         self.thinking_level = level.into();
     }
@@ -259,10 +316,39 @@ impl super::App {
 
     pub fn close_float(&mut self) {
         self.float = None;
+        self.work_detail_origin = false;
         self.context_info = None;
         self.context_line_count = 0;
         self.context_view_height = 0;
         self.settings_delete_target = None;
+    }
+
+    /// Dismiss any center float (Settings and all its submenus/forms) and docked select.
+    ///
+    /// Guarantees that the TUI returns immediately to the dialogue/composer state
+    /// no matter how deeply nested the user was inside Settings or sub-popups.
+    pub fn close_all_popups(&mut self) -> bool {
+        let had_popup = self.float_open() || self.select.is_some();
+        self.settings_inline_op = None;
+        self.settings_form_edit = None;
+        self.model_draft = None;
+        self.settings_delete_target = None;
+        self.settings_provider_focus.clear();
+        self.settings_model_focus.clear();
+        self.settings_compat_on_model = false;
+        self.bg_ps_detail_id = None;
+        self.task_detail_id = None;
+        self.close_float();
+        if let Some(kind) = self.select_kind.take() {
+            self.select = None;
+            if matches!(kind, SelectKind::Approval { .. }) {
+                self.approval = None;
+                self.approval_answer = Some(ApprovalAnswer::Deny { feedback: None });
+            }
+        } else {
+            self.select = None;
+        }
+        had_popup
     }
 
     /// Popup rows for current input (commands or models grouped by provider).

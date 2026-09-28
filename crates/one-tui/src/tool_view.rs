@@ -158,7 +158,7 @@ pub fn tool_short_label(msg: &Message) -> String {
     }
 }
 
-/// Aggregate tool names for collapsed chips: `[todo_write] [grep x2] [read x2]`.
+/// Aggregate tool names for a timeline batch: `grep x2 · ls x4 · read x9`.
 pub fn aggregate_tool_names(names: &[String]) -> String {
     let mut order: Vec<String> = Vec::new();
     let mut counts: HashMap<String, usize> = HashMap::new();
@@ -177,14 +177,15 @@ pub fn aggregate_tool_names(names: &[String]) -> String {
         .iter()
         .map(|n| {
             let c = counts.get(n).copied().unwrap_or(1);
+            let label = n.to_lowercase();
             if c > 1 {
-                format!("[{n} ×{c}]")
+                format!("{label} x{c}")
             } else {
-                format!("[{n}]")
+                label
             }
         })
         .collect::<Vec<_>>()
-        .join(" ")
+        .join(" · ")
 }
 
 /// Format multi-tool streak summary like Grok Build: `Read 2 files`, `Read 6 files, Searched 4 patterns`.
@@ -968,6 +969,15 @@ pub fn highlight_tool_output_line(line: &str) -> Option<Vec<Span<'static>>> {
     let trimmed = line.trim_start();
     let indent_len = line.len() - trimmed.len();
     let indent = &line[..indent_len];
+
+    // 0. Shell command prompt line: `$ <command>`
+    if let Some(cmd) = trimmed.strip_prefix("$ ") {
+        return Some(vec![
+            Span::raw(indent.to_string()),
+            Span::styled("$ ", Theme::meta()),
+            Span::styled(cmd.to_string(), Theme::heading_sub()),
+        ]);
+    }
 
     // 1. Server section header: `[server_name]`
     if trimmed.starts_with('[') && trimmed.ends_with(']') && !trimmed.contains(' ') {
@@ -2656,7 +2666,7 @@ mod tests {
         ];
         assert_eq!(
             aggregate_tool_names(&names),
-            "[todo_write] [grep ×2] [read ×2]"
+            "todo_write · grep x2 · read x2"
         );
     }
 

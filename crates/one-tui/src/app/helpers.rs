@@ -245,6 +245,7 @@ pub(crate) fn is_ui_slash(text: &str) -> bool {
             | "/agents"
             | "/mcp"
             | "/ps"
+            | "/work"
             | "/tasks"
             | "/jobs"
             | "/subagents"

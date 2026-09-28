@@ -166,57 +166,6 @@ pub(super) fn wrap_styled_segments(
     rows
 }
 
-pub(super) fn wrap_styled_spans(
-    spans: &[ratatui::text::Span<'static>],
-    width: usize,
-) -> Vec<Vec<ratatui::text::Span<'static>>> {
-    if width == 0 {
-        return vec![spans.to_vec()];
-    }
-    let mut rows: Vec<Vec<ratatui::text::Span<'static>>> = Vec::new();
-    let mut cur: Vec<ratatui::text::Span<'static>> = Vec::new();
-    let mut col = 0usize;
-
-    for span in spans {
-        let style = span.style;
-        let mut rest = span.content.as_ref();
-        while !rest.is_empty() {
-            if col >= width {
-                rows.push(std::mem::take(&mut cur));
-                col = 0;
-            }
-            let room = width.saturating_sub(col).max(1);
-            let (take, advance) = take_prefix_cols(rest, room);
-            if take.is_empty() {
-                rows.push(std::mem::take(&mut cur));
-                col = 0;
-                continue;
-            }
-            if let Some(last) = cur.last_mut() {
-                if last.style == style {
-                    let mut s = last.content.to_string();
-                    s.push_str(take);
-                    *last = ratatui::text::Span::styled(s, style);
-                } else {
-                    cur.push(ratatui::text::Span::styled(take.to_string(), style));
-                }
-            } else {
-                cur.push(ratatui::text::Span::styled(take.to_string(), style));
-            }
-            col = col.saturating_add(advance);
-            rest = &rest[take.len()..];
-            if col >= width && !rest.is_empty() {
-                rows.push(std::mem::take(&mut cur));
-                col = 0;
-            }
-        }
-    }
-    if !cur.is_empty() || rows.is_empty() {
-        rows.push(cur);
-    }
-    rows
-}
-
 /// Take a prefix of `s` whose display width is ≤ `max_cols`. Returns (prefix, width).
 pub(super) fn take_prefix_cols(s: &str, max_cols: usize) -> (&str, usize) {
     if max_cols == 0 {

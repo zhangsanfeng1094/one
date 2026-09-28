@@ -35,6 +35,7 @@ pub mod theme;
 pub mod tool_view;
 pub mod ui;
 pub(crate) mod user_fold;
+pub mod work;
 
 pub use crate::state::{
     ApprovalAnswer, ApprovalPrompt, ConfigOp, ModelDraft, PendingImage, PendingText, RunOutcome,
@@ -52,6 +53,7 @@ pub use notification::{
 pub use select::{SelectMode, SelectOption, SelectPhase, SelectPrompt, SelectResult};
 pub use slash::{ModelChoice, PopupKind, PopupRow, SlashCommand, SLASH_COMMANDS};
 pub use terminal::{emergency_restore_terminal, ForceQuit, TerminalSession};
+pub use work::{WorkItem, WorkKind, WorkState, WorkSummary};
 
 pub use crossterm;
 pub use ratatui;

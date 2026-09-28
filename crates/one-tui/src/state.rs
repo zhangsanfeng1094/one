@@ -169,6 +169,8 @@ pub enum RunOutcome {
     OpenMcpImportPanel,
     /// Open / refresh **bash** background process list (`/ps`).
     OpenBackgroundList,
+    /// Open or refresh unified Work Overview.
+    OpenWork,
     /// Open one **bash** process detail (stdout/stderr tail).
     OpenBackgroundDetail {
         id: String,
@@ -204,6 +206,7 @@ impl RunOutcome {
             | RunOutcome::OpenMcpPanel
             | RunOutcome::OpenMcpImportPanel
             | RunOutcome::OpenBackgroundList
+            | RunOutcome::OpenWork
             | RunOutcome::OpenBackgroundDetail { .. }
             | RunOutcome::KillBackground { .. }
             | RunOutcome::OpenSubagentList

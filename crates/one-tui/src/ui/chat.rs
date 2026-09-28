@@ -3,7 +3,7 @@
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::widgets::{Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::App;
@@ -13,11 +13,13 @@ use crate::theme::Theme;
 use crate::tool_view::{self, DiffLineKind};
 
 use super::text::{
-    display_width, fill_spans_to, pad_end, pad_start, scrollbar_thumb_geometry,
-    tokenize_input_chips, truncate_display, truncate_display_middle, wrap_paragraphs, wrap_str,
-    wrap_styled_segments, wrap_styled_spans, InputChipKind,
+    display_width, fill_spans_to, pad_end, pad_start, scrollbar_thumb_geometry, truncate_display,
+    truncate_display_middle, wrap_paragraphs, wrap_str, wrap_styled_segments,
 };
 use super::SPINNER;
+
+/// Turn header indicator uses ASCII pulsing dots so it is guaranteed 1-column wide in all locales.
+const TURN_PULSE_SPINNER: &[&str] = &[".", "o", "O", "o"];
 
 pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     // Outer padding: left gutter · content · right gap · right gutter (scrollbar track).
@@ -30,11 +32,30 @@ pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
             Constraint::Length(1),
         ])
         .split(area);
-    let content = pad[1];
+    let content_full = pad[1];
     let sb_col = pad[3];
     // Render across the full viewport width.
-    let row_width = (content.width as usize).max(16);
+    let row_width = (content_full.width as usize).max(16);
     let wrap_width = row_width;
+
+    // Pinned busy strip: queued steer/follow-up chips and the waiting spinner
+    // stay anchored just above the prompt instead of drifting up with a short
+    // transcript. Reserved before viewport math so scroll offsets account for it.
+    let strip_lines = busy_strip_lines(app, wrap_width);
+    let strip_h = strip_lines.len() as u16;
+    let (content, busy_area) = if strip_h > 0 && content_full.height > strip_h + 3 {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(strip_h)])
+            .split(content_full);
+        (chunks[0], Some(chunks[1]))
+    } else {
+        (content_full, None)
+    };
+    let sb_col = Rect {
+        height: content.height,
+        ..sb_col
+    };
     let view_h = content.height as usize;
 
     // Flatten every message into display lines, then window by **line** offset.
@@ -78,20 +99,7 @@ pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     }
 
     let start = if app.follow_bottom || view_h == 0 {
-        // Prefer the answer title when a short reply just appeared so the
-        // viewport isn't parked on the tool-log top. Long answers still
-        // follow the stream end. If the whole transcript fits, stay at 0.
-        if total <= view_h {
-            0
-        } else if let Some(ans) = turn_answer {
-            if total.saturating_sub(ans) < view_h {
-                ans.min(max_from_bottom)
-            } else {
-                max_from_bottom
-            }
-        } else {
-            max_from_bottom
-        }
+        max_from_bottom
     } else {
         app.chat_scroll
     };
@@ -102,10 +110,11 @@ pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     app.chat_content_x = content.x;
     let sel = app.selection_span();
 
-    // Sticky header: pin the user question that owns the top of the viewport
-    // once that bubble has scrolled off — not only the last turn.
+    // Sticky header: one timeline row for the user prompt that owns the
+    // viewport once that row has scrolled off. Same chrome as the turn header
+    // (chevron, clock, title, tools/duration/status) — no pin icon, no box.
     let sticky_query = sticky_query_at(&user_queries, start);
-    let need_sticky = sticky_query.is_some() && view_h >= 6;
+    let need_sticky = sticky_query.is_some() && view_h >= 4;
 
     let (sticky_area, chat_area) = if need_sticky {
         let chunks = Layout::default()
@@ -125,45 +134,24 @@ pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
     if let (Some(s_area), Some(query)) = (sticky_area, sticky_query) {
         app.chat_sticky_line = Some(query.start_line);
         app.chat_sticky_y = Some(s_area.y);
-        let single_line = query.text.replace('\n', " ");
         let width = s_area.width as usize;
-        let hint = if width >= 50 {
-            " ⇡ Pinned "
-        } else if width >= 30 {
-            " ⇡ "
+        let sticky_chevron = if query.running {
+            let spin = TURN_PULSE_SPINNER[app.spinner_frame % TURN_PULSE_SPINNER.len()];
+            Some(spin)
         } else {
-            ""
+            query.chevron.as_deref()
         };
-        let hint_w = display_width(hint);
-        let used = TURN_TIME_COL + hint_w;
-        let budget = width.saturating_sub(used).max(4);
-        let preview = truncate_display(&single_line, budget);
-
-        let mut spans = vec![
-            Span::styled("┃", Theme::sticky_query_accent()),
-            Span::styled(" ", Theme::sticky_query_bg()),
-            Span::styled(query.clock.clone(), Theme::sticky_query_time()),
-            Span::styled("  ", Theme::sticky_query_bg()),
-            Span::styled(preview, Theme::sticky_query_body()),
-        ];
-
-        let current_w: usize = spans
-            .iter()
-            .map(|s| display_width(s.content.as_ref()))
-            .sum();
-        let pad_cols = width.saturating_sub(current_w + hint_w);
-        if pad_cols > 0 {
-            spans.push(Span::styled(" ".repeat(pad_cols), Theme::sticky_query_bg()));
-        }
-        if !hint.is_empty() {
-            spans.push(Span::styled(hint, Theme::sticky_query_hint()));
-        }
-        fill_spans_to(&mut spans, width, Theme::sticky_query_bg());
-
-        frame.render_widget(
-            Paragraph::new(Line::from(spans)).style(Theme::sticky_query_bg()),
-            s_area,
+        let line = render_turn_header_line(
+            sticky_chevron,
+            &query.clock,
+            &query.text.replace('\n', " "),
+            &query.meta,
+            query.running,
+            width,
+            true,
+            false,
         );
+        frame.render_widget(Paragraph::new(vec![line]), s_area);
     } else {
         app.chat_sticky_line = None;
         app.chat_sticky_y = None;
@@ -198,55 +186,60 @@ pub(super) fn draw_chat(frame: &mut Frame<'_>, area: Rect, app: &mut App) {
 
     frame.render_widget(Paragraph::new(window).style(Theme::bg()), chat_area);
 
-    // Right-edge progress scrollbar when the transcript is taller than the viewport.
-    if total > view_h && view_h > 0 && sb_col.width > 0 && sb_col.height > 0 {
-        draw_chat_scrollbar(frame, sb_col, total, view_h, start);
+    // Pinned busy strip above the prompt (reserved at the bottom of the pane).
+    if let Some(strip_area) = busy_area {
+        frame.render_widget(Paragraph::new(strip_lines).style(Theme::bg()), strip_area);
     }
 
-    // Floating "Jump to bottom" badge when scrolled up into history.
+    // Right-edge progress scrollbar when the transcript is taller than the viewport.
+    if total > view_h && view_h > 0 && sb_col.width > 0 && sb_col.height > 0 {
+        // A fresh-turn pin can put `start` past the usual bottom offset (blank
+        // space below the question) — clamp so the thumb stays on the track.
+        draw_chat_scrollbar(frame, sb_col, total, view_h, start.min(max_from_bottom));
+    }
+
+    // One-line jump hint when browsing history. Clickable; not a bordered card.
     let show_jump_to_bottom = !app.follow_bottom && total > view_h;
-    if show_jump_to_bottom && chat_area.height >= 4 && chat_area.width >= 34 {
-        let badge_w = 31u16;
-        let badge_h = 3u16;
-        let badge_x = chat_area
-            .x
-            .saturating_add(chat_area.width.saturating_sub(badge_w + 2));
-        let badge_y = chat_area
-            .y
-            .saturating_add(chat_area.height.saturating_sub(badge_h + 1));
-        let badge_area = Rect {
-            x: badge_x,
-            y: badge_y,
-            width: badge_w,
-            height: badge_h,
-        };
-        app.chat_jump_to_bottom_rect = Some(badge_area);
-        draw_jump_to_bottom_badge(frame, badge_area);
+    if show_jump_to_bottom && chat_area.height >= 2 && chat_area.width >= 18 {
+        app.chat_jump_to_bottom_rect = Some(draw_jump_to_bottom_hint(frame, chat_area));
     } else {
         app.chat_jump_to_bottom_rect = None;
     }
 }
 
-/// Floating helper card shown when viewing history above the live bottom.
-fn draw_jump_to_bottom_badge(frame: &mut Frame<'_>, area: Rect) {
+/// Right-aligned one-line overlay: `↓ Jump to bottom  ctrl+End`.
+fn draw_jump_to_bottom_hint(frame: &mut Frame<'_>, chat_area: Rect) -> Rect {
+    let full = " ↓ Jump to bottom  ctrl+End ";
+    let short = " ↓ latest ";
+    let use_full = chat_area.width as usize >= display_width(full) + 1;
+    let label = if use_full { full } else { short };
+    let w = (display_width(label) as u16).min(chat_area.width.saturating_sub(1).max(1));
+    let area = Rect {
+        x: chat_area
+            .x
+            .saturating_add(chat_area.width.saturating_sub(w + 1)),
+        y: chat_area
+            .y
+            .saturating_add(chat_area.height.saturating_sub(1)),
+        width: w,
+        height: 1,
+    };
     frame.render_widget(Clear, area);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_type(BorderType::Plain)
-        .border_style(Style::default().fg(Theme::BORDER).bg(Theme::PANEL))
-        .style(Style::default().bg(Theme::PANEL));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let line = Line::from(vec![
-        Span::styled(" Jump to bottom ", Style::default().fg(Theme::FG)),
-        Span::styled("(ctrl+End)", Style::default().fg(Theme::MUTED)),
-        Span::styled(" ↓ ", Style::default().fg(Theme::PRIMARY)),
-    ]);
-    frame.render_widget(
-        Paragraph::new(line).style(Style::default().bg(Theme::PANEL)),
-        inner,
-    );
+    let bg = Style::default().bg(Theme::STICKY_BG);
+    let mut spans = vec![
+        Span::styled(" ↓ ", bg.fg(Theme::PRIMARY)),
+        Span::styled(
+            if use_full { "Jump to bottom" } else { "latest" },
+            bg.fg(Theme::FG).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            if use_full { "  ctrl+End " } else { " " },
+            bg.fg(Theme::MUTED),
+        ),
+    ];
+    fill_spans_to(&mut spans, w as usize, bg);
+    frame.render_widget(Paragraph::new(Line::from(spans)), area);
+    area
 }
 
 /// Main transcript scrollbar (right gutter). Thumb tracks the visible window.
@@ -360,6 +353,9 @@ fn highlight_line_full(line: &Line<'static>) -> Line<'static> {
 struct StickyQuery {
     text: String,
     clock: String,
+    chevron: Option<String>,
+    meta: String,
+    running: bool,
     start_line: usize,
     end_line: usize,
 }
@@ -434,6 +430,7 @@ fn build_chat_lines(
         }
         if msg.role == MessageRole::Tool {
             let streak = tool_view::tool_streak_len(&app.messages, i);
+            let in_current_turn = last_user_idx.is_some_and(|u| i > u);
             if turn_tools.is_none() {
                 turn_tools = Some(lines.len());
             }
@@ -511,7 +508,7 @@ fn build_chat_lines(
                 continue;
             }
 
-            if tool_view::streak_can_collapse(&app.messages, i, streak) {
+            if !in_current_turn && tool_view::streak_can_collapse(&app.messages, i, streak) {
                 let group_lines =
                     render_tool_group(&app.messages[i..i + streak], wrap_width, row_width, false);
                 push_owned(
@@ -585,8 +582,9 @@ fn build_chat_lines(
                 continue;
             }
 
-            let show_group_header =
-                streak >= 3 || tool_view::streak_shows_group_header(&app.messages, i, streak);
+            let show_group_header = (in_current_turn && streak >= 2)
+                || streak >= 3
+                || tool_view::streak_shows_group_header(&app.messages, i, streak);
             if show_group_header {
                 let header = render_tool_group(slice, wrap_width, row_width, true);
                 push_owned(
@@ -596,8 +594,13 @@ fn build_chat_lines(
                     Some(ChatLineTarget::ToolGroup(i)),
                 );
             }
+            let visible_end = if show_group_header {
+                streak.min(TOOL_BATCH_VISIBLE)
+            } else {
+                streak
+            };
             let mut k = 0;
-            while k < streak {
+            while k < visible_end {
                 let tmsg = &app.messages[i + k];
                 let running = tmsg.tool_status == Some(ToolStatus::Running);
                 // Merge repeated names on compact lists. Expanded group
@@ -625,7 +628,7 @@ fn build_chat_lines(
                 }
                 let group_child = if show_group_header {
                     Some(GroupChild {
-                        is_last: k + 1 == streak,
+                        is_last: k + 1 == visible_end && visible_end == streak,
                     })
                 } else {
                     None
@@ -638,6 +641,18 @@ fn build_chat_lines(
                     Some(ChatLineTarget::Message(i + k)),
                 );
                 k += 1;
+            }
+            if visible_end < streak {
+                let hidden = streak - visible_end;
+                push_owned(
+                    &mut lines,
+                    &mut owners,
+                    vec![Line::from(vec![
+                        Span::raw("  "),
+                        Span::styled(format!("... {hidden} more tools"), Theme::meta()),
+                    ])],
+                    Some(ChatLineTarget::ToolGroup(i)),
+                );
             }
             i += streak;
             continue;
@@ -657,7 +672,7 @@ fn build_chat_lines(
             let is_real = !extracted.user_text.is_empty();
             let is_current = last_user_idx == Some(i);
             let turn = if is_real {
-                turn_chrome(&app.messages, i, is_current)
+                turn_chrome(&app.messages, i, is_current, app.busy)
             } else {
                 None
             };
@@ -673,11 +688,21 @@ fn build_chat_lines(
                     is_current,
                     turn.as_ref(),
                     focused,
+                    app.spinner_frame,
                 );
                 let end_line = start_line + paint.lines.len().saturating_sub(1);
                 user_queries.push(StickyQuery {
-                    text: extracted.user_text.clone(),
+                    text: crate::user_fold::turn_preview(&extracted.user_text).to_string(),
                     clock: format_user_clock(msg.created_at),
+                    chevron: turn.as_ref().and_then(|t| {
+                        if t.has_followup {
+                            Some(if t.folded { "▸" } else { "▾" }.to_string())
+                        } else {
+                            None
+                        }
+                    }),
+                    meta: turn.as_ref().map(|t| t.meta.clone()).unwrap_or_default(),
+                    running: turn.as_ref().is_some_and(|t| t.running),
                     start_line,
                     end_line,
                 });
@@ -731,7 +756,7 @@ fn build_chat_lines(
         }
         let owner = if matches!(
             msg.role,
-            MessageRole::Alert | MessageRole::Thinking | MessageRole::Tool
+            MessageRole::Alert | MessageRole::Thinking | MessageRole::Tool | MessageRole::Assistant
         ) {
             Some(ChatLineTarget::Message(i))
         } else {
@@ -739,45 +764,6 @@ fn build_chat_lines(
         };
         push_owned(&mut lines, &mut owners, chunk, owner);
         i += 1;
-    }
-
-    // Spinner while waiting for first token or while waiting for model next step.
-    // Actively running tools are already rendered prominently on the outside as full tool call rows.
-    if app.busy && app.stream_buffer.is_empty() && app.thinking_buffer.is_empty() {
-        let show = app.messages.last().map(|m| !m.streaming).unwrap_or(true);
-        if show {
-            let running_n = app
-                .messages
-                .iter()
-                .filter(|m| m.tool_status == Some(ToolStatus::Running))
-                .count();
-
-            if running_n == 0 {
-                let prev_is_tool = app
-                    .messages
-                    .last()
-                    .map(|m| m.role == MessageRole::Tool)
-                    .unwrap_or(false);
-                if !prev_is_tool && !lines.is_empty() {
-                    let blank = Line::from("");
-                    lines.push(blank);
-                    owners.push(None);
-                }
-                let spin = SPINNER[app.spinner_frame % SPINNER.len()];
-                let label: &'static str = if app.busy_activity == "compacting" {
-                    "Compacting context…"
-                } else {
-                    "Waiting for model…"
-                };
-                let wait = Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled(format!("{spin} "), Theme::tool_icon_running()),
-                    Span::styled(label, Theme::busy()),
-                ]);
-                lines.push(wait);
-                owners.push(None);
-            }
-        }
     }
 
     // Trailing blank spacer at the bottom of transcript so the last message
@@ -790,6 +776,82 @@ fn build_chat_lines(
 
     debug_assert_eq!(lines.len(), owners.len());
     (lines, owners, user_queries, turn_tools, turn_answer)
+}
+
+/// Pinned busy strip anchored just above the prompt: queued steer / follow-up
+/// chips plus the waiting spinner. Lives outside the transcript flow so it
+/// stays at the bottom of the pane no matter how short the transcript is.
+fn busy_strip_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
+    let mut out: Vec<Line<'static>> = Vec::new();
+    if !app.busy {
+        return out;
+    }
+
+    // Compact queued controls sit above Waiting, not as user bubbles.
+    let queued_steers = app.queued_steers();
+    let queued_followups = app.queued_followups();
+    for (idx, text) in queued_steers.iter().enumerate() {
+        let prefix = if queued_steers.len() == 1 {
+            "↳ 你补充 ".to_string()
+        } else {
+            format!("↳ 你补充 {} ", idx + 1)
+        };
+        let budget = wrap_width
+            .saturating_sub(2usize.saturating_add(display_width(&prefix)))
+            .max(4);
+        let body = truncate_display(text, budget);
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(prefix, Theme::meta()),
+            Span::styled(body, Theme::user_steer()),
+        ]));
+    }
+    for (idx, text) in queued_followups.iter().enumerate() {
+        let prefix = if queued_followups.len() == 1 {
+            "↳ follow-up ".to_string()
+        } else {
+            format!("↳ follow-up {} ", idx + 1)
+        };
+        let budget = wrap_width
+            .saturating_sub(2usize.saturating_add(display_width(&prefix)))
+            .max(4);
+        let body = truncate_display(text, budget);
+        out.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(prefix, Theme::meta()),
+            Span::styled(body, Theme::meta()),
+        ]));
+    }
+
+    // Spinner while waiting for first token or while waiting for model next step.
+    // Actively running tools are already rendered prominently on the outside as full tool call rows.
+    if app.stream_buffer.is_empty() && app.thinking_buffer.is_empty() {
+        let show = app.messages.last().map(|m| !m.streaming).unwrap_or(true);
+        if show {
+            let running_n = app
+                .messages
+                .iter()
+                .filter(|m| m.tool_status == Some(ToolStatus::Running))
+                .count();
+            if running_n == 0 {
+                let spin = SPINNER[app.spinner_frame % SPINNER.len()];
+                let label: String = if let Some((mode, count)) = app.wait_park {
+                    let noun = if count == 1 { "task" } else { "tasks" };
+                    format!("Waiting on {count} {noun} ({mode})…")
+                } else if app.busy_activity == "compacting" {
+                    "Compacting context…".into()
+                } else {
+                    "Waiting for model…".into()
+                };
+                out.push(Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(format!("{spin} "), Theme::tool_icon_running()),
+                    Span::styled(label, Theme::busy()),
+                ]));
+            }
+        }
+    }
+    out
 }
 
 /// Empty-session welcome: brand, advanced tips, try samples — no chrome
@@ -912,11 +974,10 @@ fn empty_state_lines(app: &App, wrap_width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-/// Multi-tool group chip / expanded stack header.
+/// Multi-tool batch header.
 ///
 /// ```text
-///   ▸  5 tools · 9.8s  [todo_write] [grep ×2] [read ×2]
-///   ▾  6 tools · 9.8s          ⟳ agy_search_web  running…
+///   ▾ Tools · 19 tools · 16.4s · grep x2 · ls x4 · read x9          16.4s
 /// ```
 pub(super) fn render_tool_group(
     tools: &[Message],
@@ -934,49 +995,37 @@ pub(super) fn render_tool_group(
         .collect();
     let joined = tool_view::aggregate_tool_names(&names);
     let dur = format_ms(tool_view::tools_duration_ms(tools));
-    let running = tool_view::first_running(tools);
-    let chevron = if expanded { "▾" } else { "⮜" };
-
-    let streak_title = tool_view::format_tool_streak_summary(tools);
+    let chevron = if expanded { "▾" } else { "▸" };
+    let count = if n == 1 {
+        "1 tool".to_string()
+    } else {
+        format!("{n} tools")
+    };
 
     let mut left = vec![
         Span::raw("  "),
         Span::styled(format!("{chevron} "), Theme::tool_icon_done()),
-        Span::styled(format!("{n} tools"), Theme::tool_group_title()),
+        Span::styled("Tools", Theme::tool_group_title()),
+        Span::styled(format!(" · {count}"), Theme::tool_group_title()),
     ];
-    if let Some(streak) = &streak_title {
-        left.push(Span::styled(format!(" · {streak}"), Theme::meta()));
-    } else if let Some(d) = &dur {
+    if let Some(d) = &dur {
         left.push(Span::styled(format!(" · {d}"), Theme::meta()));
     }
-
-    let right: Vec<Span<'static>> = if let Some(r) = running {
-        let raw = r.tool_name.as_deref().unwrap_or("tool");
-        let name = tool_view::tool_display_name(raw, &r.content);
-        vec![
-            Span::styled("⟳ ", Theme::tool_icon_running()),
-            Span::styled(name, Theme::tool_name_running()),
-            Span::styled("  running…", Theme::meta()),
-        ]
-    } else {
-        let budget = wrap_width.saturating_sub(18).max(8);
-        let mut j = joined.clone();
+    if !joined.is_empty() {
+        let used: usize = left.iter().map(|s| display_width(s.content.as_ref())).sum();
+        let budget = wrap_width.saturating_sub(used + 12).max(8);
+        let mut j = joined;
         if display_width(&j) > budget {
             j = truncate_display(&j, budget);
         }
-        vec![Span::styled(j, Theme::tool_group())]
-    };
+        left.push(Span::styled(format!(" · {j}"), Theme::tool_group()));
+    }
 
-    let left_w: usize = left.iter().map(|s| display_width(s.content.as_ref())).sum();
-    let right_w: usize = right
-        .iter()
-        .map(|s| display_width(s.content.as_ref()))
-        .sum();
-    let pad = row_width.saturating_sub(left_w + right_w);
-    let mut spans = left;
-    spans.push(Span::raw(" ".repeat(pad)));
-    spans.extend(right);
-    vec![Line::from(spans)]
+    let right = dur
+        .as_deref()
+        .map(|d| vec![Span::styled(d.to_string(), Theme::meta())])
+        .unwrap_or_default();
+    vec![split_row(left, right, row_width, Theme::bg())]
 }
 
 /// Position of a tool row inside an expanded multi-tool group.
@@ -1066,7 +1115,6 @@ fn render_merged_tools(
     ));
     spans.push(Span::raw(" "));
     spans.push(paint(pad_start(&dur, time_w), Theme::meta()));
-    spans.push(Span::styled("  ▸", Theme::meta()));
     fill_spans_to(&mut spans, row_width, Theme::bg());
     vec![Line::from(spans)]
 }
@@ -1086,7 +1134,7 @@ fn message_lines(
             let mut res = Vec::new();
             if !extracted.user_text.is_empty() {
                 let is_current = last_user_message_index(&app.messages) == Some(msg_index);
-                let turn = turn_chrome(&app.messages, msg_index, is_current);
+                let turn = turn_chrome(&app.messages, msg_index, is_current, app.busy);
                 res.extend(
                     render_user(
                         message,
@@ -1096,6 +1144,7 @@ fn message_lines(
                         is_current,
                         turn.as_ref(),
                         focused,
+                        app.spinner_frame,
                     )
                     .lines,
                 );
@@ -1114,24 +1163,9 @@ fn message_lines(
             res
         }
         MessageRole::Alert => render_alert(message, wrap_width),
-        MessageRole::Thinking => render_thinking(message, app, wrap_width),
-        MessageRole::Assistant => {
-            let mut lines = render_assistant(&message.content, wrap_width);
-            if message.streaming {
-                // Live turn chrome — same `╰` slot as the finished footer; spinner
-                // stands in for duration so the row morphs into
-                // `╰ Build · model · 6m25s` without a second typewriter caret.
-                lines.push(streaming_turn_footer(app));
-            } else if let Some(footer) = &message.footer {
-                // Soft turn meta: muted hairline + peach mode glyph.
-                lines.push(Line::from(vec![
-                    Span::raw("  "),
-                    Span::styled("╰ ", Theme::meta()),
-                    Span::styled(footer.clone(), Theme::meta()),
-                ]));
-            }
-            lines
-        }
+        MessageRole::Steer => render_steer(message, wrap_width, row_width),
+        MessageRole::Thinking => render_thinking(message, app, wrap_width, row_width),
+        MessageRole::Assistant => render_assistant(message, app, wrap_width, row_width),
         MessageRole::System => render_system(&message.content, wrap_width, app.spinner_frame),
         MessageRole::Tool => render_tool(message, app, wrap_width, row_width, group_child),
     };
@@ -1167,75 +1201,46 @@ fn apply_focus_rail(lines: &mut [Line<'static>]) {
     *first = Line::from(spans);
 }
 
-/// Live assistant footer while tokens are still arriving.
-///
-/// Mirrors the finished turn footer (`╰ agent · mode · duration`) so the
-/// chrome is continuous; the braille spinner (same family as tools / Working)
-/// occupies the duration slot until the turn seals.
-fn streaming_turn_footer(app: &App) -> Line<'static> {
-    let spin = SPINNER[app.spinner_frame % SPINNER.len()];
-    let agent = if app.agent_label.is_empty() {
-        "Build"
-    } else {
-        app.agent_label.as_str()
-    };
-    let mut meta = agent.to_string();
-    if !app.mode_label.is_empty() {
-        meta.push_str(" · ");
-        meta.push_str(&app.mode_label);
-    }
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled("╰ ", Theme::meta()),
-        Span::styled(format!("{meta} · "), Theme::meta()),
-        Span::styled(spin.to_string(), Theme::prompt_bar()),
-    ])
-}
-
 /// While thinking is streaming, only keep the rolling tail so long chains
 /// don't flood the transcript (last N wrapped lines).
 pub(super) const THINKING_STREAM_TAIL_LINES: usize = 3;
+/// Visible tool rows under an expanded batch before `... N more tools`.
+const TOOL_BATCH_VISIBLE: usize = 10;
 
 /// Thinking / reasoning block — collapsible, muted.
 ///
 /// ```text
-///   ▸ [Thinking 1.2s]  Analyzing message…   (finished, default collapsed)
-///   ▾ [Thinking] ⠋                          (streaming: spinner + last 3 lines)
-///     …
-///   ▾ [Thinking 1.2s]                       (expanded full body)
-///     …
+///   ○ Thinking                                              3.2s
+///   │  analyzing the prompt config…
+///   ▸ Thinking                                              1.2s
+///   │  preview of a collapsed block…
 /// ```
-///
-/// Collapsed previews fill the remaining line width and **end-truncate** so
-/// history does not look mid-cropped (`The user wants me …l next positions`).
 pub(super) fn render_thinking(
     message: &Message,
     app: &App,
     wrap_width: usize,
+    row_width: usize,
 ) -> Vec<Line<'static>> {
-    // Live stream always shows a short tail; finished blocks honor per-message
-    // expand (click) or the global Ctrl+T default (`show_thinking`).
     let expanded = message.streaming || message.thinking_expanded;
-    let chevron = if expanded { "▾" } else { "▸" };
     let mut lines = Vec::new();
-    let dur = duration_label(message);
-    let badge = if message.streaming {
-        let spin = SPINNER[app.spinner_frame % SPINNER.len()];
-        format!("[Thinking {spin}]")
-    } else if let Some(d) = &dur {
-        format!("[Thinking {d}]")
+    let dur = duration_label(message).unwrap_or_else(|| "0ms".into());
+    let glyph = if message.streaming {
+        SPINNER[app.spinner_frame % SPINNER.len()].to_string()
+    } else if expanded {
+        "○".to_string()
     } else {
-        "[Thinking]".into()
+        "▸".to_string()
     };
 
+    let left = vec![
+        Span::raw("  "),
+        Span::styled(format!("{glyph} "), Theme::thinking_chevron()),
+        Span::styled("Thinking", Theme::thinking_badge()),
+    ];
+    let right = vec![Span::styled(dur, Theme::thinking_meta())];
+    lines.push(split_row(left, right, row_width, Theme::bg()));
+
     if expanded {
-        let header = vec![
-            Span::raw("  "),
-            Span::styled(chevron, Theme::thinking_chevron()),
-            Span::raw(" "),
-            Span::styled(badge, Theme::thinking_badge()),
-        ];
-        lines.push(Line::from(header));
         let budget = wrap_width.saturating_sub(4).max(8);
         let raw_content = if message.streaming {
             message.content.trim_start()
@@ -1243,33 +1248,24 @@ pub(super) fn render_thinking(
             message.content.trim()
         };
         let mut body = wrap_thinking_body(raw_content, budget);
-        // Live stream: rolling window of the last few lines only.
         if message.streaming && body.len() > THINKING_STREAM_TAIL_LINES {
             body = body[body.len() - THINKING_STREAM_TAIL_LINES..].to_vec();
         }
         for line in body {
             lines.push(Line::from(vec![
-                Span::styled("  │ ", Theme::thinking_meta()),
+                Span::styled("  │  ", Theme::thinking_meta()),
                 Span::styled(line, Theme::thinking_body()),
             ]));
         }
     } else {
-        // "  ▸ " + badge + "  " + preview  — use leftover cols so wide terminals
-        // show a full sentence instead of a 48-char mid-ellipsis stub.
-        let prefix_w = 2 + display_width(chevron) + 1 + display_width(&badge) + 2;
-        let preview_budget = wrap_width.saturating_sub(prefix_w).max(16);
+        let preview_budget = wrap_width.saturating_sub(6).max(16);
         let preview = thinking_preview(&message.content, preview_budget);
-        let mut spans = vec![
-            Span::raw("  "),
-            Span::styled(chevron, Theme::thinking_chevron()),
-            Span::raw(" "),
-            Span::styled(badge, Theme::thinking_badge()),
-        ];
         if !preview.is_empty() {
-            // Quoted-ish preview: italic muted body, distinct from the badge.
-            spans.push(Span::styled(format!("  {preview}"), Theme::thinking_body()));
+            lines.push(Line::from(vec![
+                Span::styled("  │  ", Theme::thinking_meta()),
+                Span::styled(preview, Theme::thinking_body()),
+            ]));
         }
-        lines.push(Line::from(spans));
     }
     lines
 }
@@ -1444,7 +1440,7 @@ pub(super) fn extract_user_and_reminders(text: &str) -> ExtractedUserContent {
     }
 
     ExtractedUserContent {
-        user_text: real_user_parts.join("\n\n"),
+        user_text: one_core::extract_user_query(&real_user_parts.join("\n\n")),
         reminders,
     }
 }
@@ -1844,85 +1840,120 @@ fn last_user_message_index(messages: &[Message]) -> Option<usize> {
     })
 }
 
-fn format_user_clock(ts: std::time::SystemTime) -> String {
+fn format_user_clock(ts: Option<std::time::SystemTime>) -> String {
+    let Some(ts) = ts else {
+        return String::new();
+    };
     chrono::DateTime::<chrono::Local>::from(ts)
         .format("%H:%M")
         .to_string()
 }
 
-/// `┃ `/`  ` + `HH:MM` + two spaces before the question.
-const TURN_TIME_COL: usize = 9;
-
-fn timeline_prefix(rail: bool) -> Vec<Span<'static>> {
-    if rail {
-        vec![
-            Span::styled("┃", Theme::turn_rail_user()),
-            Span::styled(" ", Theme::user_bg()),
-        ]
-    } else {
-        vec![Span::styled("  ", Theme::user_bg())]
-    }
-}
-
-fn timeline_header(
-    clock: &str,
-    text: &str,
-    chevron: Option<char>,
-    rail: bool,
-    dim: bool,
+fn split_row(
+    mut left: Vec<Span<'static>>,
+    right: Vec<Span<'static>>,
     row_width: usize,
+    fill: ratatui::style::Style,
 ) -> Line<'static> {
-    let mut spans = timeline_prefix(rail);
-    spans.push(Span::styled(clock.to_string(), Theme::turn_time()));
-    spans.push(Span::styled("  ", Theme::user_bg()));
-    let chevron_w = if chevron.is_some() { 2 } else { 0 };
-    let used = TURN_TIME_COL + chevron_w;
-    let budget = row_width.saturating_sub(used).max(4);
-    let shown = truncate_display(text, budget);
-    let style = if dim {
-        Theme::turn_preview_dim()
-    } else {
-        Theme::turn_preview()
-    };
-    spans.push(Span::styled(shown, style));
-    if let Some(ch) = chevron {
-        let left_w: usize = spans
-            .iter()
-            .map(|s| display_width(s.content.as_ref()))
-            .sum();
-        let gap = row_width.saturating_sub(left_w + 1).max(1);
-        spans.push(Span::styled(" ".repeat(gap), Theme::user_bg()));
-        spans.push(Span::styled(ch.to_string(), Theme::user_fold_key()));
+    let left_w: usize = left.iter().map(|s| display_width(s.content.as_ref())).sum();
+    let right_w: usize = right
+        .iter()
+        .map(|s| display_width(s.content.as_ref()))
+        .sum();
+    let pad = row_width.saturating_sub(left_w + right_w);
+    if pad > 0 {
+        left.push(Span::styled(" ".repeat(pad), fill));
     }
-    fill_spans_to(&mut spans, row_width, Theme::user_bg());
-    Line::from(spans)
+    left.extend(right);
+    fill_spans_to(&mut left, row_width, fill);
+    Line::from(left)
 }
 
-fn timeline_cont(text: &str, rail: bool, dim: bool, row_width: usize) -> Line<'static> {
-    let mut spans = timeline_prefix(rail);
-    spans.push(Span::styled("       ", Theme::user_bg()));
-    let budget = row_width.saturating_sub(TURN_TIME_COL).max(4);
-    let shown = truncate_display(text, budget);
-    let style = if dim {
-        Theme::turn_preview_dim()
+/// `▾ 19:14  title                    19 tools · 16.4s · ● running`
+fn render_turn_header_line(
+    chevron: Option<&str>,
+    clock: &str,
+    title: &str,
+    meta: &str,
+    running: bool,
+    row_width: usize,
+    highlight: bool,
+    dim: bool,
+) -> Line<'static> {
+    let fill = if highlight {
+        Theme::turn_active_bg()
     } else {
-        Theme::turn_preview()
+        Theme::bg()
     };
-    spans.push(Span::styled(shown, style));
-    fill_spans_to(&mut spans, row_width, Theme::user_bg());
-    Line::from(spans)
-}
+    let chevron_style = if highlight {
+        Theme::sticky_query_accent()
+    } else if dim {
+        Theme::turn_row_dim()
+    } else {
+        Theme::meta()
+    };
+    let time_style = if highlight {
+        Theme::turn_active_time()
+    } else if dim {
+        Theme::turn_row_dim()
+    } else {
+        Theme::turn_row_time()
+    };
+    let title_style = if highlight {
+        Theme::turn_active_title()
+    } else if dim {
+        Theme::turn_row_dim()
+    } else {
+        Theme::user_body()
+    };
+    let meta_style = if highlight {
+        Theme::turn_active_meta()
+    } else {
+        Theme::turn_row_meta()
+    };
 
-fn timeline_remainder(label: &str, rail: bool, row_width: usize) -> Line<'static> {
-    let mut spans = timeline_prefix(rail);
-    spans.push(Span::styled("       ", Theme::user_bg()));
-    spans.push(Span::styled(format!("· {label}"), Theme::turn_time()));
-    fill_spans_to(&mut spans, row_width, Theme::user_bg());
-    Line::from(spans)
+    let mut left = Vec::new();
+    if let Some(ch) = chevron {
+        left.push(Span::styled(format!("{ch} "), chevron_style));
+    } else {
+        left.push(Span::raw("  "));
+    }
+    if !clock.is_empty() {
+        left.push(Span::styled(format!("{clock}  "), time_style));
+    }
+
+    let mut right: Vec<Span<'static>> = Vec::new();
+    if !meta.is_empty() {
+        let style = if running && highlight {
+            Theme::tool_icon_running().bg(Theme::STICKY_BG)
+        } else if running {
+            Theme::tool_icon_running()
+        } else {
+            meta_style
+        };
+        right.push(Span::styled(meta.to_string(), style));
+    }
+    let used_left: usize = left.iter().map(|s| display_width(s.content.as_ref())).sum();
+    let used_right: usize = right
+        .iter()
+        .map(|s| display_width(s.content.as_ref()))
+        .sum();
+    let mut title_budget = row_width.saturating_sub(used_left + used_right + 1).max(4);
+    // Prompt text wins over status meta on a narrow row.
+    if display_width(title) > title_budget && used_right > 0 {
+        right.clear();
+        title_budget = row_width.saturating_sub(used_left + 1).max(4);
+    }
+    let preview = truncate_display(title, title_budget);
+    left.push(Span::styled(preview, title_style));
+    split_row(left, right, row_width, fill)
 }
 
 struct TurnChrome {
     folded: bool,
+    has_followup: bool,
+    running: bool,
+    meta: String,
 }
 
 struct UserPaint {
@@ -1930,17 +1961,34 @@ struct UserPaint {
     content_targets: Vec<usize>,
 }
 
-fn turn_chrome(messages: &[Message], user_idx: usize, is_current: bool) -> Option<TurnChrome> {
+fn turn_chrome(
+    messages: &[Message],
+    user_idx: usize,
+    is_current: bool,
+    busy: bool,
+) -> Option<TurnChrome> {
     let msg = messages.get(user_idx)?;
     if !crate::user_fold::is_real_user(msg) {
         return None;
     }
-    if !crate::user_fold::turn_has_followup(messages, user_idx) {
-        return None;
-    }
-    let expanded = msg.turn_expanded;
-    let folded = crate::user_fold::is_turn_folded(expanded, is_current, true);
-    Some(TurnChrome { folded })
+    let has_followup = crate::user_fold::turn_has_followup(messages, user_idx);
+    let folded = crate::user_fold::is_turn_folded(msg.turn_expanded, is_current, has_followup);
+    let stats = crate::user_fold::turn_stats(messages, user_idx);
+    let end = crate::user_fold::turn_end(messages, user_idx);
+    let slice_running = messages
+        .get(user_idx..end)
+        .into_iter()
+        .flatten()
+        .any(|m| m.streaming || m.tool_status == Some(ToolStatus::Running));
+    let running = is_current && (busy || slice_running);
+    let duration_ms = crate::user_fold::turn_duration_ms(messages, user_idx);
+    let meta = crate::user_fold::format_turn_meta(stats, duration_ms, running);
+    Some(TurnChrome {
+        folded,
+        has_followup,
+        running,
+        meta,
+    })
 }
 
 fn render_user(
@@ -1950,34 +1998,52 @@ fn render_user(
     row_width: usize,
     is_current: bool,
     turn: Option<&TurnChrome>,
-    focused: bool,
+    _focused: bool,
+    spinner_frame: usize,
 ) -> UserPaint {
     let content_folded = crate::user_fold::is_folded(msg.user_expanded, is_current, content);
-    let clock = format_user_clock(msg.created_at);
-    let turn_foldable = turn.is_some();
     let turn_folded = turn.is_some_and(|t| t.folded);
-    let rail = focused;
-    let dim = turn_folded && !is_current && !focused;
-    let chevron = if turn_foldable {
-        Some(if turn_folded { '▸' } else { '▾' })
+    let has_followup = turn.is_some_and(|t| t.has_followup);
+    let dim = turn_folded && !is_current;
+    let highlight = is_current && has_followup && !turn_folded;
+    let clock = format_user_clock(msg.created_at);
+    let inner_w = wrap_width.saturating_sub(6).max(8);
+    let meta = turn.map(|t| t.meta.as_str()).unwrap_or("");
+    let running = turn.is_some_and(|t| t.running);
+    let chevron = if running && !turn_folded {
+        let spin = TURN_PULSE_SPINNER[spinner_frame % TURN_PULSE_SPINNER.len()];
+        Some(spin)
+    } else if has_followup {
+        Some(if turn_folded { "▸" } else { "▾" })
     } else {
         None
     };
-    let budget = wrap_width.saturating_sub(TURN_TIME_COL).max(8);
+
+    let header_title = if turn_folded {
+        crate::user_fold::turn_preview(content).to_string()
+    } else {
+        crate::user_fold::turn_preview(content).to_string()
+    };
+    let mut out = vec![render_turn_header_line(
+        chevron,
+        &clock,
+        &header_title,
+        meta,
+        running,
+        row_width,
+        highlight,
+        dim,
+    )];
+    let mut content_targets = Vec::new();
 
     if turn_folded {
-        let preview = crate::user_fold::turn_preview(content);
         return UserPaint {
-            lines: vec![timeline_header(
-                &clock, &preview, chevron, rail, dim, row_width,
-            )],
-            content_targets: Vec::new(),
+            lines: out,
+            content_targets,
         };
     }
 
-    let mut out = Vec::new();
-    let mut content_targets = Vec::new();
-
+    let mut visual: Vec<String> = Vec::new();
     if content_folded {
         match crate::user_fold::collapse_plan(content) {
             Some(crate::user_fold::Collapse::Code {
@@ -1986,23 +2052,11 @@ fn render_user(
                 ..
             }) => {
                 let kept: Vec<&str> = content.lines().take(keep_before).collect();
-                let head = kept
-                    .first()
-                    .copied()
-                    .filter(|s| !s.trim().is_empty())
-                    .unwrap_or("代码块");
-                out.push(timeline_header(&clock, head, chevron, rail, dim, row_width));
-                for line in kept.iter().skip(1) {
-                    for wrapped in wrap_paragraphs(line, budget) {
-                        out.push(timeline_cont(&wrapped, rail, dim, row_width));
-                    }
+                for line in kept {
+                    visual.extend(wrap_paragraphs(line, inner_w));
                 }
-                content_targets.push(out.len());
-                out.push(timeline_remainder(
-                    &format!("代码块 ({body_lines} 行)"),
-                    rail,
-                    row_width,
-                ));
+                visual.push(format!("代码块 ({body_lines} 行)"));
+                content_targets.push(out.len() + visual.len() - 1);
             }
             Some(crate::user_fold::Collapse::Text {
                 keep,
@@ -2011,47 +2065,48 @@ fn render_user(
                 ..
             }) => {
                 let kept: Vec<&str> = content.lines().take(keep).collect();
-                let mut remain = hidden;
-                let mut visual: Vec<String> = Vec::new();
-                for line in &kept {
-                    visual.extend(wrap_paragraphs(line, budget));
+                for line in kept {
+                    visual.extend(wrap_paragraphs(line, inner_w));
                 }
+                let mut remain = hidden;
                 if chars > crate::user_fold::FOLD_CHAR_THRESHOLD
                     && visual.len() > crate::user_fold::PREVIEW_LINES
                 {
                     remain = remain.saturating_add(visual.len() - crate::user_fold::PREVIEW_LINES);
                     visual.truncate(crate::user_fold::PREVIEW_LINES);
                 }
-                let head = if visual.is_empty() {
-                    crate::user_fold::turn_preview(content)
-                } else {
-                    visual.remove(0)
-                };
-                out.push(timeline_header(
-                    &clock, &head, chevron, rail, dim, row_width,
-                ));
-                for line in visual {
-                    out.push(timeline_cont(&line, rail, dim, row_width));
-                }
                 if remain > 0 {
-                    content_targets.push(out.len());
-                    out.push(timeline_remainder(
-                        &format!("还有 {remain} 行"),
-                        rail,
-                        row_width,
-                    ));
+                    visual.push(format!("还有 {remain} 行"));
+                    content_targets.push(out.len() + visual.len() - 1);
                 }
             }
-            None => {
-                push_expanded_user_body(
-                    &mut out, content, &clock, chevron, rail, dim, budget, row_width,
-                );
-            }
+            None => visual.extend(wrap_paragraphs(content, inner_w)),
         }
     } else {
-        push_expanded_user_body(
-            &mut out, content, &clock, chevron, rail, dim, budget, row_width,
-        );
+        let lines: Vec<&str> = content.lines().collect();
+        // Header already shows the first source line; extra lines hang under it.
+        let rest = if lines.len() > 1 {
+            lines[1..].join("\n")
+        } else {
+            String::new()
+        };
+        if !rest.trim().is_empty() {
+            visual.extend(wrap_paragraphs(&rest, inner_w));
+        }
+    }
+
+    for line in visual {
+        out.push(Line::from(vec![
+            Span::styled("  │  ", Theme::meta()),
+            Span::styled(
+                line,
+                if dim {
+                    Theme::turn_row_dim()
+                } else {
+                    Theme::user_body()
+                },
+            ),
+        ]));
     }
     UserPaint {
         lines: out,
@@ -2059,242 +2114,38 @@ fn render_user(
     }
 }
 
-fn push_expanded_user_body(
-    out: &mut Vec<Line<'static>>,
-    content: &str,
-    clock: &str,
-    chevron: Option<char>,
-    rail: bool,
-    dim: bool,
-    budget: usize,
+/// Assistant: `Answer` title + full markdown body. Never folded; no tree spine.
+fn render_assistant(
+    message: &Message,
+    app: &App,
+    wrap_width: usize,
     row_width: usize,
-) {
-    let mut source = content.lines();
-    let first = source.next().unwrap_or("");
-    let head = if first.trim().is_empty() {
-        crate::user_fold::turn_preview(content)
-    } else {
-        first.to_string()
-    };
-    let wrapped = wrap_paragraphs(&head, budget);
-    if wrapped.is_empty() {
-        out.push(timeline_header(clock, &head, chevron, rail, dim, row_width));
-    } else {
-        out.push(timeline_header(
-            clock,
-            &wrapped[0],
-            chevron,
-            rail,
-            dim,
-            row_width,
-        ));
-        for line in wrapped.into_iter().skip(1) {
-            out.push(timeline_cont(&line, rail, dim, row_width));
-        }
-    }
-    let rest: String = source.collect::<Vec<_>>().join("\n");
-    if rest.trim().is_empty()
-        && !content.contains("```")
-        && !content.contains("[文本")
-        && !content.contains("[图片")
-    {
-        return;
-    }
-    if !rest.trim().is_empty() {
-        out.extend(render_user_body(&rest, budget, row_width, rail, dim));
-    } else if content.contains("```") || content.contains("[文本") || content.contains("[图片")
-    {
-        out.extend(render_user_body(content, budget, row_width, rail, dim));
-        if out.len() > 1 {
-            // First line already painted as the header; drop the duplicate body head
-            // when we re-rendered the whole content for chips/code.
-            let header = out.remove(0);
-            if !out.is_empty() {
-                out[0] = header;
-            } else {
-                out.push(header);
-            }
-        }
-    }
-}
-
-enum UserSeg {
-    Text(String),
-    Code { lang: String, body: String },
-}
-
-fn split_user_segments(content: &str) -> Vec<UserSeg> {
-    let lines: Vec<&str> = content.lines().collect();
-    let mut out = Vec::new();
-    let mut buf = String::new();
-    let mut i = 0;
-    while i < lines.len() {
-        if crate::user_fold::is_fence(lines[i]) {
-            if !buf.is_empty() {
-                out.push(UserSeg::Text(std::mem::take(&mut buf)));
-            }
-            let lang = crate::user_fold::fence_lang(lines[i]).to_string();
-            i += 1;
-            let mut body = String::new();
-            while i < lines.len() && !crate::user_fold::is_fence(lines[i]) {
-                if !body.is_empty() {
-                    body.push('\n');
-                }
-                body.push_str(lines[i]);
-                i += 1;
-            }
-            out.push(UserSeg::Code { lang, body });
-            if i < lines.len() {
-                i += 1;
-            }
-            continue;
-        }
-        if !buf.is_empty() {
-            buf.push('\n');
-        }
-        buf.push_str(lines[i]);
-        i += 1;
-    }
-    if !buf.is_empty() {
-        out.push(UserSeg::Text(buf));
-    }
-    out
-}
-
-fn render_user_body(
-    content: &str,
-    budget: usize,
-    row_width: usize,
-    rail: bool,
-    dim: bool,
 ) -> Vec<Line<'static>> {
-    let segs = split_user_segments(content);
-    if segs.is_empty() {
-        return vec![timeline_cont("", rail, dim, row_width)];
-    }
-    let mut out = Vec::new();
-    for seg in segs {
-        match seg {
-            UserSeg::Text(t) => out.extend(render_user_text(&t, budget, row_width, rail, dim)),
-            UserSeg::Code { lang, body } => {
-                out.extend(render_user_code(&lang, &body, budget, row_width, rail))
-            }
-        }
-    }
-    out
-}
-
-fn render_user_text(
-    content: &str,
-    budget: usize,
-    row_width: usize,
-    rail: bool,
-    dim: bool,
-) -> Vec<Line<'static>> {
-    let has_chips = content.contains("[文本") || content.contains("[图片");
-    if has_chips {
-        return render_user_with_chips(content, budget, row_width, rail);
-    }
-    let wrapped = wrap_paragraphs(content, budget);
-    let mut out = Vec::with_capacity(wrapped.len().max(1));
-    for line in wrapped {
-        out.push(timeline_cont(&line, rail, dim, row_width));
-    }
-    out
-}
-
-fn render_user_with_chips(
-    content: &str,
-    budget: usize,
-    row_width: usize,
-    rail: bool,
-) -> Vec<Line<'static>> {
-    let spans: Vec<Span<'static>> = tokenize_input_chips(content)
-        .into_iter()
-        .map(|(text, kind)| {
-            let style = match kind {
-                Some(InputChipKind::Text) => Theme::user_text_chip(),
-                Some(InputChipKind::Image) => Theme::user_image_chip(),
-                None => Theme::user_body(),
-            };
-            Span::styled(text, style)
-        })
-        .collect();
-    let rows = wrap_styled_spans(&spans, budget);
-    let mut out = Vec::with_capacity(rows.len().max(1));
-    if rows.is_empty() {
-        out.push(timeline_cont("", rail, false, row_width));
-        return out;
-    }
-    for row in rows {
-        let mut spans = timeline_prefix(rail);
-        spans.push(Span::styled("       ", Theme::user_bg()));
-        if !(row.is_empty() || row.iter().all(|s| s.content.trim().is_empty())) {
-            spans.extend(row);
-        }
-        fill_spans_to(&mut spans, row_width, Theme::user_bg());
-        out.push(Line::from(spans));
-    }
-    out
-}
-
-fn render_user_code(
-    lang: &str,
-    body: &str,
-    budget: usize,
-    row_width: usize,
-    rail: bool,
-) -> Vec<Line<'static>> {
-    let inner = budget.max(4);
-    let mut out = Vec::new();
-    let open = if lang.is_empty() {
-        "```".to_string()
-    } else {
-        format!("```{lang}")
-    };
-    out.push(timeline_cont(&open, rail, true, row_width));
-
-    if body.is_empty() {
-        out.push(user_code_fill_line("", inner, row_width, rail));
-    } else {
-        for line in body.split('\n') {
-            out.push(user_code_fill_line(line, inner, row_width, rail));
-        }
-    }
-
-    out.push(timeline_cont("```", rail, true, row_width));
-    out
-}
-
-fn user_code_fill_line(line: &str, inner: usize, row_width: usize, rail: bool) -> Line<'static> {
-    let shown = truncate_display(line, inner);
-    let mut spans = timeline_prefix(rail);
-    spans.push(Span::raw("       "));
-    let rest = row_width.saturating_sub(TURN_TIME_COL);
-    let pad = rest.saturating_sub(display_width(&shown));
-    spans.push(Span::styled(shown, Theme::user_code()));
-    if pad > 0 {
-        spans.push(Span::styled(" ".repeat(pad), Theme::user_code()));
-    }
-    Line::from(spans)
-}
-
-/// Assistant: soft indent + full markdown (tables, code, lists, …).
-///
-/// Live activity is painted as the turn footer (`streaming_turn_footer`), not
-/// an end-of-line caret — that kept colliding with the prompt typewriter bar.
-fn render_assistant(content: &str, wrap_width: usize) -> Vec<Line<'static>> {
-    // 2-space indent leaves room without crowding the user bubble.
     let budget = wrap_width.saturating_sub(2).max(8);
     let mut out = Vec::new();
+    let dur = if message.streaming {
+        let spin = SPINNER[app.spinner_frame % SPINNER.len()];
+        format!("{spin} streaming")
+    } else {
+        duration_label(message).unwrap_or_default()
+    };
 
-    if content.trim().is_empty() {
+    let left = vec![
+        Span::raw("  "),
+        Span::styled("Answer", Theme::heading_sub()),
+    ];
+    let right = if dur.is_empty() {
+        Vec::new()
+    } else {
+        vec![Span::styled(dur, Theme::meta())]
+    };
+    out.push(split_row(left, right, row_width, Theme::bg()));
+
+    if message.content.trim().is_empty() {
         return out;
     }
 
-    let md_lines = markdown::render(content, budget);
-    // Drop a single trailing blank line so the turn footer sits tighter.
-    let mut md_lines = md_lines;
+    let mut md_lines = markdown::render(&message.content, budget);
     while md_lines
         .last()
         .is_some_and(|l| l.spans.is_empty() || l.spans.iter().all(|s| s.content.trim().is_empty()))
@@ -2442,13 +2293,7 @@ fn render_tool(
             let spin = SPINNER[app.spinner_frame % SPINNER.len()];
             (spin.to_string(), Theme::tool_icon_running())
         }
-        ToolStatus::Done => {
-            if group_child.is_none() {
-                ("◆".into(), Theme::tool_icon_done())
-            } else {
-                ("✓".into(), Theme::tool_icon_done())
-            }
-        }
+        ToolStatus::Done => ("✓".into(), Theme::tool_icon_done()),
         ToolStatus::Error => ("✗".into(), Theme::tool_icon_error()),
     };
 
@@ -2582,17 +2427,29 @@ fn render_tool(
         } else {
             tool_view::pretty_tool_detail_full(detail, cwd)
         };
+        let output_has_cmd = message.tool_output.as_deref().is_some_and(|s| {
+            s.lines()
+                .any(|l| l.starts_with("$ ") || l.starts_with("command: "))
+        });
         let show_full_args = !full_args.is_empty()
             && ((raw_name == "use_tool" && full_args != detail)
                 || (matches!(raw_name.as_str(), "bash" | "sh" | "exec")
-                    && (pretty.contains('…')
+                    && !output_has_cmd
+                    && (pretty != full_args
+                        || pretty.contains('…')
                         || full_args.lines().count() > 1
                         || display_width(&full_args) > budget)));
 
         let mut visual: Vec<(String, Style)> = Vec::new();
         if show_full_args {
-            for line in full_args.lines() {
-                for wrapped in wrap_str(line, body_budget) {
+            let is_shell = matches!(raw_name.as_str(), "bash" | "sh" | "exec");
+            for (idx, line) in full_args.lines().enumerate() {
+                let formatted = if is_shell && idx == 0 && !line.starts_with("$ ") {
+                    format!("$ {line}")
+                } else {
+                    line.to_string()
+                };
+                for wrapped in wrap_str(&formatted, body_budget) {
                     visual.push((wrapped, Theme::tool_detail_done()));
                 }
             }
@@ -2651,7 +2508,11 @@ fn render_tool(
             };
 
             // Flatten wrapped lines first so tree tips land on the true last visual row.
-            let raw_lines: Vec<&str> = output.lines().collect();
+            // Redundant default sandbox banner is omitted to keep output clean.
+            let raw_lines: Vec<&str> = output
+                .lines()
+                .filter(|l| !l.starts_with("sandbox: bwrap"))
+                .collect();
             let total_raw = raw_lines.len();
             for line in raw_lines.iter().take(max_lines) {
                 let style = if status == ToolStatus::Error {
@@ -2911,6 +2772,55 @@ fn render_alert(message: &Message, wrap_width: usize) -> Vec<Line<'static>> {
 
 /// Truncate by **display width** (CJK-safe), append … if needed (end ellipsis).
 
+/// Mid-run steer row — lightweight timeline injection, never a user turn.
+///
+/// ```text
+///   ↳ 你补充：不要重构 shared package · 已应用
+/// ```
+///
+/// `applied` is only true when the agent actually drained the steer into the
+/// model context (live `SteerApplied` event / session reload); pending rows
+/// show no state chip rather than a fabricated one.
+fn render_steer(message: &Message, wrap_width: usize, row_width: usize) -> Vec<Line<'static>> {
+    let state = if message.steer_applied {
+        " · 已应用"
+    } else {
+        ""
+    };
+    let prefix_w = display_width("↳ 你补充：") + display_width(state);
+    let budget = wrap_width.saturating_sub(2 + prefix_w).max(8);
+    let mut out = Vec::new();
+    let mut first = true;
+    for line in wrap_paragraphs(message.content.trim(), budget) {
+        let spans = if first {
+            first = false;
+            vec![
+                Span::styled("  ", Theme::bg()),
+                Span::styled("↳ ", Theme::meta()),
+                Span::styled("你补充：", Theme::meta()),
+                Span::styled(line, Theme::user_steer()),
+                Span::styled(state, Theme::meta()),
+            ]
+        } else {
+            vec![
+                Span::styled("  ", Theme::bg()),
+                Span::styled(line, Theme::user_steer()),
+            ]
+        };
+        out.push(Line::from(spans));
+    }
+    if out.is_empty() {
+        out.push(Line::from(vec![
+            Span::styled("  ", Theme::bg()),
+            Span::styled("↳ ", Theme::meta()),
+            Span::styled("你补充：", Theme::meta()),
+            Span::styled(state, Theme::meta()),
+        ]));
+    }
+    fill_spans_to(&mut out[0].spans, row_width, Theme::bg());
+    out
+}
+
 fn pretty_tool_args(s: &str, cwd: Option<&std::path::Path>) -> String {
     tool_view::pretty_tool_detail(s, cwd)
 }
@@ -2923,6 +2833,9 @@ mod sticky_query_tests {
         StickyQuery {
             text: text.into(),
             clock: "12:00".into(),
+            chevron: Some("▾".into()),
+            meta: String::new(),
+            running: false,
             start_line,
             end_line,
         }

@@ -34,7 +34,10 @@ pub(super) fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMen
     // remaining safe on narrow/short terminals. `u16::clamp` panics when its
     // lower bound exceeds the upper bound, which used to make Settings crash
     // below ~48 columns or ~12 rows.
-    let is_subagent = matches!(menu.kind, FloatKind::Subagent | FloatKind::SubagentDetail);
+    let is_subagent = matches!(
+        menu.kind,
+        FloatKind::Subagent | FloatKind::SubagentDetail | FloatKind::Work
+    );
     let max_w = full.width.saturating_sub(2);
     // Subagent panels get a touch more width for status + activity meta.
     let min_w = if is_subagent {
@@ -221,7 +224,7 @@ pub(super) fn draw_float_menu(frame: &mut Frame<'_>, full: Rect, menu: &FloatMen
             } => {
                 if menu.kind == FloatKind::SubagentDetail {
                     lines.push(subagent_log_line(label, detail, col_w));
-                } else if menu.kind == FloatKind::Subagent {
+                } else if matches!(menu.kind, FloatKind::Subagent | FloatKind::Work) {
                     let active = !editing && *entry_index == menu.selected;
                     lines.push(subagent_item_line(label, detail, hint, col_w, active));
                 } else if readonly_log {
@@ -478,6 +481,7 @@ fn float_footer_text(menu: &FloatMenu) -> String {
         FloatKind::Background => " ↑/↓ wheel  ·  Enter log  ·  x kill  ·  Esc ",
         FloatKind::BackgroundDetail => " ↑/↓ wheel  ·  x kill  ·  Esc list ",
         FloatKind::Subagent => " ↑/↓ wheel  ·  ↵ framed log  ·  x kill  ·  Esc ",
+        FloatKind::Work => " ↑/↓ select  ·  Enter open  ·  x stop  ·  Esc close ",
         FloatKind::SubagentDetail => " ↑/↓  ·  x kill  ·  q/Esc back  ·  observational ",
         FloatKind::Commands | FloatKind::Custom => " ↑/↓ Navigate  ·  Enter Select  ·  Esc Close ",
     };
@@ -599,7 +603,7 @@ fn subagent_item_line(
     let meta = if hint.is_empty() {
         String::new()
     } else {
-        format!(" {hint}")
+        format!(" {}", pad_or_truncate(hint, col_w.saturating_div(3).max(1)))
     };
     let meta_w = meta.width();
     let name_w = col_w
@@ -664,7 +668,7 @@ fn subagent_item_line_raw(
     let meta = if hint.is_empty() {
         String::new()
     } else {
-        format!(" {hint}")
+        format!(" {}", pad_or_truncate(hint, col_w.saturating_div(3).max(1)))
     };
     let meta_w = meta.width();
     let name_w = col_w

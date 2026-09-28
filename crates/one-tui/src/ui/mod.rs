@@ -1,10 +1,9 @@
-//! OpenCode-faithful chat chrome (dark `opencode` theme).
+//! Single-column agent transcript (Claude Code / Codex CLI dialect).
 //!
-//! - User turns: timeline rows (`HH:MM  question  ▸`); expanded/focused get a `┃` spine
-//! - Chat focus (j/k): the same turn spine, not a second bubble style
-//! - Assistant: markdown body (headings, lists, code, tables), turn footer
-//! - Tool: `⚙ name detail` inline row (running / muted / error)
-//! - Prompt: left-border only + agent/model meta strip
+//! - A UI turn is one user prompt, not one model step
+//! - Folded history: `▸ HH:MM  title    N tools · duration · done`
+//! - Current turn: sticky prompt, Thinking, Tool batches, Answer
+//! - Paint with text, indent, color, rules, and `▸ ▾ ✓ ◐` only
 //! - one-cli only feeds state; all paint is here
 //!
 //! Split by paint surface: [`chat`], [`prompt`], [`status`], [`dock`],
@@ -32,7 +31,7 @@ use crate::float::FloatKind;
 use crate::theme::Theme;
 
 use chat::draw_chat;
-use dock::{draw_select_dock, draw_slash_dock};
+use dock::{draw_select_dock, draw_slash_dock, draw_work_dock};
 use float_menu::draw_float_menu;
 use header::draw_header;
 use prompt::draw_prompt;
@@ -72,14 +71,16 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
         0
     };
     let dock_h = select_h.max(slash_h);
+    let work_h = u16::from(app.work_summary.visible());
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),        // grok-build top header (path + context)
             Constraint::Min(3),           // transcript
             Constraint::Length(dock_h),   // select or `/` menu (0 when closed)
-            Constraint::Length(prompt_h), // prompt box
-            Constraint::Length(2),        // footer (identity + keys)
+            Constraint::Length(work_h),   // unified work summary when actionable
+            Constraint::Length(prompt_h), // rounded prompt box
+            Constraint::Length(1),        // Pi-style keybinding footer
         ])
         .split(frame.area());
 
@@ -90,8 +91,11 @@ pub fn draw(frame: &mut Frame<'_>, app: &mut App) {
     } else if slash_h > 0 {
         draw_slash_dock(frame, chunks[2], app);
     }
-    draw_prompt(frame, chunks[3], app);
-    draw_status(frame, chunks[4], app);
+    if work_h > 0 {
+        draw_work_dock(frame, chunks[3], app);
+    }
+    draw_prompt(frame, chunks[4], app);
+    draw_status(frame, chunks[5], app);
 
     // Top-right toast sits above chat (not the footer).
     draw_toast(frame, frame.area(), app);

@@ -7,6 +7,15 @@ use crate::state::RunOutcome;
 
 impl super::App {
     pub(crate) fn handle_float_key(&mut self, key: KeyEvent) -> RunOutcome {
+        // Ctrl+C inside any floating dialog (regardless of depth or editing mode)
+        // closes all popups and returns to conversation state.
+        if Self::is_ctrl_c(key) {
+            self.close_all_popups();
+            self.arm_ctrl_c_quit(std::time::Instant::now());
+            self.set_notice("Ctrl+C again to quit");
+            return RunOutcome::Noop;
+        }
+
         let editing = self.settings_inline_op.is_some()
             || self.settings_form_edit.is_some()
             || self.float.as_ref().map(|f| f.edit_mode).unwrap_or(false);
@@ -62,7 +71,11 @@ impl super::App {
                         .as_ref()
                         .is_some_and(|f| f.kind == FloatKind::SubagentDetail) =>
             {
-                RunOutcome::OpenSubagentList
+                if self.work_detail_origin {
+                    RunOutcome::OpenWork
+                } else {
+                    RunOutcome::OpenSubagentList
+                }
             }
             KeyCode::Esc => {
                 if self
@@ -70,14 +83,22 @@ impl super::App {
                     .as_ref()
                     .is_some_and(|f| f.kind == FloatKind::BackgroundDetail)
                 {
-                    return RunOutcome::OpenBackgroundList;
+                    return if self.work_detail_origin {
+                        RunOutcome::OpenWork
+                    } else {
+                        RunOutcome::OpenBackgroundList
+                    };
                 }
                 if self
                     .float
                     .as_ref()
                     .is_some_and(|f| f.kind == FloatKind::SubagentDetail)
                 {
-                    return RunOutcome::OpenSubagentList;
+                    return if self.work_detail_origin {
+                        RunOutcome::OpenWork
+                    } else {
+                        RunOutcome::OpenSubagentList
+                    };
                 }
                 if !self.settings_go_back() {
                     self.close_float();
@@ -90,14 +111,22 @@ impl super::App {
                     .as_ref()
                     .is_some_and(|f| f.kind == FloatKind::BackgroundDetail)
                 {
-                    return RunOutcome::OpenBackgroundList;
+                    return if self.work_detail_origin {
+                        RunOutcome::OpenWork
+                    } else {
+                        RunOutcome::OpenBackgroundList
+                    };
                 }
                 if self
                     .float
                     .as_ref()
                     .is_some_and(|f| f.kind == FloatKind::SubagentDetail)
                 {
-                    return RunOutcome::OpenSubagentList;
+                    return if self.work_detail_origin {
+                        RunOutcome::OpenWork
+                    } else {
+                        RunOutcome::OpenSubagentList
+                    };
                 }
                 if !self.settings_go_back() {
                     self.close_float();
@@ -201,6 +230,7 @@ impl super::App {
                         matches!(
                             f.kind,
                             FloatKind::Background
+                                | FloatKind::Work
                                 | FloatKind::BackgroundDetail
                                 | FloatKind::Subagent
                                 | FloatKind::SubagentDetail
@@ -279,6 +309,12 @@ impl super::App {
                 .and_then(|f| f.selected_entry())
                 .map(|e| e.item.id)
                 .filter(|id| id != "_empty" && !id.is_empty()),
+            Some(FloatKind::Work) => self
+                .float
+                .as_ref()
+                .and_then(|f| f.selected_entry())
+                .map(|e| e.item.id)
+                .filter(|id| id != "_empty"),
             _ => None,
         };
         let Some(id) = id else {
@@ -286,6 +322,17 @@ impl super::App {
             return RunOutcome::Noop;
         };
         match kind {
+            Some(FloatKind::Work) => {
+                self.work_selected_id = Some(id.clone());
+                let Some((kind, raw_id)) = id.split_once(':') else {
+                    return RunOutcome::Noop;
+                };
+                match kind {
+                    "AGENT" => RunOutcome::KillSubagent { id: raw_id.into() },
+                    "BASH" => RunOutcome::KillBackground { id: raw_id.into() },
+                    _ => RunOutcome::Noop,
+                }
+            }
             Some(FloatKind::Subagent | FloatKind::SubagentDetail) => {
                 RunOutcome::KillSubagent { id }
             }
@@ -413,6 +460,21 @@ impl super::App {
                 // CLI re-fetches a fresh bash stdout/stderr snapshot.
                 RunOutcome::OpenBackgroundDetail {
                     id: entry.item.id.clone(),
+                }
+            }
+            FloatKind::Work => {
+                if entry.item.id == "_empty" {
+                    return RunOutcome::Noop;
+                }
+                self.work_selected_id = Some(entry.item.id.clone());
+                self.work_detail_origin = true;
+                let Some((kind, id)) = entry.item.id.split_once(':') else {
+                    return RunOutcome::Noop;
+                };
+                match kind {
+                    "AGENT" => RunOutcome::OpenSubagentDetail { id: id.into() },
+                    "BASH" => RunOutcome::OpenBackgroundDetail { id: id.into() },
+                    _ => RunOutcome::Noop,
                 }
             }
             FloatKind::BackgroundDetail => {

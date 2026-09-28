@@ -136,6 +136,11 @@ pub const SLASH_COMMANDS: &[SlashCommand] = &[
         description: "background bash only · process list · stdout/stderr tail",
     },
     SlashCommand {
+        name: "/work",
+        usage: "/work",
+        description: "unified work overview · agents and background bash",
+    },
+    SlashCommand {
         name: "/tasks",
         usage: "/tasks [job_id]",
         description: "subagents (task tool) · live turns/tools · higher-level than /ps",

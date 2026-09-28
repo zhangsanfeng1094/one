@@ -1,6 +1,8 @@
 //! User-message and turn fold rules: long-paste preview, and Q&A collapse.
 
-use crate::message::{Message, MessageRole};
+use std::time::{Duration, SystemTime};
+
+use crate::message::{Message, MessageRole, ToolStatus};
 
 pub const FOLD_LINE_THRESHOLD: usize = 6;
 pub const FOLD_CHAR_THRESHOLD: usize = 400;
@@ -40,6 +42,7 @@ pub fn is_fence(line: &str) -> bool {
     t.starts_with("```") || t.starts_with("~~~")
 }
 
+#[allow(dead_code)]
 pub fn fence_lang(line: &str) -> &str {
     let t = line.trim_start();
     let rest = if let Some(r) = t.strip_prefix("```") {
@@ -96,7 +99,7 @@ pub fn visible_user_text(content: &str) -> String {
     if is_pure_system_notification_or_meta(stripped.trim()) {
         String::new()
     } else {
-        stripped
+        one_core::extract_user_query(&stripped)
     }
 }
 
@@ -176,6 +179,20 @@ pub fn turn_has_followup(messages: &[Message], user_idx: usize) -> bool {
     user_idx < messages.len() && turn_end(messages, user_idx) > user_idx + 1
 }
 
+/// Non-empty content lines across the whole turn starting at `user_idx`
+/// (question + tools + thinking + replies) — what a folded turn hides.
+/// The fold hint shows this so the count matches what expanding reveals.
+pub fn turn_hidden_lines(messages: &[Message], user_idx: usize) -> usize {
+    let end = turn_end(messages, user_idx);
+    messages
+        .iter()
+        .take(end)
+        .skip(user_idx)
+        .map(|m| m.content.lines().filter(|l| !l.trim().is_empty()).count())
+        .sum::<usize>()
+        .max(1)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct TurnStats {
     pub tools: usize,
@@ -198,21 +215,87 @@ pub fn turn_stats(messages: &[Message], user_idx: usize) -> TurnStats {
 }
 
 pub fn format_turn_summary(stats: TurnStats) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if stats.tools > 0 {
-        parts.push(format!("{} 工具", stats.tools));
+    format_turn_meta(stats, None, false)
+}
+
+/// Wall time from the user prompt to the last activity in the turn.
+///
+/// Missing timestamps must not invent a 1ms duration. Fall back to summed
+/// tool `duration_ms` when the source data actually recorded them.
+pub fn turn_duration_ms(messages: &[Message], user_idx: usize) -> Option<u64> {
+    let end = turn_end(messages, user_idx);
+    let user = messages.get(user_idx)?;
+    if end <= user_idx + 1 {
+        return None;
     }
-    if stats.thinking > 0 {
-        parts.push("thinking".into());
+    let slice = &messages[user_idx..end];
+    let running = slice
+        .iter()
+        .any(|m| m.streaming || m.tool_status == Some(ToolStatus::Running));
+    let tool_ms: u64 = slice.iter().filter_map(|m| m.duration_ms).sum();
+    if running {
+        let user_at = user.created_at?;
+        return SystemTime::now()
+            .duration_since(user_at)
+            .ok()
+            .map(|d| d.as_millis() as u64)
+            .filter(|ms| *ms > 0);
     }
-    if stats.replies > 0 {
-        parts.push("回复".into());
+    if let (Some(user_at), Some(last)) = (user.created_at, slice.last()) {
+        if let Some(last_at) = last.created_at {
+            let end_ts = match last.duration_ms {
+                Some(ms) => last_at + Duration::from_millis(ms),
+                None => last_at,
+            };
+            if let Ok(d) = end_ts.duration_since(user_at) {
+                let ms = d.as_millis() as u64;
+                if ms > 0 {
+                    return Some(ms);
+                }
+            }
+        }
     }
-    if parts.is_empty() {
-        "本轮".into()
+    (tool_ms > 0).then_some(tool_ms)
+}
+
+pub fn format_compact_duration(ms: u64) -> String {
+    if ms < 1000 {
+        format!("{ms}ms")
+    } else if ms < 60_000 {
+        let s = ms as f64 / 1000.0;
+        if s < 10.0 {
+            format!("{s:.1}s")
+        } else {
+            format!("{:.0}s", s)
+        }
     } else {
-        parts.join(" · ")
+        let m = ms / 60_000;
+        let s = (ms % 60_000) / 1000;
+        if s == 0 {
+            format!("{m}m")
+        } else {
+            format!("{m}m {s}s")
+        }
     }
+}
+
+/// Right-side turn chrome: `19 tools · 16.4s · done`.
+pub fn format_turn_meta(stats: TurnStats, duration_ms: Option<u64>, running: bool) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if stats.tools == 1 {
+        parts.push("1 tool".into());
+    } else if stats.tools > 1 {
+        parts.push(format!("{} tools", stats.tools));
+    }
+    if let Some(ms) = duration_ms.filter(|ms| *ms > 0) {
+        parts.push(format_compact_duration(ms));
+    }
+    if running {
+        parts.push("● running".into());
+    } else if stats.tools > 0 || stats.replies > 0 || stats.thinking > 0 {
+        parts.push("done".into());
+    }
+    parts.join(" · ")
 }
 
 /// First non-empty source line — compact title while the turn is collapsed.
@@ -402,7 +485,25 @@ mod tests {
         let stats = turn_stats(&messages, 0);
         assert_eq!(stats.tools, 1);
         assert_eq!(stats.replies, 1);
-        assert_eq!(format_turn_summary(stats), "1 工具 · 回复");
+        assert_eq!(format_turn_summary(stats), "1 tool · done");
         assert_eq!(turn_preview("  \nFix the leak\nmore"), "Fix the leak");
+        assert_eq!(
+            turn_duration_ms(&messages, 0),
+            None,
+            "no timestamps and no tool duration must not invent a duration"
+        );
+    }
+
+    #[test]
+    fn turn_hidden_lines_counts_question_tools_and_replies() {
+        let messages = vec![
+            Message::user("q1"),
+            Message::tool("bash", "out1\nout2", crate::message::ToolStatus::Done),
+            Message::assistant("a1\n\na2\na3"),
+            Message::user("q2"),
+        ];
+        // 1 (question) + 2 (tool output) + 3 (reply, blank line skipped).
+        assert_eq!(turn_hidden_lines(&messages, 0), 6);
+        assert_eq!(turn_hidden_lines(&messages, 3), 1);
     }
 }

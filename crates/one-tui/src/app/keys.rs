@@ -22,6 +22,10 @@ impl super::App {
         // Any other key cancels a pending "press again to quit".
         self.last_ctrl_c_at = None;
 
+        if Self::is_work_key(key) {
+            return self.toggle_work_float();
+        }
+
         // Help: handle before select/float so one chord always opens the catalog.
         // Primary is Alt+H (Ctrl chords are often eaten once by IME / terminal).
         if Self::is_help_key(key) {
@@ -186,7 +190,8 @@ impl super::App {
                 self.toggle_show_thinking();
                 RunOutcome::Noop
             }
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => self.submit_followup(),
+            // Alt+Enter while idle sends like Enter. Follow-up is busy-only
+            // (`handle_busy_key`); queuing it here would never drain.
             // Shift+Enter → newline (when terminal reports SHIFT)
             KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) => {
                 self.leave_history_browse();
@@ -450,10 +455,13 @@ impl super::App {
     }
 
     pub(crate) fn is_ctrl_c(key: KeyEvent) -> bool {
-        matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
-            && key.modifiers.contains(KeyModifiers::CONTROL)
-            && !key.modifiers.contains(KeyModifiers::SHIFT)
-            && !key.modifiers.contains(KeyModifiers::ALT)
+        if key.modifiers.contains(KeyModifiers::SHIFT) || key.modifiers.contains(KeyModifiers::ALT)
+        {
+            return false;
+        }
+        (matches!(key.code, KeyCode::Char('c') | KeyCode::Char('C'))
+            && key.modifiers.contains(KeyModifiers::CONTROL))
+            || key.code == KeyCode::Char('\u{03}')
     }
 
     /// Ctrl+B — send the running foreground bash to the background (Grok-aligned).
@@ -550,6 +558,12 @@ impl super::App {
         }
     }
 
+    pub(crate) fn is_work_key(key: KeyEvent) -> bool {
+        matches!(key.code, KeyCode::Char('t') | KeyCode::Char('T'))
+            && key.modifiers.contains(KeyModifiers::ALT)
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+    }
+
     /// Progressive Ctrl+C — never exit on a single accidental press.
     ///
     /// | State | 1st Ctrl+C | 2nd (within ~900ms) |
@@ -563,20 +577,10 @@ impl super::App {
     pub(crate) fn handle_ctrl_c(&mut self) -> RunOutcome {
         let now = Instant::now();
 
-        // 1) Close any center float entirely (Settings / commands / sessions / …).
-        if self.float_open() {
-            self.settings_inline_op = None;
-            self.settings_form_edit = None;
-            self.model_draft = None;
-            self.close_float();
-            self.arm_ctrl_c_quit(now);
-            self.set_notice("Ctrl+C again to quit");
-            return RunOutcome::Noop;
-        }
-
-        // 2) Cancel docked select (model / approval / ask_user).
-        if self.select.is_some() {
-            let _ = self.apply_select_result(crate::select::SelectResult::Cancelled);
+        // 1) Close any center float or docked select entirely (Settings at any depth,
+        // submenus, model switcher, …) returning cleanly to conversation state.
+        if self.float_open() || self.select.is_some() {
+            self.close_all_popups();
             self.arm_ctrl_c_quit(now);
             self.set_notice("Ctrl+C again to quit");
             return RunOutcome::Noop;

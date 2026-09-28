@@ -1,6 +1,6 @@
-//! Bottom status / footer (2 lines: identity + key badges).
+//! Bottom status / footer (1 line: Pi-style keybindings + model / MCP).
 
-use ratatui::layout::{Constraint, Direction, Layout, Rect};
+use ratatui::layout::Rect;
 use ratatui::text::Span;
 use ratatui::widgets::Block;
 use ratatui::Frame;
@@ -10,30 +10,13 @@ use crate::message::{MessageRole, ToolStatus};
 use crate::theme::Theme;
 use crate::tool_view;
 
-use super::prompt::{identity_spans, ops_spans, render_split_row};
+use super::prompt::render_split_row;
 use super::SPINNER;
 
 pub(super) fn draw_status(frame: &mut Frame<'_>, area: Rect, app: &App) {
     frame.render_widget(Block::default().style(Theme::footer_bg()), area);
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(1), Constraint::Length(1)])
-        .split(area);
-
-    let ident_right = {
-        let mut right = ops_spans(app);
-        if let Some(pos) = scroll_position_label(app) {
-            if !right.is_empty() {
-                right.insert(0, Span::styled("  ", Theme::footer_bg()));
-            }
-            right.insert(0, Span::styled(pos, Theme::status_faint().bg(Theme::PANEL)));
-        }
-        right
-    };
-    render_split_row(frame, rows[0], identity_spans(app), ident_right);
-
     let (left, right) = status_spans(app);
-    render_split_row(frame, rows[1], left, right);
+    render_split_row(frame, area, left, right);
 }
 
 fn scroll_position_label(app: &App) -> Option<String> {
@@ -57,43 +40,47 @@ fn scroll_position_label(app: &App) -> Option<String> {
     Some(format!("{pct}% · {shown}/{total}"))
 }
 
-/// Sparse, context-aware status strip.
+/// Sparse Pi-style status strip.
 ///
-/// Left:  keybindings only (mode-aware).
-/// Right: session stats only (think level / live context fill).
-/// Never MCP, bg, or session-cumulative ↑↓ — those live elsewhere / not in chrome.
+/// Left:  `esc interrupt  ctrl+c quit  …`
+/// Right: model / MCP.
 fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
-    // Key + label pairs, joined with double-space (no middle-dot soup).
     fn pair(key: &'static str, label: &'static str) -> [Span<'static>; 2] {
         [
-            Span::styled(format!(" {key} "), Theme::key_badge()),
-            Span::styled(format!(" {label}  "), Theme::key_badge_label()),
+            Span::styled(format!("{key} "), Theme::status_key()),
+            Span::styled(format!("{label}  "), Theme::status_faint()),
         ]
     }
 
-    // Notices are top-right toasts now — footer stays for keybindings only.
-
     if app.float_open() {
-        let mut left = vec![Span::raw("  ")];
-        left.extend(pair("↑↓", " nav  "));
-        left.extend(pair("enter", " select  "));
-        left.extend(pair("esc", " close  "));
-        left.extend(pair("Ctrl+C", " close"));
+        let mut left = vec![Span::raw(" ")];
+        left.extend(pair("↑↓", "nav"));
+        left.extend(pair("enter", "select"));
+        left.extend(pair("esc", "close"));
         return (left, Vec::new());
     }
 
     if !app.follow_bottom && app.can_scroll() {
         let mut left = vec![Span::raw(" ")];
+        if app.work_summary.visible() {
+            left.extend(pair("Alt+T", "work"));
+        }
         left.extend(pair("Shift+G", "latest"));
         left.extend(pair("wheel", "scroll"));
-        return (left, Vec::new());
+        let mut right = status_stats_spans(app);
+        if let Some(pos) = scroll_position_label(app) {
+            if !right.is_empty() {
+                right.insert(0, Span::styled("  ", Theme::footer_bg()));
+            }
+            right.insert(0, Span::styled(pos, Theme::status_faint()));
+        }
+        return (left, right);
     }
 
     if app.busy {
         let compacting = app.busy_activity == "compacting";
-        let mut left = vec![Span::raw("  ")];
+        let mut left = vec![Span::raw(" ")];
 
-        // Active running tool for Grok-style live action status
         let running_tool =
             app.messages.iter().rev().find(|m| {
                 m.role == MessageRole::Tool && m.tool_status == Some(ToolStatus::Running)
@@ -102,34 +89,26 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
         if let Some(tool) = running_tool {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
             let label_raw = tool_view::running_tool_label(tool, app.history_cwd.as_deref());
-            let label = tool_view::single_line_preview(&label_raw, 44);
-            let dur_str = tool
-                .started_at
-                .map(|t| format!("{:.1}s", t.elapsed().as_secs_f32()))
-                .unwrap_or_default();
+            let label = tool_view::single_line_preview(&label_raw, 36);
             left.push(Span::styled(
-                format!("{spinner} {label} "),
+                format!("{spinner} {label}  "),
                 Theme::tool_name_running(),
             ));
-            if !dur_str.is_empty() {
-                left.push(Span::styled(format!("{dur_str}  "), Theme::meta()));
-            }
-            if !compacting {
-                left.extend(pair("esc", " stop  "));
-                left.extend(pair("Ctrl+B", " bg"));
-            }
-        } else {
-            // Soft cancel vs hard exit — single Ctrl+C never exits (double-tap quit).
-            if !compacting {
-                left.extend(pair("esc", " stop  "));
-            }
-            left.extend(pair("Ctrl+C", "×2 quit  "));
-            if !compacting {
-                left.extend(pair("Ctrl+S", " steer  "));
-                left.extend(pair("Ctrl+B", " bg"));
-            }
         }
-        // Ops chips (MCP/bg) stay on meta; status only shows activity + stats.
+
+        if !compacting {
+            left.extend(pair("esc", "interrupt"));
+        }
+        if app.work_summary.visible() {
+            left.extend(pair("Alt+T", "work"));
+        }
+        left.extend(pair("ctrl+c", "quit"));
+        if !compacting {
+            left.extend(pair("ctrl+s", "steer"));
+            left.extend(pair("alt+enter", "follow-up"));
+            left.extend(pair("ctrl+b", "bg"));
+        }
+
         let mut right = status_stats_spans(app);
         if let Some((retry, max_retries, seconds)) = app.retry_wait_status() {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
@@ -138,11 +117,19 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
             } else {
                 format!("{spinner} retry {retry}/{max_retries} · {seconds}s")
             };
-            right.insert(0, Span::raw("  "));
+            if !right.is_empty() {
+                right.insert(0, Span::raw("  "));
+            } else {
+                right.push(Span::raw(" "));
+            }
             right.insert(0, Span::styled(label, Theme::status().fg(Theme::WARNING)));
         } else if compacting {
             let spinner = SPINNER[app.spinner_frame % SPINNER.len()];
-            right.insert(0, Span::raw("  "));
+            if !right.is_empty() {
+                right.insert(0, Span::raw("  "));
+            } else {
+                right.push(Span::raw(" "));
+            }
             right.insert(
                 0,
                 Span::styled(
@@ -151,54 +138,55 @@ fn status_spans(app: &App) -> (Vec<Span<'static>>, Vec<Span<'static>>) {
                 ),
             );
         }
-        if right.is_empty() {
-            right.push(Span::styled("working", Theme::status_faint()));
-            right.push(Span::raw("  "));
-        }
         return (left, right);
     }
 
-    // Idle: core chrome only — full catalog is Alt+H help float.
-    // When chat focus is active (empty prompt browse), surface expand/nav keys.
-    let mut left = vec![Span::raw("  ")];
+    let mut left = vec![Span::raw(" ")];
+    if app.work_summary.visible() {
+        left.extend(pair("Alt+T", "work"));
+    }
     if app.transcript_browse_focused() {
-        left.extend(pair("j/k", " nav  "));
-        left.extend(pair("↵", " expand  "));
-        left.extend(pair("Alt+Z", " fold"));
+        left.extend(pair("j/k", "navigate"));
+        left.extend(pair("enter", "expand/collapse"));
+        left.extend(pair("esc", "interrupt"));
     } else {
-        left.extend(pair("Ctrl+G", " settings"));
-        left.push(Span::styled("  │  ", Theme::status_faint()));
-        left.extend(pair("Ctrl+L", " model"));
-        left.push(Span::styled("  │  ", Theme::status_faint()));
-        left.extend(pair("Alt+H", " help"));
-        left.push(Span::styled("  │  ", Theme::status_faint()));
-        left.extend(pair("click", " expand"));
+        left.extend(pair("esc", "interrupt"));
+        left.extend(pair("ctrl+c", "quit"));
+        left.extend(pair("ctrl+n", "new run"));
+        left.extend(pair("ctrl+l", "model"));
+        left.extend(pair("↑/↓", "navigate"));
+        left.extend(pair("enter", "expand/collapse"));
     }
 
     (left, status_stats_spans(app))
 }
 
-/// Right-side session stats for the status strip: think level + live context.
-/// Kept separate so busy/idle modes share one formatter (no MCP/bg).
-///
-/// Session-cumulative ↑↓ / cache / cost are **not** shown here — they inflate
-/// into hundreds of k and get misread as context fill. Status only surfaces
-/// current prompt size (`ctx`).
 fn status_stats_spans(app: &App) -> Vec<Span<'static>> {
     let mut right = Vec::new();
-    if app.thinking_level != "off" {
-        let vis = if app.show_thinking { "·full" } else { "" };
+
+    if !app.mcp_chip_text.is_empty() {
         right.push(Span::styled(
-            format!("think:{}{vis}", app.thinking_level),
-            Theme::status_faint().bg(Theme::PANEL),
+            format!("● {}", app.mcp_chip_text),
+            mcp_chip_style(app.mcp_chip_kind),
         ));
-        right.push(Span::raw("  "));
+    }
+    if !right.is_empty() {
+        right.push(Span::raw(" "));
     }
     right
 }
 
+fn mcp_chip_style(kind: u8) -> ratatui::style::Style {
+    match kind {
+        1 => Theme::status().fg(Theme::INFO),
+        2 => Theme::status().fg(Theme::SUCCESS),
+        3 => Theme::status().fg(Theme::WARNING),
+        4 => Theme::status().fg(Theme::ERROR),
+        _ => Theme::status_faint(),
+    }
+}
+
 /// Last prompt / estimated context size (not session-cumulative billing).
-/// Token fill itself is painted on the header bar, not the footer.
 pub(super) fn format_context_usage(app: &App) -> Option<String> {
     if app.usage_tokens == 0 {
         return None;
@@ -226,7 +214,6 @@ pub(super) fn format_tokens(n: usize) -> String {
 }
 
 #[cfg(test)]
-
 mod usage_format_tests {
     use super::*;
     use crate::app::App;
@@ -234,7 +221,6 @@ mod usage_format_tests {
     #[test]
     fn status_shows_context_only_not_session_totals() {
         let mut app = App::new("test");
-        // Cumulative bill is huge — must not appear on the status strip.
         app.set_usage_io(714_677, 5_332);
         app.set_usage_cache(599_040, 0);
         app.set_usage_cost_usd(0.42);
@@ -249,7 +235,11 @@ mod usage_format_tests {
         let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
         assert!(
             !text.contains("ctx") && !text.contains("44k"),
-            "token fill belongs on the header, not footer stats: {text}"
+            "token fill belongs on the header, not footer: {text}"
+        );
+        assert!(
+            !text.contains("thinking"),
+            "think level stays off the footer: {text}"
         );
         assert!(
             !text.contains('↑')
@@ -266,10 +256,7 @@ mod usage_format_tests {
         let mut app = App::new("test");
         app.set_usage_tokens(12_500);
         app.set_usage_tokens_estimated(true);
-        assert_eq!(
-            format_context_usage(&app).as_deref(),
-            Some("ctx ~12k") // ≥10k uses integer k (format_tokens)
-        );
+        assert_eq!(format_context_usage(&app).as_deref(), Some("ctx ~12k"));
     }
 
     #[test]
@@ -283,5 +270,40 @@ mod usage_format_tests {
         let text: String = right.iter().map(|span| span.content.as_ref()).collect();
         assert!(text.contains("retry 2/10"), "status: {text}");
         assert!(text.contains("⠸"), "spinner frame: {text}");
+    }
+
+    #[test]
+    fn busy_status_omits_wait_park_from_footer() {
+        let mut app = App::new("test");
+        app.begin_busy();
+        app.spinner_frame = 1;
+        app.begin_wait_park("all", 2);
+
+        let (_, right) = status_spans(&app);
+        let text: String = right.iter().map(|span| span.content.as_ref()).collect();
+        assert!(
+            !text.contains("Waiting"),
+            "wait_park should only render in chat area, not footer: {text}"
+        );
+    }
+
+    #[test]
+    fn status_shows_mcp_without_model() {
+        let mut app = App::new("test");
+        app.set_current_model("cpa", "gemini-3.8-flash-high");
+        app.thinking_level = "medium".into();
+        app.set_mcp_chip("MCP 3/3", 2);
+
+        let spans = status_stats_spans(&app);
+        let text: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            !text.contains("gemini-3.8-flash-high"),
+            "model moved to header, not in status: {text}"
+        );
+        assert!(
+            !text.contains("medium"),
+            "thinking level moved to header, not in status: {text}"
+        );
+        assert!(text.contains("● MCP 3/3"), "mcp chip in status: {text}");
     }
 }

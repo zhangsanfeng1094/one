@@ -24,6 +24,9 @@ pub enum MessageRole {
     Tool,
     /// Ephemeral UI card (errors, warnings). Never agent context.
     Alert,
+    /// Mid-run steering injection (user-typed, enters LLM as role=user).
+    /// Display-only lightweight row — never a user turn boundary.
+    Steer,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -84,8 +87,11 @@ pub struct Message {
     /// Turn fold override (`None` = auto: current expanded, history folds).
     /// When folded, assistant / tools / thinking after this user stay hidden.
     pub turn_expanded: Option<bool>,
+    /// Assistant answer fold (`None` = auto-collapse long replies).
+    pub assistant_expanded: Option<bool>,
     /// Wall clock for the timeline `HH:MM` column (UI only).
-    pub created_at: SystemTime,
+    /// `None` when the source message had no timestamp — do not invent one.
+    pub created_at: Option<SystemTime>,
     /// Alert severity (Alert role only).
     pub alert_level: Option<AlertLevel>,
     /// Live subagent job id for `task` — click opens `/tasks` detail (not `/ps`).
@@ -94,6 +100,8 @@ pub struct Message {
     pub started_at: Option<Instant>,
     /// Wall duration once finished (`ms` for compact chrome).
     pub duration_ms: Option<u64>,
+    /// Steer row state: true when the agent drained it into model context.
+    pub steer_applied: bool,
 }
 
 fn blank_message(role: MessageRole, content: String) -> Message {
@@ -113,11 +121,13 @@ fn blank_message(role: MessageRole, content: String) -> Message {
         info_expanded: false,
         user_expanded: None,
         turn_expanded: None,
-        created_at: SystemTime::now(),
+        assistant_expanded: None,
+        created_at: None,
         alert_level: None,
         tool_job_id: None,
         started_at: None,
         duration_ms: None,
+        steer_applied: false,
     }
 }
 
@@ -243,6 +253,17 @@ impl Message {
         m
     }
 
+    /// Mid-run steer row in the transcript timeline (lightweight, no turn chrome).
+    ///
+    /// `applied`: true = drained into the model context (SteerApplied event);
+    /// false = received/pending (shown while still queued or on reload before
+    /// the run drained it — kept honest, never fabricated).
+    pub fn steer(content: impl Into<String>, applied: bool) -> Self {
+        let mut m = blank_message(MessageRole::Steer, content.into());
+        m.steer_applied = applied;
+        m
+    }
+
     pub fn streaming_assistant(content: impl Into<String>) -> Self {
         let mut m = blank_message(MessageRole::Assistant, content.into());
         m.streaming = true;
@@ -263,6 +284,7 @@ impl Message {
             MessageRole::System => "system",
             MessageRole::Tool => "tool",
             MessageRole::Alert => "alert",
+            MessageRole::Steer => "steer",
         }
     }
 }
