@@ -77,6 +77,23 @@ pub struct UserMessage {
     pub content: UserContent,
     #[serde(default = "default_timestamp")]
     pub timestamp: u64,
+    /// Product-level interaction kind. `None`/`"prompt"` = a real user turn;
+    /// `"steer"` = mid-run injection that must NOT open a new user turn.
+    /// Providers still see role=user — this is transcript/semantics only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+impl UserMessage {
+    pub fn is_steer(&self) -> bool {
+        self.kind.as_deref() == Some(UserMessageKind::STEER)
+    }
+}
+
+/// Canonical `kind` values for [`UserMessage`].
+pub struct UserMessageKind;
+impl UserMessageKind {
+    pub const STEER: &'static str = "steer";
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -143,6 +160,17 @@ impl AgentMessage {
         AgentMessage::User(UserMessage {
             content: UserContent::Text(text.into()),
             timestamp: now_ms(),
+            kind: None,
+        })
+    }
+
+    /// Mid-run steering injection: role=user for providers, `kind="steer"` for
+    /// transcript semantics (never opens a new user turn in UI).
+    pub fn steer_text(text: impl Into<String>) -> Self {
+        AgentMessage::User(UserMessage {
+            content: UserContent::Text(text.into()),
+            timestamp: now_ms(),
+            kind: Some(UserMessageKind::STEER.to_string()),
         })
     }
 
@@ -151,6 +179,7 @@ impl AgentMessage {
         AgentMessage::User(UserMessage {
             content: UserContent::Blocks(blocks),
             timestamp: now_ms(),
+            kind: None,
         })
     }
 

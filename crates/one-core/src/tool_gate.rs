@@ -25,8 +25,25 @@ pub trait ToolGate: Send + Sync {
     /// Pre-tool check. May allow, deny, or rewrite arguments.
     async fn check(&self, call: &ToolCall) -> ToolGateDecision;
 
+    /// Ask the human to confirm this call (hook/extension `Ask` decision).
+    ///
+    /// Returns the final gate decision for the call: `Allow` (user approved),
+    /// `Rewrite` (e.g. sandbox escalation applied), or `Deny` (rejected).
+    /// Default: interactive gates await their pending-approval flow; other
+    /// gates (tests / `AllowAllGate`) allow.
+    async fn confirm(&self, _call: &ToolCall, _reason: &str) -> ToolGateDecision {
+        ToolGateDecision::Allow
+    }
+
     /// Post-tool observe hook (audit, metrics, extension after_tool). Default no-op.
     async fn after_tool(&self, _call: &ToolCall, _output: &ToolOutput, _is_error: bool) {}
+
+    /// Release once-use permission leases for this call.
+    ///
+    /// Must be sync and independent of [`Self::after_tool`]: observational
+    /// hooks are fire-and-forget with a timeout, but once tokens still have
+    /// to be revoked on success, failure, cancel, and gated-but-not-run.
+    fn release_permission_lease(&self, _call: &ToolCall) {}
 }
 
 /// Always-allow gate (tests / full automation with other sandboxes).

@@ -2,7 +2,9 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 
 use crate::message::{AgentMessage, ContentBlock, TextOrImage, UserContent};
-use crate::reminder::{append_system_reminder, system_reminder};
+use crate::reminder::{
+    append_system_reminder, extract_user_query, is_system_notice_text, system_reminder,
+};
 use serde::{Deserialize, Serialize};
 
 /// Mode of conversation compaction (aligns with `grok-build` CompactionMode).
@@ -297,7 +299,7 @@ impl Default for CompactionConfig {
             context_window: 0,
             keep_recent_messages: DEFAULT_KEEP_RECENT_TURNS,
             max_summary_chars: 6_000,
-            prune: true,
+            prune: false,
             prune_protect_tokens: DEFAULT_PRUNE_PROTECT_TOKENS,
             prune_max_chars: DEFAULT_PRUNE_MAX_CHARS,
             prune_keep_last_n_turns: DEFAULT_PRUNE_KEEP_LAST_N_TURNS,
@@ -690,14 +692,35 @@ pub fn prune_old_tool_outputs(
     PruneOutcome { changes }
 }
 
-/// Start index of each user turn (the `User` message; assistant/tools follow).
+/// Start index of each human user turn (assistant/tools follow).
+/// Injected `<system-reminder>` notices are not turns (Grok `is_real_user_turn`).
 pub fn user_turn_starts(messages: &[AgentMessage]) -> Vec<usize> {
     messages
         .iter()
         .enumerate()
-        .filter(|(_, m)| matches!(m, AgentMessage::User(_)))
+        .filter(|(_, m)| is_real_user_turn(m))
         .map(|(i, _)| i)
         .collect()
+}
+
+fn is_real_user_turn(message: &AgentMessage) -> bool {
+    match message {
+        AgentMessage::User(user) => {
+            if user.is_steer() {
+                // Mid-run injection, not a turn boundary (keep_recent math).
+                return false;
+            }
+            if user.content.has_images() {
+                return true;
+            }
+            let text = user.content.as_plain_text();
+            if is_system_notice_text(&text) {
+                return false;
+            }
+            !extract_user_query(&text).is_empty()
+        }
+        _ => false,
+    }
 }
 
 pub fn user_turn_count(messages: &[AgentMessage]) -> usize {
@@ -1099,6 +1122,58 @@ pub fn compact_messages(
     compact_messages_forced(messages, config, false)
 }
 
+/// Build the user instruction appended to the live message prefix for
+/// cache-sharing (forked) context compaction.
+///
+/// Keeping `system_prompt`, `tools`, and `older` (`messages[..split]`)
+/// byte-identical to the active conversation prefix allows providers with
+/// automatic or breakpoint-based prompt caching to serve the prefix from KV cache.
+pub fn compaction_instruction(custom_instructions: Option<&str>) -> String {
+    let extra = custom_instructions
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!("\n\nUser-provided focus / instructions for this compaction:\n{s}\n"))
+        .unwrap_or_default();
+    format!(
+        "You are writing a dense, structured context compaction summary for this coding-agent session.\n\
+         Summarize the conversation above so it can replace the earlier turns without context loss.\n\n\
+         Cover the following essential areas in concise bullet points:\n\
+         1. **Goals & Key Technical Decisions**: Primary task objectives, chosen approaches, architecture rules, and conventions.\n\
+         2. **Modified Files & Key Symbols**: Exact paths edited or created, and notable functions/types/modules modified.\n\
+         3. **Commands Run, Errors & Discarded Approaches**: Commands executed, errors encountered, what failed and why it was rejected.\n\
+         4. **Pending Work & Next Steps**: Incomplete tasks, unresolved blockers, and immediate next steps.\n\
+         {extra}\n\
+         Do NOT call any tools. Reply with ONLY the summary Markdown (dense, precise, no conversational preamble or pleasantries)."
+    )
+}
+
+/// True when `older` has a valid message sequence for direct forked replay
+/// (non-empty and does not end on an assistant `ToolCall` lacking its `ToolResult`).
+pub fn can_fork_summarize_prefix(older: &[AgentMessage]) -> bool {
+    let Some(last) = older.last() else {
+        return false;
+    };
+    match last {
+        AgentMessage::Assistant(assistant) => !assistant
+            .content
+            .iter()
+            .any(|b| matches!(b, ContentBlock::ToolCall { .. })),
+        AgentMessage::User(_) | AgentMessage::ToolResult(_) => true,
+    }
+}
+
+/// Build the message array for cache-sharing forked summarization (`older` + trailing user prompt).
+pub fn compaction_request_messages(
+    older: &[AgentMessage],
+    custom_instructions: Option<&str>,
+) -> Vec<AgentMessage> {
+    let mut messages = older.to_vec();
+    messages.push(AgentMessage::user_text(compaction_instruction(
+        custom_instructions,
+    )));
+    messages
+}
+
 /// Build a one-shot user prompt asking the model to summarize older turns.
 ///
 /// Feeds a sanitized transcript (dropping thinking blocks, flattening tool calls).
@@ -1307,6 +1382,31 @@ mod tests {
         match &recent[0] {
             AgentMessage::User(u) => assert_eq!(u.content.as_display_text(), "u2"),
             other => panic!("expected last-2 turns to start at u2, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn keep_recent_skips_system_reminder_user_messages() {
+        let messages = vec![
+            AgentMessage::user_text("u1"),
+            AgentMessage::assistant_text("p", "m", "a1"),
+            AgentMessage::user_text(crate::system_reminder("MCP servers connected:")),
+            AgentMessage::user_text("<user_query>\nu2\n</user_query>"),
+            AgentMessage::assistant_text("p", "m", "a2"),
+        ];
+        assert_eq!(user_turn_count(&messages), 2);
+        let config = CompactionConfig {
+            keep_recent_messages: 1,
+            ..Default::default()
+        };
+        let (older, recent) = split_for_compaction(&messages, &config).unwrap();
+        assert_eq!(user_turn_count(older), 1);
+        assert_eq!(user_turn_count(recent), 1);
+        match &recent[0] {
+            AgentMessage::User(u) => {
+                assert!(u.content.as_display_text().contains("u2"), "{u:?}");
+            }
+            other => panic!("expected human query, got {other:?}"),
         }
     }
 
@@ -1573,10 +1673,50 @@ mod tests {
     }
 
     #[test]
-    fn default_enables_prune() {
-        assert!(CompactionConfig::default().prune);
-        assert!(CompactionConfig::from_context_window(200_000).prune);
+    fn default_disables_per_turn_prune_for_cache_stability() {
+        assert!(!CompactionConfig::default().prune);
+        assert!(!CompactionConfig::from_context_window(200_000).prune);
         assert!(!CompactionConfig::default().two_pass);
+    }
+
+    #[test]
+    fn forked_compaction_request_preserves_prefix() {
+        let older = vec![
+            AgentMessage::user_text("implement auth"),
+            AgentMessage::assistant_text("p", "m", "done"),
+        ];
+        assert!(can_fork_summarize_prefix(&older));
+        let req_msgs = compaction_request_messages(&older, Some("focus on jwt"));
+        assert_eq!(req_msgs.len(), 3);
+        assert_eq!(
+            messages_fingerprint(&req_msgs[..2]),
+            messages_fingerprint(&older)
+        );
+        match &req_msgs[2] {
+            AgentMessage::User(u) => {
+                let text = u.content.as_plain_text();
+                assert!(text.contains("focus on jwt"));
+                assert!(text.contains("Do NOT call any tools"));
+            }
+            other => panic!("expected trailing user instruction, got {other:?}"),
+        }
+
+        let dangling_tool = vec![
+            AgentMessage::user_text("run ls"),
+            AgentMessage::Assistant(crate::message::AssistantMessage {
+                content: vec![ContentBlock::ToolCall {
+                    id: "1".into(),
+                    name: "ls".into(),
+                    arguments: serde_json::json!({}),
+                }],
+                provider: "p".into(),
+                model: "m".into(),
+                stop_reason: crate::message::StopReason::ToolUse,
+                citations: vec![],
+                timestamp: 0,
+            }),
+        ];
+        assert!(!can_fork_summarize_prefix(&dangling_tool));
     }
 
     #[test]

@@ -152,6 +152,14 @@ pub enum TraceRunStatus {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TraceEvent {
+    /// A one-time reminder (batch_size = 0) or a subsequent tool batch.
+    BatchExploration {
+        ts_ms: u64,
+        run_id: String,
+        turn: usize,
+        batch_size: usize,
+        reminder: bool,
+    },
     RunStart {
         ts_ms: u64,
         run_id: String,
@@ -345,7 +353,8 @@ pub fn trace_tool_calls(
 impl TraceEvent {
     pub fn run_id(&self) -> Option<&str> {
         match self {
-            Self::RunStart { run_id, .. }
+            Self::BatchExploration { run_id, .. }
+            | Self::RunStart { run_id, .. }
             | Self::RunEnd { run_id, .. }
             | Self::TurnStart { run_id, .. }
             | Self::LlmRequest { run_id, .. }
@@ -467,6 +476,9 @@ pub fn last_user_preview(messages: &[AgentMessage], max_chars: usize) -> Option<
     }
     for m in messages.iter().rev() {
         if let AgentMessage::User(u) = m {
+            if u.is_steer() {
+                continue;
+            }
             let text = match &u.content {
                 UserContent::Text(text) => text.clone(),
                 UserContent::Blocks(blocks) => blocks
@@ -1092,10 +1104,12 @@ mod tests {
             AgentMessage::User(UserMessage {
                 content: UserContent::Text("first".into()),
                 timestamp: 0,
+                kind: None,
             }),
             AgentMessage::User(UserMessage {
                 content: UserContent::Text("second".into()),
                 timestamp: 1,
+                kind: None,
             }),
         ];
         assert_eq!(last_user_preview(&messages, 240).as_deref(), Some("second"));
@@ -1111,6 +1125,7 @@ mod tests {
             AgentMessage::User(UserMessage {
                 content: UserContent::Text("这个项目干啥的".into()),
                 timestamp: 0,
+                kind: None,
             }),
             AgentMessage::Assistant(AssistantMessage {
                 content: vec![
@@ -1162,10 +1177,12 @@ mod tests {
             AgentMessage::User(UserMessage {
                 content: UserContent::Text("turn0".into()),
                 timestamp: 0,
+                kind: None,
             }),
             AgentMessage::User(UserMessage {
                 content: UserContent::Text("turn1".into()),
                 timestamp: 1,
+                kind: None,
             }),
         ];
         let p = llm_input_preview("sys", &messages, 4096).unwrap();
@@ -1182,6 +1199,7 @@ mod tests {
             AgentMessage::User(UserMessage {
                 content: UserContent::Text("q".into()),
                 timestamp: 0,
+                kind: None,
             }),
             AgentMessage::ToolResult(ToolResultMessage {
                 tool_call_id: "c1".into(),
@@ -1209,6 +1227,7 @@ mod tests {
             AgentMessage::User(UserMessage {
                 content: UserContent::Text("old question".into()),
                 timestamp: 0,
+                kind: None,
             }),
             AgentMessage::Assistant(AssistantMessage {
                 content: vec![
@@ -1237,6 +1256,7 @@ mod tests {
             AgentMessage::User(UserMessage {
                 content: UserContent::Text("new question".into()),
                 timestamp: 3,
+                kind: None,
             }),
             AgentMessage::Assistant(AssistantMessage {
                 content: vec![ContentBlock::Text {

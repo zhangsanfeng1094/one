@@ -1,3 +1,5 @@
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -6,10 +8,88 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 
+/// Mode for waiting on multiple targets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WaitInterestMode {
+    #[default]
+    All,
+    Any,
+}
+
+impl WaitInterestMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::Any => "any",
+        }
+    }
+}
+
+pub struct RegisteredWaiter {
+    notified: Pin<Box<tokio::sync::futures::OwnedNotified>>,
+}
+
+impl RegisteredWaiter {
+    pub fn new(notify: Arc<tokio::sync::Notify>) -> Self {
+        let mut notified = Box::pin(notify.notified_owned());
+        notified.as_mut().enable();
+        Self { notified }
+    }
+}
+
+impl Future for RegisteredWaiter {
+    type Output = ();
+    fn poll(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        self.notified.as_mut().poll(cx)
+    }
+}
+///
+/// Follows subscribe-before-recheck pattern to prevent lost wakeups.
+pub trait TaskWaitWaiter: Send + Sync {
+    /// Check whether target is in terminal state right now.
+    fn is_terminal(&self, id: &str) -> bool;
+
+    /// Subscribe to terminal notification for `id` before rechecking state.
+    /// Awaiting this future resolves when the task signals or completes.
+    fn subscribe_terminal<'a>(
+        &'a self,
+        id: &'a str,
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+}
+
+/// Active wait interest registered by `wait_tasks`.
+#[derive(Clone)]
+pub struct WaitInterest {
+    pub ids: Vec<String>,
+    pub mode: WaitInterestMode,
+    pub waiter: Arc<dyn TaskWaitWaiter>,
+}
+
+impl WaitInterest {
+    pub fn new(ids: Vec<String>, mode: WaitInterestMode, waiter: Arc<dyn TaskWaitWaiter>) -> Self {
+        Self { ids, mode, waiter }
+    }
+
+    /// Check if the wait interest is currently satisfied.
+    pub fn is_satisfied(&self) -> bool {
+        if self.ids.is_empty() {
+            return true;
+        }
+        match self.mode {
+            WaitInterestMode::All => self.ids.iter().all(|id| self.waiter.is_terminal(id)),
+            WaitInterestMode::Any => self.ids.iter().any(|id| self.waiter.is_terminal(id)),
+        }
+    }
+}
+
 use crate::compaction::{
-    compacted_live_messages, extractive_summary, messages_fingerprint, should_compact_tokens,
-    split_for_compaction_forced, summarization_prompt, tokens_for_compaction, CompactApplied,
-    CompactTrigger, PrunedToolResult,
+    can_fork_summarize_prefix, compacted_live_messages, compaction_request_messages,
+    extractive_summary, messages_fingerprint, should_compact_tokens, split_for_compaction_forced,
+    summarization_prompt, tokens_for_compaction, CompactApplied, CompactTrigger, PrunedToolResult,
 };
 use crate::error::{OneError, Result};
 use crate::events::{AgentEvent, EventListener};
@@ -30,61 +110,13 @@ use crate::trace::{
 /// prompt composer attaches them when the matching settings feature is enabled.
 /// Keep this string free of optional capability prose so disabled features do
 /// not leak into the model context.
-pub const DEFAULT_SYSTEM_PROMPT: &str = r#"You are One, a Rust-native AI coding agent — an interactive CLI tool that helps users with software engineering tasks. Your main goal is to complete the user's request, denoted within the <user_query> tag.
+pub use one_prompt::builtin::DEFAULT_SYSTEM_PROMPT;
 
-<action_safety>
-Weigh each action by how easily it can be undone and how far its effects reach. Local, reversible work such as editing files and running tests is fine to do freely. Before executing any actions that are hard to reverse, reach shared external systems, or are otherwise risky or destructive, check with the user first.
-
-Confirming is cheap; a mistaken action is not (such as lost work, messages you cannot unsend, deleted branches). For those cases, take the context, the action, and the user's instructions into account; by default, say what you plan to do and ask before doing it. Users can override that default — if they explicitly ask you to act more autonomously, you may proceed without confirmation, but still mind risks and consequences.
-
-One approval is not a blank check. Approving something once (e.g. a git push) does not approve it in every later situation. Unless the user has authorized the action in advance, confirm with the user.
-
-Here are some examples of risky actions that warrant user confirmation:
-- Destructive operations such as removing files or branches, dropping database tables, killing processes, `rm -rf`, discarding uncommitted work
-- Irreversible operations such as force-pushes (including overwriting remote history), `git reset --hard`, amending commits already published, removing or downgrading dependencies, changing CI/CD pipelines
-- Actions others can see, or that change shared state: pushing code; opening, closing, or commenting on PRs and issues; sending messages (Slack, email, GitHub); posting to external services; changing shared infrastructure or permissions
-
-If you find unexpected state — unfamiliar files, branches, or configuration — investigate before deleting or overwriting; it may be the user's in-progress work.
-</action_safety>
-
-<tool_calling>
-- When you need to read multiple files, inspect several directory paths, or run multiple searches, CALL THEM IN PARALLEL in a single turn instead of issuing them one by one across separate turns. Independent observation calls (e.g. `read`, `grep`, `ls`, `web_search`, `web_fetch`) should be batched together to minimize round-trips and latency.
-- Use specialized tools instead of bash commands when possible. Prefer `read` over cat/head/tail, `edit`/`write` over sed/awk/heredoc, `grep` over grep/ripgrep, and `ls` over `bash ls`, `find`/locate, `ls -R`, or `wc`/`stat` just to inspect files. `ls` already includes line counts for text files and size for binaries.
-- Never guess file paths. Derive paths directly from context (e.g. `use`/`import` statements) or verify with `ls`/`grep` before calling `read`. If a file is not found, stop guessing and search with `grep` or `ls`.
-- Use `grep` for content search (including `files_with_matches` when locating files) and `ls` for directory inventories.
-- Reserve bash for actual system commands and terminal operations. NEVER use bash echo or other command-line tools to communicate thoughts, explanations, or instructions to the user. Output all communication directly in your response text instead.
-- Do not write inline python or node scripts with complex nested quotes inside bash commands. If a custom script is needed, write it to a temporary file via `write` first and then execute it, or use standard heredocs (`python3 - << 'EOF'`).
-- Always set `description` on tools that support it (such as bash, monitor, task) to a concise human-readable summary of what the action does (3–8 words) for display in the UI and logs.
-</tool_calling>
-
-<background_tasks>
-For watch processes, polling, and ongoing observation (CI status, log tailing, API polling):
-Use the `monitor` tool — it streams each stdout line back as a chat notification.
-</background_tasks>
-
-<output_efficiency>
-- Write like an excellent technical blog post — precise, well-structured, and clear, in complete sentences. Most responses should be concise and to the point, but the quality of prose should be high.
-- Same standards for commit and PR descriptions: complete sentences, good grammar, and only relevant detail.
-- Prefer simple, accessible language over dense technical jargon. Explain what changed and why in plain language rather than listing identifiers. Stay focused: avoid filler, repetition, over-the-top detail, and tangents the user did not ask for.
-- Keep final responses proportional to task complexity.
-</output_efficiency>
-
-<formatting>
-Your text output is rendered as GitHub-flavored markdown (CommonMark). Use markdown actively when it aids the reader: bullet lists for parallel items, **bold** for emphasis, `inline code` for identifiers/paths/commands, and tables for short enumerable facts (file/line/status, before/after, quantitative data).
-- Structured comparisons belong in markdown tables — do not draw ASCII box diagrams (`┌─┐│`). The renderer re-flows tables by display width.
-- Give the English form of a proper noun only on first mention, in inline code or italics. Never stack bold and a second color.
-- Keep paragraphs to at most 4 lines.
-</formatting>
-
-<user_guide>
-Documentation about the One TUI — including configuration, keyboard shortcuts, MCP servers, skills, theming, plugins, and more — is stored as `.md` files in `~/.one/docs/user-guide/`. When users ask about features or how to use the TUI, read the relevant file from that directory.
-</user_guide>
-
-You are running inside the "One" project (a Rust-native AI coding agent). Always respect the workspace path, git state, and available tools. When the user asks "这个项目干啥的", give a high-quality, structured Chinese project introduction with features, structure, comparison table, and quick start guide.
-"#;
+mod react;
 
 /// Reasoning / extended-thinking intensity (provider-specific mapping).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum ThinkingLevel {
     #[default]
     Off,
@@ -179,6 +211,95 @@ pub struct AgentConfig {
     pub empty_response_retries: usize,
     /// Optional compaction/pruning configuration applied during intra-turn tool loops.
     pub compaction_config: Option<crate::compaction::CompactionConfig>,
+    /// Legacy batch concurrency cap. ReAct applies it to reads; Event also
+    /// applies it to mutations of different files.
+    pub max_parallel_readonly_tools: usize,
+    /// Optional per-provider/model reminders for serial read-only exploration.
+    pub batch_exploration: Vec<BatchExplorationRule>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct BatchExplorationRule {
+    pub provider: String,
+    pub model: String,
+    /// Omitted means any thinking level.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thinking_level: Option<ThinkingLevel>,
+    /// Consecutive single read-only tool batches before the one-time reminder.
+    pub after_single_reads: usize,
+}
+
+/// Default cap for consecutive parallel-safe tools (`read` / `grep` / …).
+pub const DEFAULT_MAX_PARALLEL_READONLY_TOOLS: usize = 8;
+
+const BATCH_EXPLORATION_REMINDER: &str =
+    "若接下来有相互独立的检查，请在同一响应中发出；有依赖的检查按顺序执行。";
+
+fn batch_exploration_threshold(
+    rules: &[BatchExplorationRule],
+    provider: &dyn LlmProvider,
+    level: ThinkingLevel,
+) -> Option<usize> {
+    rules
+        .iter()
+        .find(|rule| {
+            rule.provider == provider.name()
+                && batch_model_matches(&rule.model, provider.model())
+                && rule
+                    .thinking_level
+                    .is_none_or(|configured| configured == level)
+                && rule.after_single_reads > 0
+        })
+        .map(|rule| rule.after_single_reads)
+}
+
+/// Exact model id, plus a single parenthetical suffix (`id` matches `id(medium)`).
+fn batch_model_matches(rule_model: &str, actual: &str) -> bool {
+    if rule_model == actual {
+        return true;
+    }
+    let Some(rest) = actual.strip_prefix(rule_model) else {
+        return false;
+    };
+    let Some(inner) = rest.strip_prefix('(').and_then(|s| s.strip_suffix(')')) else {
+        return false;
+    };
+    !inner.is_empty() && !inner.contains('(') && !inner.contains(')')
+}
+
+#[derive(Default)]
+struct BatchExplorationState {
+    consecutive_single_reads: usize,
+    reminded: bool,
+}
+
+impl BatchExplorationState {
+    fn observe(&mut self, calls: &[ToolCall]) {
+        if calls.len() == 1 && is_parallel_safe_tool(&calls[0].name) {
+            self.consecutive_single_reads += 1;
+        } else {
+            self.consecutive_single_reads = 0;
+        }
+    }
+
+    fn take_reminder(&mut self, threshold: usize) -> bool {
+        if !self.reminded && self.consecutive_single_reads >= threshold {
+            self.reminded = true;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// `ONE_MAX_PARALLEL_READONLY_TOOLS` when set to a positive integer.
+pub fn max_parallel_readonly_tools_from_env() -> usize {
+    std::env::var("ONE_MAX_PARALLEL_READONLY_TOOLS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(DEFAULT_MAX_PARALLEL_READONLY_TOOLS)
 }
 
 impl Default for AgentConfig {
@@ -190,6 +311,8 @@ impl Default for AgentConfig {
             server_search: false,
             empty_response_retries: DEFAULT_EMPTY_RESPONSE_RETRIES,
             compaction_config: None,
+            max_parallel_readonly_tools: DEFAULT_MAX_PARALLEL_READONLY_TOOLS,
+            batch_exploration: Vec::new(),
         }
     }
 }
@@ -408,6 +531,7 @@ pub struct Agent {
     listeners: Vec<EventListener>,
     steering_queue: Arc<Mutex<Vec<String>>>,
     followup_queue: Arc<Mutex<Vec<String>>>,
+    input_waker: Arc<tokio::sync::Notify>,
     /// Side-channel notices (e.g. background bash completions), drained before each LLM turn.
     /// Injected as user messages with a clear prefix — not tool_results (providers require pairing).
     notification_queue: Arc<Mutex<Vec<String>>>,
@@ -416,6 +540,8 @@ pub struct Agent {
     turn_progress: Option<Arc<AtomicU64>>,
     /// Optional pre-tool permission gate (allow/deny/ask/rewrite).
     tool_gate: Option<Arc<dyn ToolGate>>,
+    /// Active wait interest registered by `wait_tasks`.
+    wait_interest: Arc<Mutex<Option<WaitInterest>>>,
     /// Optional async lifecycle hooks (extensions bridge).
     hooks: Option<Arc<dyn AgentHooks>>,
     /// Optional execution trace sink (harness eval). Default: none (zero cost).
@@ -453,10 +579,12 @@ impl Agent {
             listeners: Vec::new(),
             steering_queue: Arc::new(Mutex::new(Vec::new())),
             followup_queue: Arc::new(Mutex::new(Vec::new())),
+            input_waker: Arc::new(tokio::sync::Notify::new()),
             notification_queue: Arc::new(Mutex::new(Vec::new())),
             abort_flag: Arc::new(AtomicBool::new(false)),
             turn_progress: None,
             tool_gate: None,
+            wait_interest: Arc::new(Mutex::new(None)),
             hooks: None,
             trace: None,
             trace_meta: TraceRunMeta::default(),
@@ -470,6 +598,22 @@ impl Agent {
 
     pub fn tool_gate(&self) -> Option<&Arc<dyn ToolGate>> {
         self.tool_gate.as_ref()
+    }
+
+    pub fn wait_interest_handle(&self) -> Arc<Mutex<Option<WaitInterest>>> {
+        self.wait_interest.clone()
+    }
+
+    pub fn set_wait_interest_handle(&mut self, handle: Arc<Mutex<Option<WaitInterest>>>) {
+        self.wait_interest = handle;
+    }
+
+    pub fn set_wait_interest(&self, interest: Option<WaitInterest>) {
+        *self.wait_interest.lock().expect("wait_interest lock") = interest;
+    }
+
+    pub fn clear_wait_interest(&self) {
+        *self.wait_interest.lock().expect("wait_interest lock") = None;
     }
 
     /// Install async lifecycle hooks (session / turn boundaries).
@@ -603,7 +747,8 @@ impl Agent {
         self.notification_queue.clone()
     }
 
-    /// Push a notice that will be injected before the next LLM call.
+    /// Queue a notice injected as a tagged user message before the next sample.
+    /// `prompt_user` drains this *before* the human `<user_query>` turn.
     pub fn push_notification(&self, text: impl Into<String>) {
         Self::push_queue(&self.notification_queue, text);
     }
@@ -624,6 +769,7 @@ impl Agent {
 
     pub fn abort(&self) {
         self.abort_flag.store(true, Ordering::Relaxed);
+        self.input_waker.notify_one();
     }
 
     pub fn clear_abort(&self) {
@@ -634,12 +780,18 @@ impl Agent {
         self.abort_flag.load(Ordering::Relaxed)
     }
 
+    pub fn input_waker_handle(&self) -> Arc<tokio::sync::Notify> {
+        self.input_waker.clone()
+    }
+
     pub fn steer(&self, text: impl Into<String>) {
         Self::push_queue(&self.steering_queue, text);
+        self.input_waker.notify_one();
     }
 
     pub fn follow_up(&self, text: impl Into<String>) {
         Self::push_queue(&self.followup_queue, text);
+        self.input_waker.notify_one();
     }
 
     pub fn steering_queue_handle(&self) -> Arc<Mutex<Vec<String>>> {
@@ -694,12 +846,20 @@ impl Agent {
     }
 
     /// Prompt with pre-built user message (text and/or images).
+    ///
+    /// Queued `<system-reminder>` notices are drained first so they sit *before*
+    /// the human turn (Grok Build `handle_prompt` order). The human text is
+    /// wrapped in `<user_query>`.
     pub async fn prompt_user(
         &mut self,
         provider: &dyn LlmProvider,
-        user: AgentMessage,
+        mut user: AgentMessage,
     ) -> Result<String> {
         debug_assert!(matches!(user, AgentMessage::User(_)));
+        self.drain_notifications();
+        if let AgentMessage::User(ref mut u) = user {
+            crate::reminder::wrap_user_content_query(&mut u.content);
+        }
         self.push_message(user);
         self.run(provider).await
     }
@@ -763,10 +923,27 @@ impl Agent {
         let mut final_text;
         let mut turns_done = 0usize;
         let mut stop_continuations = 0usize;
+        let batch_exploration_threshold = batch_exploration_threshold(
+            &self.config.batch_exploration,
+            provider,
+            self.config.thinking_level,
+        );
+        let mut batch_exploration = BatchExplorationState::default();
         const MAX_STOP_CONTINUATIONS: usize = 8;
 
         for turn in 0usize.. {
             if self.config.max_turns > 0 && turn >= self.config.max_turns {
+                if self.is_aborted() {
+                    return self
+                        .finish_aborted(
+                            start_len,
+                            &run_id,
+                            wall_start,
+                            turns_done,
+                            usage_at_run_start,
+                        )
+                        .await;
+                }
                 break;
             }
             if self.is_aborted() {
@@ -782,7 +959,8 @@ impl Agent {
             }
 
             self.drain_steering();
-            // Claude-style: background task completions appear as conversation notices.
+            // Mid-run notices (bg jobs, later MCP deltas) land before this sample.
+            // The opening human turn already drained in `prompt_user`.
             self.drain_notifications();
             self.maybe_compact_before_sample(provider).await;
             // Progress: report the turn about to run (1-based) for job UIs.
@@ -806,9 +984,30 @@ impl Agent {
                     .then_some(self.last_prompt_tokens),
             });
 
+            let remind_batch_exploration = batch_exploration_threshold
+                .is_some_and(|threshold| batch_exploration.take_reminder(threshold));
+            if remind_batch_exploration {
+                self.record_trace(TraceEvent::BatchExploration {
+                    ts_ms: now_ms(),
+                    run_id: run_id.clone(),
+                    turn,
+                    batch_size: 0,
+                    reminder: true,
+                });
+            }
+            let mut request_messages = self.messages.clone();
+            if remind_batch_exploration {
+                request_messages.push(AgentMessage::User(UserMessage {
+                    content: UserContent::Text(crate::reminder::system_reminder(
+                        BATCH_EXPLORATION_REMINDER,
+                    )),
+                    timestamp: now_ms(),
+                    kind: None,
+                }));
+            }
             let request = CompletionRequest {
                 system_prompt: self.config.system_prompt.clone(),
-                messages: self.messages.clone(),
+                messages: request_messages,
                 tools: self.tool_definitions(),
                 server_tools: if self.config.server_search {
                     provider.server_tools()
@@ -858,50 +1057,49 @@ impl Agent {
             let mut sample_attempt = 0usize;
             let response = loop {
                 sample_attempt += 1;
-                let listeners: Vec<_> = self.listeners.iter().collect();
-                let ttft = ttft_ms.clone();
-                let llm_start_for_cb = llm_start;
-                let sample = provider
-                    .complete_streaming(
-                        request.clone(),
-                        &mut |event| {
-                            // First stream delta → time-to-first-token.
-                            if ttft.lock().expect("ttft").is_none() {
-                                *ttft.lock().expect("ttft") =
-                                    Some(llm_start_for_cb.elapsed().as_millis() as u64);
-                            }
-                            match event {
-                                crate::streaming::StreamEvent::TextDelta(delta) => {
-                                    let agent_event = AgentEvent::TextDelta {
-                                        delta: delta.clone(),
-                                    };
-                                    for listener in &listeners {
-                                        listener(&agent_event);
-                                    }
-                                }
-                                crate::streaming::StreamEvent::ThinkingDelta(delta) => {
-                                    let agent_event = AgentEvent::ThinkingDelta {
-                                        delta: delta.clone(),
-                                    };
-                                    for listener in &listeners {
-                                        listener(&agent_event);
-                                    }
-                                }
-                                crate::streaming::StreamEvent::ServerTool { tool, status } => {
-                                    let agent_event = AgentEvent::ServerTool {
-                                        provider: provider.name().to_string(),
-                                        tool,
-                                        status,
-                                    };
-                                    for listener in &listeners {
-                                        listener(&agent_event);
-                                    }
+                let sample = {
+                    let listeners: Vec<_> = self.listeners.iter().collect();
+                    let ttft = ttft_ms.clone();
+                    let llm_start_for_cb = llm_start;
+                    let mut on_stream = |event| {
+                        // First stream delta → time-to-first-token.
+                        if ttft.lock().expect("ttft").is_none() {
+                            *ttft.lock().expect("ttft") =
+                                Some(llm_start_for_cb.elapsed().as_millis() as u64);
+                        }
+                        match event {
+                            crate::streaming::StreamEvent::TextDelta(delta) => {
+                                let agent_event = AgentEvent::TextDelta {
+                                    delta: delta.clone(),
+                                };
+                                for listener in &listeners {
+                                    listener(&agent_event);
                                 }
                             }
-                        },
-                        Some(&self.abort_flag),
-                    )
-                    .await;
+                            crate::streaming::StreamEvent::ThinkingDelta(delta) => {
+                                let agent_event = AgentEvent::ThinkingDelta {
+                                    delta: delta.clone(),
+                                };
+                                for listener in &listeners {
+                                    listener(&agent_event);
+                                }
+                            }
+                            crate::streaming::StreamEvent::ServerTool { tool, status } => {
+                                let agent_event = AgentEvent::ServerTool {
+                                    provider: provider.name().to_string(),
+                                    tool,
+                                    status,
+                                };
+                                for listener in &listeners {
+                                    listener(&agent_event);
+                                }
+                            }
+                        }
+                    };
+                    provider
+                        .complete_streaming(request.clone(), &mut on_stream, Some(&self.abort_flag))
+                        .await
+                };
 
                 let response = match sample {
                     Ok(r) => r,
@@ -1050,6 +1248,18 @@ impl Agent {
             let latency_ms = llm_start.elapsed().as_millis() as u64;
             let ttft = *ttft_ms.lock().expect("ttft");
             let tool_calls = extract_tool_calls(&response.content);
+            if batch_exploration_threshold.is_some() {
+                if batch_exploration.reminded && !tool_calls.is_empty() {
+                    self.record_trace(TraceEvent::BatchExploration {
+                        ts_ms: now_ms(),
+                        run_id: run_id.clone(),
+                        turn,
+                        batch_size: tool_calls.len(),
+                        reminder: false,
+                    });
+                }
+                batch_exploration.observe(&tool_calls);
+            }
             let text = extract_text(&response.content);
             let text_len = text.len();
             let thinking_len = extract_thinking_len(&response.content);
@@ -1152,6 +1362,7 @@ impl Agent {
                                     "[Stop Hook Feedback] {reason}"
                                 )),
                                 timestamp: crate::message::now_ms(),
+                                kind: None,
                             }));
                             self.emit(AgentEvent::TurnEnd {
                                 turn,
@@ -1175,8 +1386,54 @@ impl Agent {
                     hooks.on_turn_end(turn).await;
                 }
                 if self.drain_followup() {
+                    batch_exploration = BatchExplorationState::default();
                     continue;
                 }
+                // Check if ReAct is waiting on background tasks
+                let maybe_interest = {
+                    self.wait_interest
+                        .lock()
+                        .expect("wait_interest lock")
+                        .clone()
+                };
+                if let Some(mut interest) = maybe_interest {
+                    if !interest.is_satisfied() {
+                        let park_result = react::park_wait_interest(self, &mut interest).await;
+                        match park_result {
+                            react::ParkOutcome::Satisfied => {
+                                self.clear_wait_interest();
+                                batch_exploration = BatchExplorationState::default();
+                                continue;
+                            }
+                            react::ParkOutcome::NewInput => {
+                                // Steer/followup supersedes the declared wait: the
+                                // model can re-declare with wait_tasks if still
+                                // needed. Leaving the interest set would re-park on
+                                // the next stop (stale waiting state).
+                                self.clear_wait_interest();
+                                self.drain_steering();
+                                self.drain_followup();
+                                batch_exploration = BatchExplorationState::default();
+                                continue;
+                            }
+                            react::ParkOutcome::Aborted => {
+                                self.clear_wait_interest();
+                                return self
+                                    .finish_aborted(
+                                        start_len,
+                                        &run_id,
+                                        wall_start,
+                                        turns_done,
+                                        usage_at_run_start,
+                                    )
+                                    .await;
+                            }
+                        }
+                    } else {
+                        self.clear_wait_interest();
+                    }
+                }
+                self.clear_wait_interest();
                 self.is_busy = false;
                 self.emit(AgentEvent::AgentEnd {
                     new_messages: self.new_messages_since(start_len),
@@ -1206,10 +1463,10 @@ impl Agent {
             // Gate sequentially (HITL Ask is single-slot), then run allowed tools
             // concurrently. Steer/abort mid-batch → synthetic error toolResults so
             // tool_call / tool_result pairs stay valid for the provider.
-            match self
+            let batch_outcome = self
                 .run_tool_batch(&tool_calls, turn, &run_id, &mut tool_results)
-                .await
-            {
+                .await;
+            match batch_outcome {
                 ToolBatchOutcome::Aborted => {
                     self.emit(AgentEvent::TurnEnd {
                         turn,
@@ -1232,18 +1489,6 @@ impl Agent {
                 ToolBatchOutcome::Continue => {}
             }
 
-            if let Some(compaction_cfg) = self.config.compaction_config.clone() {
-                if compaction_cfg.prune {
-                    let outcome = crate::compaction::prune_old_tool_outputs(
-                        &mut self.messages,
-                        &compaction_cfg,
-                    );
-                    if !outcome.is_empty() {
-                        self.record_context_projection("prune", outcome.changes);
-                    }
-                }
-            }
-
             self.emit(AgentEvent::TurnEnd {
                 turn,
                 assistant,
@@ -1251,6 +1496,48 @@ impl Agent {
             });
             if let Some(hooks) = &self.hooks {
                 hooks.on_turn_end(turn).await;
+            }
+
+            // If a tool (e.g. wait_tasks) registered an active wait interest, park ReAct
+            // immediately after the tool batch is complete and results are recorded,
+            // before calling the LLM again.
+            let maybe_interest = {
+                self.wait_interest
+                    .lock()
+                    .expect("wait_interest lock")
+                    .clone()
+            };
+            if let Some(mut interest) = maybe_interest {
+                if !interest.is_satisfied() {
+                    let park_result = react::park_wait_interest(self, &mut interest).await;
+                    match park_result {
+                        react::ParkOutcome::Satisfied => {
+                            self.clear_wait_interest();
+                            batch_exploration = BatchExplorationState::default();
+                        }
+                        react::ParkOutcome::NewInput => {
+                            // Superseded by steer/followup — do not re-park later.
+                            self.clear_wait_interest();
+                            self.drain_steering();
+                            self.drain_followup();
+                            batch_exploration = BatchExplorationState::default();
+                        }
+                        react::ParkOutcome::Aborted => {
+                            self.clear_wait_interest();
+                            return self
+                                .finish_aborted(
+                                    start_len,
+                                    &run_id,
+                                    wall_start,
+                                    turns_done,
+                                    usage_at_run_start,
+                                )
+                                .await;
+                        }
+                    }
+                } else {
+                    self.clear_wait_interest();
+                }
             }
         }
 
@@ -1285,6 +1572,7 @@ impl Agent {
         turns: usize,
         usage_at_run_start: TokenUsage,
     ) -> Result<String> {
+        self.clear_wait_interest();
         self.is_busy = false;
         self.emit(AgentEvent::AgentEnd {
             new_messages: self.new_messages_since(start_len),
@@ -1330,27 +1618,54 @@ impl Agent {
 
         self.emit(AgentEvent::CompactionStart);
 
-        let prompt = summarization_prompt(&older, None);
-        let summary = match provider
-            .complete(CompletionRequest {
-                system_prompt: "You summarize coding-agent conversations for context compaction."
-                    .into(),
-                messages: vec![AgentMessage::user_text(prompt)],
-                tools: Vec::new(),
-                server_tools: Vec::new(),
-                thinking_level: ThinkingLevel::Off,
-            })
-            .await
-        {
-            Ok(response) => {
-                let text = extract_text(&response.content).trim().to_string();
-                if text.is_empty() {
-                    extractive_summary(&older, config.max_summary_chars)
-                } else {
-                    text
+        let forked_summary = if can_fork_summarize_prefix(&older) {
+            provider
+                .complete(CompletionRequest {
+                    system_prompt: self.config.system_prompt.clone(),
+                    messages: compaction_request_messages(&older, None),
+                    tools: self.tool_definitions(),
+                    server_tools: if self.config.server_search {
+                        provider.server_tools()
+                    } else {
+                        Vec::new()
+                    },
+                    thinking_level: ThinkingLevel::Off,
+                })
+                .await
+                .ok()
+                .map(|resp| extract_text(&resp.content).trim().to_string())
+                .filter(|text| !text.is_empty())
+        } else {
+            None
+        };
+
+        let summary = match forked_summary {
+            Some(text) => text,
+            None => {
+                let prompt = summarization_prompt(&older, None);
+                match provider
+                    .complete(CompletionRequest {
+                        system_prompt:
+                            "You summarize coding-agent conversations for context compaction."
+                                .into(),
+                        messages: vec![AgentMessage::user_text(prompt)],
+                        tools: Vec::new(),
+                        server_tools: Vec::new(),
+                        thinking_level: ThinkingLevel::Off,
+                    })
+                    .await
+                {
+                    Ok(response) => {
+                        let text = extract_text(&response.content).trim().to_string();
+                        if text.is_empty() {
+                            extractive_summary(&older, config.max_summary_chars)
+                        } else {
+                            text
+                        }
+                    }
+                    Err(_error) => extractive_summary(&older, config.max_summary_chars),
                 }
             }
-            Err(_error) => extractive_summary(&older, config.max_summary_chars),
         };
         if summary.trim().is_empty() {
             return;
@@ -1387,7 +1702,15 @@ impl Agent {
         let items: Vec<_> = queue.drain(..).collect();
         drop(queue);
         for text in items {
-            self.push_message(AgentMessage::user_text(text));
+            // Steer keeps role=user for providers but is tagged `kind="steer"`
+            // so transcript/UI never mistakes it for a new user turn.
+            let msg = AgentMessage::steer_text(text);
+            if let AgentMessage::User(u) = &msg {
+                self.emit(AgentEvent::SteerApplied {
+                    text: u.content.as_plain_text(),
+                });
+            }
+            self.push_message(msg);
         }
     }
 
@@ -1399,7 +1722,6 @@ impl Agent {
         let items: Vec<_> = queue.drain(..).collect();
         drop(queue);
         for text in items {
-            // Prefer harness-style system-reminder so models do not treat notices as user chat.
             let text = crate::reminder::system_reminder(text);
             self.push_message(AgentMessage::user_text(text));
         }
@@ -1416,418 +1738,6 @@ impl Agent {
             self.push_message(AgentMessage::user_text(text));
         }
         true
-    }
-
-    /// Gate + execute a batch of tool calls from one assistant turn.
-    async fn run_tool_batch(
-        &mut self,
-        tool_calls: &[ToolCall],
-        turn: usize,
-        run_id: &str,
-        tool_results: &mut Vec<AgentMessage>,
-    ) -> ToolBatchOutcome {
-        let mut slots: Vec<ToolSlot> = Vec::with_capacity(tool_calls.len());
-
-        for (i, call) in tool_calls.iter().enumerate() {
-            if self.is_aborted() {
-                self.execute_slots(&mut slots, turn, run_id, tool_results)
-                    .await;
-                for call in &tool_calls[i..] {
-                    self.emit_synthetic_skip(
-                        call,
-                        turn,
-                        run_id,
-                        "aborted before tool execution",
-                        tool_results,
-                    );
-                }
-                return ToolBatchOutcome::Aborted;
-            }
-            if i > 0 && self.has_steering() {
-                // Finish already-gated tools, skip the rest with paired error results.
-                self.execute_slots(&mut slots, turn, run_id, tool_results)
-                    .await;
-                for call in &tool_calls[i..] {
-                    self.emit_synthetic_skip(
-                        call,
-                        turn,
-                        run_id,
-                        "skipped: user steering message queued",
-                        tool_results,
-                    );
-                }
-                return ToolBatchOutcome::Continue;
-            }
-
-            let (args_bytes, preview) = args_preview(&call.arguments, self.preview_limit());
-            self.record_trace(TraceEvent::ToolStart {
-                ts_ms: now_ms(),
-                run_id: run_id.to_string(),
-                turn,
-                call_id: call.id.clone(),
-                name: call.name.clone(),
-                args_bytes,
-                args_preview: preview,
-            });
-            self.emit(AgentEvent::ToolExecutionStart {
-                tool_call: call.clone(),
-            });
-
-            match self.gate_tool(call, run_id, turn).await {
-                GateOutcome::Allow {
-                    effective,
-                    gate,
-                    tool,
-                } => {
-                    slots.push(ToolSlot::Pending {
-                        original: call.clone(),
-                        effective,
-                        gate,
-                        tool,
-                    });
-                }
-                GateOutcome::Deny { message, gate } => {
-                    slots.push(ToolSlot::Done {
-                        original: call.clone(),
-                        output: ToolOutput::text(message),
-                        is_error: true,
-                        gate,
-                        duration_ms: 0,
-                        ui_emitted: false,
-                    });
-                }
-            }
-        }
-
-        self.execute_slots(&mut slots, turn, run_id, tool_results)
-            .await;
-        if self.is_aborted() {
-            return ToolBatchOutcome::Aborted;
-        }
-        ToolBatchOutcome::Continue
-    }
-
-    /// Execute pending slots. UI/trace `ToolEnd` fires as each tool finishes;
-    /// agent `ToolResult` messages are recorded in original call order at the end.
-    ///
-    /// **Parallelism policy:** consecutive read-only tools (`read`/`grep`/`find`/…)
-    /// run via `FuturesUnordered` (each completion updates the UI immediately).
-    /// Side-effecting tools (`write`/`edit`/`bash`/MCP/…) run one at a time so
-    /// they cannot race on the same files or shell state.
-    async fn execute_slots(
-        &mut self,
-        slots: &mut Vec<ToolSlot>,
-        turn: usize,
-        run_id: &str,
-        tool_results: &mut Vec<AgentMessage>,
-    ) {
-        let n = slots.len();
-        let mut i = 0;
-        while i < n {
-            // Already finished (e.g. gate deny) — notify UI now, record later.
-            if matches!(&slots[i], ToolSlot::Done { .. }) {
-                self.emit_slot_tool_end(slots, i, turn, run_id);
-                i += 1;
-                continue;
-            }
-
-            let side_effect = match &slots[i] {
-                ToolSlot::Pending { original, .. } => !is_parallel_safe_tool(&original.name),
-                ToolSlot::Done { .. } => false,
-            };
-
-            if side_effect {
-                // UI ToolEnd before after_tool hooks (hooks must not delay the transcript).
-                self.run_pending_at(slots, i, turn, run_id).await;
-                i += 1;
-                continue;
-            }
-
-            // Gather consecutive parallel-safe pending indices until a side-effecting pending.
-            let mut batch: Vec<usize> = Vec::new();
-            let mut k = i;
-            while k < n {
-                match &slots[k] {
-                    ToolSlot::Pending { original, .. } if is_parallel_safe_tool(&original.name) => {
-                        batch.push(k);
-                        k += 1;
-                    }
-                    ToolSlot::Pending { .. } => break, // write/bash/MCP — stop before it
-                    ToolSlot::Done { .. } => {
-                        // Denial sitting between reads: notify UI now.
-                        self.emit_slot_tool_end(slots, k, turn, run_id);
-                        k += 1;
-                    }
-                }
-            }
-
-            if batch.is_empty() {
-                // Should not happen (i was Pending parallel-safe).
-                i += 1;
-                continue;
-            }
-
-            self.run_pending_batch(slots, &batch, turn, run_id).await;
-            i = k;
-        }
-
-        // Record ToolResult messages in original tool-call order (providers match by id).
-        for slot in std::mem::take(slots) {
-            match slot {
-                ToolSlot::Done {
-                    original,
-                    output,
-                    is_error,
-                    gate,
-                    duration_ms,
-                    ui_emitted,
-                } => {
-                    let execution = ToolExecutionResult {
-                        output,
-                        is_error,
-                        gate_decision: gate,
-                        duration_ms,
-                    };
-                    // Safety net: if emit was skipped, still fire UI end before recording.
-                    if !ui_emitted {
-                        self.emit_tool_end(&original, turn, run_id, &execution);
-                    }
-                    self.record_tool_result(&original, execution, tool_results);
-                }
-                ToolSlot::Pending { original, .. } => {
-                    self.finish_tool_result(
-                        &original,
-                        turn,
-                        run_id,
-                        ToolExecutionResult {
-                            output: ToolOutput::text("internal error: tool not executed"),
-                            is_error: true,
-                            gate_decision: None,
-                            duration_ms: 0,
-                        },
-                        tool_results,
-                    );
-                }
-            }
-        }
-    }
-
-    /// Fire UI/trace ToolEnd for a Done slot (no-op if already emitted or still Pending).
-    fn emit_slot_tool_end(
-        &mut self,
-        slots: &mut [ToolSlot],
-        index: usize,
-        turn: usize,
-        run_id: &str,
-    ) {
-        let Some(slot) = slots.get_mut(index) else {
-            return;
-        };
-        match slot {
-            ToolSlot::Done {
-                original,
-                output,
-                is_error,
-                gate,
-                duration_ms,
-                ui_emitted,
-            } if !*ui_emitted => {
-                let execution = ToolExecutionResult {
-                    output: output.clone(),
-                    is_error: *is_error,
-                    gate_decision: gate.clone(),
-                    duration_ms: *duration_ms,
-                };
-                let call = original.clone();
-                *ui_emitted = true;
-                self.emit_tool_end(&call, turn, run_id, &execution);
-            }
-            _ => {}
-        }
-    }
-
-    /// Run one pending tool, emit UI `ToolExecutionEnd`, then run after_tool hooks.
-    ///
-    /// **Order is intentional:** the transcript must flip the tool row as soon as
-    /// `tool.execute` returns. Extension / permission `after_tool` hooks are
-    /// observational and must not delay (or hang) the parent UI — especially for
-    /// long-running tools like foreground `task` whose child already finalized.
-    async fn run_pending_at(
-        &mut self,
-        slots: &mut [ToolSlot],
-        index: usize,
-        turn: usize,
-        run_id: &str,
-    ) {
-        let (original, effective, gate, tool) = match &slots[index] {
-            ToolSlot::Pending {
-                original,
-                effective,
-                gate,
-                tool,
-            } => (
-                original.clone(),
-                effective.clone(),
-                gate.clone(),
-                Arc::clone(tool),
-            ),
-            ToolSlot::Done { .. } => return,
-        };
-        if self.is_aborted() {
-            slots[index] = ToolSlot::Done {
-                original,
-                output: ToolOutput::text("aborted before tool execution"),
-                is_error: true,
-                gate,
-                duration_ms: 0,
-                ui_emitted: false,
-            };
-            self.emit_slot_tool_end(slots, index, turn, run_id);
-            return;
-        }
-        let start = Instant::now();
-        // Race tool work against Esc so long bash/network tools stop ~50ms after abort
-        // (bash uses kill_on_drop; dropping the future cancels the child).
-        let res =
-            match crate::streaming::race_abort(tool.execute(&effective), Some(&self.abort_flag))
-                .await
-            {
-                Ok(res) => res,
-                Err(()) => Err(OneError::Aborted),
-            };
-        let duration_ms = start.elapsed().as_millis() as u64;
-        let (output, is_error) = match res {
-            Ok(output) => {
-                let failed = tool_output_indicates_error(&original.name, &output);
-                (output, failed)
-            }
-            Err(OneError::Aborted) => (ToolOutput::text("aborted"), true),
-            Err(err) => (ToolOutput::text(err.to_string()), true),
-        };
-        // Capture hook inputs before moving into the slot.
-        let hook_output = output.clone();
-        slots[index] = ToolSlot::Done {
-            original,
-            output,
-            is_error,
-            gate,
-            duration_ms,
-            ui_emitted: false,
-        };
-        // Transcript first — parent row must not wait on after_tool.
-        // Observational hooks are fire-and-forget with a hard cap so a stuck
-        // extension/hook can never leave the parent agent parked on
-        // "Thinking…" after a foreground `task` (or any tool) has already
-        // returned. ToolExecutionEnd is already in the event queue for the UI.
-        self.emit_slot_tool_end(slots, index, turn, run_id);
-        if let Some(g) = self.tool_gate.clone() {
-            let effective = effective.clone();
-            tokio::spawn(async move {
-                let fut = g.after_tool(&effective, &hook_output, is_error);
-                let _ = tokio::time::timeout(Duration::from_secs(5), fut).await;
-            });
-        }
-    }
-
-    /// Run consecutive parallel-safe tools concurrently; emit UI ToolEnd as each finishes.
-    async fn run_pending_batch(
-        &mut self,
-        slots: &mut [ToolSlot],
-        indices: &[usize],
-        turn: usize,
-        run_id: &str,
-    ) {
-        if indices.is_empty() {
-            return;
-        }
-        if indices.len() == 1 {
-            self.run_pending_at(slots, indices[0], turn, run_id).await;
-            return;
-        }
-
-        let mut jobs: Vec<ParallelToolJob> = Vec::with_capacity(indices.len());
-        for &i in indices {
-            if let ToolSlot::Pending {
-                original,
-                effective,
-                gate,
-                tool,
-            } = &slots[i]
-            {
-                jobs.push((
-                    i,
-                    original.clone(),
-                    effective.clone(),
-                    gate.clone(),
-                    Arc::clone(tool),
-                ));
-            }
-        }
-
-        let abort = self.abort_flag.clone();
-        let mut futs = futures::stream::FuturesUnordered::new();
-        for (i, _original, effective, _gate, tool) in &jobs {
-            let tool = Arc::clone(tool);
-            let effective = effective.clone();
-            let abort = abort.clone();
-            let idx = *i;
-            futs.push(async move {
-                let start = Instant::now();
-                let res = match crate::streaming::race_abort(
-                    tool.execute(&effective),
-                    Some(abort.as_ref()),
-                )
-                .await
-                {
-                    Ok(res) => res,
-                    Err(()) => Err(OneError::Aborted),
-                };
-                (idx, res, start.elapsed().as_millis() as u64)
-            });
-        }
-
-        // Map slot index → job metadata for after_tool / Done construction.
-        let mut by_index: std::collections::HashMap<
-            usize,
-            (ToolCall, ToolCall, Option<TraceGateDecision>),
-        > = jobs
-            .into_iter()
-            .map(|(i, original, effective, gate, _)| (i, (original, effective, gate)))
-            .collect();
-
-        while let Some((i, res, duration_ms)) = futs.next().await {
-            let Some((original, effective, gate)) = by_index.remove(&i) else {
-                continue;
-            };
-            let (output, is_error) = match res {
-                Ok(output) => {
-                    let failed = tool_output_indicates_error(&original.name, &output);
-                    (output, failed)
-                }
-                Err(OneError::Aborted) => (ToolOutput::text("aborted"), true),
-                Err(err) => (ToolOutput::text(err.to_string()), true),
-            };
-            let hook_output = output.clone();
-            slots[i] = ToolSlot::Done {
-                original,
-                output,
-                is_error,
-                gate,
-                duration_ms,
-                ui_emitted: false,
-            };
-            // UI flips this row to Done as soon as *this* tool finishes — not when
-            // the whole parallel group drains, and not after after_tool hooks.
-            // Fire-and-forget after_tool (same policy as run_pending_at).
-            self.emit_slot_tool_end(slots, i, turn, run_id);
-            if let Some(g) = self.tool_gate.clone() {
-                let effective = effective.clone();
-                tokio::spawn(async move {
-                    let fut = g.after_tool(&effective, &hook_output, is_error);
-                    let _ = tokio::time::timeout(Duration::from_secs(5), fut).await;
-                });
-            }
-        }
     }
 
     fn has_steering(&self) -> bool {
@@ -2005,7 +1915,7 @@ impl Agent {
         self.record_tool_result(call, execution, tool_results);
     }
 
-    fn emit(&mut self, event: AgentEvent) {
+    fn emit(&self, event: AgentEvent) {
         for listener in &self.listeners {
             listener(&event);
         }
@@ -2036,40 +1946,11 @@ impl Agent {
     }
 }
 
-type ParallelToolJob = (
-    usize,
-    ToolCall,
-    ToolCall,
-    Option<TraceGateDecision>,
-    Arc<dyn Tool>,
-);
-
 struct ToolExecutionResult {
     output: ToolOutput,
     is_error: bool,
     gate_decision: Option<TraceGateDecision>,
     duration_ms: u64,
-}
-
-/// Slot for concurrent tool execution (gate already applied).
-enum ToolSlot {
-    Pending {
-        original: ToolCall,
-        effective: ToolCall,
-        gate: Option<TraceGateDecision>,
-        tool: Arc<dyn Tool>,
-    },
-    Done {
-        original: ToolCall,
-        output: ToolOutput,
-        is_error: bool,
-        gate: Option<TraceGateDecision>,
-        duration_ms: u64,
-        /// Whether [`AgentEvent::ToolExecutionEnd`] / trace ToolEnd already fired.
-        /// UI emits as soon as the tool finishes; agent ToolResult is recorded later
-        /// in original call order.
-        ui_emitted: bool,
-    },
 }
 
 enum ToolBatchOutcome {
@@ -2389,6 +2270,305 @@ where
 mod tests {
     use super::*;
     use crate::message::TextOrImage;
+    use crate::tool::ToolDefinition;
+
+    struct BatchTestTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl Tool for BatchTestTool {
+        fn definition(&self) -> ToolDefinition {
+            ToolDefinition {
+                name: self.0.into(),
+                description: "test tool".into(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            }
+        }
+
+        async fn execute(&self, _call: &ToolCall) -> Result<ToolOutput> {
+            Ok(ToolOutput::text("ok"))
+        }
+    }
+
+    struct BatchTestProvider {
+        provider: &'static str,
+        model: &'static str,
+        batches: Vec<Vec<&'static str>>,
+        requests: Mutex<Vec<CompletionRequest>>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmProvider for BatchTestProvider {
+        fn name(&self) -> &str {
+            self.provider
+        }
+        fn model(&self) -> &str {
+            self.model
+        }
+
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+            let mut requests = self.requests.lock().unwrap();
+            let turn = requests.len();
+            requests.push(request);
+            let calls = self.batches.get(turn).cloned().unwrap_or_default();
+            let content = if calls.is_empty() {
+                vec![ContentBlock::text("done")]
+            } else {
+                calls
+                    .into_iter()
+                    .enumerate()
+                    .map(|(i, name)| ContentBlock::ToolCall {
+                        id: format!("{turn}-{i}"),
+                        name: name.into(),
+                        arguments: serde_json::json!({}),
+                    })
+                    .collect()
+            };
+            let stop_reason = if content
+                .iter()
+                .any(|b| matches!(b, ContentBlock::ToolCall { .. }))
+            {
+                StopReason::ToolUse
+            } else {
+                StopReason::Stop
+            };
+            Ok(CompletionResponse {
+                provider: self.provider.into(),
+                model: self.model.into(),
+                content,
+                stop_reason,
+                usage: TokenUsage::default(),
+                citations: Vec::new(),
+            })
+        }
+    }
+
+    async fn run_batch_test(
+        provider_name: &'static str,
+        model: &'static str,
+        level: ThinkingLevel,
+        batches: Vec<Vec<&'static str>>,
+    ) -> (Vec<CompletionRequest>, Vec<TraceEvent>) {
+        run_batch_test_with_rules(
+            provider_name,
+            model,
+            level,
+            batches,
+            vec![BatchExplorationRule {
+                provider: "cpa".into(),
+                model: "gemini-3.8-flash-high".into(),
+                thinking_level: Some(ThinkingLevel::Medium),
+                after_single_reads: 4,
+            }],
+        )
+        .await
+    }
+
+    async fn run_batch_test_with_rules(
+        provider_name: &'static str,
+        model: &'static str,
+        level: ThinkingLevel,
+        batches: Vec<Vec<&'static str>>,
+        rules: Vec<BatchExplorationRule>,
+    ) -> (Vec<CompletionRequest>, Vec<TraceEvent>) {
+        let provider = BatchTestProvider {
+            provider: provider_name,
+            model,
+            batches,
+            requests: Mutex::new(Vec::new()),
+        };
+        let trace = Arc::new(crate::trace::MemoryTrace::new());
+        let tools: Vec<Arc<dyn Tool>> = ["read", "grep", "ls", "write"]
+            .into_iter()
+            .map(|name| Arc::new(BatchTestTool(name)) as Arc<dyn Tool>)
+            .collect();
+        let mut agent = Agent::new(
+            AgentConfig {
+                thinking_level: level,
+                batch_exploration: rules,
+                ..AgentConfig::default()
+            },
+            tools,
+        );
+        agent.set_trace(Some(trace.clone()));
+        assert_eq!(agent.prompt(&provider, "explore").await.unwrap(), "done");
+        let requests = provider.requests.into_inner().unwrap();
+        (requests, trace.events())
+    }
+
+    fn reminder_count(request: &CompletionRequest) -> usize {
+        request
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(message,
+                    AgentMessage::User(UserMessage { content: UserContent::Text(text), .. })
+                        if text.contains(BATCH_EXPLORATION_REMINDER)
+                            && crate::reminder::has_system_reminder(text)
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn batch_exploration_reminds_once_and_tracks_following_batches() {
+        let (requests, events) = run_batch_test(
+            "cpa",
+            "gemini-3.8-flash-high",
+            ThinkingLevel::Medium,
+            vec![
+                vec!["read"],
+                vec!["grep"],
+                vec!["read"],
+                vec!["ls"],
+                vec!["read"],
+                vec!["read", "grep"],
+                vec!["read"],
+            ],
+        )
+        .await;
+        assert_eq!(
+            requests.iter().map(reminder_count).collect::<Vec<_>>(),
+            vec![0, 0, 0, 0, 1, 0, 0, 0]
+        );
+        let observations: Vec<(usize, usize, bool)> = events
+            .iter()
+            .filter_map(|event| {
+                if let TraceEvent::BatchExploration {
+                    turn,
+                    batch_size,
+                    reminder,
+                    ..
+                } = event
+                {
+                    Some((*turn, *batch_size, *reminder))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            observations,
+            vec![(4, 0, true), (4, 1, false), (5, 2, false), (6, 1, false)]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TraceEvent::ToolEnd { .. }))
+                .count(),
+            8,
+            "single dependent checks must still execute after the reminder"
+        );
+    }
+
+    #[tokio::test]
+    async fn batch_exploration_resets_on_multi_call_and_write() {
+        for interruption in [vec!["read", "grep"], vec!["write"]] {
+            let (requests, _) = run_batch_test(
+                "cpa",
+                "gemini-3.8-flash-high",
+                ThinkingLevel::Medium,
+                vec![
+                    vec!["read"],
+                    vec!["read"],
+                    interruption,
+                    vec!["read"],
+                    vec!["read"],
+                    vec!["read"],
+                    vec!["read"],
+                ],
+            )
+            .await;
+            assert_eq!(
+                requests.iter().map(reminder_count).collect::<Vec<_>>(),
+                vec![0, 0, 0, 0, 0, 0, 0, 1]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_exploration_is_off_for_other_model_or_thinking_level() {
+        for (provider, model, level) in [
+            ("other", "gemini-3.8-flash-high", ThinkingLevel::Medium),
+            ("cpa", "gemini-3.8-flash-low", ThinkingLevel::Medium),
+            ("cpa", "gemini-3.8-flash-high", ThinkingLevel::High),
+        ] {
+            let (requests, events) =
+                run_batch_test(provider, model, level, vec![vec!["read"]; 5]).await;
+            assert!(requests.iter().all(|request| reminder_count(request) == 0));
+            assert!(!events
+                .iter()
+                .any(|event| matches!(event, TraceEvent::BatchExploration { .. })));
+        }
+        let (requests, events) = run_batch_test_with_rules(
+            "cpa",
+            "gemini-3.8-flash-high",
+            ThinkingLevel::Medium,
+            vec![vec!["read"]; 5],
+            Vec::new(),
+        )
+        .await;
+        assert!(requests.iter().all(|request| reminder_count(request) == 0));
+        assert!(!events
+            .iter()
+            .any(|event| matches!(event, TraceEvent::BatchExploration { .. })));
+    }
+
+    #[tokio::test]
+    async fn batch_exploration_matches_parenthetical_model_suffix() {
+        let (requests, _) = run_batch_test_with_rules(
+            "cpa",
+            "gemini-3.8-flash-high(medium)",
+            ThinkingLevel::High,
+            vec![vec!["read"]; 5],
+            vec![BatchExplorationRule {
+                provider: "cpa".into(),
+                model: "gemini-3.8-flash-high".into(),
+                thinking_level: None,
+                after_single_reads: 4,
+            }],
+        )
+        .await;
+        assert_eq!(
+            requests.iter().map(reminder_count).collect::<Vec<_>>(),
+            vec![0, 0, 0, 0, 1, 0]
+        );
+
+        let (requests, _) = run_batch_test_with_rules(
+            "cpa",
+            "gemini-3.8-flash-highest",
+            ThinkingLevel::High,
+            vec![vec!["read"]; 5],
+            vec![BatchExplorationRule {
+                provider: "cpa".into(),
+                model: "gemini-3.8-flash-high".into(),
+                thinking_level: None,
+                after_single_reads: 4,
+            }],
+        )
+        .await;
+        assert!(requests.iter().all(|request| reminder_count(request) == 0));
+    }
+
+    #[tokio::test]
+    async fn batch_exploration_uses_configured_model_and_threshold() {
+        let (requests, _) = run_batch_test_with_rules(
+            "custom",
+            "model-x",
+            ThinkingLevel::Low,
+            vec![vec!["read"], vec!["grep"], vec!["read"]],
+            vec![BatchExplorationRule {
+                provider: "custom".into(),
+                model: "model-x".into(),
+                thinking_level: None,
+                after_single_reads: 2,
+            }],
+        )
+        .await;
+        assert_eq!(
+            requests.iter().map(reminder_count).collect::<Vec<_>>(),
+            vec![0, 0, 1, 0]
+        );
+    }
 
     #[test]
     fn system_prompt_uses_one_tool_names() {
@@ -2943,10 +3123,21 @@ mod tests {
             }
 
             async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
-                if request
+                let is_compaction_request = request
                     .system_prompt
                     .starts_with("You summarize coding-agent")
-                {
+                    || request.messages.last().is_some_and(|m| match m {
+                        AgentMessage::User(u) => u
+                            .content
+                            .as_plain_text()
+                            .contains("context compaction summary"),
+                        _ => false,
+                    });
+                if is_compaction_request {
+                    // Cache-sharing forked compaction keeps the session system prompt
+                    // and replays the prior conversation prefix before the trailing prompt.
+                    assert_eq!(request.system_prompt, AgentConfig::default().system_prompt);
+                    assert!(request.messages.len() >= 4);
                     self.summary_calls.fetch_add(1, Ordering::SeqCst);
                     return Ok(CompletionResponse {
                         provider: self.name().into(),
@@ -3250,16 +3441,23 @@ mod tests {
             async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
                 let n = self.calls.fetch_add(1, Ordering::SeqCst);
                 if n == 0 {
-                    let has_notice = request.messages.iter().any(|m| match m {
-                        AgentMessage::User(u) => u
-                            .content
-                            .as_plain_text()
-                            .contains("[Background task completed]"),
-                        _ => false,
-                    });
+                    let users: Vec<String> = request
+                        .messages
+                        .iter()
+                        .filter_map(|m| match m {
+                            AgentMessage::User(u) => Some(u.content.as_plain_text()),
+                            _ => None,
+                        })
+                        .collect();
+                    assert!(users.len() >= 2, "notice then human query, got {users:?}");
                     assert!(
-                        has_notice,
-                        "notification should be injected before LLM call"
+                        users[0].contains("[Background task completed]")
+                            && crate::reminder::has_system_reminder(&users[0]),
+                        "notification should be a tagged user message before the query: {users:?}"
+                    );
+                    assert!(
+                        users[1].contains("<user_query>") && users[1].contains("hi"),
+                        "human turn should be wrapped in <user_query> after the notice: {users:?}"
                     );
                 }
                 Ok(CompletionResponse {
@@ -3646,5 +3844,1522 @@ mod tests {
         assert_eq!(result, "fixed and completed");
         assert_eq!(provider.calls.load(Ordering::SeqCst), 2);
         assert_eq!(stop_hooks.stop_calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn parallel_readonly_tools_respect_concurrency_cap_and_order() {
+        use crate::tool::{Tool, ToolDefinition};
+        use crate::tool_gate::{ToolGate, ToolGateDecision};
+        use std::sync::atomic::AtomicUsize;
+        use std::time::Duration;
+
+        struct CountingRead {
+            current: Arc<AtomicUsize>,
+            peak: Arc<AtomicUsize>,
+            hold: Duration,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for CountingRead {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "read".into(),
+                    description: "slow read".into(),
+                    parameters: serde_json::json!({"type":"object","properties":{}}),
+                }
+            }
+            async fn execute(&self, call: &ToolCall) -> Result<ToolOutput> {
+                let n = self.current.fetch_add(1, Ordering::SeqCst) + 1;
+                self.peak.fetch_max(n, Ordering::SeqCst);
+                tokio::time::sleep(self.hold).await;
+                self.current.fetch_sub(1, Ordering::SeqCst);
+                Ok(ToolOutput::text(format!("done-{}", call.id)))
+            }
+        }
+
+        struct AllowGate {
+            released: Arc<AtomicUsize>,
+        }
+
+        #[async_trait::async_trait]
+        impl ToolGate for AllowGate {
+            async fn check(&self, _call: &ToolCall) -> ToolGateDecision {
+                ToolGateDecision::Allow
+            }
+            fn release_permission_lease(&self, _call: &ToolCall) {
+                self.released.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        struct BatchProvider;
+
+        #[async_trait::async_trait]
+        impl LlmProvider for BatchProvider {
+            fn name(&self) -> &str {
+                "batch"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+                let has_tools = request
+                    .messages
+                    .iter()
+                    .any(|m| matches!(m, AgentMessage::ToolResult(_)));
+                if has_tools {
+                    return Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::Text {
+                            text: "done".into(),
+                        }],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    });
+                }
+                Ok(CompletionResponse {
+                    provider: self.name().into(),
+                    model: self.model().into(),
+                    content: (0..4)
+                        .map(|i| ContentBlock::ToolCall {
+                            id: format!("c{i}"),
+                            name: "read".into(),
+                            arguments: serde_json::json!({}),
+                        })
+                        .collect(),
+                    stop_reason: StopReason::ToolUse,
+                    usage: TokenUsage::default(),
+                    citations: Vec::new(),
+                })
+            }
+        }
+
+        let current = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let released = Arc::new(AtomicUsize::new(0));
+        let mut agent = Agent::new(
+            AgentConfig {
+                max_parallel_readonly_tools: 2,
+                ..AgentConfig::default()
+            },
+            vec![Arc::new(CountingRead {
+                current,
+                peak: peak.clone(),
+                hold: Duration::from_millis(40),
+            })],
+        );
+        agent.set_tool_gate(Some(Arc::new(AllowGate {
+            released: released.clone(),
+        })));
+        let out = agent.prompt(&BatchProvider, "go").await.expect("prompt");
+        assert_eq!(out, "done");
+        assert!(
+            peak.load(Ordering::SeqCst) <= 2,
+            "peak={}",
+            peak.load(Ordering::SeqCst)
+        );
+        assert_eq!(released.load(Ordering::SeqCst), 4);
+        let results: Vec<_> = agent
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::ToolResult(tr) => {
+                    Some((tr.tool_call_id.as_str(), tr.content.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(results.len(), 4);
+        for (i, (id, _)) in results.iter().enumerate() {
+            assert_eq!(*id, format!("c{i}"));
+        }
+    }
+
+    struct MockTaskWaiter {
+        terminals: std::sync::Mutex<std::collections::HashSet<String>>,
+        notifiers: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Notify>>>,
+    }
+
+    impl MockTaskWaiter {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                terminals: std::sync::Mutex::new(std::collections::HashSet::new()),
+                notifiers: std::sync::Mutex::new(std::collections::HashMap::new()),
+            })
+        }
+        fn get_or_create_notify(&self, id: &str) -> Arc<tokio::sync::Notify> {
+            let mut map = self.notifiers.lock().unwrap();
+            map.entry(id.to_string())
+                .or_insert_with(|| Arc::new(tokio::sync::Notify::new()))
+                .clone()
+        }
+        fn complete(&self, id: &str) {
+            let notify = {
+                let mut terms = self.terminals.lock().unwrap();
+                terms.insert(id.to_string());
+                self.get_or_create_notify(id)
+            };
+            notify.notify_waiters();
+        }
+    }
+
+    impl TaskWaitWaiter for MockTaskWaiter {
+        fn is_terminal(&self, id: &str) -> bool {
+            self.terminals.lock().unwrap().contains(id)
+        }
+        fn subscribe_terminal<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            let notify = self.get_or_create_notify(id);
+            Box::pin(RegisteredWaiter::new(notify))
+        }
+    }
+
+    #[tokio::test]
+    async fn react_park_and_wake_on_task_completion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct TurnCountingProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for TurnCountingProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    // Turn 0: LLM finishes its tool calls and has nothing more to do, waiting on background
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("waiting for task...")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    // Turn 1: LLM sees the drained completion notification
+                    let has_notice = request.messages.iter().any(|m| match m {
+                        AgentMessage::User(u) => {
+                            u.content.as_plain_text().contains("bg_1 completed")
+                        }
+                        _ => false,
+                    });
+                    assert!(
+                        has_notice,
+                        "drained notification must be present in LLM turn"
+                    );
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("all finished!")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_1".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        let waiter_clone = waiter.clone();
+        let agent_notification_queue = agent.notification_queue_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            agent_notification_queue
+                .lock()
+                .unwrap()
+                .push("bg_1 completed".into());
+            waiter_clone.complete("bg_1");
+        });
+
+        let provider = TurnCountingProvider {
+            turns: AtomicUsize::new(0),
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "all finished!");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn react_park_respects_any_mode() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AnyProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for AnyProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("waiting for any...")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("one done!")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_1".into(), "bg_2".into()],
+            WaitInterestMode::Any,
+            waiter.clone(),
+        )));
+
+        let waiter_clone = waiter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            waiter_clone.complete("bg_2");
+        });
+
+        let provider = AnyProvider {
+            turns: AtomicUsize::new(0),
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "one done!");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 2);
+        assert!(!waiter.is_terminal("bg_1"));
+        assert!(waiter.is_terminal("bg_2"));
+    }
+
+    #[tokio::test]
+    async fn react_park_respects_all_mode() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AllProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for AllProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("waiting for all...")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("both done!")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_1".into(), "bg_2".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        let waiter_clone = waiter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            waiter_clone.complete("bg_1");
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            waiter_clone.complete("bg_2");
+        });
+
+        let provider = AllProvider {
+            turns: AtomicUsize::new(0),
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "both done!");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn react_unrelated_notification_does_not_wake() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct UnrelatedProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for UnrelatedProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("waiting...")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("target finished")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["target".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        let waiter_clone = waiter.clone();
+        let q = agent.notification_queue_handle();
+        tokio::spawn(async move {
+            // Push unrelated notification (e.g. monitor line or dev server output)
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            q.lock()
+                .unwrap()
+                .push("unrelated monitor output line".into());
+            waiter_clone.complete("unrelated_task");
+
+            // Later, complete target
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            waiter_clone.complete("target");
+        });
+
+        let provider = UnrelatedProvider {
+            turns: AtomicUsize::new(0),
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "target finished");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn react_unawaited_background_task_does_not_park() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SimpleProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for SimpleProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                self.turns.fetch_add(1, Ordering::SeqCst);
+                Ok(CompletionResponse {
+                    provider: self.name().into(),
+                    model: self.model().into(),
+                    content: vec![ContentBlock::text("immediate completion")],
+                    stop_reason: StopReason::Stop,
+                    usage: TokenUsage::default(),
+                    citations: Vec::new(),
+                })
+            }
+        }
+
+        // An unawaited background task running (no WaitInterest registered)
+        let agent = Agent::new(AgentConfig::default(), Vec::new());
+        // wait_interest is None
+        let mut agent = agent;
+        let provider = SimpleProvider {
+            turns: AtomicUsize::new(0),
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "immediate completion");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn react_instant_completion_no_lost_wakeup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct InstantProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for InstantProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("waiting...")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("done")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let waiter = MockTaskWaiter::new();
+        // Task is already complete BEFORE agent runs / checks
+        waiter.complete("bg_instant");
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_instant".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        let provider = InstantProvider {
+            turns: AtomicUsize::new(0),
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "waiting..."); // Because interest was satisfied immediately, ReAct didn't park
+    }
+
+    #[tokio::test]
+    async fn react_abort_interrupts_park() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct BlockedProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for BlockedProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                self.turns.fetch_add(1, Ordering::SeqCst);
+                Ok(CompletionResponse {
+                    provider: self.name().into(),
+                    model: self.model().into(),
+                    content: vec![ContentBlock::text("waiting forever...")],
+                    stop_reason: StopReason::Stop,
+                    usage: TokenUsage::default(),
+                    citations: Vec::new(),
+                })
+            }
+        }
+
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_forever".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        let abort_flag = agent.abort_handle();
+        let input_waker = agent.input_waker_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            abort_flag.store(true, Ordering::Relaxed);
+            input_waker.notify_one();
+        });
+
+        let provider = BlockedProvider {
+            turns: AtomicUsize::new(0),
+        };
+        let err = agent.prompt(&provider, "start").await;
+        assert!(err.is_err(), "aborted run should return error/aborted");
+    }
+
+    #[tokio::test]
+    async fn react_steering_input_wakes_park() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SteerProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for SteerProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("waiting...")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    let has_steer = request.messages.iter().any(|m| match m {
+                        AgentMessage::User(u) => {
+                            u.content.as_plain_text().contains("steer message")
+                        }
+                        _ => false,
+                    });
+                    assert!(has_steer, "steering message must be delivered to LLM turn");
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("handled steering")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_long".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        let steering_queue = agent.steering_queue_handle();
+        let input_waker = agent.input_waker_handle();
+        let waiter_clone = waiter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            steering_queue.lock().unwrap().push("steer message".into());
+            input_waker.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            waiter_clone.complete("bg_long");
+        });
+
+        let provider = SteerProvider {
+            turns: AtomicUsize::new(0),
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "handled steering");
+        // Exactly 2 turns: steer wakes the park, the next stop ends the run.
+        // The wait interest was cleared on NewInput — no re-park after the
+        // steer is consumed (stale waiting state would hang until bg completes).
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn steer_message_keeps_steer_kind_and_serializes() {
+        let msg = AgentMessage::steer_text("不要重构 shared package");
+        let AgentMessage::User(u) = &msg else {
+            panic!("steer must stay role=user for providers");
+        };
+        assert!(u.is_steer());
+        assert_eq!(u.kind.as_deref(), Some("steer"));
+        // Round-trip through the session/jsonl wire format.
+        let json = serde_json::to_string(&msg).expect("serialize");
+        assert!(
+            json.contains("\"kind\":\"steer\""),
+            "wire carries kind: {json}"
+        );
+        let back: AgentMessage = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, msg);
+
+        // Plain user turns stay kind-free (old format unchanged).
+        let plain = AgentMessage::user_text("real turn");
+        let AgentMessage::User(pu) = &plain else {
+            panic!()
+        };
+        assert!(!pu.is_steer());
+        let plain_json = serde_json::to_string(&plain).expect("serialize");
+        assert!(!plain_json.contains("kind"), "old format stays minimal");
+        // Legacy sessions without `kind` still deserialize as user turns.
+        let legacy = r#"{"role":"user","content":"old prompt","timestamp":123}"#;
+        let m: AgentMessage = serde_json::from_str(legacy).expect("legacy parse");
+        assert!(matches!(&m, AgentMessage::User(u) if !u.is_steer()));
+    }
+
+    #[tokio::test]
+    async fn steer_drain_tags_message_and_emits_event() {
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Arc, Mutex};
+
+        // Provider: first turn parks on a background waiter; steering wakes it.
+        struct P {
+            turns: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl LlmProvider for P {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn > 0 {
+                    return Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("done")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    });
+                }
+                Ok(CompletionResponse {
+                    provider: self.name().into(),
+                    model: self.model().into(),
+                    content: vec![ContentBlock::text("waiting")],
+                    stop_reason: StopReason::Stop,
+                    usage: TokenUsage::default(),
+                    citations: Vec::new(),
+                })
+            }
+        }
+
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_job".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_sink = seen.clone();
+        agent.subscribe(Box::new(move |event: &AgentEvent| {
+            if let AgentEvent::SteerApplied { text } = event {
+                seen_sink.lock().unwrap().push(text.clone());
+            }
+        }));
+
+        let steering_queue = agent.steering_queue_handle();
+        let input_waker = agent.input_waker_handle();
+        let waiter_clone = waiter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            steering_queue.lock().unwrap().push("steer now".into());
+            input_waker.notify_one();
+            tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+            waiter_clone.complete("bg_job");
+        });
+
+        let provider = P {
+            turns: AtomicUsize::new(0),
+        };
+        agent.prompt(&provider, "start").await.expect("run");
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            &["steer now".to_string()],
+            "SteerApplied must fire once with the steer text"
+        );
+        let steers = agent
+            .messages
+            .iter()
+            .filter(|m| matches!(m, AgentMessage::User(u) if u.is_steer()))
+            .count();
+        assert_eq!(steers, 1, "drained steer is tagged kind=steer in context");
+        let turns = crate::compaction::user_turn_count(&agent.messages);
+        assert_eq!(turns, 1, "steer must not count as a user turn boundary");
+    }
+
+    // ---- Acceptance: real park (blocked in tokio::select) + external wake ----
+
+    /// Shared provider for park acceptance tests: turn 0 returns text (parks via
+    /// pre-set wait interest on the no-tool-call path); the final turn asserts
+    /// the woken request contains `expect_snippet` and returns "done".
+    struct ParkProvider {
+        turns: std::sync::atomic::AtomicUsize,
+        expect_snippet: Option<&'static str>,
+    }
+    #[async_trait]
+    impl LlmProvider for ParkProvider {
+        fn name(&self) -> &str {
+            "park-provider"
+        }
+        fn model(&self) -> &str {
+            "test"
+        }
+        async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+            let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+            if turn == 0 {
+                return Ok(CompletionResponse {
+                    provider: self.name().into(),
+                    model: self.model().into(),
+                    content: vec![ContentBlock::text("parking")],
+                    stop_reason: StopReason::Stop,
+                    usage: TokenUsage::default(),
+                    citations: Vec::new(),
+                });
+            }
+            if let Some(snippet) = self.expect_snippet {
+                let hit = request.messages.iter().any(|m| match m {
+                    AgentMessage::User(u) => u.content.as_plain_text().contains(snippet),
+                    _ => false,
+                });
+                assert!(hit, "woken turn must see {snippet:?} in context");
+            }
+            Ok(CompletionResponse {
+                provider: self.name().into(),
+                model: self.model().into(),
+                content: vec![ContentBlock::text("done")],
+                stop_reason: StopReason::Stop,
+                usage: TokenUsage::default(),
+                citations: Vec::new(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn park_acceptance_steering_wakes_and_is_consumed() {
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_a".into(), "bg_b".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        // After the agent is truly parked, inject a steer externally.
+        let steering_queue = agent.steering_queue_handle();
+        let input_waker = agent.input_waker_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            Agent::push_queue(&steering_queue, "redirect to job_output");
+            input_waker.notify_one();
+        });
+
+        let provider = ParkProvider {
+            turns: std::sync::atomic::AtomicUsize::new(0),
+            expect_snippet: Some("redirect to job_output"),
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "done");
+        assert_eq!(provider.turns.load(std::sync::atomic::Ordering::SeqCst), 2);
+        // Steer actually entered the model context as a tagged steer message.
+        let steers = agent
+            .messages
+            .iter()
+            .filter(|m| matches!(m, AgentMessage::User(u) if u.is_steer()))
+            .count();
+        assert_eq!(steers, 1);
+    }
+
+    #[tokio::test]
+    async fn park_acceptance_followup_wakes_and_enters_next_turn() {
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_followup".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        let followup_queue = agent.followup_queue_handle();
+        let input_waker = agent.input_waker_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            Agent::push_queue(&followup_queue, "followup: check results");
+            input_waker.notify_one();
+        });
+
+        let provider = ParkProvider {
+            turns: std::sync::atomic::AtomicUsize::new(0),
+            expect_snippet: Some("followup: check results"),
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "done");
+        assert_eq!(provider.turns.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn park_acceptance_abort_exits_immediately_without_extra_turns() {
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_never_finishes".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        let abort_flag = agent.abort_handle();
+        let input_waker = agent.input_waker_handle();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            abort_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            input_waker.notify_one();
+        });
+
+        let provider = ParkProvider {
+            turns: std::sync::atomic::AtomicUsize::new(0),
+            expect_snippet: None,
+        };
+        let started = std::time::Instant::now();
+        let err = agent.prompt(&provider, "start").await;
+        assert!(err.is_err(), "abort during park must end the run");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "abort must wake immediately, took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(
+            provider.turns.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "no further LLM turn after abort"
+        );
+        // Waiting state must not linger.
+        assert!(
+            agent.wait_interest_handle().lock().unwrap().is_none(),
+            "interest cleared after abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn park_acceptance_completion_wakes_and_clears_waiting_state() {
+        use std::sync::{Arc, Mutex};
+
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_c1".into(), "bg_c2".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        // Track WaitParkStart/End pairing.
+        let starts: Arc<Mutex<Vec<(WaitInterestMode, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let ends = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let starts_cb = starts.clone();
+        let ends_cb = ends.clone();
+        agent.subscribe(Box::new(move |event| match event {
+            AgentEvent::WaitParkStart { mode, ids } => {
+                starts_cb.lock().unwrap().push((*mode, ids.len()));
+            }
+            AgentEvent::WaitParkEnd => {
+                ends_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+            _ => {}
+        }));
+
+        // Complete the tasks externally while the agent is parked.
+        let waiter_clone = waiter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            waiter_clone.complete("bg_c1");
+            tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            waiter_clone.complete("bg_c2");
+        });
+
+        let provider = ParkProvider {
+            turns: std::sync::atomic::AtomicUsize::new(0),
+            expect_snippet: None,
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "done");
+        assert_eq!(provider.turns.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let starts = starts.lock().unwrap().clone();
+        assert_eq!(
+            starts,
+            vec![(WaitInterestMode::All, 2)],
+            "one WaitParkStart with mode + id count"
+        );
+        assert_eq!(
+            ends.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "exactly one WaitParkEnd — waiting state fully cleared"
+        );
+    }
+
+    #[tokio::test]
+    async fn park_acceptance_any_mode_wakes_on_first_completion() {
+        use std::sync::{Arc, Mutex};
+
+        let waiter = MockTaskWaiter::new();
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_any1".into(), "bg_any2".into()],
+            WaitInterestMode::Any,
+            waiter.clone(),
+        )));
+
+        let starts: Arc<Mutex<Vec<(WaitInterestMode, usize)>>> = Arc::new(Mutex::new(Vec::new()));
+        let starts_cb = starts.clone();
+        agent.subscribe(Box::new(move |event| {
+            if let AgentEvent::WaitParkStart { mode, ids } = event {
+                starts_cb.lock().unwrap().push((*mode, ids.len()));
+            }
+        }));
+
+        let waiter_clone = waiter.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            // Only the first target completes; the second never does.
+            waiter_clone.complete("bg_any1");
+        });
+
+        let provider = ParkProvider {
+            turns: std::sync::atomic::AtomicUsize::new(0),
+            expect_snippet: None,
+        };
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "done");
+        assert_eq!(provider.turns.load(std::sync::atomic::Ordering::SeqCst), 2);
+
+        let starts = starts.lock().unwrap().clone();
+        assert_eq!(
+            starts,
+            vec![(WaitInterestMode::Any, 2)],
+            "any-mode interest carries mode + both ids"
+        );
+        assert!(waiter.is_terminal("bg_any1"));
+        assert!(!waiter.is_terminal("bg_any2"));
+    }
+
+    struct DeterministicRaceWaiter<F: Fn() + Send + Sync + 'static> {
+        base: Arc<MockTaskWaiter>,
+        hook: F,
+        called: AtomicBool,
+    }
+
+    impl<F: Fn() + Send + Sync + 'static> DeterministicRaceWaiter<F> {
+        fn new(hook: F) -> Self {
+            Self {
+                base: MockTaskWaiter::new(),
+                hook,
+                called: AtomicBool::new(false),
+            }
+        }
+        fn complete(&self, id: &str) {
+            self.base.complete(id);
+        }
+    }
+
+    impl<F: Fn() + Send + Sync + 'static> TaskWaitWaiter for DeterministicRaceWaiter<F> {
+        fn is_terminal(&self, id: &str) -> bool {
+            self.base.is_terminal(id)
+        }
+        fn subscribe_terminal<'a>(
+            &'a self,
+            id: &'a str,
+        ) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            if !self.called.swap(true, Ordering::SeqCst) {
+                (self.hook)();
+            }
+            self.base.subscribe_terminal(id)
+        }
+    }
+
+    #[tokio::test]
+    async fn react_deterministic_race_steering_during_subscribe_does_not_lose_wakeup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        let steering_queue = agent.steering_queue_handle();
+        let input_waker = agent.input_waker_handle();
+
+        // Hook injects steering synchronously right when subscribe_terminal is called
+        let waiter = Arc::new(DeterministicRaceWaiter::new(move || {
+            steering_queue
+                .lock()
+                .unwrap()
+                .push("race steering message".into());
+            input_waker.notify_one();
+        }));
+
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_never".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        // Use a generic waiter type by storing an Arc<MockTaskWaiter> directly
+        struct SteerProvider2<W: TaskWaitWaiter + 'static> {
+            turns: AtomicUsize,
+            waiter: Arc<W>,
+            complete_fn: Box<dyn Fn(&W) + Send + Sync>,
+        }
+
+        #[async_trait::async_trait]
+        impl<W: TaskWaitWaiter + 'static> LlmProvider for SteerProvider2<W> {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("waiting...")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else if turn == 1 {
+                    let has_steer = request.messages.iter().any(|m| match m {
+                        AgentMessage::User(u) => {
+                            u.content.as_plain_text().contains("race steering message")
+                        }
+                        _ => false,
+                    });
+                    assert!(has_steer, "steering message must be delivered to LLM turn");
+                    (self.complete_fn)(&self.waiter);
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("handled race steering")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("final")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let provider = SteerProvider2 {
+            turns: AtomicUsize::new(0),
+            waiter: waiter.clone(),
+            complete_fn: Box::new(|w| w.complete("bg_never")),
+        };
+        // The background task NEVER finishes on its own; the raced steering message must wake ReAct immediately!
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "handled race steering");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn react_deterministic_race_followup_during_subscribe_does_not_lose_wakeup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        let followup_queue = agent.followup_queue_handle();
+        let input_waker = agent.input_waker_handle();
+
+        // Hook injects followup synchronously right when subscribe_terminal is called
+        let waiter = Arc::new(DeterministicRaceWaiter::new(move || {
+            followup_queue
+                .lock()
+                .unwrap()
+                .push("race followup message".into());
+            input_waker.notify_one();
+        }));
+
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_never".into()],
+            WaitInterestMode::All,
+            waiter.clone(),
+        )));
+
+        struct FollowupProvider2<W: TaskWaitWaiter + 'static> {
+            turns: AtomicUsize,
+            waiter: Arc<W>,
+            complete_fn: Box<dyn Fn(&W) + Send + Sync>,
+        }
+
+        #[async_trait::async_trait]
+        impl<W: TaskWaitWaiter + 'static> LlmProvider for FollowupProvider2<W> {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.turns.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("waiting...")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else if turn == 1 {
+                    let has_followup = request.messages.iter().any(|m| match m {
+                        AgentMessage::User(u) => {
+                            u.content.as_plain_text().contains("race followup message")
+                        }
+                        _ => false,
+                    });
+                    assert!(
+                        has_followup,
+                        "followup message must be delivered to LLM turn"
+                    );
+                    (self.complete_fn)(&self.waiter);
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("handled race followup")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("final")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                }
+            }
+        }
+
+        let provider = FollowupProvider2 {
+            turns: AtomicUsize::new(0),
+            waiter: waiter.clone(),
+            complete_fn: Box::new(|w| w.complete("bg_never")),
+        };
+        // The background task NEVER finishes on its own; the raced followup message must wake ReAct immediately!
+        let out = agent.prompt(&provider, "start").await.expect("run");
+        assert_eq!(out, "handled race followup");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn react_deterministic_race_abort_during_subscribe_does_not_lose_wakeup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct AbortProvider {
+            turns: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for AbortProvider {
+            fn name(&self) -> &str {
+                "test-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                self.turns.fetch_add(1, Ordering::SeqCst);
+                Ok(CompletionResponse {
+                    provider: self.name().into(),
+                    model: self.model().into(),
+                    content: vec![ContentBlock::text("waiting...")],
+                    stop_reason: StopReason::Stop,
+                    usage: TokenUsage::default(),
+                    citations: Vec::new(),
+                })
+            }
+        }
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        let abort_flag = agent.abort_handle();
+        let input_waker = agent.input_waker_handle();
+
+        // Hook injects abort synchronously right when subscribe_terminal is called
+        let waiter = Arc::new(DeterministicRaceWaiter::new(move || {
+            abort_flag.store(true, Ordering::Relaxed);
+            input_waker.notify_one();
+        }));
+
+        agent.set_wait_interest(Some(WaitInterest::new(
+            vec!["bg_never".into()],
+            WaitInterestMode::All,
+            waiter,
+        )));
+
+        let provider = AbortProvider {
+            turns: AtomicUsize::new(0),
+        };
+        // The background task NEVER finishes, but the raced abort must terminate park immediately!
+        let err = agent.prompt(&provider, "start").await;
+        assert!(err.is_err(), "aborted run should return error");
+        assert_eq!(provider.turns.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn react_park_deterministic_lifecycle_and_single_agent_end() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio::sync::Notify;
+
+        #[derive(Default)]
+        struct EventTracker {
+            agent_starts: AtomicUsize,
+            agent_ends: AtomicUsize,
+            agent_end_seen_before_task_terminal: AtomicBool,
+        }
+
+        let tracker = Arc::new(EventTracker::default());
+
+        let tool_executed = Arc::new(Notify::new());
+        let task_terminal = Arc::new(AtomicBool::new(false));
+        let second_complete_entered = Arc::new(AtomicBool::new(false));
+        let provider_invocations = Arc::new(AtomicUsize::new(0));
+
+        struct MockTool {
+            tool_executed: Arc<Notify>,
+            wait_interest_handle: Arc<std::sync::Mutex<Option<WaitInterest>>>,
+            waiter: Arc<MockTaskWaiter>,
+        }
+
+        #[async_trait::async_trait]
+        impl Tool for MockTool {
+            fn definition(&self) -> ToolDefinition {
+                ToolDefinition {
+                    name: "test_wait_tasks".into(),
+                    description: "mock wait tasks".into(),
+                    parameters: serde_json::json!({
+                        "type": "object",
+                        "properties": {}
+                    }),
+                }
+            }
+            async fn execute(&self, _call: &ToolCall) -> Result<ToolOutput> {
+                // Register active wait interest on "bg_task_1"
+                *self.wait_interest_handle.lock().unwrap() = Some(WaitInterest::new(
+                    vec!["bg_task_1".into()],
+                    WaitInterestMode::All,
+                    self.waiter.clone(),
+                ));
+                self.tool_executed.notify_waiters();
+                Ok(ToolOutput::text("registered wait interest"))
+            }
+        }
+
+        struct LifecycleProvider {
+            invocations: Arc<AtomicUsize>,
+            task_terminal: Arc<AtomicBool>,
+            second_complete_entered: Arc<AtomicBool>,
+            unblock_second_turn: Arc<Notify>,
+        }
+
+        #[async_trait::async_trait]
+        impl LlmProvider for LifecycleProvider {
+            fn name(&self) -> &str {
+                "lifecycle-provider"
+            }
+            fn model(&self) -> &str {
+                "test"
+            }
+            async fn complete(&self, _request: CompletionRequest) -> Result<CompletionResponse> {
+                let turn = self.invocations.fetch_add(1, Ordering::SeqCst);
+                if turn == 0 {
+                    // Turn 0: emit tool call to test_wait_tasks
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::ToolCall {
+                            id: "tc_1".into(),
+                            name: "test_wait_tasks".into(),
+                            arguments: serde_json::json!({}),
+                        }],
+                        stop_reason: StopReason::ToolUse,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else if turn == 1 {
+                    // Turn 1: MUST ONLY happen AFTER task is terminal!
+                    assert!(
+                        self.task_terminal.load(Ordering::SeqCst),
+                        "provider complete must NOT be called for second turn before task is terminal!"
+                    );
+                    self.second_complete_entered.store(true, Ordering::SeqCst);
+                    self.unblock_second_turn.notified().await;
+                    Ok(CompletionResponse {
+                        provider: self.name().into(),
+                        model: self.model().into(),
+                        content: vec![ContentBlock::text("final answer")],
+                        stop_reason: StopReason::Stop,
+                        usage: TokenUsage::default(),
+                        citations: Vec::new(),
+                    })
+                } else {
+                    panic!("unexpected third completion call");
+                }
+            }
+        }
+
+        let waiter = MockTaskWaiter::new();
+        let unblock_second_turn = Arc::new(Notify::new());
+
+        let mut agent = Agent::new(AgentConfig::default(), Vec::new());
+        let wait_interest_handle = agent.wait_interest_handle();
+
+        let tool = Arc::new(MockTool {
+            tool_executed: tool_executed.clone(),
+            wait_interest_handle,
+            waiter: waiter.clone(),
+        });
+        agent.set_tools(vec![tool]);
+
+        let tracker_for_cb = tracker.clone();
+        let task_terminal_for_cb = task_terminal.clone();
+        agent.subscribe(Box::new(move |event| match event {
+            AgentEvent::AgentStart { .. } => {
+                tracker_for_cb.agent_starts.fetch_add(1, Ordering::SeqCst);
+            }
+            AgentEvent::AgentEnd { .. } => {
+                tracker_for_cb.agent_ends.fetch_add(1, Ordering::SeqCst);
+                if !task_terminal_for_cb.load(Ordering::SeqCst) {
+                    tracker_for_cb
+                        .agent_end_seen_before_task_terminal
+                        .store(true, Ordering::SeqCst);
+                }
+            }
+            _ => {}
+        }));
+
+        let provider = LifecycleProvider {
+            invocations: provider_invocations.clone(),
+            task_terminal: task_terminal.clone(),
+            second_complete_entered: second_complete_entered.clone(),
+            unblock_second_turn: unblock_second_turn.clone(),
+        };
+
+        let notification_handle = agent.notification_queue_handle();
+        let agent_task =
+            tokio::spawn(async move { agent.prompt(&provider, "do task and wait").await });
+
+        // 1. Wait until tool executes and registers WaitInterest
+        tool_executed.notified().await;
+
+        // Yield slightly so ReAct finishes tool batch, sees unsatisfied WaitInterest, and parks
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        // 2. Verify deterministic state during park:
+        // - AgentStart has occurred
+        assert_eq!(tracker.agent_starts.load(Ordering::SeqCst), 1);
+        // - AgentEnd has NOT occurred
+        assert_eq!(tracker.agent_ends.load(Ordering::SeqCst), 0);
+        assert!(
+            !tracker
+                .agent_end_seen_before_task_terminal
+                .load(Ordering::SeqCst),
+            "AgentEnd must not fire during park"
+        );
+        // - Provider has NOT received second complete call
+        assert_eq!(provider_invocations.load(Ordering::SeqCst), 1);
+        assert!(!second_complete_entered.load(Ordering::SeqCst));
+
+        // 3. Complete the background task (task terminal)
+        task_terminal.store(true, Ordering::SeqCst);
+        notification_handle
+            .lock()
+            .unwrap()
+            .push("bg_task_1 completed".into());
+        waiter.complete("bg_task_1");
+
+        // 4. Wait for provider to enter second complete call (woken up)
+        while !second_complete_entered.load(Ordering::SeqCst) {
+            tokio::task::yield_now().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Provider is now in second complete call; AgentEnd must still NOT have fired!
+        assert_eq!(tracker.agent_ends.load(Ordering::SeqCst), 0);
+        assert_eq!(provider_invocations.load(Ordering::SeqCst), 2);
+
+        // 5. Unblock second turn completion so agent run can finish
+        unblock_second_turn.notify_one();
+
+        let out = agent_task.await.expect("join").expect("prompt success");
+        assert_eq!(out, "final answer");
+
+        // 6. Verify final lifecycle:
+        // - Exactly one AgentStart and exactly one AgentEnd
+        assert_eq!(tracker.agent_starts.load(Ordering::SeqCst), 1);
+        assert_eq!(tracker.agent_ends.load(Ordering::SeqCst), 1);
+        assert!(!tracker
+            .agent_end_seen_before_task_terminal
+            .load(Ordering::SeqCst));
     }
 }

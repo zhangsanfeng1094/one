@@ -12,16 +12,20 @@ pub mod tool_gate;
 pub mod trace;
 
 pub use agent::{
-    Agent, AgentConfig, Citation, CompletionRequest, CompletionResponse, LlmProvider, ServerTool,
-    ThinkingLevel, TokenUsage, TraceRunMeta,
+    max_parallel_readonly_tools_from_env, Agent, AgentConfig, BatchExplorationRule, Citation,
+    CompletionRequest, CompletionResponse, LlmProvider, RegisteredWaiter, ServerTool,
+    TaskWaitWaiter, ThinkingLevel, TokenUsage, TraceRunMeta, WaitInterest, WaitInterestMode,
+    DEFAULT_MAX_PARALLEL_READONLY_TOOLS,
 };
 pub use compaction::{
-    attach_compaction_reminder, compact_messages, compact_messages_forced, compacted_live_messages,
-    edited_paths_from_messages, estimate_message_parts, estimate_tokens, estimate_tokens_str,
-    extractive_summary, format_compaction_reminder, format_transcript, is_context_overflow_error,
-    prefire_threshold, prefix_fingerprint, prune_old_tool_outputs, scale_token_weights,
-    should_compact, should_compact_tokens, should_prefire_prune, should_prefire_two_pass,
-    split_for_compaction, split_for_compaction_forced, split_two_pass, summarization_prompt,
+    attach_compaction_reminder, can_fork_summarize_prefix, compact_messages,
+    compact_messages_forced, compacted_live_messages, compaction_instruction,
+    compaction_request_messages, edited_paths_from_messages, estimate_message_parts,
+    estimate_tokens, estimate_tokens_str, extractive_summary, format_compaction_reminder,
+    format_transcript, is_context_overflow_error, prefire_threshold, prefix_fingerprint,
+    prune_old_tool_outputs, scale_token_weights, should_compact, should_compact_tokens,
+    should_prefire_prune, should_prefire_two_pass, split_for_compaction,
+    split_for_compaction_forced, split_two_pass, summarization_prompt,
     threshold_for_context_window, threshold_for_context_window_ratio, tokens_for_compaction,
     two_pass_pass1_prompt, two_pass_pass2_prompt, user_turn_count, user_turn_starts,
     CompactApplied, CompactRequest, CompactTrigger, CompactionCheckpoint, CompactionConfig,
@@ -38,8 +42,9 @@ pub use events::AgentEvent;
 pub use hooks::{AgentHooks, NoopHooks, StopDecision};
 pub use message::{AgentMessage, AssistantMessage, StopReason, ToolResultMessage, UserMessage};
 pub use reminder::{
-    append_system_reminder, has_system_reminder, system_reminder, SYSTEM_REMINDER_CLOSE,
-    SYSTEM_REMINDER_OPEN,
+    append_system_reminder, extract_user_query, has_system_reminder, has_user_query,
+    is_system_notice_text, system_reminder, wrap_user_content_query, wrap_user_query,
+    SYSTEM_REMINDER_CLOSE, SYSTEM_REMINDER_OPEN, USER_QUERY_CLOSE, USER_QUERY_OPEN,
 };
 pub use streaming::{
     race_abort, wait_until_aborted, ServerToolStatus, StreamEvent, ABORT_POLL_INTERVAL,
