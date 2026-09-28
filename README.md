@@ -23,50 +23,86 @@
 - **上下文压缩**：LLM 摘要 + overflow 重试 + `/compact`
 - **执行轨迹**：`--trace` → Langfuse（OTLP）+ `one bench` harness
 
+## 安装与更新
+
+支持 **Linux (`x86_64` / `aarch64`)**、**macOS (`x86_64` / Apple Silicon `aarch64`)** 以及 **Windows WSL2**。
+
+### 1. 一键安装（推荐）
+
+```bash
+# 安装最新 Release 版本
+curl -fsSL https://github.com/zhangsanfeng1094/one/releases/latest/download/install.sh | bash
+
+# 或安装指定版本（如 0.1.0）
+curl -fsSL https://github.com/zhangsanfeng1094/one/releases/latest/download/install.sh | bash -s 0.1.0
+```
+
+安装脚本会自动：
+1. 识别当前系统与芯片架构，下载对应预编译二进制至 `~/.one/downloads/one-<version>-<platform>` 并校验 `SHA256SUMS`。
+2. 创建软链接 `~/.one/bin/one`，并将 `~/.one/bin` 自动写入 `~/.bashrc` / `~/.zshrc` / `~/.profile`。
+
+安装后让当前终端立即生效（或重新打开终端）：
+
+```bash
+export PATH="$HOME/.one/bin:$PATH"
+one --version
+```
+
+### 2. 日常自更新 (`one update`)
+
+安装完成后，无需再次运行安装脚本，直接使用内置的 `one update` 即可升级：
+
+```bash
+# 自更新到最新版本
+one update
+
+# 仅检查是否有新版本（不下载安装）
+one update --check
+
+# 安装或回退到指定版本
+one update --version 0.1.0
+
+# 强制重新下载并覆盖安装当前版本
+one update --force-reinstall
+```
+
+### 3. 本地源码编译安装
+
+如果你在本地克隆了仓库进行开发，可以一键把本地编译产物安装到 `~/.one/bin/one`：
+
+```bash
+./scripts/install.sh --local
+```
+
 ## 快速开始
 
 ```bash
-# 一键安装最新版本（或指定版本，如 bash -s 0.1.0）
-curl -fsSL https://raw.githubusercontent.com/zhangsanfeng1094/one/main/scripts/install.sh | bash
-
-# 从当前仓库本地编译并安装到 ~/.one/bin/one
-./scripts/install.sh --local
-
-# 检查更新 / 自更新到最新版本
-one update --check
-one update
-
-# 编译（需要 Rust 工具链；推荐安装 build-essential）
-cargo build -p one-cli
+# 启动交互式 TUI
+one
 
 # Print 模式（Mock provider，无需 API key）
-cargo run -p one-cli -- -p "list files in current directory"
+one -p "list files in current directory" --provider mock
 
-# 交互模式
-cargo run -p one-cli
+# 继续上次 session / 交互选择历史会话
+one --continue
+one --resume
 
-# 继续上次 session / 交互选择历史
-cargo run -p one-cli -- --continue
-cargo run -p one-cli -- --resume
+# JSON 事件流 / RPC 模式 / ACP 模式（IDE / Zed 等）
+one --mode json -p "hello"
+one --mode rpc --no-session
+one acp --provider mock --yes
 
-# JSON 事件流
-cargo run -p one-cli -- --mode json -p "hello"
-
-# RPC 模式（stdin JSONL）
-cargo run -p one-cli -- --mode rpc --no-session
-
-# ACP 模式（Agent Client Protocol，IDE / Zed 等）
-cargo run -p one-cli -- acp --provider mock --yes
-# 详见 docs/acp.md
-
-# 真实 LLM（http-providers 已是 one-cli 默认 feature）
+# 使用 API Key 调用真实模型
 export ANTHROPIC_API_KEY=...
-cargo run -p one-cli -- --provider anthropic -p "hello"
+one --provider anthropic -p "hello"
 
-# 订阅登录后使用
-cargo run -p one-cli -- login          # 交互选 Codex / xAI / OpenCode …
-cargo run -p one-cli -- --provider openai-codex -p "hello"
-cargo run -p one-cli -- --provider xai -p "hello"
+# 订阅 OAuth 登录后使用（交互选 Codex / xAI / OpenCode …）
+one login
+one --provider openai-codex -p "hello"
+one --provider xai -p "hello"
+
+# 开发调试：直接通过 cargo 运行
+cargo run -p one-cli -- -p "list files in current directory"
 ```
 
 编译后的二进制名为 **`one`**（`target/debug/one` 或 `target/release/one`）。
