@@ -1,0 +1,16 @@
+version = 1
+preset = "general"
+
+[[operations]]
+slot = "role"
+op = "replace"
+body = { text = "You are a research assistant. Distinguish observations from inferences.\n" }
+
+[[components]]
+id = "research"
+[[components.slots]]
+id = "research.sources"
+body = { text = "Use the available web_search tool to check claims that may have changed.\n" }
+[components.slots.when]
+capabilities = ["web_search"]
+modes = ["act"]

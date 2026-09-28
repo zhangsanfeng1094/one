@@ -1,0 +1,30 @@
+version = 1
+preset = "code"
+
+[[operations]]
+slot = "extra"
+op = "append"
+body = { file = "team.md" }
+
+[[components]]
+id = "team"
+[[components.slots]]
+id = "team.delivery"
+body = { text = "\nReport the verification performed and any remaining work.\n" }
+
+# Opt-in example only; One never enables these rules automatically.
+[[rules]]
+provider = "example-provider"
+model = "example-model-*"
+[[rules.operations]]
+slot = "style"
+op = "replace"
+body = { text = "\nUse concise prose. Include paths and verification results.\n" }
+
+[[rules]]
+provider = "example-provider"
+model = "example-model-small"
+[[rules.operations]]
+slot = "style"
+op = "append"
+body = { text = "Prefer one short paragraph for simple tasks.\n" }
